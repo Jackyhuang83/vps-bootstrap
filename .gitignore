@@ -1,0 +1,35 @@
+# macOS
+.DS_Store
+
+# Editors / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+*.orig
+
+# Logs
+*.log
+
+# Local environment / secrets
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Local runtime/config exports
+config.local.json
+*.local.json
+
+# Backup directories
+backup/
+backups/
