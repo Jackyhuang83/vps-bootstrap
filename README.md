@@ -29,6 +29,10 @@
 curl -fsSL https://你的域名/assets/scripts/ss2022.sh -o /usr/local/bin/ss2022 && chmod +x /usr/local/bin/ss2022 && ln -sf /usr/local/bin/ss2022 /usr/local/bin/proxy && ss2022
 ```
 
+```bash
+curl -fsSL https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh -o /usr/local/bin/ss2022 && chmod +x /usr/local/bin/ss2022 && ln -sf /usr/local/bin/ss2022 /usr/local/bin/proxy && ss2022
+```
+
 安装完成后，可在终端任意位置执行：
 
 ```bash
