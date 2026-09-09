@@ -2,7 +2,13 @@
 # ==============================================================================
 # 项目名称: VPS Bootstrap & SS2022 多协议代理管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.7.0-dev8
+# 当前版本: v1.7.0-dev9
+#
+# v1.7.0-dev9:
+#   - 修复 Xray 临时配置文件无法自动识别 JSON 格式：校验时显式使用 -format json
+#   - Xray 组件全面命名空间隔离：ss2022-xray.service / /usr/local/lib/ss2022/xray / /etc/ss2022-xray/config.json
+#   - 不再覆盖或管理服务器已有的 /usr/local/bin/xray、xray.service、/usr/local/etc/xray/config.json
+#   - VLESS Reality 仍固定使用 Xray-core v26.3.27 + SHA256 校验
 #
 # v1.7.0-dev8:
 #   - VLESS Reality 服务端由 sing-box 改为 Xray-core v26.3.27（官方稳定版）
@@ -55,7 +61,7 @@
 #   这是开发版。建议先在测试 VPS 验证，再替换公开分发的 v1.6.1。
 # ==============================================================================
 
-SCRIPT_VERSION="v1.7.0-dev8"
+SCRIPT_VERSION="v1.7.0-dev9"
 AUTHOR="DevOps"
 
 RED='\033[0;31m'
@@ -76,11 +82,12 @@ SINGBOX_VERSION="1.13.20"
 
 # ----------------------------- Xray (VLESS Reality) ---------------------------
 XRAY_VERSION="26.3.27"
-XRAY_BIN="/usr/local/bin/xray"
-XRAY_CONF="/etc/xray/config.json"
-XRAY_SERVICE="/etc/systemd/system/xray.service"
-XRAY_USER="xray"
-XRAY_GROUP="xray"
+XRAY_BIN="/usr/local/lib/ss2022/xray"
+XRAY_CONF="/etc/ss2022-xray/config.json"
+XRAY_SERVICE_NAME="ss2022-xray"
+XRAY_SERVICE="/etc/systemd/system/${XRAY_SERVICE_NAME}.service"
+XRAY_USER="ss2022-xray"
+XRAY_GROUP="ss2022-xray"
 XRAY_USER_MARKER="/etc/ss2022-xray-user-managed"
 XRAY_SHA256_AMD64="23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae"
 XRAY_SHA256_ARM64="4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c"
@@ -243,7 +250,7 @@ show_dashboard() {
         sb_status="${RED}○ 已停止${PLAIN}"
     fi
 
-    if systemctl is-active --quiet xray 2>/dev/null; then
+    if systemctl is-active --quiet "$XRAY_SERVICE_NAME" 2>/dev/null; then
         xray_status="${GREEN}● 运行中${PLAIN}"
     elif [[ -f "$XRAY_CONF" || -x "$XRAY_BIN" ]]; then
         xray_status="${RED}○ 已停止${PLAIN}"
@@ -1705,7 +1712,7 @@ update_vless_reality() {
         if write_xray_vless_config "$new_listen" "$new_port" "$new_uuid" "$new_sni" "$new_private" "$new_short_id"; then
             save_mode_state "vless" "$(jq -n --arg host "$current_host" --arg network "$new_network" --arg public_key "$new_public" '{host:$host,network:$network,public_key:$public_key,core:"xray"}')" || true
             echo -e "${GREEN}✔ VLESS Reality (Xray) 更新成功。${PLAIN}"
-        else journalctl -u xray -n 30 --no-pager 2>/dev/null || true; fi
+        else journalctl -u "$XRAY_SERVICE_NAME" -n 30 --no-pager 2>/dev/null || true; fi
         pause
     done
 }
@@ -1837,7 +1844,7 @@ delete_vless_reality() {
     if [[ $has_xray -eq 0 && $has_legacy -eq 0 ]]; then echo -e "${YELLOW}未部署 VLESS Reality。${PLAIN}"; pause; return; fi
     read -rp "确认删除 VLESS Reality（含旧 sing-box / 新 Xray 配置）？[y/N]: " yes
     if [[ "$yes" =~ ^[Yy]$ ]]; then
-        if [[ $has_xray -eq 1 ]]; then systemctl disable --now xray >/dev/null 2>&1 || true; rm -f "$XRAY_CONF"; fi
+        if [[ $has_xray -eq 1 ]]; then systemctl disable --now "$XRAY_SERVICE_NAME" >/dev/null 2>&1 || true; rm -f "$XRAY_CONF"; fi
         if [[ $has_legacy -eq 1 ]]; then remove_singbox_mode vless || true; fi
         remove_mode_state "vless" || true
         echo -e "${GREEN}✔ VLESS Reality 已删除；Xray 二进制保留供后续部署。${PLAIN}"
@@ -2063,10 +2070,13 @@ deploy_vless_reality() {
     fi
     if json_has_inbound_tag "$TAG_VLESS"; then
         echo -e "${YELLOW}[检测到旧配置] 当前 VLESS Reality 仍由 sing-box 承载。${PLAIN}"
-        echo -e "${YELLOW}dev8 起 VLESS 改用 Xray。为避免端口冲突和隐式迁移，请先：VLESS Reality → 删除，再重新部署。${PLAIN}"
+        echo -e "${YELLOW}dev8 起 VLESS 改用 Xray；dev9 起使用独立 ss2022-xray 服务。为避免端口冲突和隐式迁移，请先：VLESS Reality → 删除，再重新部署。${PLAIN}"
         pause; return
     fi
     select_network_mode || return
+    if [[ -x /usr/local/bin/xray ]] || systemctl cat xray.service >/dev/null 2>&1 || [[ -f /usr/local/etc/xray/config.json ]]; then
+        echo -e "${YELLOW}[提示] 检测到服务器已有 Xray。dev9 使用独立 ss2022-xray 服务、二进制和配置，不会覆盖或重启现有 xray.service。${PLAIN}"
+    fi
     install_xray_core || { pause; return; }
     ask_xray_port "请输入 VLESS Reality 监听端口" "443" || return
     vless_port="$PORT"
@@ -2094,7 +2104,7 @@ deploy_vless_reality() {
         echo -e "${GREEN}✔ VLESS Reality (Xray) 部署成功。${PLAIN}"
         show_vless_details "$SERVER_HOST" "$vless_port" "$uuid" "$sni" "$REALITY_PUBLIC_KEY" "$short_id"
     else
-        journalctl -u xray -n 30 --no-pager 2>/dev/null || true
+        journalctl -u "$XRAY_SERVICE_NAME" -n 30 --no-pager 2>/dev/null || true
     fi
     pause
 }
@@ -2122,16 +2132,16 @@ write_xray_service() {
     ensure_xray_user || return 1
     cat > "$XRAY_SERVICE" <<'SERVICE'
 [Unit]
-Description=Xray VLESS Reality service
+Description=ss2022.sh managed Xray VLESS Reality service
 Documentation=https://github.com/XTLS/Xray-core
 After=network.target nss-lookup.target network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=xray
-Group=xray
-ExecStart=/usr/local/bin/xray run -config /etc/xray/config.json
+User=ss2022-xray
+Group=ss2022-xray
+ExecStart=/usr/local/lib/ss2022/xray run -format json -config /etc/ss2022-xray/config.json
 Restart=on-failure
 RestartSec=10s
 LimitNOFILE=1048576
@@ -2152,7 +2162,7 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 WantedBy=multi-user.target
 SERVICE
     systemctl daemon-reload || return 1
-    systemctl enable xray >/dev/null 2>&1 || return 1
+    systemctl enable "$XRAY_SERVICE_NAME" >/dev/null 2>&1 || return 1
 }
 
 install_xray_core() {
@@ -2176,6 +2186,7 @@ install_xray_core() {
         rm -rf "$tmp"; echo -e "${RED}[错误] Xray SHA256 校验失败。${PLAIN}"; return 1
     fi
     unzip -q "$zip" xray -d "$tmp/unpack" || { rm -rf "$tmp"; return 1; }
+    install -d -m 755 "$(dirname "$XRAY_BIN")" || { rm -rf "$tmp"; return 1; }
     install -m 755 "$tmp/unpack/xray" "$XRAY_BIN" || { rm -rf "$tmp"; return 1; }
     rm -rf "$tmp"
     "$XRAY_BIN" version >/dev/null 2>&1 || return 1
@@ -2217,7 +2228,7 @@ ask_xray_port() {
         if xray_port_conflict_configured "$input" no; then
             echo -e "${RED}[错误] 端口 ${input} 已被现有代理配置占用。${PLAIN}"; continue
         fi
-        pid=$(systemctl show -p MainPID --value xray 2>/dev/null || true)
+        pid=$(systemctl show -p MainPID --value "$XRAY_SERVICE_NAME" 2>/dev/null || true)
         if port_in_use_by_other_process "$input" "$pid" >/tmp/ss2022-port-conflict.$$ 2>/dev/null; then
             echo -e "${RED}[错误] 端口 ${input} 已被其他进程占用：${PLAIN}"; cat /tmp/ss2022-port-conflict.$$; rm -f /tmp/ss2022-port-conflict.$$; continue
         fi
@@ -2228,10 +2239,12 @@ ask_xray_port() {
 
 write_xray_vless_config() {
     local listen="$1" port="$2" uuid="$3" sni="$4" private="$5" short_id="$6" candidate backup="" had_old=0
-    mkdir -p /etc/xray || return 1
-    chown root:"$XRAY_GROUP" /etc/xray 2>/dev/null || true
-    chmod 750 /etc/xray
-    candidate=$(mktemp /etc/xray/config.json.tmp.XXXXXX) || return 1
+    local conf_dir
+    conf_dir=$(dirname "$XRAY_CONF")
+    mkdir -p "$conf_dir" || return 1
+    chown root:"$XRAY_GROUP" "$conf_dir" 2>/dev/null || true
+    chmod 750 "$conf_dir"
+    candidate=$(mktemp "${conf_dir}/config.tmp.XXXXXX.json") || return 1
     jq -n --arg listen "$listen" --argjson port "$port" --arg uuid "$uuid" --arg sni "$sni" --arg private "$private" --arg sid "$short_id" '{
       log:{loglevel:"warning"},
       inbounds:[{
@@ -2244,17 +2257,17 @@ write_xray_vless_config() {
     chown root:"$XRAY_GROUP" "$candidate" 2>/dev/null || true
     chmod 640 "$candidate"
     echo -e "${YELLOW}>> 校验新 Xray 配置...${PLAIN}"
-    if ! "$XRAY_BIN" run -test -config "$candidate"; then
+    if ! "$XRAY_BIN" run -test -format json -config "$candidate"; then
         echo -e "${RED}[错误] 新 Xray 配置未通过测试，原配置保持不变。${PLAIN}"; rm -f "$candidate"; return 1
     fi
     if [[ -f "$XRAY_CONF" ]]; then
-        had_old=1; backup=$(mktemp /etc/xray/config.json.rollback.XXXXXX) || { rm -f "$candidate"; return 1; }; cp -a "$XRAY_CONF" "$backup"
+        had_old=1; backup=$(mktemp "$(dirname "$XRAY_CONF")/config.rollback.XXXXXX.json") || { rm -f "$candidate"; return 1; }; cp -a "$XRAY_CONF" "$backup"
     fi
     mv -f "$candidate" "$XRAY_CONF" || { rm -f "$candidate" "$backup"; return 1; }
     chown root:"$XRAY_GROUP" "$XRAY_CONF"; chmod 640 "$XRAY_CONF"
-    if ! systemctl restart xray; then
+    if ! systemctl restart "$XRAY_SERVICE_NAME"; then
         echo -e "${RED}[错误] Xray 新配置启动失败，正在回滚...${PLAIN}"
-        if [[ $had_old -eq 1 && -f "$backup" ]]; then mv -f "$backup" "$XRAY_CONF"; chown root:"$XRAY_GROUP" "$XRAY_CONF"; chmod 640 "$XRAY_CONF"; systemctl restart xray || true; else rm -f "$XRAY_CONF"; fi
+        if [[ $had_old -eq 1 && -f "$backup" ]]; then mv -f "$backup" "$XRAY_CONF"; chown root:"$XRAY_GROUP" "$XRAY_CONF"; chmod 640 "$XRAY_CONF"; systemctl restart "$XRAY_SERVICE_NAME" || true; else rm -f "$XRAY_CONF"; fi
         return 1
     fi
     rm -f "$backup"
@@ -2756,8 +2769,8 @@ show_service_status() {
     systemctl --no-pager --full status sing-box 2>/dev/null | head -n 15 || echo "未安装/未加载"
 
     echo ""
-    echo -e "${YELLOW}【Xray / VLESS Reality】${PLAIN}"
-    systemctl --no-pager --full status xray 2>/dev/null | head -n 15 || echo "未安装/未加载"
+    echo -e "${YELLOW}【ss2022-xray / VLESS Reality】${PLAIN}"
+    systemctl --no-pager --full status "$XRAY_SERVICE_NAME" 2>/dev/null | head -n 15 || echo "未安装/未加载"
 
     echo ""
     echo -e "${YELLOW}【Snell v5】${PLAIN}"
@@ -2770,14 +2783,14 @@ show_service_status() {
 
 full_uninstall() {
     local yes=""
-    echo -e "${RED}此操作会删除 sing-box、Xray、Snell v5、全部节点配置、服务文件和快捷命令。${PLAIN}"
+    echo -e "${RED}此操作会删除 sing-box、ss2022-xray、Snell v5 及本脚本管理的全部节点配置；不会删除服务器原有 xray.service。${PLAIN}"
     read -rp "确认彻底卸载？请输入 YES: " yes
     [[ "$yes" == "YES" ]] || return
 
-    systemctl disable --now sing-box xray snell-v5 ipv6-keepalive.timer >/dev/null 2>&1 || true
+    systemctl disable --now sing-box "$XRAY_SERVICE_NAME" snell-v5 ipv6-keepalive.timer >/dev/null 2>&1 || true
     systemctl stop ipv6-keepalive.service >/dev/null 2>&1 || true
 
-    rm -rf /etc/sing-box /etc/xray /etc/snell "$STATE_DIR"
+    rm -rf /etc/sing-box /etc/snell /etc/ss2022-xray "$STATE_DIR" /usr/local/lib/ss2022
     rm -f \
         /usr/local/bin/ss2022 \
         /usr/local/bin/proxy \
@@ -2822,10 +2835,10 @@ service_management() {
         echo -e "${CYAN}════════════════════ 服务运维管理 ════════════════════${PLAIN}"
         echo "  1. 查看全部服务状态与监听端口"
         echo "  2. 查看 sing-box 实时日志"
-        echo "  3. 查看 Xray 实时日志"
+        echo "  3. 查看 ss2022-xray 实时日志"
         echo "  4. 查看 Snell v5 实时日志"
         echo "  5. 重启 sing-box"
-        echo "  6. 重启 Xray"
+        echo "  6. 重启 ss2022-xray"
         echo "  7. 重启 Snell v5"
         echo "  8. 查看 IPv6 Keepalive 状态"
         echo "  9. 彻底卸载全部代理组件"
@@ -2835,10 +2848,10 @@ service_management() {
         case "$c" in
             1) show_service_status; pause ;;
             2) journalctl -u sing-box -f -n 30 ;;
-            3) journalctl -u xray -f -n 30 ;;
+            3) journalctl -u "$XRAY_SERVICE_NAME" -f -n 30 ;;
             4) journalctl -u snell-v5 -f -n 30 ;;
             5) if systemctl restart sing-box; then echo -e "${GREEN}✔ sing-box 已重启。${PLAIN}"; else journalctl -u sing-box -n 30 --no-pager; fi; pause ;;
-            6) if systemctl restart xray; then echo -e "${GREEN}✔ Xray 已重启。${PLAIN}"; else journalctl -u xray -n 30 --no-pager; fi; pause ;;
+            6) if systemctl restart "$XRAY_SERVICE_NAME"; then echo -e "${GREEN}✔ ss2022-xray 已重启。${PLAIN}"; else journalctl -u "$XRAY_SERVICE_NAME" -n 30 --no-pager; fi; pause ;;
             7) if systemctl restart snell-v5; then echo -e "${GREEN}✔ Snell v5 已重启。${PLAIN}"; else journalctl -u snell-v5 -n 30 --no-pager; fi; pause ;;
             8) systemctl list-timers --all | grep -E 'keepalive|NEXT' || echo "未检测到 Keepalive 定时器。"; pause ;;
             9) full_uninstall ;;
