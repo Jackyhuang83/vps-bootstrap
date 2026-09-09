@@ -2,9 +2,9 @@
 # ==============================================================================
 # 项目名称: VPS Bootstrap & SS2022 多协议代理管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.7.0-dev9
+# 当前版本: v1.7.0
 #
-# v1.7.0-dev9:
+# v1.7.0:
 #   - 修复 Xray 临时配置文件无法自动识别 JSON 格式：校验时显式使用 -format json
 #   - Xray 组件全面命名空间隔离：ss2022-xray.service / /usr/local/lib/ss2022/xray / /etc/ss2022-xray/config.json
 #   - 不再覆盖或管理服务器已有的 /usr/local/bin/xray、xray.service、/usr/local/etc/xray/config.json
@@ -61,7 +61,7 @@
 #   这是开发版。建议先在测试 VPS 验证，再替换公开分发的 v1.6.1。
 # ==============================================================================
 
-SCRIPT_VERSION="v1.7.0-dev9"
+SCRIPT_VERSION="v1.7.0"
 AUTHOR="DevOps"
 
 RED='\033[0;31m'
