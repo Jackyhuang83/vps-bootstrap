@@ -2,7 +2,14 @@
 # ==============================================================================
 # 项目名称: VPS Bootstrap & SS2022 多协议代理管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.7.0-dev3
+# 当前版本: v1.7.0-dev4
+#
+# v1.7.0-dev4:
+#   - 四种代理模式统一改为二级管理菜单：部署 / 更新 / 删除
+#   - 部署：仅用于新建节点；检测到已存在时拒绝覆盖
+#   - 更新：保留现有密钥/UUID/PSK，仅修改端口、网络、SNI、UDP、服务器地址等配置
+#   - 删除：在对应协议菜单内直接删除，不再要求进入服务运维菜单
+#   - VLESS Reality 更新不会重新生成 UUID / Reality Key / Short ID
 #
 # v1.7.0-dev3:
 #   - 节点输出统一增加：通用/分享信息、Surge、Loon、FlClash(Mihomo)、Shadowrocket、二维码
@@ -25,7 +32,7 @@
 #   这是开发版。建议先在测试 VPS 验证，再替换公开分发的 v1.6.1。
 # ==============================================================================
 
-SCRIPT_VERSION="v1.7.0-dev3"
+SCRIPT_VERSION="v1.7.0-dev4"
 AUTHOR="DevOps"
 
 RED='\033[0;31m'
@@ -1277,9 +1284,398 @@ YAML
     echo -e "${CYAN}═════════════════════════════════════════════════════════${PLAIN}"
 }
 
+
+select_network_mode_for_update() {
+    local current_network="$1"
+    local require_time_sync="${2:-yes}"
+    local default_choice="1" n=""
+
+    [[ "$current_network" == "ipv6" ]] && default_choice="2"
+
+    while true; do
+        echo ""
+        echo "请选择 VPS 入站网络模式："
+        echo "  1) IPv4 / 双栈（监听 0.0.0.0）"
+        echo "  2) IPv6-only（监听 ::，启用 IPv6 Keepalive）"
+        echo "  0) 取消"
+        read -rp "请选择 [0-2，默认: ${default_choice}]: " n
+        n=${n:-$default_choice}
+
+        case "$n" in
+            1)
+                NETWORK_MODE="ipv4"
+                LISTEN_ADDR="0.0.0.0"
+                prepare_ipv4_env "$require_time_sync" || return 1
+                disable_keepalive_for_ipv4
+                return 0
+                ;;
+            2)
+                NETWORK_MODE="ipv6"
+                LISTEN_ADDR="::"
+                prepare_ipv6_env "$require_time_sync" || return 1
+                setup_keepalive || return 1
+                return 0
+                ;;
+            0) return 1 ;;
+            *) echo -e "${RED}输入无效。${PLAIN}" ;;
+        esac
+    done
+}
+
+ask_server_host_with_default() {
+    local current_host="$1" input=""
+    if [[ -n "$current_host" ]]; then
+        read -rp "服务器地址/域名 [默认保持: ${current_host}]: " input
+        SERVER_HOST=${input:-$current_host}
+    else
+        ask_server_host
+    fi
+}
+
+infer_network_from_listen() {
+    local listen="$1"
+    [[ "$listen" == "::" ]] && printf 'ipv6' || printf 'ipv4'
+}
+
+protocol_exists_snell() {
+    [[ -f "$SNELL_CONF" ]]
+}
+
+update_ss2022() {
+    local excluded_tags='["ss-in"]'
+    local current_port current_method current_key current_listen current_host current_network
+    local inbound add_json rotate=""
+
+    if ! json_has_inbound_tag "$TAG_SS"; then
+        echo -e "${YELLOW}未部署 SS2022，请先选择“部署”。${PLAIN}"
+        pause
+        return
+    fi
+
+    current_port=$(jq -r --arg t "$TAG_SS" '.inbounds[] | select(.tag==$t) | .listen_port' "$SINGBOX_CONF")
+    current_method=$(jq -r --arg t "$TAG_SS" '.inbounds[] | select(.tag==$t) | .method' "$SINGBOX_CONF")
+    current_key=$(jq -r --arg t "$TAG_SS" '.inbounds[] | select(.tag==$t) | .password' "$SINGBOX_CONF")
+    current_listen=$(jq -r --arg t "$TAG_SS" '.inbounds[] | select(.tag==$t) | .listen' "$SINGBOX_CONF")
+    current_host=$(get_mode_state_field "ss" "host" 2>/dev/null || true)
+    current_network=$(get_mode_state_field "ss" "network" 2>/dev/null || true)
+    [[ -n "$current_network" ]] || current_network=$(infer_network_from_listen "$current_listen")
+
+    select_network_mode_for_update "$current_network" || return
+    ask_singbox_port "请输入 SS2022 监听端口" "$current_port" "$excluded_tags" || return
+
+    METHOD="$current_method"
+    SS_KEY="$current_key"
+    echo -e "${YELLOW}[保持] 加密算法: ${METHOD}${PLAIN}"
+    echo -e "${YELLOW}[保持] SS2022 密钥不变。${PLAIN}"
+    read -rp "是否重新生成 SS2022 加密算法/密钥？[y/N]: " rotate
+    if [[ "$rotate" =~ ^[Yy]$ ]]; then
+        get_ss_cipher_and_key || { pause; return; }
+    fi
+
+    ask_server_host_with_default "$current_host"
+
+    inbound=$(jq -n \
+        --arg listen "$LISTEN_ADDR" \
+        --argjson port "$PORT" \
+        --arg method "$METHOD" \
+        --arg password "$SS_KEY" \
+        '{type:"shadowsocks",tag:"ss-in",listen:$listen,listen_port:$port,method:$method,password:$password}')
+    add_json=$(jq -n --argjson a "$inbound" '[$a]')
+
+    if update_singbox_inbounds "$excluded_tags" "$add_json"; then
+        save_mode_state "ss" "$(jq -n --arg host "$SERVER_HOST" --arg network "$NETWORK_MODE" '{host:$host,network:$network}')" || true
+        echo -e "${GREEN}✔ SS2022 更新成功，原节点身份默认保持不变。${PLAIN}"
+        show_ss_details "$SERVER_HOST" "$PORT" "$METHOD" "$SS_KEY"
+    else
+        journalctl -u sing-box -n 30 --no-pager 2>/dev/null || true
+    fi
+    pause
+}
+
+update_shadowtls() {
+    local excluded_tags='["ss-shadowtls-in","ss-shadowtls-backend","ss-shadowtls-udp"]'
+    local current_port current_method current_ss_key current_stls_pass current_sni current_listen
+    local current_host current_network current_udp_enabled="false" current_udp_port=""
+    local tcp_port sni udp_choice udp_enabled="false" udp_port="" default_udp="" rotate_ss="" rotate_stls=""
+    local outer backend udp_inbound add_json=""
+
+    if ! json_has_inbound_tag "$TAG_STLS"; then
+        echo -e "${YELLOW}未部署 SS2022 + ShadowTLS v3，请先选择“部署”。${PLAIN}"
+        pause
+        return
+    fi
+
+    current_port=$(get_inbound_port "$TAG_STLS")
+    current_stls_pass=$(jq -r --arg t "$TAG_STLS" '.inbounds[] | select(.tag==$t) | .users[0].password' "$SINGBOX_CONF")
+    current_sni=$(jq -r --arg t "$TAG_STLS" '.inbounds[] | select(.tag==$t) | .handshake.server' "$SINGBOX_CONF")
+    current_listen=$(jq -r --arg t "$TAG_STLS" '.inbounds[] | select(.tag==$t) | .listen' "$SINGBOX_CONF")
+    current_method=$(jq -r --arg t "$TAG_STLS_BACKEND" '.inbounds[] | select(.tag==$t) | .method' "$SINGBOX_CONF")
+    current_ss_key=$(jq -r --arg t "$TAG_STLS_BACKEND" '.inbounds[] | select(.tag==$t) | .password' "$SINGBOX_CONF")
+    current_host=$(get_mode_state_field "shadowtls" "host" 2>/dev/null || true)
+    current_network=$(get_mode_state_field "shadowtls" "network" 2>/dev/null || true)
+    [[ -n "$current_network" ]] || current_network=$(infer_network_from_listen "$current_listen")
+    if json_has_inbound_tag "$TAG_STLS_UDP"; then
+        current_udp_enabled="true"
+        current_udp_port=$(get_inbound_port "$TAG_STLS_UDP")
+    fi
+
+    select_network_mode_for_update "$current_network" || return
+    ask_singbox_port "请输入 ShadowTLS 对外 TCP 端口" "$current_port" "$excluded_tags" || return
+    tcp_port="$PORT"
+
+    METHOD="$current_method"
+    SS_KEY="$current_ss_key"
+    read -rp "是否重新生成内部 SS2022 加密算法/密钥？[y/N]: " rotate_ss
+    if [[ "$rotate_ss" =~ ^[Yy]$ ]]; then
+        get_ss_cipher_and_key || { pause; return; }
+    fi
+
+    local stls_pass="$current_stls_pass"
+    read -rp "是否重新生成 ShadowTLS 密码？[y/N]: " rotate_stls
+    if [[ "$rotate_stls" =~ ^[Yy]$ ]]; then
+        stls_pass=$(openssl rand -base64 24 | tr -d '\n') || { echo -e "${RED}[错误] ShadowTLS 密码生成失败。${PLAIN}"; pause; return; }
+    fi
+
+    read -rp "ShadowTLS 握手/SNI [默认保持: ${current_sni}]: " sni
+    sni=${sni:-$current_sni}
+
+    if [[ "$current_udp_enabled" == "true" ]]; then
+        read -rp "是否继续启用独立 SS2022 UDP Relay？[Y/n]: " udp_choice
+        if [[ ! "$udp_choice" =~ ^[Nn]$ ]]; then
+            udp_enabled="true"
+        fi
+    else
+        read -rp "是否启用独立 SS2022 UDP Relay？[y/N]: " udp_choice
+        [[ "$udp_choice" =~ ^[Yy]$ ]] && udp_enabled="true"
+    fi
+
+    if [[ "$udp_enabled" == "true" ]]; then
+        default_udp=${current_udp_port:-$(( (tcp_port + 10000) % 65535 ))}
+        [[ "$default_udp" -lt 1024 ]] && default_udp=58589
+        while true; do
+            read -rp "请输入独立 UDP 端口 [默认: ${default_udp}]: " udp_port
+            udp_port=${udp_port:-$default_udp}
+            validate_port_number "$udp_port" || { echo -e "${RED}端口无效。${PLAIN}"; continue; }
+            port_is_available_for_singbox_mode "$udp_port" "$excluded_tags" && break
+        done
+    fi
+
+    ask_server_host_with_default "$current_host"
+
+    outer=$(jq -n --arg listen "$LISTEN_ADDR" --argjson port "$tcp_port" --arg password "$stls_pass" --arg sni "$sni" \
+        '{type:"shadowtls",tag:"ss-shadowtls-in",listen:$listen,listen_port:$port,version:3,users:[{name:"default",password:$password}],handshake:{server:$sni,server_port:443},strict_mode:true,detour:"ss-shadowtls-backend"}')
+    backend=$(jq -n --arg method "$METHOD" --arg password "$SS_KEY" \
+        '{type:"shadowsocks",tag:"ss-shadowtls-backend",listen:"127.0.0.1",network:"tcp",method:$method,password:$password}')
+
+    if [[ "$udp_enabled" == "true" ]]; then
+        udp_inbound=$(jq -n --arg listen "$LISTEN_ADDR" --argjson port "$udp_port" --arg method "$METHOD" --arg password "$SS_KEY" \
+            '{type:"shadowsocks",tag:"ss-shadowtls-udp",listen:$listen,listen_port:$port,network:"udp",method:$method,password:$password}')
+        add_json=$(jq -n --argjson a "$outer" --argjson b "$backend" --argjson c "$udp_inbound" '[$a,$b,$c]')
+    else
+        add_json=$(jq -n --argjson a "$outer" --argjson b "$backend" '[$a,$b]')
+    fi
+
+    if update_singbox_inbounds "$excluded_tags" "$add_json"; then
+        save_mode_state "shadowtls" "$(jq -n --arg host "$SERVER_HOST" --arg network "$NETWORK_MODE" '{host:$host,network:$network}')" || true
+        echo -e "${GREEN}✔ SS2022 + ShadowTLS v3 更新成功。${PLAIN}"
+        show_shadowtls_details "$SERVER_HOST" "$tcp_port" "$METHOD" "$SS_KEY" "$stls_pass" "$sni" "$udp_enabled" "$udp_port"
+    else
+        journalctl -u sing-box -n 30 --no-pager 2>/dev/null || true
+    fi
+    pause
+}
+
+update_vless_reality() {
+    local excluded_tags='["vless-reality-in"]'
+    local current_port uuid current_sni private short_id current_listen current_host current_network public
+    local vless_port sni choice inbound add_json
+
+    if ! json_has_inbound_tag "$TAG_VLESS"; then
+        echo -e "${YELLOW}未部署 VLESS Reality，请先选择“部署”。${PLAIN}"
+        pause
+        return
+    fi
+
+    current_port=$(get_inbound_port "$TAG_VLESS")
+    uuid=$(jq -r --arg t "$TAG_VLESS" '.inbounds[] | select(.tag==$t) | .users[0].uuid' "$SINGBOX_CONF")
+    current_sni=$(jq -r --arg t "$TAG_VLESS" '.inbounds[] | select(.tag==$t) | .tls.reality.handshake.server' "$SINGBOX_CONF")
+    private=$(jq -r --arg t "$TAG_VLESS" '.inbounds[] | select(.tag==$t) | .tls.reality.private_key' "$SINGBOX_CONF")
+    short_id=$(jq -r --arg t "$TAG_VLESS" '.inbounds[] | select(.tag==$t) | .tls.reality.short_id[0]' "$SINGBOX_CONF")
+    current_listen=$(jq -r --arg t "$TAG_VLESS" '.inbounds[] | select(.tag==$t) | .listen' "$SINGBOX_CONF")
+    current_host=$(get_mode_state_field "vless" "host" 2>/dev/null || true)
+    current_network=$(get_mode_state_field "vless" "network" 2>/dev/null || true)
+    public=$(get_mode_state_field "vless" "public_key" 2>/dev/null || true)
+    [[ -n "$current_network" ]] || current_network=$(infer_network_from_listen "$current_listen")
+
+    select_network_mode_for_update "$current_network" || return
+    ask_singbox_port "请输入 VLESS Reality 监听端口" "$current_port" "$excluded_tags" || return
+    vless_port="$PORT"
+
+    echo ""
+    echo -e "当前 Reality SNI: ${CYAN}${current_sni}${PLAIN}"
+    echo "  1. 保持当前 SNI（默认）"
+    echo "  2. swdist.apple.com（推荐测试）"
+    echo "  3. www.icloud.com"
+    echo "  4. 自定义域名"
+    read -rp "请选择 [1-4，默认 1]: " choice
+    case "${choice:-1}" in
+        1) sni="$current_sni" ;;
+        2) sni="swdist.apple.com" ;;
+        3) sni="www.icloud.com" ;;
+        4)
+            while [[ -z "$sni" ]]; do read -rp "请输入 Reality 握手/SNI 域名: " sni; done
+            ;;
+        *) echo -e "${YELLOW}输入无效，保持当前 SNI。${PLAIN}"; sni="$current_sni" ;;
+    esac
+
+    ask_server_host_with_default "$current_host"
+
+    inbound=$(jq -n --arg listen "$LISTEN_ADDR" --argjson port "$vless_port" --arg uuid "$uuid" --arg sni "$sni" --arg private_key "$private" --arg short_id "$short_id" \
+        '{type:"vless",tag:"vless-reality-in",listen:$listen,listen_port:$port,network:"tcp",users:[{name:"default",uuid:$uuid,flow:"xtls-rprx-vision"}],tls:{enabled:true,reality:{enabled:true,handshake:{server:$sni,server_port:443},private_key:$private_key,short_id:[$short_id],max_time_difference:"1m"}}}')
+    add_json=$(jq -n --argjson a "$inbound" '[$a]')
+
+    if update_singbox_inbounds "$excluded_tags" "$add_json"; then
+        save_mode_state "vless" "$(jq -n --arg host "$SERVER_HOST" --arg network "$NETWORK_MODE" --arg public_key "$public" '{host:$host,network:$network,public_key:$public_key}')" || true
+        echo -e "${GREEN}✔ VLESS Reality 更新成功。UUID / Reality Key / Short ID 均保持不变。${PLAIN}"
+        if [[ -n "$public" ]]; then
+            show_vless_details "$SERVER_HOST" "$vless_port" "$uuid" "$sni" "$public" "$short_id"
+        else
+            echo -e "${YELLOW}[提示] 当前 state.json 缺少 Public Key；服务端配置已更新，但客户端参数仍需补齐 Public Key。${PLAIN}"
+        fi
+    else
+        journalctl -u sing-box -n 30 --no-pager 2>/dev/null || true
+    fi
+    pause
+}
+
+update_snell_v5() {
+    local current_port current_psk current_listen current_host current_network
+    local snell_port listen_value ipv6_flag tmp
+
+    if ! protocol_exists_snell; then
+        echo -e "${YELLOW}未部署 Snell v5，请先选择“部署”。${PLAIN}"
+        pause
+        return
+    fi
+    if [[ ! -x "$SNELL_BIN" ]]; then
+        echo -e "${RED}[错误] Snell v5 配置存在，但二进制缺失。请删除后重新部署。${PLAIN}"
+        pause
+        return
+    fi
+
+    current_port=$(snell_port_from_config)
+    current_psk=$(awk -F'=' '/^[[:space:]]*psk[[:space:]]*=/{sub(/^[[:space:]]*/,"",$2); sub(/[[:space:]]*$/,"",$2); print $2; exit}' "$SNELL_CONF")
+    current_listen=$(awk -F'=' '/^[[:space:]]*listen[[:space:]]*=/{print $2; exit}' "$SNELL_CONF")
+    current_host=$(get_mode_state_field "snell" "host" 2>/dev/null || true)
+    current_network=$(get_mode_state_field "snell" "network" 2>/dev/null || true)
+    if [[ -z "$current_network" ]]; then
+        [[ "$current_listen" == *"["* ]] && current_network="ipv6" || current_network="ipv4"
+    fi
+
+    select_network_mode_for_update "$current_network" "no" || return
+    while true; do
+        read -rp "请输入 Snell v5 监听端口 [默认: ${current_port}]: " snell_port
+        snell_port=${snell_port:-$current_port}
+        validate_port_number "$snell_port" || { echo -e "${RED}端口无效。${PLAIN}"; continue; }
+        port_is_available_for_snell "$snell_port" && break
+    done
+    ask_server_host_with_default "$current_host"
+
+    if [[ "$NETWORK_MODE" == "ipv6" ]]; then
+        listen_value="[::]:${snell_port}"
+        ipv6_flag="true"
+    else
+        listen_value="0.0.0.0:${snell_port}"
+        ipv6_flag="false"
+    fi
+
+    ensure_snell_user || { pause; return; }
+    write_snell_service || { pause; return; }
+    tmp=$(mktemp "/etc/snell-v5.conf.tmp.XXXXXX") || return
+    chmod 600 "$tmp"
+    cat > "$tmp" <<CONFIG
+[snell-server]
+listen = ${listen_value}
+psk = ${current_psk}
+version = 5
+ipv6 = ${ipv6_flag}
+obfs = off
+CONFIG
+
+    if apply_snell_config "$tmp"; then
+        save_mode_state "snell" "$(jq -n --arg host "$SERVER_HOST" --arg network "$NETWORK_MODE" '{host:$host,network:$network}')" || true
+        echo -e "${GREEN}✔ Snell v5 更新成功，原 PSK 保持不变。${PLAIN}"
+        show_snell_details "$SERVER_HOST" "$snell_port" "$current_psk"
+    else
+        journalctl -u snell-v5 -n 30 --no-pager 2>/dev/null || true
+    fi
+    pause
+}
+
+delete_ss2022() {
+    if ! json_has_inbound_tag "$TAG_SS"; then echo -e "${YELLOW}未部署 SS2022。${PLAIN}"; pause; return; fi
+    local yes=""; read -rp "确认删除 SS2022？[y/N]: " yes
+    if [[ "$yes" =~ ^[Yy]$ ]] && remove_singbox_mode ss; then echo -e "${GREEN}✔ SS2022 已删除。${PLAIN}"; fi
+    pause
+}
+
+delete_shadowtls() {
+    if ! json_has_inbound_tag "$TAG_STLS"; then echo -e "${YELLOW}未部署 SS2022 + ShadowTLS v3。${PLAIN}"; pause; return; fi
+    local yes=""; read -rp "确认删除 SS2022 + ShadowTLS v3？[y/N]: " yes
+    if [[ "$yes" =~ ^[Yy]$ ]] && remove_singbox_mode stls; then echo -e "${GREEN}✔ SS2022 + ShadowTLS v3 已删除。${PLAIN}"; fi
+    pause
+}
+
+delete_vless_reality() {
+    if ! json_has_inbound_tag "$TAG_VLESS"; then echo -e "${YELLOW}未部署 VLESS Reality。${PLAIN}"; pause; return; fi
+    local yes=""; read -rp "确认删除 VLESS Reality？[y/N]: " yes
+    if [[ "$yes" =~ ^[Yy]$ ]] && remove_singbox_mode vless; then echo -e "${GREEN}✔ VLESS Reality 已删除。${PLAIN}"; fi
+    pause
+}
+
+delete_snell_v5() {
+    if ! protocol_exists_snell; then echo -e "${YELLOW}未部署 Snell v5。${PLAIN}"; pause; return; fi
+    local yes=""; read -rp "确认删除 Snell v5 配置与服务？[y/N]: " yes
+    if [[ "$yes" =~ ^[Yy]$ ]]; then
+        systemctl disable --now snell-v5 >/dev/null 2>&1 || true
+        rm -f "$SNELL_CONF" "$SNELL_SERVICE"
+        remove_mode_state "snell" || true
+        systemctl daemon-reload || true
+        echo -e "${GREEN}✔ Snell v5 节点已删除，官方二进制保留。${PLAIN}"
+    fi
+    pause
+}
+
+protocol_action_menu() {
+    local title="$1" deploy_fn="$2" update_fn="$3" delete_fn="$4"
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ ${title} ════════════════════${PLAIN}"
+        echo "  1. 部署"
+        echo "  2. 更新"
+        echo "  3. 删除"
+        echo "  0. 返回"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-3]: " c
+        case "$c" in
+            1) "$deploy_fn" ;;
+            2) "$update_fn" ;;
+            3) "$delete_fn" ;;
+            0) return ;;
+            *) echo -e "${RED}输入无效。${PLAIN}"; sleep 1 ;;
+        esac
+    done
+}
+
 deploy_ss2022() {
     local excluded_tags='["ss-in"]'
     local inbound add_json
+
+    if json_has_inbound_tag "$TAG_SS"; then
+        echo -e "${YELLOW}SS2022 已存在。请返回并选择“更新”或“删除”。${PLAIN}"
+        pause
+        return
+    fi
 
     select_network_mode || return
     install_singbox_core || { pause; return; }
@@ -1316,6 +1712,12 @@ deploy_ss2022() {
 deploy_shadowtls() {
     local excluded_tags='["ss-shadowtls-in","ss-shadowtls-backend","ss-shadowtls-udp"]'
     local tcp_port stls_pass sni udp_choice udp_enabled="false" udp_port=""
+
+    if json_has_inbound_tag "$TAG_STLS"; then
+        echo -e "${YELLOW}SS2022 + ShadowTLS v3 已存在。请返回并选择“更新”或“删除”。${PLAIN}"
+        pause
+        return
+    fi
     local outer backend udp_inbound add_json=""
     local default_udp=""
 
@@ -1444,6 +1846,12 @@ generate_reality_keypair() {
 deploy_vless_reality() {
     local excluded_tags='["vless-reality-in"]'
     local vless_port uuid sni short_id inbound add_json reality_sni_choice
+
+    if json_has_inbound_tag "$TAG_VLESS"; then
+        echo -e "${YELLOW}VLESS Reality 已存在。请返回并选择“更新”或“删除”。${PLAIN}"
+        pause
+        return
+    fi
     local REALITY_PRIVATE_KEY="" REALITY_PUBLIC_KEY=""
 
     select_network_mode || return
@@ -1776,6 +2184,12 @@ apply_snell_config() {
 deploy_snell_v5() {
     local snell_port psk listen_value ipv6_flag tmp
 
+    if protocol_exists_snell; then
+        echo -e "${YELLOW}Snell v5 已存在。请返回并选择“更新”或“删除”。${PLAIN}"
+        pause
+        return
+    fi
+
     select_network_mode "no" || return
     install_snell_v5_core || { pause; return; }
     ensure_snell_user || { pause; return; }
@@ -2095,12 +2509,11 @@ service_management() {
         echo "  3. 查看 Snell v5 实时日志"
         echo "  4. 重启 sing-box"
         echo "  5. 重启 Snell v5"
-        echo "  6. 删除单个协议"
-        echo "  7. 查看 IPv6 Keepalive 状态"
-        echo "  8. 彻底卸载全部代理组件"
+        echo "  6. 查看 IPv6 Keepalive 状态"
+        echo "  7. 彻底卸载全部代理组件"
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0-8]: " c
+        read -rp "请选择 [0-7]: " c
 
         case "$c" in
             1) show_service_status; pause ;;
@@ -2114,12 +2527,11 @@ service_management() {
                 if systemctl restart snell-v5; then echo -e "${GREEN}✔ Snell v5 已重启。${PLAIN}"; else journalctl -u snell-v5 -n 30 --no-pager; fi
                 pause
                 ;;
-            6) remove_protocol_menu ;;
-            7)
+            6)
                 systemctl list-timers --all | grep -E 'keepalive|NEXT' || echo "未检测到 Keepalive 定时器。"
                 pause
                 ;;
-            8) full_uninstall ;;
+            7) full_uninstall ;;
             0) return ;;
             *) sleep 1 ;;
         esac
@@ -2131,10 +2543,10 @@ main() {
 
     while true; do
         show_dashboard
-        echo "  1. 部署 / 更新 SS2022"
-        echo "  2. 部署 / 更新 SS2022 + ShadowTLS v3（增强伪装）"
-        echo "  3. 部署 / 更新 VLESS Reality"
-        echo "  4. 部署 / 更新 Snell v5"
+        echo "  1. SS2022"
+        echo "  2. SS2022 + ShadowTLS v3（增强伪装）"
+        echo "  3. VLESS Reality"
+        echo "  4. Snell v5"
         echo "  5. 查看当前节点参数与客户端配置"
         echo "  6. 服务运维管理"
         echo "  0. 退出管理面板"
@@ -2142,10 +2554,10 @@ main() {
         read -rp "请输入选项编号 [0-6]: " choice
 
         case "$choice" in
-            1) deploy_ss2022 ;;
-            2) deploy_shadowtls ;;
-            3) deploy_vless_reality ;;
-            4) deploy_snell_v5 ;;
+            1) protocol_action_menu "SS2022" deploy_ss2022 update_ss2022 delete_ss2022 ;;
+            2) protocol_action_menu "SS2022 + ShadowTLS v3" deploy_shadowtls update_shadowtls delete_shadowtls ;;
+            3) protocol_action_menu "VLESS Reality" deploy_vless_reality update_vless_reality delete_vless_reality ;;
+            4) protocol_action_menu "Snell v5" deploy_snell_v5 update_snell_v5 delete_snell_v5 ;;
             5) view_config_menu ;;
             6) service_management ;;
             0)
