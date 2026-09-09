@@ -2,7 +2,16 @@
 # ==============================================================================
 # 项目名称: VPS Bootstrap & SS2022 多协议代理管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.7.0-dev1
+# 当前版本: v1.7.0-dev3
+#
+# v1.7.0-dev3:
+#   - 节点输出统一增加：通用/分享信息、Surge、Loon、FlClash(Mihomo)、Shadowrocket、二维码
+#   - VLESS Reality 默认握手目标改为 swdist.apple.com，可快捷选择 www.icloud.com 或自定义
+#   - 对客户端不支持的协议明确标注，不生成伪配置
+#
+# v1.7.0-dev2:
+#   - 修复 VLESS Reality 默认握手目标：由 www.microsoft.com 改为 www.cloudflare.com
+#   - VLESS Reality 显式限定 TCP，并提示 Surge 不支持 VLESS
 #
 # v1.7.0-dev1:
 #   - 保留 v1.6.1 SS2022 / IPv4 / IPv6 / 时间同步 / SHA256 / 非 root / 回滚机制
@@ -16,7 +25,7 @@
 #   这是开发版。建议先在测试 VPS 验证，再替换公开分发的 v1.6.1。
 # ==============================================================================
 
-SCRIPT_VERSION="v1.7.0-dev1"
+SCRIPT_VERSION="v1.7.0-dev3"
 AUTHOR="DevOps"
 
 RED='\033[0;31m'
@@ -1009,6 +1018,14 @@ format_host_for_uri() {
     fi
 }
 
+show_qr() {
+    local payload="$1"
+    if command -v qrencode &>/dev/null; then
+        echo -e "${YELLOW}【二维码】${PLAIN}"
+        qrencode -t ANSIUTF8 "$payload" 2>/dev/null || true
+    fi
+}
+
 show_ss_details() {
     local host="$1" port="$2" method="$3" pass="$4"
     local tag="Proxy-SS2022"
@@ -1028,13 +1045,16 @@ show_ss_details() {
     echo -e "  密钥: ${CYAN}${pass}${PLAIN}"
     echo -e "  UDP : ${GREEN}开启${PLAIN}"
     echo ""
+    echo -e "${YELLOW}【通用 URI / SIP002】${PLAIN}"
+    echo -e "${GREEN}${ss_url}${PLAIN}"
+    echo ""
     echo -e "${YELLOW}【Surge】${PLAIN}"
     echo -e "${GREEN}${tag} = ss, ${host}, ${port}, encrypt-method=${method}, password=\"${pass}\", udp-relay=true${PLAIN}"
     echo ""
     echo -e "${YELLOW}【Loon】${PLAIN}"
-    echo -e "${GREEN}${tag} = Shadowsocks, ${host}, ${port}, ${method}, \"${pass}\", udp=true${PLAIN}"
+    echo -e "${GREEN}${tag} = Shadowsocks,${host},${port},${method},\"${pass}\",fast-open=false,udp=true${PLAIN}"
     echo ""
-    echo -e "${YELLOW}【Clash / Mihomo】${PLAIN}"
+    echo -e "${YELLOW}【FlClash / Mihomo】${PLAIN}"
     cat <<YAML
 - name: "${tag}"
   type: ss
@@ -1045,23 +1065,25 @@ show_ss_details() {
   udp: true
 YAML
     echo ""
-    echo -e "${YELLOW}【SIP002】${PLAIN}"
-    echo -e "${GREEN}${ss_url}${PLAIN}"
+    echo -e "${YELLOW}【Shadowrocket】${PLAIN}"
+    echo -e "${GREEN}${tag} = ss,${host},${port},password=${pass},method=${method},udp=1${PLAIN}"
+    echo -e "${YELLOW}[提示] Shadowrocket 也可直接复制/扫描上面的通用 SS URI 导入。${PLAIN}"
     echo ""
-    if command -v qrencode &>/dev/null; then
-        echo -e "${YELLOW}【二维码】${PLAIN}"
-        qrencode -t ANSIUTF8 "$ss_url" 2>/dev/null || true
-    fi
+    show_qr "$ss_url"
     echo -e "${CYAN}═════════════════════════════════════════════════════════${PLAIN}"
 }
 
 show_shadowtls_details() {
     local host="$1" port="$2" method="$3" ss_pass="$4" stls_pass="$5" sni="$6" udp_enabled="$7" udp_port="$8"
     local tag="Proxy-SS2022-ShadowTLS"
-    local udp_part="udp-relay=false"
+    local surge_udp="udp-relay=false" loon_udp="udp=false" mihomo_udp="false"
+    local qr_payload
 
     if [[ "$udp_enabled" == "true" ]]; then
-        udp_part="udp-relay=true, udp-port=${udp_port}"
+        surge_udp="udp-relay=true, udp-port=${udp_port}"
+        loon_udp="udp-port=${udp_port},udp=true"
+        # Mihomo 的 SS+ShadowTLS 客户端配置没有独立 udp-port 字段；不要错误指向 ShadowTLS TCP 端口。
+        mihomo_udp="false"
     fi
 
     echo ""
@@ -1078,8 +1100,65 @@ show_shadowtls_details() {
         echo -e "  UDP Relay: ${YELLOW}关闭${PLAIN}"
     fi
     echo ""
+    echo -e "${YELLOW}【通用参数】${PLAIN}"
+    cat <<EOF
+协议: SS2022 + ShadowTLS v3
+服务器: ${host}
+TCP端口: ${port}
+加密: ${method}
+SS2022密钥: ${ss_pass}
+ShadowTLS密码: ${stls_pass}
+ShadowTLS SNI: ${sni}
+EOF
+    if [[ "$udp_enabled" == "true" ]]; then
+        echo "UDP端口: ${udp_port}"
+    else
+        echo "UDP: 关闭"
+    fi
+    echo ""
     echo -e "${YELLOW}【Surge】${PLAIN}"
-    echo -e "${GREEN}${tag} = ss, ${host}, ${port}, encrypt-method=${method}, password=\"${ss_pass}\", ${udp_part}, shadow-tls-password=\"${stls_pass}\", shadow-tls-version=3, shadow-tls-sni=${sni}${PLAIN}"
+    echo -e "${GREEN}${tag} = ss, ${host}, ${port}, encrypt-method=${method}, password=\"${ss_pass}\", ${surge_udp}, shadow-tls-password=\"${stls_pass}\", shadow-tls-version=3, shadow-tls-sni=${sni}${PLAIN}"
+    echo ""
+    echo -e "${YELLOW}【Loon】${PLAIN}"
+    echo -e "${GREEN}${tag} = Shadowsocks,${host},${port},${method},\"${ss_pass}\",shadow-tls-password=\"${stls_pass}\",shadow-tls-sni=${sni},shadow-tls-version=3,${loon_udp},fast-open=false${PLAIN}"
+    echo ""
+    echo -e "${YELLOW}【FlClash / Mihomo】${PLAIN}"
+    cat <<YAML
+- name: "${tag}"
+  type: ss
+  server: "${host}"
+  port: ${port}
+  cipher: ${method}
+  password: "${ss_pass}"
+  udp: ${mihomo_udp}
+  plugin: shadow-tls
+  plugin-opts:
+    host: "${sni}"
+    password: "${stls_pass}"
+    version: 3
+YAML
+    if [[ "$udp_enabled" == "true" ]]; then
+        echo -e "${YELLOW}[提示] FlClash/Mihomo 的 ShadowTLS SS 节点没有 Surge/Loon 的独立 udp-port 参数，因此这里安全地保持 udp:false；TCP ShadowTLS 不受影响。${PLAIN}"
+    fi
+    echo ""
+    echo -e "${YELLOW}【Shadowrocket】${PLAIN}"
+    echo "类型: Shadowsocks"
+    echo "地址: ${host}"
+    echo "端口: ${port}"
+    echo "加密方法: ${method}"
+    echo "密码: ${ss_pass}"
+    echo "ShadowTLS: v3"
+    echo "ShadowTLS 密码: ${stls_pass}"
+    echo "SNI: ${sni}"
+    if [[ "$udp_enabled" == "true" ]]; then
+        echo "UDP: 开启；独立 UDP 端口: ${udp_port}（若当前 Shadowrocket 版本无独立 UDP 端口字段，则仅使用 TCP）"
+    else
+        echo "UDP: 关闭"
+    fi
+    echo ""
+    qr_payload=$(jq -cn --arg type "ss2022-shadowtls" --arg server "$host" --argjson port "$port" --arg cipher "$method" --arg password "$ss_pass" --arg stls_password "$stls_pass" --arg sni "$sni" --arg udp "$udp_enabled" --arg udp_port "$udp_port" '{type:$type,server:$server,port:$port,cipher:$cipher,password:$password,shadow_tls:{version:3,password:$stls_password,sni:$sni},udp:($udp=="true"),udp_port:(if $udp_port=="" then null else ($udp_port|tonumber) end)}')
+    show_qr "$qr_payload"
+    echo -e "${YELLOW}[二维码说明] SS2022+ShadowTLS 尚无统一跨客户端 URI；二维码保存完整参数，客户端仍应使用上面的对应格式。${PLAIN}"
     echo -e "${CYAN}════════════════════════════════════════════════════════════${PLAIN}"
 }
 
@@ -1102,16 +1181,53 @@ show_vless_details() {
     echo -e "  Public Key: ${CYAN}${public_key}${PLAIN}"
     echo -e "  Short ID: ${CYAN}${short_id}${PLAIN}"
     echo ""
-    echo -e "${YELLOW}【标准 VLESS Reality URI】${PLAIN}"
+    echo -e "${YELLOW}【通用 VLESS URI】${PLAIN}"
     echo -e "${GREEN}${vless_uri}${PLAIN}"
     echo ""
-    echo -e "${YELLOW}[说明] Surge 当前官方协议列表未提供 VLESS；此链接用于支持 VLESS Reality 的客户端。${PLAIN}"
+    echo -e "${YELLOW}【Surge】${PLAIN}"
+    echo -e "${YELLOW}不支持 VLESS Reality，不生成伪配置。${PLAIN}"
+    echo ""
+    echo -e "${YELLOW}【Loon】${PLAIN}"
+    echo -e "${GREEN}${tag} = VLESS,${host},${port},\"${uuid}\",transport=tcp,flow=xtls-rprx-vision,public-key=\"${public_key}\",short-id=${short_id},over-tls=true,sni=${sni},udp=true${PLAIN}"
+    echo ""
+    echo -e "${YELLOW}【FlClash / Mihomo】${PLAIN}"
+    cat <<YAML
+- name: "${tag}"
+  type: vless
+  server: "${host}"
+  port: ${port}
+  uuid: "${uuid}"
+  network: tcp
+  tls: true
+  udp: true
+  flow: xtls-rprx-vision
+  servername: "${sni}"
+  reality-opts:
+    public-key: "${public_key}"
+    short-id: "${short_id}"
+  client-fingerprint: chrome
+YAML
+    echo ""
+    echo -e "${YELLOW}【Shadowrocket】${PLAIN}"
+    echo -e "${GREEN}推荐直接复制/扫描上面的通用 VLESS URI 导入。${PLAIN}"
+    echo "类型: VLESS / Reality"
+    echo "地址: ${host}:${port}"
+    echo "UUID: ${uuid}"
+    echo "Flow: xtls-rprx-vision"
+    echo "SNI: ${sni}"
+    echo "Public Key: ${public_key}"
+    echo "Short ID: ${short_id}"
+    echo "Fingerprint: chrome"
+    echo ""
+    show_qr "$vless_uri"
     echo -e "${CYAN}════════════════════════════════════════════════════════════${PLAIN}"
 }
 
 show_snell_details() {
     local host="$1" port="$2" psk="$3"
     local tag="Proxy-Snell-v5"
+    local surge_line qr_payload
+    surge_line="${tag} = snell, ${host}, ${port}, psk=\"${psk}\", version=5, reuse=true, tfo=true"
 
     echo ""
     echo -e "${CYAN}════════════════════ Snell v5 配置 ════════════════════${PLAIN}"
@@ -1121,8 +1237,43 @@ show_snell_details() {
     echo -e "  版本: ${CYAN}5${PLAIN}"
     echo -e "  UDP : ${GREEN}Snell v5 原生支持${PLAIN}"
     echo ""
+    echo -e "${YELLOW}【通用参数】${PLAIN}"
+    echo "协议: Snell v5"
+    echo "服务器: ${host}"
+    echo "端口: ${port}"
+    echo "PSK: ${psk}"
+    echo "version: 5"
+    echo ""
     echo -e "${YELLOW}【Surge】${PLAIN}"
-    echo -e "${GREEN}${tag} = snell, ${host}, ${port}, psk=\"${psk}\", version=5, reuse=true, tfo=true${PLAIN}"
+    echo -e "${GREEN}${surge_line}${PLAIN}"
+    echo ""
+    echo -e "${YELLOW}【Loon】${PLAIN}"
+    echo -e "${YELLOW}Loon 官方当前协议列表不包含 Snell，不生成伪配置。${PLAIN}"
+    echo ""
+    echo -e "${YELLOW}【FlClash / Mihomo】${PLAIN}"
+    cat <<YAML
+- name: "${tag}"
+  type: snell
+  server: "${host}"
+  port: ${port}
+  psk: "${psk}"
+  version: 5
+  reuse: true
+  udp: true
+YAML
+    echo -e "${YELLOW}[提示] Mihomo 提供 Snell 兼容实现；Snell 官方定位仍主要面向 Surge。${PLAIN}"
+    echo ""
+    echo -e "${YELLOW}【Shadowrocket】${PLAIN}"
+    echo "类型: Snell"
+    echo "地址: ${host}"
+    echo "端口: ${port}"
+    echo "PSK/密码: ${psk}"
+    echo "版本: 5"
+    echo "UDP: 开启"
+    echo ""
+    qr_payload=$(jq -cn --arg type "snell" --arg server "$host" --argjson port "$port" --arg psk "$psk" '{type:$type,server:$server,port:$port,psk:$psk,version:5,udp:true}')
+    show_qr "$qr_payload"
+    echo -e "${YELLOW}[二维码说明] Snell 没有统一的跨客户端分享 URI；二维码保存完整参数。${PLAIN}"
     echo -e "${CYAN}═════════════════════════════════════════════════════════${PLAIN}"
 }
 
@@ -1292,7 +1443,7 @@ generate_reality_keypair() {
 
 deploy_vless_reality() {
     local excluded_tags='["vless-reality-in"]'
-    local vless_port uuid sni short_id inbound add_json
+    local vless_port uuid sni short_id inbound add_json reality_sni_choice
     local REALITY_PRIVATE_KEY="" REALITY_PUBLIC_KEY=""
 
     select_network_mode || return
@@ -1321,8 +1472,26 @@ deploy_vless_reality() {
         return
     }
 
-    read -rp "请输入 Reality 握手/SNI 域名 [默认: www.microsoft.com]: " sni
-    sni=${sni:-www.microsoft.com}
+    echo -e "${YELLOW}[提示] Reality 握手目标应选择从本机可正常访问的 TLS 1.3 站点。${PLAIN}"
+    echo -e "${YELLOW}[提示] 当前 sing-box 已知 www.microsoft.com 可能触发 Reality 握手兼容问题。${PLAIN}"
+    echo "请选择 Reality 握手/SNI："
+    echo "  1. swdist.apple.com（默认，Apple CDN；当前已知可用）"
+    echo "  2. www.icloud.com（Apple iCloud）"
+    echo "  3. 自定义域名"
+    read -rp "请选择 [1-3，默认 1]: " reality_sni_choice
+    case "${reality_sni_choice:-1}" in
+        1) sni="swdist.apple.com" ;;
+        2) sni="www.icloud.com" ;;
+        3)
+            while [[ -z "$sni" ]]; do
+                read -rp "请输入 Reality 握手/SNI 域名: " sni
+            done
+            ;;
+        *)
+            echo -e "${YELLOW}[提示] 输入无效，使用默认 swdist.apple.com。${PLAIN}"
+            sni="swdist.apple.com"
+            ;;
+    esac
 
     ask_server_host
 
@@ -1338,6 +1507,7 @@ deploy_vless_reality() {
           tag:"vless-reality-in",
           listen:$listen,
           listen_port:$port,
+          network:"tcp",
           users:[{
             name:"default",
             uuid:$uuid,
