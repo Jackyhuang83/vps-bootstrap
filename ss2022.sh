@@ -2,7 +2,12 @@
 # ==============================================================================
 # 项目名称: VPS Bootstrap & SS2022 多协议代理管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.7.0-dev5
+# 当前版本: v1.7.0-dev6
+#
+# v1.7.0-dev6:
+#   - 修复 VLESS Reality 服务端 inbound 错误写入 network 字段的问题
+#   - sing-box 1.13.20 的 VLESS inbound 不支持 network 字段；仅 VLESS outbound 支持该字段
+#   - 修复后可正常按项更新 Reality SNI，失败时仍保持原配置不变
 #
 # v1.7.0-dev5:
 #   - 修复“更新”仍然进入整套部署问答的问题
@@ -38,7 +43,7 @@
 #   这是开发版。建议先在测试 VPS 验证，再替换公开分发的 v1.6.1。
 # ==============================================================================
 
-SCRIPT_VERSION="v1.7.0-dev5"
+SCRIPT_VERSION="v1.7.0-dev6"
 AUTHOR="DevOps"
 
 RED='\033[0;31m'
@@ -1672,7 +1677,7 @@ update_vless_reality() {
         esac
 
         inbound=$(jq -n --arg listen "$new_listen" --argjson port "$new_port" --arg uuid "$new_uuid" --arg sni "$new_sni" --arg private_key "$new_private" --arg short_id "$new_short_id" \
-            '{type:"vless",tag:"vless-reality-in",listen:$listen,listen_port:$port,network:"tcp",users:[{name:"default",uuid:$uuid,flow:"xtls-rprx-vision"}],tls:{enabled:true,reality:{enabled:true,handshake:{server:$sni,server_port:443},private_key:$private_key,short_id:[$short_id],max_time_difference:"1m"}}}')
+            '{type:"vless",tag:"vless-reality-in",listen:$listen,listen_port:$port,users:[{name:"default",uuid:$uuid,flow:"xtls-rprx-vision"}],tls:{enabled:true,reality:{enabled:true,handshake:{server:$sni,server_port:443},private_key:$private_key,short_id:[$short_id],max_time_difference:"1m"}}}')
         add_json=$(jq -n --argjson a "$inbound" '[$a]')
 
         if update_singbox_inbounds "$excluded_tags" "$add_json"; then
@@ -2097,7 +2102,6 @@ deploy_vless_reality() {
           tag:"vless-reality-in",
           listen:$listen,
           listen_port:$port,
-          network:"tcp",
           users:[{
             name:"default",
             uuid:$uuid,
