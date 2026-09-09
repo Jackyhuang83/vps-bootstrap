@@ -2,7 +2,19 @@
 # ==============================================================================
 # 项目名称: VPS Bootstrap & SS2022 多协议代理管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.7.0-dev6
+# 当前版本: v1.7.0-dev8
+#
+# v1.7.0-dev8:
+#   - VLESS Reality 服务端由 sing-box 改为 Xray-core v26.3.27（官方稳定版）
+#   - 规避 sing-box Reality 客户端/服务端互联的已知 verification failed / processed invalid connection 问题
+#   - Xray 固定版本 + SHA256 校验，amd64/arm64
+#   - 旧 sing-box VLESS 可识别并删除；为保证回滚清晰，不做隐式跨核心迁移
+#   - SS2022 / SS2022+ShadowTLS 继续使用 sing-box；Snell v5 保持不变
+#
+# v1.7.0-dev7:
+#   - 修复 VLESS Reality 服务端 TLS 缺少 server_name 的问题
+#   - tls.server_name 与 reality.handshake.server 始终保持一致
+#   - 避免客户端 SNI 与服务端 Reality 接受的 ServerName 不一致导致 processed invalid connection
 #
 # v1.7.0-dev6:
 #   - 修复 VLESS Reality 服务端 inbound 错误写入 network 字段的问题
@@ -43,7 +55,7 @@
 #   这是开发版。建议先在测试 VPS 验证，再替换公开分发的 v1.6.1。
 # ==============================================================================
 
-SCRIPT_VERSION="v1.7.0-dev6"
+SCRIPT_VERSION="v1.7.0-dev8"
 AUTHOR="DevOps"
 
 RED='\033[0;31m'
@@ -61,6 +73,17 @@ SINGBOX_USER="sing-box"
 SINGBOX_GROUP="sing-box"
 SINGBOX_USER_MARKER="/etc/ss2022-singbox-user-managed"
 SINGBOX_VERSION="1.13.20"
+
+# ----------------------------- Xray (VLESS Reality) ---------------------------
+XRAY_VERSION="26.3.27"
+XRAY_BIN="/usr/local/bin/xray"
+XRAY_CONF="/etc/xray/config.json"
+XRAY_SERVICE="/etc/systemd/system/xray.service"
+XRAY_USER="xray"
+XRAY_GROUP="xray"
+XRAY_USER_MARKER="/etc/ss2022-xray-user-managed"
+XRAY_SHA256_AMD64="23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae"
+XRAY_SHA256_ARM64="4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c"
 
 # ----------------------------- Snell v5 ---------------------------------------
 SNELL_VERSION="5.0.1"
@@ -132,6 +155,26 @@ get_singbox_version() {
     fi
 }
 
+get_xray_version() {
+    if [[ -x "$XRAY_BIN" ]]; then
+        local xv
+        xv=$("$XRAY_BIN" version 2>/dev/null | head -n 1 | awk '{print $2}')
+        echo "Xray ${xv:-已安装}"
+    else
+        echo "Xray 未安装"
+    fi
+}
+
+xray_vless_exists() {
+    [[ -f "$XRAY_CONF" ]] || return 1
+    jq -e '.inbounds[]? | select(.protocol=="vless" and (.tag // "") == "vless-reality-in")' "$XRAY_CONF" >/dev/null 2>&1
+}
+
+get_xray_vless_port() {
+    [[ -f "$XRAY_CONF" ]] || return 1
+    jq -r '.inbounds[]? | select(.protocol=="vless" and (.tag // "") == "vless-reality-in") | .port // empty' "$XRAY_CONF" 2>/dev/null | head -n1
+}
+
 get_snell_version() {
     if [[ -x "$SNELL_BIN" ]]; then
         echo "Snell v${SNELL_VERSION}"
@@ -180,8 +223,9 @@ get_inbound_port() {
 
 show_dashboard() {
     clear
-    local sys_info singbox_info snell_info time_sync_status
+    local sys_info singbox_info xray_info snell_info time_sync_status
     local sb_status="${YELLOW}○ 未安装${PLAIN}"
+    local xray_status="${YELLOW}○ 未安装${PLAIN}"
     local snell_status="${YELLOW}○ 未安装${PLAIN}"
     local keepalive_status="${YELLOW}○ 未配置${PLAIN}"
     local proto_list="" installed_count=0
@@ -189,6 +233,7 @@ show_dashboard() {
 
     sys_info=$(get_sys_info)
     singbox_info=$(get_singbox_version)
+    xray_info=$(get_xray_version)
     snell_info=$(get_snell_version)
     time_sync_status=$(get_time_sync_status)
 
@@ -196,6 +241,12 @@ show_dashboard() {
         sb_status="${GREEN}● 运行中${PLAIN}"
     elif [[ -f "$SINGBOX_CONF" || -x "$SINGBOX_BIN" ]]; then
         sb_status="${RED}○ 已停止${PLAIN}"
+    fi
+
+    if systemctl is-active --quiet xray 2>/dev/null; then
+        xray_status="${GREEN}● 运行中${PLAIN}"
+    elif [[ -f "$XRAY_CONF" || -x "$XRAY_BIN" ]]; then
+        xray_status="${RED}○ 已停止${PLAIN}"
     fi
 
     if systemctl is-active --quiet snell-v5 2>/dev/null; then
@@ -224,10 +275,14 @@ show_dashboard() {
         fi
     fi
 
-    if json_has_inbound_tag "$TAG_VLESS"; then
+    if xray_vless_exists; then
+        p=$(get_xray_vless_port)
+        ((installed_count++))
+        proto_list+="\n    • VLESS Reality (Xray) - 端口: ${CYAN}${p}${PLAIN}"
+    elif json_has_inbound_tag "$TAG_VLESS"; then
         p=$(get_inbound_port "$TAG_VLESS")
         ((installed_count++))
-        proto_list+="\n    • VLESS Reality - 端口: ${CYAN}${p}${PLAIN}"
+        proto_list+="\n    • VLESS Reality (旧 sing-box，待迁移) - 端口: ${YELLOW}${p}${PLAIN}"
     fi
 
     if [[ -f "$SNELL_CONF" ]]; then
@@ -242,6 +297,7 @@ show_dashboard() {
     echo -e "${CYAN}═════════════════════════════════════════════════════════════════${PLAIN}"
     echo -e "  系统信息: ${sys_info}"
     echo -e "  sing-box: ${singbox_info} / ${sb_status}"
+    echo -e "  Xray核心: ${xray_info} / ${xray_status}"
     echo -e "  Snell核心: ${snell_info} / ${snell_status}"
     echo -e "  时间同步: ${time_sync_status}"
     echo -e "  IPv6链路保活: ${keepalive_status}"
@@ -1576,119 +1632,80 @@ update_shadowtls() {
 }
 
 update_vless_reality() {
-    local excluded_tags='["vless-reality-in"]'
     local choice="" confirm="" current_port uuid current_sni private short_id current_listen current_host current_network public
-    local new_port new_uuid new_sni new_private new_short_id new_listen new_network new_public inbound add_json
+    local new_port new_uuid new_sni new_private new_short_id new_listen new_network new_public out
     local REALITY_PRIVATE_KEY="" REALITY_PUBLIC_KEY=""
-
-    if ! json_has_inbound_tag "$TAG_VLESS"; then
-        echo -e "${YELLOW}未部署 VLESS Reality，请先选择“部署”。${PLAIN}"
-        pause
-        return
+    if ! xray_vless_exists; then
+        if json_has_inbound_tag "$TAG_VLESS"; then
+            echo -e "${YELLOW}[旧 sing-box VLESS] dev8 不做隐式跨核心更新。请先删除旧 VLESS，再部署 Xray 版。${PLAIN}"
+        else
+            echo -e "${YELLOW}未部署 VLESS Reality，请先选择“部署”。${PLAIN}"
+        fi
+        pause; return
     fi
-
     while true; do
-        current_port=$(get_inbound_port "$TAG_VLESS")
-        uuid=$(jq -r --arg t "$TAG_VLESS" '.inbounds[] | select(.tag==$t) | .users[0].uuid' "$SINGBOX_CONF")
-        current_sni=$(jq -r --arg t "$TAG_VLESS" '.inbounds[] | select(.tag==$t) | .tls.reality.handshake.server' "$SINGBOX_CONF")
-        private=$(jq -r --arg t "$TAG_VLESS" '.inbounds[] | select(.tag==$t) | .tls.reality.private_key' "$SINGBOX_CONF")
-        short_id=$(jq -r --arg t "$TAG_VLESS" '.inbounds[] | select(.tag==$t) | .tls.reality.short_id[0]' "$SINGBOX_CONF")
-        current_listen=$(jq -r --arg t "$TAG_VLESS" '.inbounds[] | select(.tag==$t) | .listen' "$SINGBOX_CONF")
+        current_port=$(get_xray_vless_port)
+        uuid=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .settings.clients[0].id' "$XRAY_CONF")
+        current_sni=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .streamSettings.realitySettings.serverNames[0]' "$XRAY_CONF")
+        private=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .streamSettings.realitySettings.privateKey' "$XRAY_CONF")
+        short_id=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .streamSettings.realitySettings.shortIds[0]' "$XRAY_CONF")
+        current_listen=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .listen' "$XRAY_CONF")
         current_host=$(get_mode_state_field "vless" "host" 2>/dev/null || true)
         current_network=$(get_mode_state_field "vless" "network" 2>/dev/null || true)
         public=$(get_mode_state_field "vless" "public_key" 2>/dev/null || true)
         [[ -n "$current_network" ]] || current_network=$(infer_network_from_listen "$current_listen")
-
+        if [[ -z "$public" && -n "$private" ]]; then
+            out=$("$XRAY_BIN" x25519 -i "$private" 2>/dev/null || true)
+            public=$(printf '%s
+' "$out" | awk -F': *' '/^Password \(PublicKey\):/ {print $2; exit}')
+            [[ -n "$public" ]] || public=$(printf '%s
+' "$out" | awk -F': *' '/^Public key:/ {print $2; exit}')
+        fi
         clear
-        echo -e "${CYAN}════════════════ VLESS Reality 更新 ════════════════${PLAIN}"
+        echo -e "${CYAN}════════════════ VLESS Reality (Xray) 更新 ════════════════${PLAIN}"
         echo -e "当前网络模式 : ${GREEN}${current_network}${PLAIN}"
         echo -e "当前监听端口 : ${GREEN}${current_port}${PLAIN}"
         echo -e "当前 Reality SNI: ${GREEN}${current_sni}${PLAIN}"
         echo -e "当前服务器地址: ${GREEN}${current_host:-未保存}${PLAIN}"
         echo -e "当前 UUID     : ${GREEN}${uuid}${PLAIN}"
-        echo ""
         echo "  1. 修改网络模式"
         echo "  2. 修改监听端口"
-        echo "  3. 修改 Reality SNI / 握手目标"
+        echo "  3. 修改 Reality SNI / target"
         echo "  4. 修改服务器地址/域名"
         echo "  5. 重新生成 UUID / Reality Key / Short ID"
         echo "  6. 查看当前节点配置"
         echo "  0. 返回"
         read -rp "请选择 [0-6]: " choice
-
-        new_port="$current_port"; new_uuid="$uuid"; new_sni="$current_sni"; new_private="$private"
-        new_short_id="$short_id"; new_listen="$current_listen"; new_network="$current_network"; new_public="$public"
-
+        new_port="$current_port"; new_uuid="$uuid"; new_sni="$current_sni"; new_private="$private"; new_short_id="$short_id"; new_listen="$current_listen"; new_network="$current_network"; new_public="$public"
         case "$choice" in
-            1)
-                select_network_mode_for_update "$current_network" || continue
-                new_listen="$LISTEN_ADDR"; new_network="$NETWORK_MODE"
-                ;;
-            2)
-                ask_singbox_port "请输入 VLESS Reality 监听端口" "$current_port" "$excluded_tags" || continue
-                new_port="$PORT"
-                ;;
+            1) select_network_mode_for_update "$current_network" || continue; new_listen="$LISTEN_ADDR"; new_network="$NETWORK_MODE" ;;
+            2) ask_xray_port "请输入 VLESS Reality 监听端口" "$current_port" "$current_port" || continue; new_port="$PORT" ;;
             3)
                 echo "当前 Reality SNI: ${current_sni}"
                 echo "  1. 保持当前 SNI"
-                echo "  2. swdist.apple.com（推荐）"
+                echo "  2. swdist.apple.com"
                 echo "  3. www.icloud.com"
-                echo "  4. 自定义域名"
-                read -rp "请选择 [1-4，默认 1]: " choice
+                echo "  4. speed.cloudflare.com"
+                echo "  5. 自定义域名"
+                read -rp "请选择 [1-5，默认 1]: " choice
                 case "${choice:-1}" in
-                    1) new_sni="$current_sni" ;;
-                    2) new_sni="swdist.apple.com" ;;
-                    3) new_sni="www.icloud.com" ;;
-                    4)
-                        new_sni=""
-                        while [[ -z "$new_sni" ]]; do read -rp "请输入 Reality 握手/SNI 域名: " new_sni; done
-                        ;;
-                    *) continue ;;
-                esac
+                    1) new_sni="$current_sni" ;; 2) new_sni="swdist.apple.com" ;; 3) new_sni="www.icloud.com" ;; 4) new_sni="speed.cloudflare.com" ;; 5) new_sni=""; while [[ -z "$new_sni" ]]; do read -rp "请输入 Reality 握手/SNI 域名: " new_sni; done ;; *) continue ;; esac
                 ;;
-            4)
-                ask_server_host_with_default "$current_host"
-                if save_mode_state "vless" "$(jq -n --arg host "$SERVER_HOST" --arg network "$current_network" --arg public_key "$public" '{host:$host,network:$network,public_key:$public_key}')"; then
-                    echo -e "${GREEN}✔ 服务器地址已更新，不影响 UUID / Reality Key / Short ID。${PLAIN}"
-                fi
-                pause
-                continue
-                ;;
+            4) ask_server_host_with_default "$current_host"; save_mode_state "vless" "$(jq -n --arg host "$SERVER_HOST" --arg network "$current_network" --arg public_key "$public" '{host:$host,network:$network,public_key:$public_key,core:"xray"}')" || true; echo -e "${GREEN}✔ 服务器地址已更新。${PLAIN}"; pause; continue ;;
             5)
                 echo -e "${YELLOW}[警告] 此操作会生成全新的 VLESS 节点身份，所有客户端参数都必须重新导入。${PLAIN}"
-                read -rp "确认重新生成？[y/N]: " confirm
-                [[ "$confirm" =~ ^[Yy]$ ]] || continue
-                if ! generate_reality_keypair; then
-                    echo -e "${RED}[错误] Reality 密钥对生成失败。${PLAIN}"; pause; continue
-                fi
-                new_private="$REALITY_PRIVATE_KEY"; new_public="$REALITY_PUBLIC_KEY"
-                new_uuid=$("$SINGBOX_BIN" generate uuid 2>/dev/null || true)
-                [[ -n "$new_uuid" ]] || new_uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)
-                new_short_id=$(openssl rand -hex 8) || { echo -e "${RED}[错误] Short ID 生成失败。${PLAIN}"; pause; continue; }
-                [[ -n "$new_uuid" ]] || { echo -e "${RED}[错误] UUID 生成失败。${PLAIN}"; pause; continue; }
+                read -rp "确认重新生成？[y/N]: " confirm; [[ "$confirm" =~ ^[Yy]$ ]] || continue
+                generate_xray_reality_keypair || { echo -e "${RED}[错误] Xray Reality 密钥对生成失败。${PLAIN}"; pause; continue; }
+                new_private="$REALITY_PRIVATE_KEY"; new_public="$REALITY_PUBLIC_KEY"; new_uuid=$("$XRAY_BIN" uuid 2>/dev/null | head -n1); new_short_id=$(openssl rand -hex 8) || continue
                 ;;
-            6)
-                view_vless_config
-                pause
-                continue
-                ;;
+            6) view_vless_config; pause; continue ;;
             0) return ;;
             *) continue ;;
         esac
-
-        inbound=$(jq -n --arg listen "$new_listen" --argjson port "$new_port" --arg uuid "$new_uuid" --arg sni "$new_sni" --arg private_key "$new_private" --arg short_id "$new_short_id" \
-            '{type:"vless",tag:"vless-reality-in",listen:$listen,listen_port:$port,users:[{name:"default",uuid:$uuid,flow:"xtls-rprx-vision"}],tls:{enabled:true,reality:{enabled:true,handshake:{server:$sni,server_port:443},private_key:$private_key,short_id:[$short_id],max_time_difference:"1m"}}}')
-        add_json=$(jq -n --argjson a "$inbound" '[$a]')
-
-        if update_singbox_inbounds "$excluded_tags" "$add_json"; then
-            save_mode_state "vless" "$(jq -n --arg host "$current_host" --arg network "$new_network" --arg public_key "$new_public" '{host:$host,network:$network,public_key:$public_key}')" || true
-            echo -e "${GREEN}✔ VLESS Reality 更新成功。${PLAIN}"
-            if [[ "$choice" != "5" ]]; then
-                echo -e "${YELLOW}[保持] UUID / Reality Key / Short ID 未改变。${PLAIN}"
-            fi
-        else
-            journalctl -u sing-box -n 30 --no-pager 2>/dev/null || true
-        fi
+        if write_xray_vless_config "$new_listen" "$new_port" "$new_uuid" "$new_sni" "$new_private" "$new_short_id"; then
+            save_mode_state "vless" "$(jq -n --arg host "$current_host" --arg network "$new_network" --arg public_key "$new_public" '{host:$host,network:$network,public_key:$public_key,core:"xray"}')" || true
+            echo -e "${GREEN}✔ VLESS Reality (Xray) 更新成功。${PLAIN}"
+        else journalctl -u xray -n 30 --no-pager 2>/dev/null || true; fi
         pause
     done
 }
@@ -1814,9 +1831,17 @@ delete_shadowtls() {
 }
 
 delete_vless_reality() {
-    if ! json_has_inbound_tag "$TAG_VLESS"; then echo -e "${YELLOW}未部署 VLESS Reality。${PLAIN}"; pause; return; fi
-    local yes=""; read -rp "确认删除 VLESS Reality？[y/N]: " yes
-    if [[ "$yes" =~ ^[Yy]$ ]] && remove_singbox_mode vless; then echo -e "${GREEN}✔ VLESS Reality 已删除。${PLAIN}"; fi
+    local has_xray=0 has_legacy=0 yes=""
+    xray_vless_exists && has_xray=1
+    json_has_inbound_tag "$TAG_VLESS" && has_legacy=1
+    if [[ $has_xray -eq 0 && $has_legacy -eq 0 ]]; then echo -e "${YELLOW}未部署 VLESS Reality。${PLAIN}"; pause; return; fi
+    read -rp "确认删除 VLESS Reality（含旧 sing-box / 新 Xray 配置）？[y/N]: " yes
+    if [[ "$yes" =~ ^[Yy]$ ]]; then
+        if [[ $has_xray -eq 1 ]]; then systemctl disable --now xray >/dev/null 2>&1 || true; rm -f "$XRAY_CONF"; fi
+        if [[ $has_legacy -eq 1 ]]; then remove_singbox_mode vless || true; fi
+        remove_mode_state "vless" || true
+        echo -e "${GREEN}✔ VLESS Reality 已删除；Xray 二进制保留供后续部署。${PLAIN}"
+    fi
     pause
 }
 
@@ -2031,103 +2056,209 @@ generate_reality_keypair() {
 }
 
 deploy_vless_reality() {
-    local excluded_tags='["vless-reality-in"]'
-    local vless_port uuid sni short_id inbound add_json reality_sni_choice
-
-    if json_has_inbound_tag "$TAG_VLESS"; then
-        echo -e "${YELLOW}VLESS Reality 已存在。请返回并选择“更新”或“删除”。${PLAIN}"
-        pause
-        return
-    fi
+    local vless_port uuid sni short_id reality_sni_choice
     local REALITY_PRIVATE_KEY="" REALITY_PUBLIC_KEY=""
-
+    if xray_vless_exists; then
+        echo -e "${YELLOW}VLESS Reality (Xray) 已存在。请返回并选择“更新”或“删除”。${PLAIN}"; pause; return
+    fi
+    if json_has_inbound_tag "$TAG_VLESS"; then
+        echo -e "${YELLOW}[检测到旧配置] 当前 VLESS Reality 仍由 sing-box 承载。${PLAIN}"
+        echo -e "${YELLOW}dev8 起 VLESS 改用 Xray。为避免端口冲突和隐式迁移，请先：VLESS Reality → 删除，再重新部署。${PLAIN}"
+        pause; return
+    fi
     select_network_mode || return
-    install_singbox_core || { pause; return; }
-
-    ask_singbox_port "请输入 VLESS Reality 监听端口" "443" "$excluded_tags" || return
+    install_xray_core || { pause; return; }
+    ask_xray_port "请输入 VLESS Reality 监听端口" "443" || return
     vless_port="$PORT"
-
-    if ! generate_reality_keypair; then
-        echo -e "${RED}[错误] Reality 密钥对生成失败。${PLAIN}"
-        pause
-        return
-    fi
-
-    uuid=$("$SINGBOX_BIN" generate uuid 2>/dev/null || true)
+    generate_xray_reality_keypair || { echo -e "${RED}[错误] Xray Reality 密钥对生成失败。${PLAIN}"; pause; return; }
+    uuid=$("$XRAY_BIN" uuid 2>/dev/null | head -n1)
     [[ -n "$uuid" ]] || uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)
-    if [[ -z "$uuid" ]]; then
-        echo -e "${RED}[错误] UUID 生成失败。${PLAIN}"
-        pause
-        return
-    fi
-
-    short_id=$(openssl rand -hex 8) || {
-        echo -e "${RED}[错误] Short ID 生成失败。${PLAIN}"
-        pause
-        return
-    }
-
-    echo -e "${YELLOW}[提示] Reality 握手目标应选择从本机可正常访问的 TLS 1.3 站点。${PLAIN}"
-    echo -e "${YELLOW}[提示] 当前 sing-box 已知 www.microsoft.com 可能触发 Reality 握手兼容问题。${PLAIN}"
+    [[ -n "$uuid" ]] || { echo -e "${RED}[错误] UUID 生成失败。${PLAIN}"; pause; return; }
+    short_id=$(openssl rand -hex 8) || { echo -e "${RED}[错误] Short ID 生成失败。${PLAIN}"; pause; return; }
     echo "请选择 Reality 握手/SNI："
-    echo "  1. swdist.apple.com（默认，Apple CDN；当前已知可用）"
-    echo "  2. www.icloud.com（Apple iCloud）"
-    echo "  3. 自定义域名"
-    read -rp "请选择 [1-3，默认 1]: " reality_sni_choice
+    echo "  1. swdist.apple.com（本轮兼容性测试）"
+    echo "  2. www.icloud.com（本轮兼容性测试）"
+    echo "  3. speed.cloudflare.com（更适合作为长期默认候选）"
+    echo "  4. 自定义域名"
+    read -rp "请选择 [1-4，默认 1]: " reality_sni_choice
     case "${reality_sni_choice:-1}" in
         1) sni="swdist.apple.com" ;;
         2) sni="www.icloud.com" ;;
-        3)
-            while [[ -z "$sni" ]]; do
-                read -rp "请输入 Reality 握手/SNI 域名: " sni
-            done
-            ;;
-        *)
-            echo -e "${YELLOW}[提示] 输入无效，使用默认 swdist.apple.com。${PLAIN}"
-            sni="swdist.apple.com"
-            ;;
+        3) sni="speed.cloudflare.com" ;;
+        4) while [[ -z "$sni" ]]; do read -rp "请输入 Reality 握手/SNI 域名: " sni; done ;;
+        *) sni="swdist.apple.com" ;;
     esac
-
     ask_server_host
-
-    inbound=$(jq -n \
-        --arg listen "$LISTEN_ADDR" \
-        --argjson port "$vless_port" \
-        --arg uuid "$uuid" \
-        --arg sni "$sni" \
-        --arg private_key "$REALITY_PRIVATE_KEY" \
-        --arg short_id "$short_id" \
-        '{
-          type:"vless",
-          tag:"vless-reality-in",
-          listen:$listen,
-          listen_port:$port,
-          users:[{
-            name:"default",
-            uuid:$uuid,
-            flow:"xtls-rprx-vision"
-          }],
-          tls:{
-            enabled:true,
-            reality:{
-              enabled:true,
-              handshake:{server:$sni,server_port:443},
-              private_key:$private_key,
-              short_id:[$short_id],
-              max_time_difference:"1m"
-            }
-          }
-        }')
-    add_json=$(jq -n --argjson a "$inbound" '[$a]')
-
-    if update_singbox_inbounds "$excluded_tags" "$add_json"; then
-        echo -e "${GREEN}✔ VLESS Reality 部署成功。${PLAIN}"
-        save_mode_state "vless" "$(jq -n --arg host "$SERVER_HOST" --arg network "$NETWORK_MODE" --arg public_key "$REALITY_PUBLIC_KEY" '{host:$host,network:$network,public_key:$public_key}')" || true
+    if write_xray_vless_config "$LISTEN_ADDR" "$vless_port" "$uuid" "$sni" "$REALITY_PRIVATE_KEY" "$short_id"; then
+        save_mode_state "vless" "$(jq -n --arg host "$SERVER_HOST" --arg network "$NETWORK_MODE" --arg public_key "$REALITY_PUBLIC_KEY" '{host:$host,network:$network,public_key:$public_key,core:"xray"}')" || true
+        echo -e "${GREEN}✔ VLESS Reality (Xray) 部署成功。${PLAIN}"
         show_vless_details "$SERVER_HOST" "$vless_port" "$uuid" "$sni" "$REALITY_PUBLIC_KEY" "$short_id"
     else
-        journalctl -u sing-box -n 30 --no-pager 2>/dev/null || true
+        journalctl -u xray -n 30 --no-pager 2>/dev/null || true
     fi
     pause
+}
+
+ensure_xray_user() {
+    local nologin_shell=""
+    if id -u "$XRAY_USER" >/dev/null 2>&1; then
+        if ! getent group "$XRAY_GROUP" >/dev/null 2>&1; then
+            groupadd --system "$XRAY_GROUP" || return 1
+        fi
+        if ! id -nG "$XRAY_USER" 2>/dev/null | tr ' ' '\n' | grep -qx "$XRAY_GROUP"; then
+            usermod -a -G "$XRAY_GROUP" "$XRAY_USER" || return 1
+        fi
+        return 0
+    fi
+    nologin_shell=$(command -v nologin 2>/dev/null || true)
+    nologin_shell=${nologin_shell:-/usr/sbin/nologin}
+    useradd --system --user-group --no-create-home --home-dir /nonexistent --shell "$nologin_shell" "$XRAY_USER" || return 1
+    touch "$XRAY_USER_MARKER"
+    chmod 600 "$XRAY_USER_MARKER"
+    return 0
+}
+
+write_xray_service() {
+    ensure_xray_user || return 1
+    cat > "$XRAY_SERVICE" <<'SERVICE'
+[Unit]
+Description=Xray VLESS Reality service
+Documentation=https://github.com/XTLS/Xray-core
+After=network.target nss-lookup.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xray
+Group=xray
+ExecStart=/usr/local/bin/xray run -config /etc/xray/config.json
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=1048576
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+PrivateTmp=true
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+    systemctl daemon-reload || return 1
+    systemctl enable xray >/dev/null 2>&1 || return 1
+}
+
+install_xray_core() {
+    local arch asset sha curl_family tmp zip url actual
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64|amd64) asset="Xray-linux-64.zip"; sha="$XRAY_SHA256_AMD64" ;;
+        aarch64|arm64) asset="Xray-linux-arm64-v8a.zip"; sha="$XRAY_SHA256_ARM64" ;;
+        *) echo -e "${RED}[错误] Xray 暂不支持当前 CPU 架构: ${arch}${PLAIN}"; return 1 ;;
+    esac
+    [[ "$NETWORK_MODE" == "ipv6" ]] && curl_family="-6" || curl_family="-4"
+    tmp=$(mktemp -d /tmp/xray-install.XXXXXX) || return 1
+    zip="$tmp/$asset"
+    url="https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/${asset}"
+    echo -e "${YELLOW}>> 下载 Xray-core ${XRAY_VERSION} 官方稳定版并校验 SHA256...${PLAIN}"
+    if ! curl $curl_family -fL --retry 3 --connect-timeout 15 --max-time 300 -o "$zip" "$url"; then
+        rm -rf "$tmp"; echo -e "${RED}[错误] Xray 下载失败。${PLAIN}"; return 1
+    fi
+    actual=$(sha256sum "$zip" | awk '{print $1}')
+    if [[ "$actual" != "$sha" ]]; then
+        rm -rf "$tmp"; echo -e "${RED}[错误] Xray SHA256 校验失败。${PLAIN}"; return 1
+    fi
+    unzip -q "$zip" xray -d "$tmp/unpack" || { rm -rf "$tmp"; return 1; }
+    install -m 755 "$tmp/unpack/xray" "$XRAY_BIN" || { rm -rf "$tmp"; return 1; }
+    rm -rf "$tmp"
+    "$XRAY_BIN" version >/dev/null 2>&1 || return 1
+    write_xray_service || return 1
+    echo -e "${GREEN}✔ Xray-core ${XRAY_VERSION} 已安装并通过固定 SHA256 校验。${PLAIN}"
+}
+
+generate_xray_reality_keypair() {
+    local out private public
+    out=$("$XRAY_BIN" x25519 2>/dev/null) || return 1
+    private=$(printf '%s\n' "$out" | awk -F': *' '/^PrivateKey:/ {print $2; exit}')
+    public=$(printf '%s\n' "$out" | awk -F': *' '/^Password \(PublicKey\):/ {print $2; exit}')
+    # 兼容旧版 Xray 输出
+    [[ -n "$private" ]] || private=$(printf '%s\n' "$out" | awk -F': *' '/^Private key:/ {print $2; exit}')
+    [[ -n "$public" ]] || public=$(printf '%s\n' "$out" | awk -F': *' '/^Public key:/ {print $2; exit}')
+    [[ -n "$public" ]] || public=$(printf '%s\n' "$out" | awk -F': *' '/^Password:/ {print $2; exit}')
+    [[ -n "$private" && -n "$public" ]] || return 1
+    REALITY_PRIVATE_KEY="$private"
+    REALITY_PUBLIC_KEY="$public"
+}
+
+xray_port_conflict_configured() {
+    local port="$1" exclude_current="${2:-no}"
+    if [[ "$exclude_current" != "yes" ]] && xray_vless_exists && [[ "$(get_xray_vless_port)" == "$port" ]]; then
+        return 0
+    fi
+    if singbox_config_port_conflict "$port" '[]'; then return 0; fi
+    if [[ -f "$SNELL_CONF" ]] && [[ "$(snell_port_from_config 2>/dev/null || true)" == "$port" ]]; then return 0; fi
+    return 1
+}
+
+ask_xray_port() {
+    local prompt="$1" default="$2" current_port="${3:-}" input pid
+    while true; do
+        read -rp "${prompt} [默认: ${default}]: " input
+        input=${input:-$default}
+        validate_port_number "$input" || { echo -e "${RED}输入无效，请输入 1-65535。${PLAIN}"; continue; }
+        if [[ -n "$current_port" && "$input" == "$current_port" ]]; then PORT="$input"; return 0; fi
+        if xray_port_conflict_configured "$input" no; then
+            echo -e "${RED}[错误] 端口 ${input} 已被现有代理配置占用。${PLAIN}"; continue
+        fi
+        pid=$(systemctl show -p MainPID --value xray 2>/dev/null || true)
+        if port_in_use_by_other_process "$input" "$pid" >/tmp/ss2022-port-conflict.$$ 2>/dev/null; then
+            echo -e "${RED}[错误] 端口 ${input} 已被其他进程占用：${PLAIN}"; cat /tmp/ss2022-port-conflict.$$; rm -f /tmp/ss2022-port-conflict.$$; continue
+        fi
+        rm -f /tmp/ss2022-port-conflict.$$ 2>/dev/null || true
+        PORT="$input"; return 0
+    done
+}
+
+write_xray_vless_config() {
+    local listen="$1" port="$2" uuid="$3" sni="$4" private="$5" short_id="$6" candidate backup="" had_old=0
+    mkdir -p /etc/xray || return 1
+    chown root:"$XRAY_GROUP" /etc/xray 2>/dev/null || true
+    chmod 750 /etc/xray
+    candidate=$(mktemp /etc/xray/config.json.tmp.XXXXXX) || return 1
+    jq -n --arg listen "$listen" --argjson port "$port" --arg uuid "$uuid" --arg sni "$sni" --arg private "$private" --arg sid "$short_id" '{
+      log:{loglevel:"warning"},
+      inbounds:[{
+        listen:$listen, port:$port, protocol:"vless", tag:"vless-reality-in",
+        settings:{clients:[{id:$uuid,flow:"xtls-rprx-vision"}],decryption:"none"},
+        streamSettings:{network:"tcp",security:"reality",realitySettings:{show:false,dest:($sni+":443"),xver:0,serverNames:[$sni],privateKey:$private,shortIds:[$sid]}}
+      }],
+      outbounds:[{protocol:"freedom",tag:"direct"}]
+    }' > "$candidate" || { rm -f "$candidate"; return 1; }
+    chown root:"$XRAY_GROUP" "$candidate" 2>/dev/null || true
+    chmod 640 "$candidate"
+    echo -e "${YELLOW}>> 校验新 Xray 配置...${PLAIN}"
+    if ! "$XRAY_BIN" run -test -config "$candidate"; then
+        echo -e "${RED}[错误] 新 Xray 配置未通过测试，原配置保持不变。${PLAIN}"; rm -f "$candidate"; return 1
+    fi
+    if [[ -f "$XRAY_CONF" ]]; then
+        had_old=1; backup=$(mktemp /etc/xray/config.json.rollback.XXXXXX) || { rm -f "$candidate"; return 1; }; cp -a "$XRAY_CONF" "$backup"
+    fi
+    mv -f "$candidate" "$XRAY_CONF" || { rm -f "$candidate" "$backup"; return 1; }
+    chown root:"$XRAY_GROUP" "$XRAY_CONF"; chmod 640 "$XRAY_CONF"
+    if ! systemctl restart xray; then
+        echo -e "${RED}[错误] Xray 新配置启动失败，正在回滚...${PLAIN}"
+        if [[ $had_old -eq 1 && -f "$backup" ]]; then mv -f "$backup" "$XRAY_CONF"; chown root:"$XRAY_GROUP" "$XRAY_CONF"; chmod 640 "$XRAY_CONF"; systemctl restart xray || true; else rm -f "$XRAY_CONF"; fi
+        return 1
+    fi
+    rm -f "$backup"
+    echo -e "${GREEN}✔ Xray 配置已校验并安全切换。${PLAIN}"
 }
 
 ensure_snell_user() {
@@ -2483,44 +2614,32 @@ view_shadowtls_config() {
 }
 
 view_vless_config() {
-    local host port uuid sni private public short_id listen keys
-
-    json_has_inbound_tag "$TAG_VLESS" || {
-        echo -e "${YELLOW}未部署 VLESS Reality。${PLAIN}"
+    local host port uuid sni private public short_id listen out
+    if ! xray_vless_exists; then
+        if json_has_inbound_tag "$TAG_VLESS"; then
+            echo -e "${YELLOW}检测到旧 sing-box VLESS Reality。dev8 起请删除后重新部署为 Xray 版。${PLAIN}"
+        else
+            echo -e "${YELLOW}未部署 VLESS Reality。${PLAIN}"
+        fi
         return
-    }
-
-    port=$(jq -r --arg t "$TAG_VLESS" '.inbounds[] | select(.tag==$t) | .listen_port' "$SINGBOX_CONF")
-    uuid=$(jq -r --arg t "$TAG_VLESS" '.inbounds[] | select(.tag==$t) | .users[0].uuid' "$SINGBOX_CONF")
-    sni=$(jq -r --arg t "$TAG_VLESS" '.inbounds[] | select(.tag==$t) | .tls.reality.handshake.server' "$SINGBOX_CONF")
-    private=$(jq -r --arg t "$TAG_VLESS" '.inbounds[] | select(.tag==$t) | .tls.reality.private_key' "$SINGBOX_CONF")
-    short_id=$(jq -r --arg t "$TAG_VLESS" '.inbounds[] | select(.tag==$t) | .tls.reality.short_id[0]' "$SINGBOX_CONF")
-    listen=$(jq -r --arg t "$TAG_VLESS" '.inbounds[] | select(.tag==$t) | .listen' "$SINGBOX_CONF")
-
+    fi
+    port=$(get_xray_vless_port)
+    uuid=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .settings.clients[0].id' "$XRAY_CONF")
+    sni=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .streamSettings.realitySettings.serverNames[0]' "$XRAY_CONF")
+    private=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .streamSettings.realitySettings.privateKey' "$XRAY_CONF")
+    short_id=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .streamSettings.realitySettings.shortIds[0]' "$XRAY_CONF")
+    listen=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .listen' "$XRAY_CONF")
     host=$(get_mode_state_field "vless" "host" 2>/dev/null || true)
     public=$(get_mode_state_field "vless" "public_key" 2>/dev/null || true)
-    if [[ -z "$host" ]]; then
-        if [[ "$listen" == "::" ]]; then
-            host=$(get_global_ipv6 2>/dev/null || echo "请填写IPv6地址")
-        else
-            host=$(get_public_ipv4 2>/dev/null || echo "请填写服务器地址")
-        fi
+    if [[ -z "$public" && -n "$private" ]]; then
+        out=$("$XRAY_BIN" x25519 -i "$private" 2>/dev/null || true)
+        public=$(printf '%s
+' "$out" | awk -F': *' '/^Password \(PublicKey\):/ {print $2; exit}')
+        [[ -n "$public" ]] || public=$(printf '%s
+' "$out" | awk -F': *' '/^Public key:/ {print $2; exit}')
     fi
-
-    if [[ -n "$public" ]]; then
-        show_vless_details "$host" "$port" "$uuid" "$sni" "$public" "$short_id"
-    else
-        echo ""
-        echo -e "${CYAN}════════════════════ VLESS Reality 服务端配置 ════════════════════${PLAIN}"
-        echo -e "  地址: ${CYAN}${host}${PLAIN}"
-        echo -e "  端口: ${CYAN}${port}${PLAIN}"
-        echo -e "  UUID: ${CYAN}${uuid}${PLAIN}"
-        echo -e "  SNI : ${CYAN}${sni}${PLAIN}"
-        echo -e "  Private Key: ${CYAN}${private}${PLAIN}"
-        echo -e "  Short ID: ${CYAN}${short_id}${PLAIN}"
-        echo -e "${YELLOW}[提示] 这是从旧配置升级而来的节点，state.json 中没有 Public Key；重新部署一次 VLESS Reality 后即可完整保存/查看客户端参数。${PLAIN}"
-        echo -e "${CYAN}════════════════════════════════════════════════════════════${PLAIN}"
-    fi
+    if [[ -z "$host" ]]; then if [[ "$listen" == "::" ]]; then host=$(get_global_ipv6 2>/dev/null || echo "请填写IPv6地址"); else host=$(get_public_ipv4 2>/dev/null || echo "请填写服务器地址"); fi; fi
+    show_vless_details "$host" "$port" "$uuid" "$sni" "$public" "$short_id"
 }
 
 view_snell_config() {
@@ -2637,30 +2756,36 @@ show_service_status() {
     systemctl --no-pager --full status sing-box 2>/dev/null | head -n 15 || echo "未安装/未加载"
 
     echo ""
+    echo -e "${YELLOW}【Xray / VLESS Reality】${PLAIN}"
+    systemctl --no-pager --full status xray 2>/dev/null | head -n 15 || echo "未安装/未加载"
+
+    echo ""
     echo -e "${YELLOW}【Snell v5】${PLAIN}"
     systemctl --no-pager --full status snell-v5 2>/dev/null | head -n 15 || echo "未安装/未加载"
 
     echo ""
     echo -e "${YELLOW}【监听端口】${PLAIN}"
-    ss -lntup 2>/dev/null | grep -E 'sing-box|snell-server' || echo "未检测到代理监听"
+    ss -lntup 2>/dev/null | grep -E 'sing-box|xray|snell-server' || echo "未检测到代理监听"
 }
 
 full_uninstall() {
     local yes=""
-    echo -e "${RED}此操作会删除 sing-box、Snell v5、全部节点配置、服务文件和快捷命令。${PLAIN}"
+    echo -e "${RED}此操作会删除 sing-box、Xray、Snell v5、全部节点配置、服务文件和快捷命令。${PLAIN}"
     read -rp "确认彻底卸载？请输入 YES: " yes
     [[ "$yes" == "YES" ]] || return
 
-    systemctl disable --now sing-box snell-v5 ipv6-keepalive.timer >/dev/null 2>&1 || true
+    systemctl disable --now sing-box xray snell-v5 ipv6-keepalive.timer >/dev/null 2>&1 || true
     systemctl stop ipv6-keepalive.service >/dev/null 2>&1 || true
 
-    rm -rf /etc/sing-box /etc/snell "$STATE_DIR"
+    rm -rf /etc/sing-box /etc/xray /etc/snell "$STATE_DIR"
     rm -f \
         /usr/local/bin/ss2022 \
         /usr/local/bin/proxy \
         "$SINGBOX_BIN" \
+        "$XRAY_BIN" \
         "$SNELL_BIN" \
         "$SINGBOX_SERVICE" \
+        "$XRAY_SERVICE" \
         "$SNELL_SERVICE" \
         /etc/systemd/system/ipv6-keepalive.service \
         /etc/systemd/system/ipv6-keepalive.timer \
@@ -2674,6 +2799,11 @@ full_uninstall() {
     if [[ -f "$SINGBOX_USER_MARKER" ]]; then
         userdel "$SINGBOX_USER" >/dev/null 2>&1 || true
         rm -f "$SINGBOX_USER_MARKER"
+    fi
+
+    if [[ -f "$XRAY_USER_MARKER" ]]; then
+        userdel "$XRAY_USER" >/dev/null 2>&1 || true
+        rm -f "$XRAY_USER_MARKER"
     fi
 
     if [[ -f "$SNELL_USER_MARKER" ]]; then
@@ -2692,32 +2822,26 @@ service_management() {
         echo -e "${CYAN}════════════════════ 服务运维管理 ════════════════════${PLAIN}"
         echo "  1. 查看全部服务状态与监听端口"
         echo "  2. 查看 sing-box 实时日志"
-        echo "  3. 查看 Snell v5 实时日志"
-        echo "  4. 重启 sing-box"
-        echo "  5. 重启 Snell v5"
-        echo "  6. 查看 IPv6 Keepalive 状态"
-        echo "  7. 彻底卸载全部代理组件"
+        echo "  3. 查看 Xray 实时日志"
+        echo "  4. 查看 Snell v5 实时日志"
+        echo "  5. 重启 sing-box"
+        echo "  6. 重启 Xray"
+        echo "  7. 重启 Snell v5"
+        echo "  8. 查看 IPv6 Keepalive 状态"
+        echo "  9. 彻底卸载全部代理组件"
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0-7]: " c
-
+        read -rp "请选择 [0-9]: " c
         case "$c" in
             1) show_service_status; pause ;;
             2) journalctl -u sing-box -f -n 30 ;;
-            3) journalctl -u snell-v5 -f -n 30 ;;
-            4)
-                if systemctl restart sing-box; then echo -e "${GREEN}✔ sing-box 已重启。${PLAIN}"; else journalctl -u sing-box -n 30 --no-pager; fi
-                pause
-                ;;
-            5)
-                if systemctl restart snell-v5; then echo -e "${GREEN}✔ Snell v5 已重启。${PLAIN}"; else journalctl -u snell-v5 -n 30 --no-pager; fi
-                pause
-                ;;
-            6)
-                systemctl list-timers --all | grep -E 'keepalive|NEXT' || echo "未检测到 Keepalive 定时器。"
-                pause
-                ;;
-            7) full_uninstall ;;
+            3) journalctl -u xray -f -n 30 ;;
+            4) journalctl -u snell-v5 -f -n 30 ;;
+            5) if systemctl restart sing-box; then echo -e "${GREEN}✔ sing-box 已重启。${PLAIN}"; else journalctl -u sing-box -n 30 --no-pager; fi; pause ;;
+            6) if systemctl restart xray; then echo -e "${GREEN}✔ Xray 已重启。${PLAIN}"; else journalctl -u xray -n 30 --no-pager; fi; pause ;;
+            7) if systemctl restart snell-v5; then echo -e "${GREEN}✔ Snell v5 已重启。${PLAIN}"; else journalctl -u snell-v5 -n 30 --no-pager; fi; pause ;;
+            8) systemctl list-timers --all | grep -E 'keepalive|NEXT' || echo "未检测到 Keepalive 定时器。"; pause ;;
+            9) full_uninstall ;;
             0) return ;;
             *) sleep 1 ;;
         esac
