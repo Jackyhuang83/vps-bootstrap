@@ -2,7 +2,22 @@
 # ==============================================================================
 # 项目名称: VPS Bootstrap & SS2022 多协议代理管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.7.0
+# 当前版本: v1.8.0-dev2
+#
+# v1.8.0-dev2:
+#   - 新增 Realm L4 端口转发：单端口 / 端口段、TCP / UDP / TCP+UDP、IPv4 / IPv6 / 双栈
+#   - Realm 使用独立命名空间：ss2022-realm.service / /usr/local/lib/ss2022/realm / /etc/ss2022-realm
+#   - 转发规则统一保存于 /etc/ss2022/forwarding.json，支持查看 / 修改 / 删除 / 测试
+#   - 固定 Realm v2.9.6，并使用 GitHub 官方 Release asset digest 做 SHA256 校验
+#   - 不引入 MPTCP、TLS/WS/WSS 隧道、负载均衡、故障转移、流量统计等平台化能力
+#
+# v1.8.0-dev1:
+#   - 新增 VPS 服务端分流：全局默认出口 + 按服务规则覆盖 + IPv4/IPv6 指定
+#   - 新增 Cloudflare 官方 WARP Local Proxy 出口（MASQUE / SOCKS5）
+#   - 新增 SS2022 / SOCKS5 落地节点，支持多个落地节点与单独测试
+#   - 内置 OpenAI、Netflix、YouTube、Google、Telegram、MyTVSuper、Apple TV+、TikTok 规则
+#   - SS2022 / SS2022+ShadowTLS / VLESS Reality 参与服务端分流；Snell v5 保持官方 snell-server，由 Surge Rules 分流
+#   - 分流状态统一保存于 /etc/ss2022/routing.json，并分别生成 sing-box / Xray 路由配置
 #
 # v1.7.0:
 #   - 修复 Xray 临时配置文件无法自动识别 JSON 格式：校验时显式使用 -format json
@@ -58,10 +73,10 @@
 #   - sing-box 多协议入口可共存，按 tag 增删，不再互相覆盖
 #
 # 注意:
-#   这是开发版。建议先在测试 VPS 验证，再替换公开分发的 v1.6.1。
+#   这是 v1.8.0 分流功能开发版。建议先在测试 VPS 验证，不要直接覆盖 v1.7.0 Release。
 # ==============================================================================
 
-SCRIPT_VERSION="v1.7.0"
+SCRIPT_VERSION="v1.8.0-dev3"
 AUTHOR="DevOps"
 
 RED='\033[0;31m'
@@ -105,12 +120,28 @@ SNELL_USER_MARKER="/etc/ss2022-snell-user-managed"
 SNELL_SHA256_AMD64="9bea1c2b9e35b73b31634856c04d18c393072b9e5dcde6a32781d8b8f908c539"
 SNELL_SHA256_ARM64="2f178bf5ac468ce1a130454efa40a0603fbbe4e47ecc4880a989f4abc7f824cf"
 
+# ----------------------------- Realm L4 端口转发 -------------------------------
+# 固定官方稳定版本；下载后使用 GitHub Release API 返回的 asset digest 进行 SHA256 校验。
+REALM_VERSION="2.9.6"
+REALM_BIN="/usr/local/lib/ss2022/realm"
+REALM_CONF="/etc/ss2022-realm/config.json"
+REALM_SERVICE_NAME="ss2022-realm"
+REALM_SERVICE="/etc/systemd/system/${REALM_SERVICE_NAME}.service"
+REALM_USER="ss2022-realm"
+REALM_GROUP="ss2022-realm"
+REALM_USER_MARKER="/etc/ss2022-realm-user-managed"
+FORWARDING_FILE="/etc/ss2022/forwarding.json"
+REALM_MAX_RANGE_PORTS=1000
+
 # ----------------------------- 网络环境 ----------------------------------------
 BACKUP_DNS="/root/resolv.conf.orig"
 DNS_MARKER="/etc/ss2022-ipv6-dns-managed"
 FORCE_IPV6_CONF="/etc/apt/apt.conf.d/99force-ipv6"
 STATE_DIR="/etc/ss2022"
 STATE_FILE="${STATE_DIR}/state.json"
+ROUTING_FILE="${STATE_DIR}/routing.json"
+WARP_DEFAULT_PORT=40000
+WARP_MANAGED_MARKER="${STATE_DIR}/warp-package-managed"
 
 # ----------------------------- sing-box tag -----------------------------------
 TAG_SS="ss-in"
@@ -230,11 +261,13 @@ get_inbound_port() {
 
 show_dashboard() {
     clear
-    local sys_info singbox_info xray_info snell_info time_sync_status
+    local sys_info singbox_info xray_info snell_info time_sync_status realm_info realm_status forwarding_count=0
     local sb_status="${YELLOW}○ 未安装${PLAIN}"
     local xray_status="${YELLOW}○ 未安装${PLAIN}"
     local snell_status="${YELLOW}○ 未安装${PLAIN}"
     local keepalive_status="${YELLOW}○ 未配置${PLAIN}"
+    realm_info="Realm 未安装"
+    realm_status="${YELLOW}○ 未安装${PLAIN}"
     local proto_list="" installed_count=0
     local p=""
 
@@ -243,6 +276,19 @@ show_dashboard() {
     xray_info=$(get_xray_version)
     snell_info=$(get_snell_version)
     time_sync_status=$(get_time_sync_status)
+
+    if [[ -x "$REALM_BIN" ]]; then
+        realm_info=$("$REALM_BIN" --version 2>/dev/null | head -n1)
+        realm_info=${realm_info:-"Realm 已安装"}
+        if systemctl is-active --quiet "$REALM_SERVICE_NAME" 2>/dev/null; then
+            realm_status="${GREEN}● 运行中${PLAIN}"
+        else
+            realm_status="${RED}○ 已停止${PLAIN}"
+        fi
+    fi
+    if [[ -f "$FORWARDING_FILE" ]]; then
+        forwarding_count=$(jq '.rules|length' "$FORWARDING_FILE" 2>/dev/null || echo 0)
+    fi
 
     if systemctl is-active --quiet sing-box 2>/dev/null; then
         sb_status="${GREEN}● 运行中${PLAIN}"
@@ -306,6 +352,7 @@ show_dashboard() {
     echo -e "  sing-box: ${singbox_info} / ${sb_status}"
     echo -e "  Xray核心: ${xray_info} / ${xray_status}"
     echo -e "  Snell核心: ${snell_info} / ${snell_status}"
+    echo -e "  Realm转发: ${realm_info} / ${realm_status} / 规则 ${forwarding_count} 条"
     echo -e "  时间同步: ${time_sync_status}"
     echo -e "  IPv6链路保活: ${keepalive_status}"
     if [[ $installed_count -gt 0 ]]; then
@@ -1491,6 +1538,7 @@ update_ss2022() {
         add_json=$(jq -n --argjson a "$inbound" '[$a]')
         if update_singbox_inbounds "$excluded_tags" "$add_json"; then
             save_mode_state "ss" "$(jq -n --arg host "$current_host" --arg network "$new_network" '{host:$host,network:$network}')" || true
+            apply_routing_config >/dev/null 2>&1 || echo -e "${YELLOW}[提示] 节点已更新，但现有分流配置未能自动应用。${PLAIN}"
             echo -e "${GREEN}✔ SS2022 更新成功。${PLAIN}"
         else
             journalctl -u sing-box -n 30 --no-pager 2>/dev/null || true
@@ -1630,6 +1678,7 @@ update_shadowtls() {
 
         if update_singbox_inbounds "$excluded_tags" "$add_json"; then
             save_mode_state "shadowtls" "$(jq -n --arg host "$current_host" --arg network "$new_network" '{host:$host,network:$network}')" || true
+            apply_routing_config >/dev/null 2>&1 || echo -e "${YELLOW}[提示] 节点已更新，但现有分流配置未能自动应用。${PLAIN}"
             echo -e "${GREEN}✔ SS2022 + ShadowTLS v3 更新成功。${PLAIN}"
         else
             journalctl -u sing-box -n 30 --no-pager 2>/dev/null || true
@@ -1711,6 +1760,7 @@ update_vless_reality() {
         esac
         if write_xray_vless_config "$new_listen" "$new_port" "$new_uuid" "$new_sni" "$new_private" "$new_short_id"; then
             save_mode_state "vless" "$(jq -n --arg host "$current_host" --arg network "$new_network" --arg public_key "$new_public" '{host:$host,network:$network,public_key:$public_key,core:"xray"}')" || true
+            apply_routing_config >/dev/null 2>&1 || echo -e "${YELLOW}[提示] VLESS 已更新，但现有分流配置未能自动应用。${PLAIN}"
             echo -e "${GREEN}✔ VLESS Reality (Xray) 更新成功。${PLAIN}"
         else journalctl -u "$XRAY_SERVICE_NAME" -n 30 --no-pager 2>/dev/null || true; fi
         pause
@@ -1919,6 +1969,7 @@ deploy_ss2022() {
     add_json=$(jq -n --argjson a "$inbound" '[$a]')
 
     if update_singbox_inbounds "$excluded_tags" "$add_json"; then
+        apply_routing_config >/dev/null 2>&1 || echo -e "${YELLOW}[提示] 节点已部署，但现有分流配置未能自动应用，请进入“分流管理”重新应用。${PLAIN}"
         echo -e "${GREEN}✔ SS2022 部署成功。${PLAIN}"
         save_mode_state "ss" "$(jq -n --arg host "$SERVER_HOST" --arg network "$NETWORK_MODE" '{host:$host,network:$network}')" || true
         show_ss_details "$SERVER_HOST" "$PORT" "$METHOD" "$SS_KEY"
@@ -2040,6 +2091,7 @@ deploy_shadowtls() {
     fi
 
     if update_singbox_inbounds "$excluded_tags" "$add_json"; then
+        apply_routing_config >/dev/null 2>&1 || echo -e "${YELLOW}[提示] 节点已部署，但现有分流配置未能自动应用，请进入“分流管理”重新应用。${PLAIN}"
         echo -e "${GREEN}✔ SS2022 + ShadowTLS v3 部署成功。${PLAIN}"
         save_mode_state "shadowtls" "$(jq -n --arg host "$SERVER_HOST" --arg network "$NETWORK_MODE" '{host:$host,network:$network}')" || true
         show_shadowtls_details "$SERVER_HOST" "$tcp_port" "$METHOD" "$SS_KEY" "$stls_pass" "$sni" "$udp_enabled" "$udp_port"
@@ -2101,6 +2153,7 @@ deploy_vless_reality() {
     ask_server_host
     if write_xray_vless_config "$LISTEN_ADDR" "$vless_port" "$uuid" "$sni" "$REALITY_PRIVATE_KEY" "$short_id"; then
         save_mode_state "vless" "$(jq -n --arg host "$SERVER_HOST" --arg network "$NETWORK_MODE" --arg public_key "$REALITY_PUBLIC_KEY" '{host:$host,network:$network,public_key:$public_key,core:"xray"}')" || true
+        apply_routing_config >/dev/null 2>&1 || echo -e "${YELLOW}[提示] VLESS 已部署，但现有分流配置未能自动应用。${PLAIN}"
         echo -e "${GREEN}✔ VLESS Reality (Xray) 部署成功。${PLAIN}"
         show_vless_details "$SERVER_HOST" "$vless_port" "$uuid" "$sni" "$REALITY_PUBLIC_KEY" "$short_id"
     else
@@ -2763,6 +2816,2138 @@ remove_protocol_menu() {
     done
 }
 
+# ==============================================================================
+# v1.8.0 分流模块
+# - 适用入口：SS2022 / SS2022+ShadowTLS / VLESS Reality
+# - Snell v5 保持官方 snell-server，不参与服务端分流
+# - 出口：DIRECT / Cloudflare WARP Local Proxy / SS2022 或 SOCKS5 落地节点
+# - 规则：全局默认出口 + 按服务覆盖 + IPv4/IPv6 选择
+# ==============================================================================
+
+routing_init_state() {
+    mkdir -p "$STATE_DIR" || return 1
+    chmod 700 "$STATE_DIR"
+    if [[ ! -f "$ROUTING_FILE" ]]; then
+        cat > "$ROUTING_FILE" <<EOF
+{
+  "version": 1,
+  "default_outbound": "direct",
+  "warp": {
+    "proxy_host": "127.0.0.1",
+    "proxy_port": ${WARP_DEFAULT_PORT}
+  },
+  "chain_nodes": [],
+  "rules": []
+}
+EOF
+        chmod 600 "$ROUTING_FILE"
+        return 0
+    fi
+
+    local tmp
+    tmp=$(mktemp "${STATE_DIR}/routing.json.tmp.XXXXXX") || return 1
+    if ! jq --argjson port "$WARP_DEFAULT_PORT" '
+      .version = (.version // 1) |
+      .default_outbound = (.default_outbound // "direct") |
+      .warp = (.warp // {}) |
+      .warp.proxy_host = (.warp.proxy_host // "127.0.0.1") |
+      .warp.proxy_port = (.warp.proxy_port // $port) |
+      .chain_nodes = (.chain_nodes // []) |
+      .rules = (.rules // [])
+    ' "$ROUTING_FILE" > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    mv -f "$tmp" "$ROUTING_FILE"
+    chmod 600 "$ROUTING_FILE"
+}
+
+
+
+
+routing_commit_state_candidate() {
+    # 原子更新 routing.json：只有 sing-box / Xray 两侧都校验并应用成功后才提交状态。
+    local candidate="$1" backup rc=0
+    [[ -f "$candidate" ]] || return 1
+    jq -e 'type=="object" and (.chain_nodes|type=="array") and (.rules|type=="array") and (.default_outbound|type=="string")' "$candidate" >/dev/null 2>&1 || {
+        echo -e "${RED}[错误] 新分流状态文件格式无效。${PLAIN}"
+        rm -f "$candidate"
+        return 1
+    }
+
+    backup=$(mktemp "${STATE_DIR}/routing.json.rollback.XXXXXX") || { rm -f "$candidate"; return 1; }
+    cp -a "$ROUTING_FILE" "$backup" || { rm -f "$candidate" "$backup"; return 1; }
+
+    mv -f "$candidate" "$ROUTING_FILE" || { rm -f "$backup"; return 1; }
+    chmod 600 "$ROUTING_FILE"
+
+    if ! apply_routing_config; then
+        rc=1
+        echo -e "${YELLOW}>> 分流状态同步失败，恢复上一版 routing.json...${PLAIN}"
+        mv -f "$backup" "$ROUTING_FILE"
+        chmod 600 "$ROUTING_FILE"
+    else
+        rm -f "$backup"
+    fi
+    return "$rc"
+}
+
+routing_service_name() {
+    case "$1" in
+        openai) echo "OpenAI / ChatGPT" ;;
+        netflix) echo "Netflix" ;;
+        youtube) echo "YouTube" ;;
+        google) echo "Google" ;;
+        telegram) echo "Telegram" ;;
+        mytvsuper) echo "MyTVSuper" ;;
+        appletv) echo "Apple TV+" ;;
+        tiktok) echo "TikTok" ;;
+        custom) echo "自定义规则" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+routing_preset_match_json() {
+    case "$1" in
+        openai)
+            jq -nc '{domain:[],domain_suffix:["openai.com","chatgpt.com","oaistatic.com","oaiusercontent.com"],domain_keyword:[],ip_cidr:[]}'
+            ;;
+        netflix)
+            jq -nc '{domain:[],domain_suffix:["netflix.com","netflix.net","nflxext.com","nflximg.com","nflximg.net","nflxso.net","nflxvideo.net"],domain_keyword:[],ip_cidr:[]}'
+            ;;
+        youtube)
+            jq -nc '{domain:[],domain_suffix:["youtube.com","youtube-nocookie.com","youtu.be","googlevideo.com","ytimg.com","gvt2.com"],domain_keyword:["youtube"],ip_cidr:[]}'
+            ;;
+        google)
+            jq -nc '{domain:[],domain_suffix:["google.com","googleapis.com","gstatic.com","googleusercontent.com","1e100.net"],domain_keyword:[],ip_cidr:[]}'
+            ;;
+        telegram)
+            jq -nc '{domain:[],domain_suffix:["telegram.org","telegram.me","t.me","telesco.pe"],domain_keyword:[],ip_cidr:["149.154.160.0/20","185.76.151.0/24","91.105.192.0/23","91.108.4.0/22","91.108.8.0/22","91.108.12.0/22","91.108.16.0/22","91.108.20.0/22","91.108.56.0/22","2001:67c:4e8::/48","2001:b28:f23c::/48","2001:b28:f23d::/48","2001:b28:f23f::/48","2a0a:f280::/32"]}'
+            ;;
+        mytvsuper)
+            jq -nc '{domain:[],domain_suffix:["mytvsuper.com","tvb.com"],domain_keyword:["nowtv100","rthklive"],ip_cidr:[]}'
+            ;;
+        appletv)
+            jq -nc '{domain:["hls-amt.itunes.apple.com","hls.itunes.apple.com","np-edge.itunes.apple.com","play-edge.itunes.apple.com","tv.applemusic.com","uts-api.itunes.apple.com"],domain_suffix:["tv.apple.com"],domain_keyword:[],ip_cidr:[]}'
+            ;;
+        tiktok)
+            jq -nc '{domain:["lf16-effectcdn.byteeffecttos-g.com","lf16-pkgcdn.pitaya-clientai.com","p16-tiktokcdn-com.akamaized.net"],domain_suffix:["bytedapm.com","bytegecko-i18n.com","byteintlapi.com","byteoversea.com","ibytedtos.com","ibyteimg.com","ipstatp.com","isnssdk.com","muscdn.com","musical.ly","sgpstatp.com","snssdk.com","tik-tokapi.com","tiktok.com","tiktokcdn-us.com","tiktokcdn.com","tiktokd.net","tiktokd.org","tiktokmusic.app","tiktokv.com","tiktokv.us","ttwebview.com"],domain_keyword:["tiktok","musical.ly"],ip_cidr:[]}'
+            ;;
+        *)
+            jq -nc '{domain:[],domain_suffix:[],domain_keyword:[],ip_cidr:[]}'
+            ;;
+    esac
+}
+
+routing_rule_match_json() {
+    local rule_json="$1" service custom_type values preset
+    service=$(jq -r '.service // "custom"' <<<"$rule_json")
+    if [[ "$service" != "custom" ]]; then
+        routing_preset_match_json "$service"
+        return
+    fi
+    custom_type=$(jq -r '.custom_type // "domain_suffix"' <<<"$rule_json")
+    values=$(jq -c '.values // []' <<<"$rule_json")
+    case "$custom_type" in
+        domain) jq -nc --argjson v "$values" '{domain:$v,domain_suffix:[],domain_keyword:[],ip_cidr:[]}' ;;
+        domain_suffix) jq -nc --argjson v "$values" '{domain:[],domain_suffix:$v,domain_keyword:[],ip_cidr:[]}' ;;
+        domain_keyword) jq -nc --argjson v "$values" '{domain:[],domain_suffix:[],domain_keyword:$v,ip_cidr:[]}' ;;
+        ip_cidr) jq -nc --argjson v "$values" '{domain:[],domain_suffix:[],domain_keyword:[],ip_cidr:$v}' ;;
+        *) jq -nc '{domain:[],domain_suffix:[],domain_keyword:[],ip_cidr:[]}' ;;
+    esac
+}
+
+routing_node_name_exists() {
+    local name="$1"
+    routing_init_state || return 1
+    jq -e --arg name "$name" 'any(.chain_nodes[]?; .name==$name)' "$ROUTING_FILE" >/dev/null 2>&1
+}
+
+routing_preset_rule_exists() {
+    local service="$1"
+    routing_init_state || return 1
+    [[ "$service" != "custom" ]] || return 1
+    jq -e --arg service "$service" 'any(.rules[]?; .service==$service)' "$ROUTING_FILE" >/dev/null 2>&1
+}
+
+routing_node_exists() {
+    local id="$1"
+    routing_init_state || return 1
+    jq -e --arg id "$id" '.chain_nodes[]? | select(.id==$id)' "$ROUTING_FILE" >/dev/null 2>&1
+}
+
+
+routing_outbound_label() {
+    local ref="$1" id name
+    case "$ref" in
+        direct) echo "DIRECT（本 VPS）" ;;
+        warp) echo "WARP" ;;
+        chain:*)
+            id=${ref#chain:}
+            name=$(jq -r --arg id "$id" '.chain_nodes[]? | select(.id==$id) | .name // empty' "$ROUTING_FILE" 2>/dev/null | head -n1)
+            echo "${name:-$id}"
+            ;;
+        *) echo "$ref" ;;
+    esac
+}
+
+routing_tag_singbox() {
+    local ref="$1"
+    case "$ref" in
+        direct) echo "direct" ;;
+        warp) echo "route-warp" ;;
+        chain:*) echo "route-chain-${ref#chain:}" ;;
+        *) echo "direct" ;;
+    esac
+}
+
+routing_tag_xray() {
+    local ref="$1" family="${2:-default}" base
+    case "$ref" in
+        direct) base="route-direct" ;;
+        warp) base="route-warp" ;;
+        chain:*) base="route-chain-${ref#chain:}" ;;
+        *) base="route-direct" ;;
+    esac
+    case "$family" in
+        ipv4) echo "${base}-v4" ;;
+        ipv6) echo "${base}-v6" ;;
+        *) echo "$base" ;;
+    esac
+}
+
+warp_proxy_port() {
+    routing_init_state || { echo "$WARP_DEFAULT_PORT"; return; }
+    jq -r --argjson p "$WARP_DEFAULT_PORT" '.warp.proxy_port // $p' "$ROUTING_FILE" 2>/dev/null
+}
+
+warp_proxy_ready() {
+    local port
+    command -v warp-cli >/dev/null 2>&1 || return 1
+    port=$(warp_proxy_port)
+    ss -H -ltn 2>/dev/null | awk -v p=":${port}" '$4 ~ p"$" {found=1} END{exit !found}' || return 1
+    warp-cli --accept-tos status 2>/dev/null | grep -qi 'Connected' || return 1
+    return 0
+}
+
+warp_is_referenced() {
+    routing_init_state || return 1
+    jq -e '.default_outbound=="warp" or any(.rules[]?; .outbound=="warp")' "$ROUTING_FILE" >/dev/null 2>&1
+}
+
+routing_node_is_referenced() {
+    local id="$1"
+    routing_init_state || return 1
+    jq -e --arg ref "chain:${id}" '.default_outbound==$ref or any(.rules[]?; .outbound==$ref)' "$ROUTING_FILE" >/dev/null 2>&1
+}
+
+url_decode_simple() {
+    # SIP002 URI userinfo uses percent-encoding; a literal + is part of a Base64 key, not a space.
+    local data="$1"
+    printf '%b' "${data//%/\\x}"
+}
+
+base64url_decode() {
+    local s="$1" mod
+    s=${s//-/+}; s=${s//_/\/}
+    mod=$(( ${#s} % 4 ))
+    [[ $mod -eq 2 ]] && s+="=="
+    [[ $mod -eq 3 ]] && s+="="
+    printf '%s' "$s" | base64 -d 2>/dev/null
+}
+
+parse_ss_uri() {
+    local uri="$1" body userinfo hostport decoded host port method pass
+    uri=${uri#ss://}
+    uri=${uri%%#*}
+    uri=${uri%%\?*}
+    [[ "$uri" == *"@"* ]] || return 1
+    userinfo=${uri%@*}
+    hostport=${uri##*@}
+    if [[ "$userinfo" == *:* ]]; then
+        decoded=$(url_decode_simple "$userinfo")
+    else
+        decoded=$(base64url_decode "$userinfo") || return 1
+    fi
+    method=${decoded%%:*}
+    pass=${decoded#*:}
+    [[ "$decoded" == *:* && -n "$method" && -n "$pass" ]] || return 1
+    if [[ "$hostport" =~ ^\[([^]]+)\]:([0-9]+)$ ]]; then
+        host=${BASH_REMATCH[1]}; port=${BASH_REMATCH[2]}
+    elif [[ "$hostport" =~ ^([^:]+):([0-9]+)$ ]]; then
+        host=${BASH_REMATCH[1]}; port=${BASH_REMATCH[2]}
+    else
+        return 1
+    fi
+    validate_port_number "$port" || return 1
+    CHAIN_SERVER="$host"; CHAIN_PORT="$port"; CHAIN_METHOD="$method"; CHAIN_PASSWORD="$pass"
+}
+
+validate_ss2022_outbound() {
+    local method="$1" pass="$2" bytes
+    case "$method" in
+        2022-blake3-aes-128-gcm) bytes=16 ;;
+        2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) bytes=32 ;;
+        *) return 1 ;;
+    esac
+    validate_ss2022_key "$pass" "$bytes"
+}
+
+
+routing_choose_outbound() {
+    local prompt="${1:-请选择出口}" nodes count idx choice i id name type
+    routing_init_state || return 1
+    nodes=$(jq -c '.chain_nodes' "$ROUTING_FILE")
+    count=$(jq 'length' <<<"$nodes")
+    echo "$prompt"
+    echo "  1. DIRECT（当前 VPS 本身出口）"
+    if warp_proxy_ready; then
+        echo "  2. WARP（Cloudflare Local Proxy）"
+    else
+        echo "  2. WARP（当前不可用，请先安装/连接）"
+    fi
+    i=0
+    while [[ $i -lt $count ]]; do
+        name=$(jq -r ".[$i].name" <<<"$nodes")
+        type=$(jq -r ".[$i].type" <<<"$nodes")
+        printf '  %d. %s [%s]\n' "$((i+3))" "$name" "$type"
+        i=$((i+1))
+    done
+    read -rp "请选择: " choice
+    case "$choice" in
+        1) SELECTED_OUTBOUND="direct"; return 0 ;;
+        2)
+            if warp_proxy_ready; then SELECTED_OUTBOUND="warp"; return 0; fi
+            echo -e "${RED}[错误] WARP 当前不可用。${PLAIN}"; return 1
+            ;;
+        *)
+            [[ "$choice" =~ ^[0-9]+$ ]] || return 1
+            idx=$((choice-3))
+            [[ $idx -ge 0 && $idx -lt $count ]] || return 1
+            id=$(jq -r ".[$idx].id" <<<"$nodes")
+            SELECTED_OUTBOUND="chain:${id}"
+            return 0
+            ;;
+    esac
+}
+
+routing_choose_ip_family() {
+    local c
+    echo "请选择 IP 地址族："
+    echo "  1. 默认（不强制）"
+    echo "  2. 仅 IPv4"
+    echo "  3. 仅 IPv6"
+    read -rp "请选择 [1-3，默认 1]: " c
+    c=${c:-1}
+    case "$c" in
+        1) SELECTED_IP_FAMILY="default" ;;
+        2) SELECTED_IP_FAMILY="ipv4" ;;
+        3) SELECTED_IP_FAMILY="ipv6" ;;
+        *) return 1 ;;
+    esac
+}
+
+build_singbox_routing_candidate() {
+    local output="$1" outbounds='[]' rules='[{"action":"sniff","timeout":"300ms"}]' nodes count i node type tag ref default_ref default_tag port
+    local rule_count r rmatch family outbound domains suffix keywords ips part action
+    [[ -f "$SINGBOX_CONF" && -x "$SINGBOX_BIN" ]] || return 2
+    routing_init_state || return 1
+
+    outbounds=$(jq -nc '[{"type":"direct","tag":"direct"}]')
+    port=$(warp_proxy_port)
+    outbounds=$(jq -c --argjson p "$port" '. + [{"type":"socks","tag":"route-warp","server":"127.0.0.1","server_port":$p}]' <<<"$outbounds")
+
+    nodes=$(jq -c '.chain_nodes' "$ROUTING_FILE")
+    count=$(jq 'length' <<<"$nodes")
+    i=0
+    while [[ $i -lt $count ]]; do
+        node=$(jq -c ".[$i]" <<<"$nodes")
+        type=$(jq -r '.type' <<<"$node")
+        tag="route-chain-$(jq -r '.id' <<<"$node")"
+        if [[ "$type" == "ss2022" ]]; then
+            outbounds=$(jq -c --arg tag "$tag" --arg server "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" '. + [{type:"shadowsocks",tag:$tag,server:$server,server_port:$port,method:$method,password:$pass}]' <<<"$outbounds")
+        else
+            outbounds=$(jq -c --arg tag "$tag" --arg server "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg user "$(jq -r '.username // ""' <<<"$node")" --arg pass "$(jq -r '.password // ""' <<<"$node")" '. + [({type:"socks",tag:$tag,server:$server,server_port:$port} + (if $user!="" then {username:$user,password:$pass} else {} end))]' <<<"$outbounds")
+        fi
+        i=$((i+1))
+    done
+
+    rule_count=$(jq '.rules|length' "$ROUTING_FILE")
+    i=0
+    while [[ $i -lt $rule_count ]]; do
+        r=$(jq -c ".rules[$i]" "$ROUTING_FILE")
+        rmatch=$(routing_rule_match_json "$r")
+        family=$(jq -r '.ip_family // "default"' <<<"$r")
+        outbound=$(jq -r '.outbound' <<<"$r")
+        action=$(routing_tag_singbox "$outbound")
+        domains=$(jq -c '.domain' <<<"$rmatch")
+        suffix=$(jq -c '.domain_suffix' <<<"$rmatch")
+        keywords=$(jq -c '.domain_keyword' <<<"$rmatch")
+        ips=$(jq -c '.ip_cidr' <<<"$rmatch")
+
+        for part in domain domain_suffix domain_keyword; do
+            local arr
+            arr=$(jq -c ".$part" <<<"$rmatch")
+            [[ $(jq 'length' <<<"$arr") -gt 0 ]] || continue
+            if [[ "$family" == "ipv4" || "$family" == "ipv6" ]]; then
+                local strategy
+                [[ "$family" == "ipv4" ]] && strategy="ipv4_only" || strategy="ipv6_only"
+                rules=$(jq -c --arg key "$part" --argjson vals "$arr" --arg strategy "$strategy" '. + [({action:"resolve",strategy:$strategy} + {($key):$vals})]' <<<"$rules")
+            fi
+            rules=$(jq -c --arg key "$part" --argjson vals "$arr" --arg out "$action" '. + [({action:"route",outbound:$out} + {($key):$vals})]' <<<"$rules")
+        done
+
+        if [[ $(jq 'length' <<<"$ips") -gt 0 ]]; then
+            if [[ "$family" == "ipv4" ]]; then
+                ips=$(jq -c '[.[] | select(contains(":")|not)]' <<<"$ips")
+            elif [[ "$family" == "ipv6" ]]; then
+                ips=$(jq -c '[.[] | select(contains(":"))]' <<<"$ips")
+            fi
+            if [[ $(jq 'length' <<<"$ips") -gt 0 ]]; then
+                rules=$(jq -c --argjson vals "$ips" --arg out "$action" '. + [{ip_cidr:$vals,action:"route",outbound:$out}]' <<<"$rules")
+            fi
+        fi
+        i=$((i+1))
+    done
+
+    default_ref=$(jq -r '.default_outbound' "$ROUTING_FILE")
+    default_tag=$(routing_tag_singbox "$default_ref")
+    jq --argjson outs "$outbounds" --argjson rules "$rules" --arg final "$default_tag" '
+      .dns = (.dns // {}) |
+      .dns.servers = ((.dns.servers // []) as $servers |
+        if any($servers[]?; .tag == "local-dns") then $servers
+        else $servers + [{type:"local",tag:"local-dns"}] end) |
+      .outbounds = $outs |
+      .route = (.route // {}) |
+      .route.rules = $rules |
+      .route.final = $final |
+      .route.default_domain_resolver = (.route.default_domain_resolver // "local-dns")
+    ' "$SINGBOX_CONF" > "$output"
+}
+
+xray_outbound_for_node() {
+    local node="$1" tag="$2" family="${3:-default}" type strategy="AsIs"
+    type=$(jq -r '.type' <<<"$node")
+    [[ "$family" == "ipv4" ]] && strategy="ForceIPv4"
+    [[ "$family" == "ipv6" ]] && strategy="ForceIPv6"
+    if [[ "$type" == "ss2022" ]]; then
+        jq -nc --arg tag "$tag" --arg address "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" --arg ts "$strategy" '{protocol:"shadowsocks",tag:$tag,targetStrategy:$ts,settings:{address:$address,port:$port,method:$method,password:$pass}}'
+    else
+        jq -nc --arg tag "$tag" --arg address "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg user "$(jq -r '.username // ""' <<<"$node")" --arg pass "$(jq -r '.password // ""' <<<"$node")" --arg ts "$strategy" '{protocol:"socks",tag:$tag,targetStrategy:$ts,settings:({address:$address,port:$port} + (if $user!="" then {user:$user,pass:$pass} else {} end))}'
+    fi
+}
+
+xray_direct_outbound() {
+    local tag="$1" family="${2:-default}" ds="AsIs"
+    [[ "$family" == "ipv4" ]] && ds="UseIPv4"
+    [[ "$family" == "ipv6" ]] && ds="UseIPv6"
+    jq -nc --arg tag "$tag" --arg ds "$ds" '{protocol:"freedom",tag:$tag,settings:{domainStrategy:$ds}}'
+}
+
+xray_warp_outbound() {
+    local tag="$1" family="${2:-default}" ts="AsIs" port
+    [[ "$family" == "ipv4" ]] && ts="ForceIPv4"
+    [[ "$family" == "ipv6" ]] && ts="ForceIPv6"
+    port=$(warp_proxy_port)
+    jq -nc --arg tag "$tag" --argjson port "$port" --arg ts "$ts" '{protocol:"socks",tag:$tag,targetStrategy:$ts,settings:{address:"127.0.0.1",port:$port}}'
+}
+
+build_xray_routing_candidate() {
+    local output="$1" outbounds='[]' rules='[]' nodes count i node ref family base match
+    local rule_count r rmatch domains suffix keywords ips xdomains tag part arr default_ref default_tag
+    [[ -f "$XRAY_CONF" && -x "$XRAY_BIN" ]] || return 2
+    routing_init_state || return 1
+
+    outbounds=$(jq -nc --argjson a "$(xray_direct_outbound route-direct default)" --argjson b "$(xray_direct_outbound route-direct-v4 ipv4)" --argjson c "$(xray_direct_outbound route-direct-v6 ipv6)" --argjson d "$(xray_warp_outbound route-warp default)" --argjson e "$(xray_warp_outbound route-warp-v4 ipv4)" --argjson f "$(xray_warp_outbound route-warp-v6 ipv6)" '[$a,$b,$c,$d,$e,$f]')
+
+    nodes=$(jq -c '.chain_nodes' "$ROUTING_FILE")
+    count=$(jq 'length' <<<"$nodes")
+    i=0
+    while [[ $i -lt $count ]]; do
+        node=$(jq -c ".[$i]" <<<"$nodes")
+        local nid b o4 o6
+        nid=$(jq -r '.id' <<<"$node")
+        b=$(xray_outbound_for_node "$node" "route-chain-${nid}" default)
+        o4=$(xray_outbound_for_node "$node" "route-chain-${nid}-v4" ipv4)
+        o6=$(xray_outbound_for_node "$node" "route-chain-${nid}-v6" ipv6)
+        outbounds=$(jq -c --argjson a "$b" --argjson b "$o4" --argjson c "$o6" '. + [$a,$b,$c]' <<<"$outbounds")
+        i=$((i+1))
+    done
+
+    rule_count=$(jq '.rules|length' "$ROUTING_FILE")
+    i=0
+    while [[ $i -lt $rule_count ]]; do
+        r=$(jq -c ".rules[$i]" "$ROUTING_FILE")
+        rmatch=$(routing_rule_match_json "$r")
+        family=$(jq -r '.ip_family // "default"' <<<"$r")
+        ref=$(jq -r '.outbound' <<<"$r")
+        tag=$(routing_tag_xray "$ref" "$family")
+        xdomains='[]'
+        domains=$(jq -c '.domain' <<<"$rmatch")
+        suffix=$(jq -c '.domain_suffix' <<<"$rmatch")
+        keywords=$(jq -c '.domain_keyword' <<<"$rmatch")
+        xdomains=$(jq -c --argjson a "$domains" --argjson b "$suffix" --argjson c "$keywords" '$a|map("full:"+.) + ($b|map("domain:"+.)) + ($c|map("keyword:"+.))' <<<"{}")
+        if [[ $(jq 'length' <<<"$xdomains") -gt 0 ]]; then
+            rules=$(jq -c --argjson d "$xdomains" --arg tag "$tag" '. + [{type:"field",domain:$d,outboundTag:$tag}]' <<<"$rules")
+        fi
+        ips=$(jq -c '.ip_cidr' <<<"$rmatch")
+        if [[ "$family" == "ipv4" ]]; then ips=$(jq -c '[.[]|select(contains(":")|not)]' <<<"$ips"); fi
+        if [[ "$family" == "ipv6" ]]; then ips=$(jq -c '[.[]|select(contains(":"))]' <<<"$ips"); fi
+        if [[ $(jq 'length' <<<"$ips") -gt 0 ]]; then
+            rules=$(jq -c --argjson ip "$ips" --arg tag "$tag" '. + [{type:"field",ip:$ip,outboundTag:$tag}]' <<<"$rules")
+        fi
+        i=$((i+1))
+    done
+
+    default_ref=$(jq -r '.default_outbound' "$ROUTING_FILE")
+    default_tag=$(routing_tag_xray "$default_ref" default)
+    rules=$(jq -c --arg tag "$default_tag" '. + [{type:"field",network:"tcp,udp",outboundTag:$tag}]' <<<"$rules")
+
+    jq --argjson outs "$outbounds" --argjson rules "$rules" '
+      .inbounds = ((.inbounds // []) | map(
+        if .tag == "vless-reality-in" then
+          .sniffing = {enabled:true,destOverride:["http","tls","quic"],routeOnly:true}
+        else . end
+      )) |
+      .outbounds = $outs |
+      .routing = {domainStrategy:"AsIs",rules:$rules}
+    ' "$XRAY_CONF" > "$output"
+}
+
+apply_routing_config() {
+    routing_init_state || return 1
+    local sb_tmp="" xr_tmp="" sb_backup="" xr_backup="" sb_active=0 xr_active=0 failed=0
+
+    if [[ -f "$SINGBOX_CONF" && -x "$SINGBOX_BIN" ]]; then
+        sb_tmp=$(mktemp "/etc/sing-box/config.routing.XXXXXX.json") || return 1
+        build_singbox_routing_candidate "$sb_tmp" || { rm -f "$sb_tmp"; return 1; }
+        echo -e "${YELLOW}>> 校验 sing-box 分流配置...${PLAIN}"
+        if ! "$SINGBOX_BIN" check -c "$sb_tmp"; then
+            echo -e "${RED}[错误] sing-box 分流配置校验失败，未应用任何修改。${PLAIN}"
+            rm -f "$sb_tmp"
+            return 1
+        fi
+        sb_active=1
+    fi
+
+    if [[ -f "$XRAY_CONF" && -x "$XRAY_BIN" ]]; then
+        xr_tmp=$(mktemp "/etc/ss2022-xray/config.routing.XXXXXX.json") || { rm -f "$sb_tmp"; return 1; }
+        build_xray_routing_candidate "$xr_tmp" || { rm -f "$sb_tmp" "$xr_tmp"; return 1; }
+        chown root:"$XRAY_GROUP" "$xr_tmp" 2>/dev/null || true
+        chmod 640 "$xr_tmp"
+        echo -e "${YELLOW}>> 校验 Xray 分流配置...${PLAIN}"
+        if ! "$XRAY_BIN" run -test -format json -config "$xr_tmp"; then
+            echo -e "${RED}[错误] Xray 分流配置校验失败，未应用任何修改。${PLAIN}"
+            rm -f "$sb_tmp" "$xr_tmp"
+            return 1
+        fi
+        xr_active=1
+    fi
+
+    if [[ $sb_active -eq 0 && $xr_active -eq 0 ]]; then
+        echo -e "${YELLOW}[提示] 当前尚未部署 SS2022/ShadowTLS/VLESS；分流状态已保存，部署节点后会自动生效。${PLAIN}"
+        return 0
+    fi
+
+    if [[ $sb_active -eq 1 ]]; then
+        sb_backup=$(mktemp "/etc/sing-box/config.routing.rollback.XXXXXX.json") || { rm -f "$sb_tmp" "$xr_tmp"; return 1; }
+        cp -a "$SINGBOX_CONF" "$sb_backup" || return 1
+    fi
+    if [[ $xr_active -eq 1 ]]; then
+        xr_backup=$(mktemp "/etc/ss2022-xray/config.routing.rollback.XXXXXX.json") || { rm -f "$sb_tmp" "$xr_tmp" "$sb_backup"; return 1; }
+        cp -a "$XRAY_CONF" "$xr_backup" || return 1
+    fi
+
+    if [[ $sb_active -eq 1 ]]; then
+        mv -f "$sb_tmp" "$SINGBOX_CONF" || failed=1
+        chown root:"$SINGBOX_GROUP" "$SINGBOX_CONF" 2>/dev/null || true
+        chmod 640 "$SINGBOX_CONF"
+    fi
+    if [[ $failed -eq 0 && $xr_active -eq 1 ]]; then
+        mv -f "$xr_tmp" "$XRAY_CONF" || failed=1
+        chown root:"$XRAY_GROUP" "$XRAY_CONF" 2>/dev/null || true
+        chmod 640 "$XRAY_CONF"
+    fi
+
+    if [[ $failed -eq 0 && $sb_active -eq 1 ]] && ! systemctl restart sing-box; then failed=1; fi
+    if [[ $failed -eq 0 && $xr_active -eq 1 ]] && ! systemctl restart "$XRAY_SERVICE_NAME"; then failed=1; fi
+
+    if [[ $failed -ne 0 ]]; then
+        echo -e "${RED}[错误] 分流配置应用失败，正在回滚 sing-box / Xray...${PLAIN}"
+        if [[ $sb_active -eq 1 && -f "$sb_backup" ]]; then mv -f "$sb_backup" "$SINGBOX_CONF"; chown root:"$SINGBOX_GROUP" "$SINGBOX_CONF" 2>/dev/null || true; chmod 640 "$SINGBOX_CONF"; systemctl restart sing-box >/dev/null 2>&1 || true; fi
+        if [[ $xr_active -eq 1 && -f "$xr_backup" ]]; then mv -f "$xr_backup" "$XRAY_CONF"; chown root:"$XRAY_GROUP" "$XRAY_CONF" 2>/dev/null || true; chmod 640 "$XRAY_CONF"; systemctl restart "$XRAY_SERVICE_NAME" >/dev/null 2>&1 || true; fi
+        rm -f "$sb_tmp" "$xr_tmp" "$sb_backup" "$xr_backup"
+        return 1
+    fi
+
+    rm -f "$sb_backup" "$xr_backup"
+    echo -e "${GREEN}✔ 分流配置已通过双核心校验并安全应用。${PLAIN}"
+}
+
+warp_install_client() {
+    local managed=0 codename port
+    routing_init_state || return 1
+    port=$(warp_proxy_port)
+    if ! command -v warp-cli >/dev/null 2>&1; then
+        echo -e "${YELLOW}>> 安装 Cloudflare 官方 WARP Linux 客户端...${PLAIN}"
+        apt-get update -y || return 1
+        apt-get install -y curl ca-certificates gnupg lsb-release || return 1
+        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg || return 1
+        codename=$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-}")
+        [[ -n "$codename" ]] || codename=$(lsb_release -cs 2>/dev/null || true)
+        [[ -n "$codename" ]] || { echo -e "${RED}[错误] 无法识别 Debian/Ubuntu 发行版代号。${PLAIN}"; return 1; }
+        echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${codename} main" > /etc/apt/sources.list.d/cloudflare-client.list
+        apt-get update -y || return 1
+        apt-get install -y cloudflare-warp || return 1
+        managed=1
+        touch "$WARP_MANAGED_MARKER"
+    fi
+
+    systemctl enable --now warp-svc >/dev/null 2>&1 || true
+    sleep 1
+    if ! warp-cli --accept-tos registration show >/dev/null 2>&1; then
+        echo -e "${YELLOW}>> 注册 WARP Consumer 客户端...${PLAIN}"
+        warp-cli --accept-tos registration new || return 1
+    fi
+    warp-cli --accept-tos tunnel protocol set MASQUE >/dev/null 2>&1 || true
+    warp-cli --accept-tos mode proxy || return 1
+    warp-cli --accept-tos proxy port "$port" || return 1
+    warp-cli --accept-tos connect || return 1
+    local n=0
+    while [[ $n -lt 15 ]]; do
+        if warp_proxy_ready; then
+            echo -e "${GREEN}✔ WARP Local Proxy 已连接：127.0.0.1:${port}${PLAIN}"
+            return 0
+        fi
+        sleep 1; n=$((n+1))
+    done
+    echo -e "${RED}[错误] WARP 已配置，但 15 秒内未进入 Connected 状态。${PLAIN}"
+    warp-cli --accept-tos status 2>/dev/null || true
+    return 1
+}
+
+warp_show_status() {
+    local port
+    port=$(warp_proxy_port)
+    echo -e "${CYAN}════════════════ WARP 状态 ════════════════${PLAIN}"
+    if ! command -v warp-cli >/dev/null 2>&1; then echo "未安装 Cloudflare WARP。"; return; fi
+    warp-cli --accept-tos status 2>/dev/null || true
+    echo ""
+    warp-cli --accept-tos settings 2>/dev/null | grep -Ei 'mode|proxy|protocol' || true
+    echo ""
+    echo "Local Proxy: 127.0.0.1:${port}"
+    if warp_proxy_ready; then echo -e "状态: ${GREEN}可用${PLAIN}"; else echo -e "状态: ${YELLOW}未就绪${PLAIN}"; fi
+}
+
+warp_test_exit() {
+    local port trace
+    port=$(warp_proxy_port)
+    warp_proxy_ready || { echo -e "${RED}[错误] WARP Local Proxy 当前不可用。${PLAIN}"; return 1; }
+    echo -e "${YELLOW}>> 测试 WARP 出口...${PLAIN}"
+    trace=$(curl -fsS --connect-timeout 8 --max-time 15 --socks5-hostname "127.0.0.1:${port}" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null) || { echo -e "${RED}[错误] WARP 出口请求失败。${PLAIN}"; return 1; }
+    printf '%s\n' "$trace" | grep -E '^(ip|loc|warp|colo)=' || true
+    if grep -qE '^warp=(on|plus)$' <<<"$trace"; then echo -e "${GREEN}✔ WARP 出口正常。${PLAIN}"; else echo -e "${YELLOW}[警告] 请求成功，但 trace 未显示 warp=on/plus。${PLAIN}"; fi
+}
+
+warp_reregister() {
+    command -v warp-cli >/dev/null 2>&1 || { echo -e "${YELLOW}WARP 未安装。${PLAIN}"; return 1; }
+    warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
+    warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
+    warp-cli --accept-tos registration new || return 1
+    warp-cli --accept-tos tunnel protocol set MASQUE >/dev/null 2>&1 || true
+    warp-cli --accept-tos mode proxy || return 1
+    warp-cli --accept-tos proxy port "$(warp_proxy_port)" || return 1
+    warp-cli --accept-tos connect || return 1
+    sleep 2
+    warp_test_exit
+}
+
+warp_uninstall_client() {
+    if warp_is_referenced; then
+        echo -e "${RED}[错误] 当前默认出口或分流规则仍引用 WARP。请先修改这些规则再卸载。${PLAIN}"
+        return 1
+    fi
+    command -v warp-cli >/dev/null 2>&1 || { echo -e "${YELLOW}WARP 未安装。${PLAIN}"; return 0; }
+    warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
+    if [[ -f "$WARP_MANAGED_MARKER" ]]; then
+        warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
+        apt-get remove -y cloudflare-warp || return 1
+        rm -f /etc/apt/sources.list.d/cloudflare-client.list /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg "$WARP_MANAGED_MARKER"
+        echo -e "${GREEN}✔ 已卸载由 ss2022.sh 安装的 Cloudflare WARP。${PLAIN}"
+    else
+        echo -e "${YELLOW}[提示] WARP 不是由本脚本安装，仅执行断开，不删除软件包。${PLAIN}"
+    fi
+}
+
+warp_management() {
+    while true; do
+        clear
+        warp_show_status
+        echo ""
+        echo "  1. 安装 / 配置 Cloudflare WARP Local Proxy"
+        echo "  2. 测试 WARP 出口"
+        echo "  3. 重连 WARP"
+        echo "  4. 重新注册 WARP"
+        echo "  5. 卸载 WARP"
+        echo "  0. 返回"
+        read -rp "请选择 [0-5]: " c
+        case "$c" in
+            1) warp_install_client; pause ;;
+            2) warp_test_exit; pause ;;
+            3) if command -v warp-cli >/dev/null; then warp-cli --accept-tos disconnect >/dev/null 2>&1 || true; warp-cli --accept-tos connect; sleep 2; warp_test_exit; else echo "WARP 未安装。"; fi; pause ;;
+            4) warp_reregister; pause ;;
+            5) warp_uninstall_client; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+chain_add_ss2022() {
+    local name mode uri server port method pass id node
+    read -rp "节点名称（例如 US-LA）: " name
+    [[ -n "$name" ]] || return 1
+    if routing_node_name_exists "$name"; then echo -e "${RED}[错误] 落地节点名称 ${name} 已存在，请使用唯一名称。${PLAIN}"; return 1; fi
+    echo "  1. 粘贴 ss:// URI"
+    echo "  2. 手动输入"
+    read -rp "请选择 [1-2，默认 1]: " mode
+    mode=${mode:-1}
+    if [[ "$mode" == "1" ]]; then
+        read -rp "请粘贴 SS2022 ss:// URI: " uri
+        if ! parse_ss_uri "$uri"; then echo -e "${RED}[错误] 无法解析该 ss:// URI。${PLAIN}"; return 1; fi
+        server="$CHAIN_SERVER"; port="$CHAIN_PORT"; method="$CHAIN_METHOD"; pass="$CHAIN_PASSWORD"
+    else
+        read -rp "服务器地址/域名: " server
+        read -rp "端口: " port
+        validate_port_number "$port" || { echo -e "${RED}[错误] 端口无效。${PLAIN}"; return 1; }
+        echo "  1. 2022-blake3-aes-128-gcm"
+        echo "  2. 2022-blake3-aes-256-gcm"
+        echo "  3. 2022-blake3-chacha20-poly1305"
+        read -rp "加密算法 [1-3]: " mode
+        case "$mode" in
+            1) method="2022-blake3-aes-128-gcm" ;;
+            2) method="2022-blake3-aes-256-gcm" ;;
+            3) method="2022-blake3-chacha20-poly1305" ;;
+            *) return 1 ;;
+        esac
+        read -rp "SS2022 Key: " pass
+    fi
+    if ! validate_ss2022_outbound "$method" "$pass"; then echo -e "${RED}[错误] SS2022 加密算法或 Key 长度不合法。${PLAIN}"; return 1; fi
+    id="n$(date +%s)${RANDOM}"
+    node=$(jq -nc --arg id "$id" --arg name "$name" --arg server "$server" --argjson port "$port" --arg method "$method" --arg pass "$pass" '{id:$id,name:$name,type:"ss2022",server:$server,port:$port,method:$method,password:$pass}')
+    local tmp
+    tmp=$(mktemp "${STATE_DIR}/routing.json.tmp.XXXXXX") || return 1
+    jq --argjson n "$node" '.chain_nodes += [$n]' "$ROUTING_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+    routing_commit_state_candidate "$tmp" || return 1
+    echo -e "${GREEN}✔ SS2022 落地节点 ${name} 已添加。${PLAIN}"
+}
+
+chain_add_socks5() {
+    local name server port auth user="" pass="" id node tmp
+    echo -e "${YELLOW}[提示] SOCKS5 本身不加密；公网落地优先建议使用 SS2022，SOCKS5 仅用于可信或已受保护的链路。${PLAIN}"
+    read -rp "节点名称（例如 HK-SOCKS）: " name
+    [[ -n "$name" ]] || return 1
+    if routing_node_name_exists "$name"; then echo -e "${RED}[错误] 落地节点名称 ${name} 已存在，请使用唯一名称。${PLAIN}"; return 1; fi
+    read -rp "服务器地址/域名: " server
+    read -rp "端口: " port
+    validate_port_number "$port" || { echo -e "${RED}[错误] 端口无效。${PLAIN}"; return 1; }
+    read -rp "是否需要用户名/密码认证？[y/N]: " auth
+    if [[ "$auth" =~ ^[Yy]$ ]]; then read -rp "用户名: " user; read -rsp "密码: " pass; echo ""; fi
+    id="n$(date +%s)${RANDOM}"
+    node=$(jq -nc --arg id "$id" --arg name "$name" --arg server "$server" --argjson port "$port" --arg user "$user" --arg pass "$pass" '{id:$id,name:$name,type:"socks5",server:$server,port:$port,username:$user,password:$pass}')
+    tmp=$(mktemp "${STATE_DIR}/routing.json.tmp.XXXXXX") || return 1
+    jq --argjson n "$node" '.chain_nodes += [$n]' "$ROUTING_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+    routing_commit_state_candidate "$tmp" || return 1
+    echo -e "${GREEN}✔ SOCKS5 落地节点 ${name} 已添加。${PLAIN}"
+}
+
+chain_list_nodes() {
+    routing_init_state || return 1
+    local count i node
+    count=$(jq '.chain_nodes|length' "$ROUTING_FILE")
+    echo -e "${CYAN}════════════════ 落地节点 ════════════════${PLAIN}"
+    if [[ $count -eq 0 ]]; then echo "暂无落地节点。"; return; fi
+    i=0
+    while [[ $i -lt $count ]]; do
+        node=$(jq -c ".chain_nodes[$i]" "$ROUTING_FILE")
+        printf '  %d. %s [%s] %s:%s\n' "$((i+1))" "$(jq -r '.name' <<<"$node")" "$(jq -r '.type' <<<"$node")" "$(jq -r '.server' <<<"$node")" "$(jq -r '.port' <<<"$node")"
+        i=$((i+1))
+    done
+}
+
+chain_select_id() {
+    local count c
+    routing_init_state || return 1
+    count=$(jq '.chain_nodes|length' "$ROUTING_FILE")
+    [[ $count -gt 0 ]] || { echo "暂无落地节点。"; return 1; }
+    chain_list_nodes
+    read -rp "请选择节点编号: " c
+    [[ "$c" =~ ^[0-9]+$ && $c -ge 1 && $c -le $count ]] || return 1
+    SELECTED_NODE_ID=$(jq -r ".chain_nodes[$((c-1))].id" "$ROUTING_FILE")
+}
+
+ip_echo_url_for_family() {
+    case "${1:-default}" in
+        ipv4) echo "https://api4.ipify.org" ;;
+        ipv6) echo "https://api6.ipify.org" ;;
+        *) echo "https://api.ipify.org" ;;
+    esac
+}
+
+test_ss2022_node_with_singbox() {
+    local node="$1" family="${2:-default}" port cfg pid out rc=1 n=19080 url
+    url=$(ip_echo_url_for_family "$family")
+    [[ -x "$SINGBOX_BIN" ]] || { echo -e "${YELLOW}[提示] 未安装 sing-box，无法执行 SS2022 实连测试。${PLAIN}"; return 1; }
+    while ss -H -ltn 2>/dev/null | grep -q ":${n} "; do n=$((n+1)); [[ $n -lt 19150 ]] || return 1; done
+    port=$n
+    cfg=$(mktemp /tmp/ss2022-chain-test.XXXXXX.json) || return 1
+    jq -n --arg server "$(jq -r '.server' <<<"$node")" --argjson sport "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" --argjson lp "$port" '{log:{level:"warn"},inbounds:[{type:"socks",tag:"test-in",listen:"127.0.0.1",listen_port:$lp}],outbounds:[{type:"shadowsocks",tag:"test-out",server:$server,server_port:$sport,method:$method,password:$pass}],route:{final:"test-out"}}' > "$cfg"
+    "$SINGBOX_BIN" check -c "$cfg" >/dev/null 2>&1 || { rm -f "$cfg"; return 1; }
+    "$SINGBOX_BIN" run -c "$cfg" >/tmp/ss2022-chain-test.log 2>&1 & pid=$!
+    sleep 1
+    out=$(curl -fsS --connect-timeout 8 --max-time 15 --socks5-hostname "127.0.0.1:${port}" "$url" 2>/dev/null) && rc=0
+    kill "$pid" >/dev/null 2>&1 || true; wait "$pid" 2>/dev/null || true; rm -f "$cfg"
+    if [[ $rc -eq 0 ]]; then echo -e "${GREEN}✔ 落地节点可用，出口 IP: ${out}${PLAIN}"; return 0; fi
+    echo -e "${RED}[错误] SS2022 落地节点测试失败。${PLAIN}"; tail -n 10 /tmp/ss2022-chain-test.log 2>/dev/null || true; return 1
+}
+
+chain_test_node() {
+    chain_select_id || return 1
+    local node type server port user pass out
+    node=$(jq -c --arg id "$SELECTED_NODE_ID" '.chain_nodes[]|select(.id==$id)' "$ROUTING_FILE")
+    type=$(jq -r '.type' <<<"$node")
+    echo -e "${YELLOW}>> 测试 $(jq -r '.name' <<<"$node")...${PLAIN}"
+    if [[ "$type" == "ss2022" ]]; then
+        test_ss2022_node_with_singbox "$node" default
+    else
+        server=$(jq -r '.server' <<<"$node"); port=$(jq -r '.port' <<<"$node"); user=$(jq -r '.username // ""' <<<"$node"); pass=$(jq -r '.password // ""' <<<"$node")
+        if [[ -n "$user" ]]; then
+            out=$(curl -fsS --connect-timeout 8 --max-time 15 --proxy-user "${user}:${pass}" --socks5-hostname "${server}:${port}" https://api.ipify.org 2>/dev/null) || { echo -e "${RED}[错误] SOCKS5 测试失败。${PLAIN}"; return 1; }
+        else
+            out=$(curl -fsS --connect-timeout 8 --max-time 15 --socks5-hostname "${server}:${port}" https://api.ipify.org 2>/dev/null) || { echo -e "${RED}[错误] SOCKS5 测试失败。${PLAIN}"; return 1; }
+        fi
+        echo -e "${GREEN}✔ 落地节点可用，出口 IP: ${out}${PLAIN}"
+    fi
+}
+
+chain_delete_node() {
+    chain_select_id || return 1
+    local id="$SELECTED_NODE_ID" name tmp yes
+    name=$(jq -r --arg id "$id" '.chain_nodes[]|select(.id==$id)|.name' "$ROUTING_FILE")
+    if routing_node_is_referenced "$id"; then echo -e "${RED}[错误] ${name} 仍被默认出口或分流规则引用，不能删除。${PLAIN}"; return 1; fi
+    read -rp "确认删除落地节点 ${name}？[y/N]: " yes
+    [[ "$yes" =~ ^[Yy]$ ]] || return 0
+    tmp=$(mktemp "${STATE_DIR}/routing.json.tmp.XXXXXX") || return 1
+    jq --arg id "$id" '.chain_nodes |= map(select(.id!=$id))' "$ROUTING_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+    routing_commit_state_candidate "$tmp" || return 1
+    echo -e "${GREEN}✔ 已删除 ${name}。${PLAIN}"
+}
+
+routing_set_default_outbound() {
+    routing_choose_outbound "请选择全局默认出口（未命中特殊规则的流量使用此出口）：" || return 1
+    local tmp label
+    label=$(routing_outbound_label "$SELECTED_OUTBOUND")
+    tmp=$(mktemp "${STATE_DIR}/routing.json.tmp.XXXXXX") || return 1
+    jq --arg out "$SELECTED_OUTBOUND" '.default_outbound=$out' "$ROUTING_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+    if ! routing_commit_state_candidate "$tmp"; then echo -e "${RED}[错误] 默认出口配置应用失败，已恢复原配置。${PLAIN}"; return 1; fi
+    echo -e "${GREEN}✔ 默认出口已设置为：${label}${PLAIN}"
+}
+
+chain_management() {
+    while true; do
+        clear; routing_init_state || return
+        local def count
+        def=$(jq -r '.default_outbound' "$ROUTING_FILE"); count=$(jq '.chain_nodes|length' "$ROUTING_FILE")
+        echo -e "${CYAN}════════════════ 链式代理管理 ════════════════${PLAIN}"
+        echo "默认出口 : $(routing_outbound_label "$def")"
+        echo "落地节点 : ${count} 个"
+        echo ""
+        echo "  1. 添加落地节点"
+        echo "  2. 查看落地节点"
+        echo "  3. 删除落地节点"
+        echo "  4. 测试落地节点"
+        echo "  5. 设置默认出口"
+        echo "  0. 返回"
+        read -rp "请选择 [0-5]: " c
+        case "$c" in
+            1)
+                echo "  1. SS2022"
+                echo "  2. SOCKS5"
+                read -rp "节点类型 [1-2]: " t
+                [[ "$t" == "1" ]] && chain_add_ss2022
+                [[ "$t" == "2" ]] && chain_add_socks5
+                pause ;;
+            2) chain_list_nodes; pause ;;
+            3) chain_delete_node; pause ;;
+            4) chain_test_node; pause ;;
+            5) routing_set_default_outbound; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+routing_add_rule() {
+    routing_init_state || return 1
+    local c service name custom_type values='[]' v id rule tmp
+    echo "请选择服务："
+    echo "  1. OpenAI / ChatGPT"
+    echo "  2. Netflix"
+    echo "  3. YouTube"
+    echo "  4. Google"
+    echo "  5. Telegram"
+    echo "  6. MyTVSuper"
+    echo "  7. Apple TV+"
+    echo "  8. TikTok"
+    echo "  9. 自定义域名 / IP"
+    echo "  0. 返回"
+    read -rp "请选择 [0-9]: " c
+    case "$c" in
+        1) service=openai ;; 2) service=netflix ;; 3) service=youtube ;; 4) service=google ;;
+        5) service=telegram ;; 6) service=mytvsuper ;; 7) service=appletv ;; 8) service=tiktok ;;
+        9) service=custom ;;
+        0) return 0 ;;
+        *) return 1 ;;
+    esac
+    name=$(routing_service_name "$service")
+    if [[ "$service" != "custom" ]] && routing_preset_rule_exists "$service"; then
+        echo -e "${RED}[错误] ${name} 已存在分流规则。请先修改或删除现有规则，避免重复匹配。${PLAIN}"
+        return 1
+    fi
+    if [[ "$service" == "custom" ]]; then
+        echo "自定义匹配类型："
+        echo "  1. 精确域名"
+        echo "  2. 域名后缀"
+        echo "  3. 域名关键字"
+        echo "  4. IP / CIDR"
+        read -rp "请选择 [1-4]: " c
+        case "$c" in 1) custom_type=domain;; 2) custom_type=domain_suffix;; 3) custom_type=domain_keyword;; 4) custom_type=ip_cidr;; *) return 1;; esac
+        read -rp "请输入匹配值（多个用英文逗号分隔）: " v
+        values=$(printf '%s' "$v" | jq -R 'split(",")|map(gsub("^\\s+|\\s+$";""))|map(select(length>0))')
+        [[ $(jq 'length' <<<"$values") -gt 0 ]] || return 1
+        read -rp "规则名称 [默认: 自定义规则]: " name
+        name=${name:-自定义规则}
+    fi
+    routing_choose_outbound "请选择该规则的实际出口：" || return 1
+    routing_choose_ip_family || return 1
+    id="r$(date +%s)${RANDOM}"
+    rule=$(jq -nc --arg id "$id" --arg name "$name" --arg service "$service" --arg ctype "${custom_type:-}" --argjson vals "$values" --arg out "$SELECTED_OUTBOUND" --arg fam "$SELECTED_IP_FAMILY" '{id:$id,name:$name,service:$service,custom_type:$ctype,values:$vals,outbound:$out,ip_family:$fam}')
+    tmp=$(mktemp "${STATE_DIR}/routing.json.tmp.XXXXXX") || return 1
+    jq --argjson r "$rule" '.rules += [$r]' "$ROUTING_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+    routing_commit_state_candidate "$tmp" || return 1
+    echo -e "${GREEN}✔ 分流规则已添加：${name} → $(routing_outbound_label "$SELECTED_OUTBOUND") / ${SELECTED_IP_FAMILY}${PLAIN}"
+}
+
+routing_list_rules() {
+    routing_init_state || return 1
+    local count i r
+    count=$(jq '.rules|length' "$ROUTING_FILE")
+    echo -e "${CYAN}════════════════ 当前分流规则 ════════════════${PLAIN}"
+    printf '%-4s %-24s %-22s %-10s\n' "序号" "服务" "出口" "地址族"
+    printf '%s\n' "----------------------------------------------------------------"
+    if [[ $count -eq 0 ]]; then echo "暂无特殊规则；所有流量使用全局默认出口。"; fi
+    i=0
+    while [[ $i -lt $count ]]; do
+        r=$(jq -c ".rules[$i]" "$ROUTING_FILE")
+        printf '%-4s %-24s %-22s %-10s\n' "$((i+1))" "$(jq -r '.name' <<<"$r")" "$(routing_outbound_label "$(jq -r '.outbound' <<<"$r")")" "$(jq -r '.ip_family' <<<"$r")"
+        i=$((i+1))
+    done
+    echo ""
+    echo "默认出口: $(routing_outbound_label "$(jq -r '.default_outbound' "$ROUTING_FILE")")"
+}
+
+routing_select_rule_index() {
+    local count c
+    routing_init_state || return 1
+    count=$(jq '.rules|length' "$ROUTING_FILE")
+    [[ $count -gt 0 ]] || { echo "暂无分流规则。"; return 1; }
+    routing_list_rules
+    read -rp "请选择规则编号: " c
+    [[ "$c" =~ ^[0-9]+$ && $c -ge 1 && $c -le $count ]] || return 1
+    SELECTED_RULE_INDEX=$((c-1))
+}
+
+routing_modify_rule() {
+    routing_select_rule_index || return 1
+    local idx="$SELECTED_RULE_INDEX" c tmp service custom_type values v n
+    service=$(jq -r ".rules[$idx].service" "$ROUTING_FILE")
+    echo "  1. 修改出口"
+    echo "  2. 修改 IP 地址族"
+    echo "  3. 修改规则名称"
+    if [[ "$service" == "custom" ]]; then echo "  4. 修改自定义匹配条件"; fi
+    read -rp "请选择: " c
+    tmp=$(mktemp "${STATE_DIR}/routing.json.tmp.XXXXXX") || return 1
+    case "$c" in
+        1)
+            routing_choose_outbound "请选择新出口：" || { rm -f "$tmp"; return 1; }
+            jq --argjson idx "$idx" --arg out "$SELECTED_OUTBOUND" '.rules[$idx].outbound=$out' "$ROUTING_FILE" > "$tmp" ;;
+        2)
+            routing_choose_ip_family || { rm -f "$tmp"; return 1; }
+            jq --argjson idx "$idx" --arg fam "$SELECTED_IP_FAMILY" '.rules[$idx].ip_family=$fam' "$ROUTING_FILE" > "$tmp" ;;
+        3)
+            read -rp "新名称: " n; [[ -n "$n" ]] || { rm -f "$tmp"; return 1; }
+            jq --argjson idx "$idx" --arg n "$n" '.rules[$idx].name=$n' "$ROUTING_FILE" > "$tmp" ;;
+        4)
+            [[ "$service" == "custom" ]] || { rm -f "$tmp"; return 1; }
+            echo "自定义匹配类型："
+            echo "  1. 精确域名"
+            echo "  2. 域名后缀"
+            echo "  3. 域名关键字"
+            echo "  4. IP / CIDR"
+            read -rp "请选择 [1-4]: " c
+            case "$c" in 1) custom_type=domain;; 2) custom_type=domain_suffix;; 3) custom_type=domain_keyword;; 4) custom_type=ip_cidr;; *) rm -f "$tmp"; return 1;; esac
+            read -rp "请输入匹配值（多个用英文逗号分隔）: " v
+            values=$(printf '%s' "$v" | jq -R 'split(",")|map(gsub("^\\s+|\\s+$";""))|map(select(length>0))')
+            [[ $(jq 'length' <<<"$values") -gt 0 ]] || { rm -f "$tmp"; return 1; }
+            jq --argjson idx "$idx" --arg ctype "$custom_type" --argjson vals "$values" '.rules[$idx].custom_type=$ctype | .rules[$idx].values=$vals' "$ROUTING_FILE" > "$tmp" ;;
+        *) rm -f "$tmp"; return 1 ;;
+    esac
+    routing_commit_state_candidate "$tmp"
+}
+
+routing_delete_rule() {
+    routing_select_rule_index || return 1
+    local idx="$SELECTED_RULE_INDEX" name tmp yes
+    name=$(jq -r ".rules[$idx].name" "$ROUTING_FILE")
+    read -rp "确认删除规则 ${name}？[y/N]: " yes
+    [[ "$yes" =~ ^[Yy]$ ]] || return 0
+    tmp=$(mktemp "${STATE_DIR}/routing.json.tmp.XXXXXX") || return 1
+    jq --argjson idx "$idx" 'del(.rules[$idx])' "$ROUTING_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+    routing_commit_state_candidate "$tmp"
+}
+
+routing_move_rule() {
+    routing_select_rule_index || return 1
+    local idx="$SELECTED_RULE_INDEX" count c new tmp
+    count=$(jq '.rules|length' "$ROUTING_FILE")
+    echo "  1. 上移"
+    echo "  2. 下移"
+    read -rp "请选择 [1-2]: " c
+    [[ "$c" == "1" && $idx -gt 0 ]] && new=$((idx-1))
+    [[ "$c" == "2" && $idx -lt $((count-1)) ]] && new=$((idx+1))
+    [[ -n "${new:-}" ]] || { echo "无法继续移动。"; return 1; }
+    tmp=$(mktemp "${STATE_DIR}/routing.json.tmp.XXXXXX") || return 1
+    jq --argjson a "$idx" --argjson b "$new" '.rules as $r | .rules[$a]=$r[$b] | .rules[$b]=$r[$a]' "$ROUTING_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+    routing_commit_state_candidate "$tmp"
+}
+
+routing_rule_management() {
+    while true; do
+        clear
+        routing_list_rules
+        echo ""
+        echo "  1. 新增规则"
+        echo "  2. 修改规则"
+        echo "  3. 删除规则"
+        echo "  4. 调整规则优先级"
+        echo "  5. 设置全局默认出口"
+        echo "  0. 返回"
+        read -rp "请选择 [0-5]: " c
+        case "$c" in
+            1) routing_add_rule; pause ;;
+            2) routing_modify_rule; pause ;;
+            3) routing_delete_rule; pause ;;
+            4) routing_move_rule; pause ;;
+            5) routing_set_default_outbound; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+routing_show_config() {
+    routing_init_state || return 1
+    local def count i r
+    echo -e "${CYAN}════════════════ 当前分流配置 ════════════════${PLAIN}"
+    echo ""
+    echo "【入口】"
+    protocol_exists_singbox_tag "$TAG_SS" && echo "  SS2022                : 服务端分流 ✓" || echo "  SS2022                : 未部署"
+    protocol_exists_singbox_tag "$TAG_STLS" && echo "  SS2022 + ShadowTLS     : 服务端分流 ✓" || echo "  SS2022 + ShadowTLS     : 未部署"
+    xray_vless_exists && echo "  VLESS Reality          : 服务端分流 ✓" || echo "  VLESS Reality          : 未部署"
+    protocol_exists_snell && echo "  Snell v5               : 官方 snell-server；服务端分流 —（请用 Surge Rules）" || echo "  Snell v5               : 未部署"
+    echo ""
+    echo "【默认出口】"
+    def=$(jq -r '.default_outbound' "$ROUTING_FILE")
+    echo "  $(routing_outbound_label "$def")"
+    echo ""
+    echo "【WARP】"
+    if warp_proxy_ready; then echo "  Running / 127.0.0.1:$(warp_proxy_port)"; else echo "  未连接"; fi
+    echo ""
+    echo "【落地节点】"
+    chain_list_nodes
+    echo ""
+    echo "【规则】"
+    routing_list_rules
+}
+
+routing_test_exit_ref() {
+    local ref="$1" family="${2:-default}" label out="" rc=1 url
+    label=$(routing_outbound_label "$ref")
+    url=$(ip_echo_url_for_family "$family")
+    if [[ "$ref" == "direct" ]]; then
+        if [[ "$family" == "ipv4" ]]; then out=$(curl -4fsS --connect-timeout 6 --max-time 10 "$url" 2>/dev/null) && rc=0
+        elif [[ "$family" == "ipv6" ]]; then out=$(curl -6fsS --connect-timeout 6 --max-time 10 "$url" 2>/dev/null) && rc=0
+        else out=$(curl -fsS --connect-timeout 6 --max-time 10 "$url" 2>/dev/null) && rc=0; fi
+    elif [[ "$ref" == "warp" ]]; then
+        if warp_proxy_ready; then
+            out=$(curl -fsS --connect-timeout 8 --max-time 15 --socks5-hostname "127.0.0.1:$(warp_proxy_port)" "$url" 2>/dev/null) && rc=0
+        fi
+    elif [[ "$ref" == chain:* ]]; then
+        local id=${ref#chain:} node type server sport user pass
+        node=$(jq -c --arg id "$id" '.chain_nodes[]? | select(.id==$id)' "$ROUTING_FILE")
+        [[ -n "$node" ]] || return 1
+        type=$(jq -r '.type' <<<"$node")
+        if [[ "$type" == "socks5" ]]; then
+            server=$(jq -r '.server' <<<"$node"); sport=$(jq -r '.port' <<<"$node"); user=$(jq -r '.username // ""' <<<"$node"); pass=$(jq -r '.password // ""' <<<"$node")
+            if [[ -n "$user" ]]; then out=$(curl -fsS --connect-timeout 8 --max-time 15 --proxy-user "${user}:${pass}" --socks5-hostname "${server}:${sport}" "$url" 2>/dev/null) && rc=0
+            else out=$(curl -fsS --connect-timeout 8 --max-time 15 --socks5-hostname "${server}:${sport}" "$url" 2>/dev/null) && rc=0; fi
+        else
+            test_ss2022_node_with_singbox "$node" "$family" && return 0 || return 1
+        fi
+    fi
+    if [[ $rc -eq 0 ]]; then echo -e "${GREEN}✔ ${label} / ${family}: ${out}${PLAIN}"; return 0; fi
+    echo -e "${RED}✘ ${label} / ${family}: 测试失败${PLAIN}"; return 1
+}
+
+routing_test_effect() {
+    routing_init_state || return 1
+    echo -e "${CYAN}════════════════ 基础出口测试 ════════════════${PLAIN}"
+    routing_test_exit_ref direct ipv4 || true
+    if ip -6 route show default 2>/dev/null | grep -q default; then routing_test_exit_ref direct ipv6 || true; fi
+    command -v warp-cli >/dev/null 2>&1 && routing_test_exit_ref warp default || true
+    local count i id rule_count r ref fam key tested='|'
+    count=$(jq '.chain_nodes|length' "$ROUTING_FILE")
+    i=0
+    while [[ $i -lt $count ]]; do id=$(jq -r ".chain_nodes[$i].id" "$ROUTING_FILE"); routing_test_exit_ref "chain:${id}" default || true; i=$((i+1)); done
+
+    echo ""
+    echo -e "${CYAN}════════════════ 规则出口验证 ════════════════${PLAIN}"
+    rule_count=$(jq '.rules|length' "$ROUTING_FILE")
+    if [[ $rule_count -eq 0 ]]; then
+        echo "暂无特殊规则；未命中规则的流量使用全局默认出口：$(routing_outbound_label "$(jq -r '.default_outbound' "$ROUTING_FILE")")"
+    else
+        i=0
+        while [[ $i -lt $rule_count ]]; do
+            r=$(jq -c ".rules[$i]" "$ROUTING_FILE")
+            ref=$(jq -r '.outbound' <<<"$r")
+            fam=$(jq -r '.ip_family // "default"' <<<"$r")
+            key="${ref}@${fam}"
+            echo "$(jq -r '.name' <<<"$r") → $(routing_outbound_label "$ref") / ${fam}"
+            if [[ "$tested" != *"|${key}|"* ]]; then
+                routing_test_exit_ref "$ref" "$fam" || true
+                tested+="${key}|"
+            else
+                echo "  （同一出口/地址族已在上方验证）"
+            fi
+            i=$((i+1))
+        done
+    fi
+    echo ""
+    echo -e "${YELLOW}[说明] 规则出口验证会验证“目标出口 + 地址族”是否可用；服务域名匹配仍以运行时规则命中为准。${PLAIN}"
+    echo -e "${YELLOW}WARP Local Proxy 为应用层代理；QUIC/UDP 不作为 v1.8.0-dev1 的 WARP 分流保证范围。${PLAIN}"
+}
+
+routing_management() {
+    while true; do
+        clear
+        routing_init_state || return
+        local def count rules warp_state="未连接"
+        def=$(jq -r '.default_outbound' "$ROUTING_FILE")
+        count=$(jq '.chain_nodes|length' "$ROUTING_FILE")
+        rules=$(jq '.rules|length' "$ROUTING_FILE")
+        warp_proxy_ready && warp_state="Running"
+        echo -e "${CYAN}════════════════════ 分流管理 ════════════════════${PLAIN}"
+        echo "服务端分流适用：SS2022 / SS2022+ShadowTLS / VLESS Reality"
+        echo "Snell v5：保持官方 snell-server，分流请使用 Surge Rules"
+        echo ""
+        echo "默认出口 : $(routing_outbound_label "$def")"
+        echo "WARP     : ${warp_state}"
+        echo "落地节点 : ${count} 个"
+        echo "规则     : ${rules} 条"
+        echo ""
+        echo "  1. WARP 出口管理"
+        echo "  2. 链式代理管理"
+        echo "  3. 分流规则管理"
+        echo "  4. 查看当前分流配置"
+        echo "  5. 测试分流效果"
+        echo "  0. 返回"
+        echo -e "${CYAN}══════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-5]: " c
+        case "$c" in
+            1) warp_management ;;
+            2) chain_management ;;
+            3) routing_rule_management ;;
+            4) routing_show_config; pause ;;
+            5) routing_test_effect; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+
+
+# ==============================================================================
+# v1.8.0-dev2 Realm L4 端口转发模块
+# - 只保留核心端口转发：单端口 / 端口段、TCP / UDP / TCP+UDP、IPv4 / IPv6 / 双栈
+# - 不启用 MPTCP / TLS / WS / WSS / Proxy Protocol / 负载均衡 / 故障转移
+# - 独立命名空间，避免覆盖服务器已有 realm.service / /usr/local/bin/realm
+# ==============================================================================
+
+ensure_realm_user() {
+    local nologin_shell=""
+    if getent group "$REALM_GROUP" >/dev/null 2>&1; then
+        :
+    else
+        groupadd --system "$REALM_GROUP" || return 1
+    fi
+
+    if id -u "$REALM_USER" >/dev/null 2>&1; then
+        if ! id -nG "$REALM_USER" 2>/dev/null | tr ' ' '\n' | grep -qx "$REALM_GROUP"; then
+            usermod -a -G "$REALM_GROUP" "$REALM_USER" || return 1
+        fi
+        return 0
+    fi
+
+    nologin_shell=$(command -v nologin 2>/dev/null || true)
+    nologin_shell=${nologin_shell:-/usr/sbin/nologin}
+    useradd --system --gid "$REALM_GROUP" --no-create-home --home-dir /nonexistent --shell "$nologin_shell" "$REALM_USER" || return 1
+    touch "$REALM_USER_MARKER"
+    chmod 600 "$REALM_USER_MARKER"
+    return 0
+}
+
+write_realm_service() {
+    ensure_realm_user || return 1
+    mkdir -p "$(dirname "$REALM_CONF")" "$(dirname "$REALM_BIN")" || return 1
+
+    cat > "$REALM_SERVICE" <<SERVICE
+[Unit]
+Description=ss2022.sh managed Realm L4 forwarding service
+Documentation=https://github.com/zhboner/realm
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${REALM_USER}
+Group=${REALM_GROUP}
+ExecStart=${REALM_BIN} -c ${REALM_CONF}
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=1048576
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+    systemctl daemon-reload || return 1
+    return 0
+}
+
+forwarding_init_state() {
+    mkdir -p "$STATE_DIR" || return 1
+    chmod 700 "$STATE_DIR"
+    if [[ ! -f "$FORWARDING_FILE" ]]; then
+        cat > "$FORWARDING_FILE" <<'EOF'
+{
+  "version": 1,
+  "rules": []
+}
+EOF
+        chmod 600 "$FORWARDING_FILE"
+        return 0
+    fi
+
+    if ! jq -e 'type=="object" and ((.rules // [])|type=="array")' "$FORWARDING_FILE" >/dev/null 2>&1; then
+        echo -e "${RED}[错误] ${FORWARDING_FILE} 格式损坏，请先备份后修复。${PLAIN}"
+        return 1
+    fi
+
+    local tmp=""
+    tmp=$(mktemp "${STATE_DIR}/forwarding.json.tmp.XXXXXX") || return 1
+    if ! jq '.version=(.version // 1) | .rules=(.rules // [])' "$FORWARDING_FILE" > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    mv -f "$tmp" "$FORWARDING_FILE"
+    chmod 600 "$FORWARDING_FILE"
+}
+
+realm_asset_name() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo "realm-x86_64-unknown-linux-musl.tar.gz" ;;
+        aarch64|arm64) echo "realm-aarch64-unknown-linux-musl.tar.gz" ;;
+        *) return 1 ;;
+    esac
+}
+
+realm_fetch_asset_metadata() {
+    local asset="$1" api tmp expected url
+    api="https://api.github.com/repos/zhboner/realm/releases/tags/v${REALM_VERSION}"
+    tmp=$(mktemp) || return 1
+
+    if ! curl -fsSL --retry 2 --connect-timeout 10 --max-time 30 \
+        -H 'Accept: application/vnd.github+json' "$api" -o "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+
+    url=$(jq -r --arg a "$asset" '.assets[]? | select(.name==$a) | .browser_download_url // empty' "$tmp" | head -n1)
+    expected=$(jq -r --arg a "$asset" '.assets[]? | select(.name==$a) | .digest // empty' "$tmp" | head -n1)
+    rm -f "$tmp"
+
+    expected=${expected#sha256:}
+    [[ -n "$url" && "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || return 1
+    printf '%s\t%s\n' "$url" "$expected"
+}
+
+install_realm_core() {
+    install_dependencies || return 1
+
+    local asset="" metadata="" url="" expected="" archive="" actual="" tmpdir="" src="" download_url=""
+    asset=$(realm_asset_name) || {
+        echo -e "${RED}[错误] Realm 当前仅支持 x86_64 / aarch64 Linux。${PLAIN}"
+        return 1
+    }
+
+    echo -e "${YELLOW}>> 获取 Realm v${REALM_VERSION} 官方 Release 校验信息...${PLAIN}"
+    metadata=$(realm_fetch_asset_metadata "$asset") || {
+        echo -e "${RED}[错误] 无法从 GitHub 官方 Release 获取 ${asset} 的 SHA256 digest，拒绝不校验安装。${PLAIN}"
+        return 1
+    }
+    url=${metadata%%$'\t'*}
+    expected=${metadata#*$'\t'}
+
+    archive="/tmp/${asset}"
+    rm -f "$archive"
+    local sources=(
+        "$url"
+        "https://ghproxy.net/${url}"
+        "https://gh-proxy.com/${url}"
+        "https://ghps.cc/${url}"
+    )
+
+    local ok=0
+    for download_url in "${sources[@]}"; do
+        echo -e "   尝试下载: ${CYAN}${download_url}${PLAIN}"
+        rm -f "$archive"
+        if ! curl -fL --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 120 "$download_url" -o "$archive"; then
+            echo -e "${YELLOW}   下载失败，尝试下一个源。${PLAIN}"
+            continue
+        fi
+        actual=$(sha256sum "$archive" | awk '{print $1}')
+        if [[ "${actual,,}" != "${expected,,}" ]]; then
+            echo -e "${RED}   SHA256 校验失败，拒绝安装。${PLAIN}"
+            echo "   期望: $expected"
+            echo "   实际: $actual"
+            continue
+        fi
+        if ! tar -tzf "$archive" >/dev/null 2>&1; then
+            echo -e "${RED}   Realm 压缩包结构无效。${PLAIN}"
+            continue
+        fi
+        if tar -tzf "$archive" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
+            echo -e "${RED}   Realm 压缩包包含不安全路径，拒绝解压。${PLAIN}"
+            continue
+        fi
+        ok=1
+        break
+    done
+    [[ $ok -eq 1 ]] || { rm -f "$archive"; return 1; }
+
+    tmpdir=$(mktemp -d) || { rm -f "$archive"; return 1; }
+    tar -xzf "$archive" -C "$tmpdir" || { rm -rf "$tmpdir" "$archive"; return 1; }
+    src=$(find "$tmpdir" -type f -name realm -perm -u+x -print -quit 2>/dev/null || true)
+    if [[ -z "$src" ]]; then
+        src=$(find "$tmpdir" -type f -name realm -print -quit 2>/dev/null || true)
+    fi
+    [[ -n "$src" ]] || {
+        echo -e "${RED}[错误] Realm 压缩包中未找到二进制。${PLAIN}"
+        rm -rf "$tmpdir" "$archive"
+        return 1
+    }
+
+    mkdir -p "$(dirname "$REALM_BIN")"
+    install -m 0755 "$src" "$REALM_BIN" || { rm -rf "$tmpdir" "$archive"; return 1; }
+    rm -rf "$tmpdir" "$archive"
+
+    local installed_version=""
+    installed_version=$("$REALM_BIN" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)
+    if [[ "$installed_version" != "$REALM_VERSION" ]]; then
+        echo -e "${RED}[错误] Realm 安装后版本校验失败：期望 ${REALM_VERSION}，实际 ${installed_version:-未知}。${PLAIN}"
+        rm -f "$REALM_BIN"
+        return 1
+    fi
+
+    write_realm_service || return 1
+    echo -e "${GREEN}✔ Realm v${REALM_VERSION} 已安装并通过 SHA256/版本校验。${PLAIN}"
+}
+
+forwarding_format_host_port() {
+    local host="$1" port="$2"
+    host=${host#[}
+    host=${host%]}
+    if [[ "$host" == *:* ]]; then
+        printf '[%s]:%s' "$host" "$port"
+    else
+        printf '%s:%s' "$host" "$port"
+    fi
+}
+
+forwarding_network_json() {
+    local proto="$1" ipv6_only="${2:-false}"
+    case "$proto" in
+        tcp) jq -nc --argjson v6 "$ipv6_only" '{no_tcp:false,use_udp:false,ipv6_only:$v6}' ;;
+        udp) jq -nc --argjson v6 "$ipv6_only" '{no_tcp:true,use_udp:true,ipv6_only:$v6}' ;;
+        both) jq -nc --argjson v6 "$ipv6_only" '{no_tcp:false,use_udp:true,ipv6_only:$v6}' ;;
+        *) return 1 ;;
+    esac
+}
+
+realm_build_config_from_state() {
+    local state="$1" out="$2"
+    [[ -f "$state" ]] || return 1
+
+    local endpoints='[]' rule="" id="" type="" family="" proto="" host=""
+    local lport="" rport="" lstart="" lend="" rstart="" p="" rp=""
+    local remote="" network="" ep="" listen=""
+    while IFS= read -r rule; do
+        [[ -n "$rule" ]] || continue
+        id=$(jq -r '.id' <<<"$rule")
+        type=$(jq -r '.type' <<<"$rule")
+        family=$(jq -r '.listen_family' <<<"$rule")
+        proto=$(jq -r '.protocol' <<<"$rule")
+        host=$(jq -r '.remote_host' <<<"$rule")
+
+        if [[ "$type" == "single" ]]; then
+            lstart=$(jq -r '.listen_port' <<<"$rule")
+            lend="$lstart"
+            rstart=$(jq -r '.remote_port' <<<"$rule")
+        else
+            lstart=$(jq -r '.listen_start' <<<"$rule")
+            lend=$(jq -r '.listen_end' <<<"$rule")
+            rstart=$(jq -r '.remote_start' <<<"$rule")
+        fi
+
+        p="$lstart"
+        while [[ "$p" -le "$lend" ]]; do
+            rp=$((rstart + p - lstart))
+            remote=$(forwarding_format_host_port "$host" "$rp")
+
+            case "$family" in
+                ipv4)
+                    listen="0.0.0.0:${p}"
+                    network=$(forwarding_network_json "$proto" false) || return 1
+                    ep=$(jq -nc --arg l "$listen" --arg r "$remote" --argjson n "$network" --arg id "$id" \
+                        '{listen:$l,remote:$r,network:$n}')
+                    endpoints=$(jq -nc --argjson a "$endpoints" --argjson e "$ep" '$a + [$e]')
+                    ;;
+                ipv6)
+                    listen="[::]:${p}"
+                    network=$(forwarding_network_json "$proto" true) || return 1
+                    ep=$(jq -nc --arg l "$listen" --arg r "$remote" --argjson n "$network" --arg id "$id" \
+                        '{listen:$l,remote:$r,network:$n}')
+                    endpoints=$(jq -nc --argjson a "$endpoints" --argjson e "$ep" '$a + [$e]')
+                    ;;
+                dual)
+                    # Realm 官方语义：[::]:port + ipv6_only=false 会同时接受 IPv6 与 IPv4-mapped IPv6，
+                    # 因此双栈只生成一个 endpoint，避免同端口重复 bind。
+                    listen="[::]:${p}"
+                    network=$(forwarding_network_json "$proto" false) || return 1
+                    ep=$(jq -nc --arg l "$listen" --arg r "$remote" --argjson n "$network" --arg id "$id" \
+                        '{listen:$l,remote:$r,network:$n}')
+                    endpoints=$(jq -nc --argjson a "$endpoints" --argjson e "$ep" '$a + [$e]')
+                    ;;
+                *) return 1 ;;
+            esac
+            p=$((p+1))
+        done
+    done < <(jq -c '.rules[]?' "$state")
+
+    jq -n --argjson eps "$endpoints" '{
+      log:{level:"warn",output:"stdout"},
+      network:{
+        no_tcp:false,
+        use_udp:false,
+        tcp_timeout:5,
+        udp_timeout:30,
+        tcp_keepalive:15,
+        tcp_keepalive_probe:3
+      },
+      endpoints:$eps
+    }' > "$out"
+    jq -e '.endpoints|type=="array"' "$out" >/dev/null 2>&1
+}
+
+forwarding_rule_interval() {
+    local rule="$1"
+    if [[ "$(jq -r '.type' <<<"$rule")" == "single" ]]; then
+        printf '%s %s\n' "$(jq -r '.listen_port' <<<"$rule")" "$(jq -r '.listen_port' <<<"$rule")"
+    else
+        printf '%s %s\n' "$(jq -r '.listen_start' <<<"$rule")" "$(jq -r '.listen_end' <<<"$rule")"
+    fi
+}
+
+forwarding_state_port_conflict() {
+    local start="$1" end="$2" exclude_id="${3:-}" rule="" s="" e=""
+    while IFS= read -r rule; do
+        [[ -n "$rule" ]] || continue
+        [[ -n "$exclude_id" && "$(jq -r '.id' <<<"$rule")" == "$exclude_id" ]] && continue
+        read -r s e < <(forwarding_rule_interval "$rule")
+        if (( start <= e && end >= s )); then
+            return 0
+        fi
+    done < <(jq -c '.rules[]?' "$FORWARDING_FILE")
+    return 1
+}
+
+forwarding_os_port_conflict_range() {
+    local start="$1" end="$2" allowed_pid=""
+    allowed_pid=$(systemctl show -p MainPID --value "$REALM_SERVICE_NAME" 2>/dev/null || true)
+    local p lines conflicts
+    lines=$(ss -H -lntup 2>/dev/null || true)
+    p="$start"
+    while [[ "$p" -le "$end" ]]; do
+        conflicts=$(printf '%s\n' "$lines" | awk -v p="$p" '
+          {
+            addr=$5; n=split(addr,a,":");
+            if (a[n] == p) print
+          }')
+        if [[ -n "$conflicts" && "$allowed_pid" =~ ^[0-9]+$ && "$allowed_pid" -gt 0 ]]; then
+            conflicts=$(printf '%s\n' "$conflicts" | grep -v "pid=${allowed_pid}," || true)
+        fi
+        if [[ -n "$conflicts" ]]; then
+            echo -e "${RED}[错误] 端口 ${p} 已被其他进程占用：${PLAIN}"
+            printf '%s\n' "$conflicts"
+            return 0
+        fi
+        p=$((p+1))
+    done
+    return 1
+}
+
+forwarding_apply_state_candidate() {
+    local candidate="$1" cfg_tmp="" state_backup="" cfg_backup="" old_count=0 new_count=0
+    [[ -f "$candidate" ]] || return 1
+    jq -e 'type=="object" and (.rules|type=="array")' "$candidate" >/dev/null 2>&1 || {
+        rm -f "$candidate"
+        return 1
+    }
+
+    new_count=$(jq '.rules|length' "$candidate")
+    if [[ "$new_count" -gt 0 && ! -x "$REALM_BIN" ]]; then
+        install_realm_core || { rm -f "$candidate"; return 1; }
+    fi
+    [[ "$new_count" -eq 0 ]] || write_realm_service || { rm -f "$candidate"; return 1; }
+
+    mkdir -p /etc/ss2022-realm || { rm -f "$candidate"; return 1; }
+    cfg_tmp=$(mktemp "/etc/ss2022-realm/config.json.tmp.XXXXXX") || { rm -f "$candidate"; return 1; }
+    if ! realm_build_config_from_state "$candidate" "$cfg_tmp"; then
+        rm -f "$candidate" "$cfg_tmp"
+        echo -e "${RED}[错误] Realm 配置生成失败。${PLAIN}"
+        return 1
+    fi
+
+    state_backup=$(mktemp "${STATE_DIR}/forwarding.rollback.XXXXXX") || { rm -f "$candidate" "$cfg_tmp"; return 1; }
+    cp -a "$FORWARDING_FILE" "$state_backup" || { rm -f "$candidate" "$cfg_tmp" "$state_backup"; return 1; }
+    old_count=$(jq '.rules|length' "$state_backup" 2>/dev/null || echo 0)
+
+    mkdir -p "$(dirname "$REALM_CONF")"
+    if [[ -f "$REALM_CONF" ]]; then
+        cfg_backup=$(mktemp "/etc/ss2022-realm/config.rollback.XXXXXX") || { rm -f "$candidate" "$cfg_tmp" "$state_backup"; return 1; }
+        cp -a "$REALM_CONF" "$cfg_backup"
+    fi
+
+    mv -f "$candidate" "$FORWARDING_FILE"
+    chmod 600 "$FORWARDING_FILE"
+    mv -f "$cfg_tmp" "$REALM_CONF"
+    chmod 600 "$REALM_CONF"
+
+    if [[ "$new_count" -eq 0 ]]; then
+        systemctl disable --now "$REALM_SERVICE_NAME" >/dev/null 2>&1 || true
+        rm -f "$state_backup" "$cfg_backup"
+        echo -e "${GREEN}✔ Realm 转发规则已清空，服务已停止。${PLAIN}"
+        return 0
+    fi
+
+    systemctl daemon-reload || true
+    systemctl enable "$REALM_SERVICE_NAME" >/dev/null 2>&1 || true
+    if systemctl restart "$REALM_SERVICE_NAME" && sleep 1 && systemctl is-active --quiet "$REALM_SERVICE_NAME"; then
+        rm -f "$state_backup" "$cfg_backup"
+        echo -e "${GREEN}✔ Realm 转发配置已应用。${PLAIN}"
+        return 0
+    fi
+
+    echo -e "${RED}[错误] Realm 新配置启动失败，正在恢复旧配置和旧规则...${PLAIN}"
+    mv -f "$state_backup" "$FORWARDING_FILE"
+    if [[ -n "$cfg_backup" && -f "$cfg_backup" ]]; then
+        mv -f "$cfg_backup" "$REALM_CONF"
+    else
+        rm -f "$REALM_CONF"
+    fi
+    if [[ "$old_count" -gt 0 ]]; then
+        systemctl restart "$REALM_SERVICE_NAME" >/dev/null 2>&1 || true
+    else
+        systemctl disable --now "$REALM_SERVICE_NAME" >/dev/null 2>&1 || true
+    fi
+    journalctl -u "$REALM_SERVICE_NAME" -n 30 --no-pager 2>/dev/null || true
+    return 1
+}
+
+forwarding_choose_family() {
+    local default="${1:-ipv4}" c=""
+    echo "请选择监听网络：" >&2
+    echo "  1. IPv4" >&2
+    echo "  2. IPv6" >&2
+    echo "  3. 双栈 IPv4 + IPv6" >&2
+    local d=1
+    [[ "$default" == "ipv6" ]] && d=2
+    [[ "$default" == "dual" ]] && d=3
+    read -rp "请选择 [1-3，默认 ${d}]: " c
+    c=${c:-$d}
+    case "$c" in
+        1) echo ipv4 ;;
+        2) echo ipv6 ;;
+        3) echo dual ;;
+        *) return 1 ;;
+    esac
+}
+
+forwarding_choose_protocol() {
+    local default="${1:-both}" c=""
+    echo "请选择转发协议：" >&2
+    echo "  1. TCP" >&2
+    echo "  2. UDP" >&2
+    echo "  3. TCP + UDP" >&2
+    local d=3
+    [[ "$default" == "tcp" ]] && d=1
+    [[ "$default" == "udp" ]] && d=2
+    read -rp "请选择 [1-3，默认 ${d}]: " c
+    c=${c:-$d}
+    case "$c" in
+        1) echo tcp ;;
+        2) echo udp ;;
+        3) echo both ;;
+        *) return 1 ;;
+    esac
+}
+
+forwarding_sanitize_host() {
+    local h="$1"
+    h=${h#[}
+    h=${h%]}
+    [[ -n "$h" && "$h" != *[[:space:]]* ]] || return 1
+    printf '%s' "$h"
+}
+
+forwarding_next_name() {
+    local base="$1" name="" n=2
+    name="$base"
+    while jq -e --arg n "$name" '.rules[]? | select(.name==$n)' "$FORWARDING_FILE" >/dev/null 2>&1; do
+        name="${base}-${n}"
+        n=$((n+1))
+    done
+    echo "$name"
+}
+
+forwarding_add_single() {
+    forwarding_init_state || return
+    local port="" rhost="" rport="" family="" proto="" name="" candidate="" id=""
+    while true; do
+        read -rp "本机监听端口: " port
+        validate_port_number "$port" && break
+        echo -e "${RED}端口必须为 1-65535。${PLAIN}"
+    done
+
+    if forwarding_state_port_conflict "$port" "$port"; then
+        echo -e "${RED}[错误] 端口 ${port} 已存在 Realm 转发规则。${PLAIN}"
+        pause; return
+    fi
+    if forwarding_os_port_conflict_range "$port" "$port"; then
+        pause; return
+    fi
+
+    family=$(forwarding_choose_family ipv4) || { echo "无效选择"; pause; return; }
+    proto=$(forwarding_choose_protocol both) || { echo "无效选择"; pause; return; }
+
+    while true; do
+        read -rp "目标服务器 IP/域名: " rhost
+        rhost=$(forwarding_sanitize_host "$rhost" 2>/dev/null || true)
+        [[ -n "$rhost" ]] && break
+        echo -e "${RED}目标地址不能为空或包含空格。${PLAIN}"
+    done
+    while true; do
+        read -rp "目标端口 [默认: ${port}]: " rport
+        rport=${rport:-$port}
+        validate_port_number "$rport" && break
+        echo -e "${RED}目标端口必须为 1-65535。${PLAIN}"
+    done
+
+    read -rp "规则备注 [默认: PF-${port}]: " name
+    name=${name:-"PF-${port}"}
+    name=$(forwarding_next_name "$name")
+    id="pf-$(date +%s)-${RANDOM}"
+
+    echo ""
+    echo "确认添加：${name}"
+    echo "  监听 : ${family} / ${port}"
+    echo "  目标 : ${rhost}:${rport}"
+    echo "  协议 : ${proto}"
+    local yes=""
+    read -rp "确认？[Y/n]: " yes
+    [[ ! "$yes" =~ ^[Nn]$ ]] || return
+
+    candidate=$(mktemp "${STATE_DIR}/forwarding.candidate.XXXXXX") || return
+    if ! jq \
+        --arg id "$id" --arg name "$name" --arg family "$family" --arg proto "$proto" \
+        --arg host "$rhost" --argjson lp "$port" --argjson rp "$rport" \
+        '.rules += [{id:$id,name:$name,type:"single",listen_family:$family,protocol:$proto,listen_port:$lp,remote_host:$host,remote_port:$rp}]' \
+        "$FORWARDING_FILE" > "$candidate"; then
+        rm -f "$candidate"; return
+    fi
+    forwarding_apply_state_candidate "$candidate"
+    pause
+}
+
+forwarding_add_range() {
+    forwarding_init_state || return
+    local start="" end="" rhost="" rstart="" rend="" family="" proto="" name="" candidate="" id="" count=""
+    while true; do
+        read -rp "本机起始端口: " start
+        validate_port_number "$start" && break
+        echo -e "${RED}端口必须为 1-65535。${PLAIN}"
+    done
+    while true; do
+        read -rp "本机结束端口: " end
+        if validate_port_number "$end" && [[ "$end" -ge "$start" ]]; then break; fi
+        echo -e "${RED}结束端口必须 >= 起始端口且 <= 65535。${PLAIN}"
+    done
+    count=$((end-start+1))
+    if [[ "$count" -gt "$REALM_MAX_RANGE_PORTS" ]]; then
+        echo -e "${RED}[错误] 单条端口段最多 ${REALM_MAX_RANGE_PORTS} 个端口。${PLAIN}"
+        pause; return
+    fi
+    if forwarding_state_port_conflict "$start" "$end"; then
+        echo -e "${RED}[错误] ${start}-${end} 与现有 Realm 转发规则端口重叠。${PLAIN}"
+        pause; return
+    fi
+    if forwarding_os_port_conflict_range "$start" "$end"; then
+        pause; return
+    fi
+
+    family=$(forwarding_choose_family ipv4) || { echo "无效选择"; pause; return; }
+    proto=$(forwarding_choose_protocol both) || { echo "无效选择"; pause; return; }
+
+    while true; do
+        read -rp "目标服务器 IP/域名: " rhost
+        rhost=$(forwarding_sanitize_host "$rhost" 2>/dev/null || true)
+        [[ -n "$rhost" ]] && break
+        echo -e "${RED}目标地址不能为空或包含空格。${PLAIN}"
+    done
+    while true; do
+        read -rp "目标起始端口 [默认: ${start}]: " rstart
+        rstart=${rstart:-$start}
+        if validate_port_number "$rstart"; then
+            rend=$((rstart+count-1))
+            [[ "$rend" -le 65535 ]] && break
+        fi
+        echo -e "${RED}目标端口段必须落在 1-65535。${PLAIN}"
+    done
+
+    read -rp "规则备注 [默认: PF-${start}-${end}]: " name
+    name=${name:-"PF-${start}-${end}"}
+    name=$(forwarding_next_name "$name")
+    id="pf-$(date +%s)-${RANDOM}"
+
+    echo ""
+    echo "确认添加：${name}"
+    echo "  监听 : ${family} / ${start}-${end}"
+    echo "  目标 : ${rhost}:${rstart}-${rend}"
+    echo "  协议 : ${proto}"
+    local yes=""
+    read -rp "确认？[Y/n]: " yes
+    [[ ! "$yes" =~ ^[Nn]$ ]] || return
+
+    candidate=$(mktemp "${STATE_DIR}/forwarding.candidate.XXXXXX") || return
+    if ! jq \
+        --arg id "$id" --arg name "$name" --arg family "$family" --arg proto "$proto" \
+        --arg host "$rhost" --argjson ls "$start" --argjson le "$end" --argjson rs "$rstart" \
+        '.rules += [{id:$id,name:$name,type:"range",listen_family:$family,protocol:$proto,listen_start:$ls,listen_end:$le,remote_host:$host,remote_start:$rs}]' \
+        "$FORWARDING_FILE" > "$candidate"; then
+        rm -f "$candidate"; return
+    fi
+    forwarding_apply_state_candidate "$candidate"
+    pause
+}
+
+forwarding_print_rules() {
+    forwarding_init_state || return 1
+    local count="" i=0 r="" type="" ports="" remote="" rstart="" rend="" lstart="" lend=""
+    count=$(jq '.rules|length' "$FORWARDING_FILE")
+    if [[ "$count" -eq 0 ]]; then
+        echo "暂无 Realm 转发规则。"
+        return 0
+    fi
+    printf "%-4s %-22s %-9s %-7s %-15s %s\n" "序号" "备注" "监听" "协议" "本机端口" "目标"
+    echo "------------------------------------------------------------------------------------------------"
+    while [[ "$i" -lt "$count" ]]; do
+        r=$(jq -c ".rules[$i]" "$FORWARDING_FILE")
+        type=$(jq -r '.type' <<<"$r")
+        if [[ "$type" == "single" ]]; then
+            ports=$(jq -r '.listen_port|tostring' <<<"$r")
+            remote="$(jq -r '.remote_host' <<<"$r"):$(jq -r '.remote_port' <<<"$r")"
+        else
+            lstart=$(jq -r '.listen_start' <<<"$r"); lend=$(jq -r '.listen_end' <<<"$r")
+            rstart=$(jq -r '.remote_start' <<<"$r"); rend=$((rstart+lend-lstart))
+            ports="${lstart}-${lend}"
+            remote="$(jq -r '.remote_host' <<<"$r"):${rstart}-${rend}"
+        fi
+        printf "%-4s %-22s %-9s %-7s %-15s %s\n" \
+            "$((i+1))" "$(jq -r '.name' <<<"$r")" "$(jq -r '.listen_family' <<<"$r")" \
+            "$(jq -r '.protocol' <<<"$r")" "$ports" "$remote"
+        i=$((i+1))
+    done
+}
+
+forwarding_select_rule_index() {
+    forwarding_print_rules >&2
+    local count="" c=""
+    count=$(jq '.rules|length' "$FORWARDING_FILE")
+    [[ "$count" -gt 0 ]] || return 1
+    read -rp "请选择规则序号 [1-${count}]: " c
+    [[ "$c" =~ ^[0-9]+$ && "$c" -ge 1 && "$c" -le "$count" ]] || return 1
+    echo $((c-1))
+}
+
+forwarding_edit_rule() {
+    forwarding_init_state || return
+    local idx="" rule="" id="" c="" candidate="" new="" old_start="" old_end="" start="" end="" rstart="" count="" rend=""
+    idx=$(forwarding_select_rule_index) || { echo "无效选择。"; pause; return; }
+    rule=$(jq -c ".rules[$idx]" "$FORWARDING_FILE")
+    id=$(jq -r '.id' <<<"$rule")
+
+    while true; do
+        clear
+        rule=$(jq -c --arg id "$id" '.rules[] | select(.id==$id)' "$FORWARDING_FILE")
+        [[ -n "$rule" ]] || return
+        echo -e "${CYAN}════════════════════ 修改转发规则 ════════════════════${PLAIN}"
+        echo "备注 : $(jq -r '.name' <<<"$rule")"
+        echo "监听 : $(jq -r '.listen_family' <<<"$rule")"
+        echo "协议 : $(jq -r '.protocol' <<<"$rule")"
+        if [[ "$(jq -r '.type' <<<"$rule")" == "single" ]]; then
+            echo "端口 : $(jq -r '.listen_port' <<<"$rule") → $(jq -r '.remote_host' <<<"$rule"):$(jq -r '.remote_port' <<<"$rule")"
+        else
+            old_start=$(jq -r '.listen_start' <<<"$rule"); old_end=$(jq -r '.listen_end' <<<"$rule")
+            rstart=$(jq -r '.remote_start' <<<"$rule"); rend=$((rstart+old_end-old_start))
+            echo "端口 : ${old_start}-${old_end} → $(jq -r '.remote_host' <<<"$rule"):${rstart}-${rend}"
+        fi
+        echo ""
+        echo "  1. 修改备注"
+        echo "  2. 修改监听网络"
+        echo "  3. 修改转发协议"
+        echo "  4. 修改目标服务器/目标端口"
+        echo "  5. 修改本机监听端口/端口段"
+        echo "  0. 返回"
+        read -rp "请选择 [0-5]: " c
+        [[ "$c" == "0" ]] && return
+
+        candidate=$(mktemp "${STATE_DIR}/forwarding.candidate.XXXXXX") || return
+        case "$c" in
+            1)
+                read -rp "新备注: " new
+                [[ -n "$new" ]] || { rm -f "$candidate"; continue; }
+                jq --arg id "$id" --arg v "$new" '(.rules[]|select(.id==$id)|.name)=$v' "$FORWARDING_FILE" > "$candidate"
+                ;;
+            2)
+                new=$(forwarding_choose_family "$(jq -r '.listen_family' <<<"$rule")") || { rm -f "$candidate"; continue; }
+                jq --arg id "$id" --arg v "$new" '(.rules[]|select(.id==$id)|.listen_family)=$v' "$FORWARDING_FILE" > "$candidate"
+                ;;
+            3)
+                new=$(forwarding_choose_protocol "$(jq -r '.protocol' <<<"$rule")") || { rm -f "$candidate"; continue; }
+                jq --arg id "$id" --arg v "$new" '(.rules[]|select(.id==$id)|.protocol)=$v' "$FORWARDING_FILE" > "$candidate"
+                ;;
+            4)
+                local nhost="" nr=""
+                read -rp "目标服务器 IP/域名 [当前: $(jq -r '.remote_host' <<<"$rule")]: " nhost
+                nhost=${nhost:-$(jq -r '.remote_host' <<<"$rule")}
+                nhost=$(forwarding_sanitize_host "$nhost" 2>/dev/null || true)
+                [[ -n "$nhost" ]] || { rm -f "$candidate"; continue; }
+                if [[ "$(jq -r '.type' <<<"$rule")" == "single" ]]; then
+                    nr=$(jq -r '.remote_port' <<<"$rule")
+                    read -rp "目标端口 [当前: ${nr}]: " new
+                    new=${new:-$nr}
+                    validate_port_number "$new" || { rm -f "$candidate"; continue; }
+                    jq --arg id "$id" --arg h "$nhost" --argjson p "$new" \
+                        '(.rules[]|select(.id==$id)|.remote_host)=$h | (.rules[]|select(.id==$id)|.remote_port)=$p' \
+                        "$FORWARDING_FILE" > "$candidate"
+                else
+                    nr=$(jq -r '.remote_start' <<<"$rule")
+                    count=$(( $(jq -r '.listen_end' <<<"$rule") - $(jq -r '.listen_start' <<<"$rule") + 1 ))
+                    read -rp "目标起始端口 [当前: ${nr}]: " new
+                    new=${new:-$nr}
+                    validate_port_number "$new" || { rm -f "$candidate"; continue; }
+                    [[ $((new+count-1)) -le 65535 ]] || { echo "目标端口段越界。"; rm -f "$candidate"; pause; continue; }
+                    jq --arg id "$id" --arg h "$nhost" --argjson p "$new" \
+                        '(.rules[]|select(.id==$id)|.remote_host)=$h | (.rules[]|select(.id==$id)|.remote_start)=$p' \
+                        "$FORWARDING_FILE" > "$candidate"
+                fi
+                ;;
+            5)
+                read -r old_start old_end < <(forwarding_rule_interval "$rule")
+                if [[ "$(jq -r '.type' <<<"$rule")" == "single" ]]; then
+                    read -rp "新监听端口 [当前: ${old_start}]: " start
+                    start=${start:-$old_start}
+                    validate_port_number "$start" || { rm -f "$candidate"; continue; }
+                    end="$start"
+                else
+                    read -rp "新起始端口 [当前: ${old_start}]: " start
+                    start=${start:-$old_start}
+                    read -rp "新结束端口 [当前: ${old_end}]: " end
+                    end=${end:-$old_end}
+                    if ! validate_port_number "$start" || ! validate_port_number "$end" || [[ "$end" -lt "$start" ]]; then
+                        rm -f "$candidate"; continue
+                    fi
+                    count=$((end-start+1))
+                    [[ "$count" -le "$REALM_MAX_RANGE_PORTS" ]] || { echo "端口段过大。"; rm -f "$candidate"; pause; continue; }
+                fi
+                if forwarding_state_port_conflict "$start" "$end" "$id"; then
+                    echo "与其他 Realm 转发规则端口重叠。"; rm -f "$candidate"; pause; continue
+                fi
+                if [[ "$start" != "$old_start" || "$end" != "$old_end" ]] && forwarding_os_port_conflict_range "$start" "$end"; then
+                    rm -f "$candidate"; pause; continue
+                fi
+                if [[ "$(jq -r '.type' <<<"$rule")" == "single" ]]; then
+                    jq --arg id "$id" --argjson p "$start" '(.rules[]|select(.id==$id)|.listen_port)=$p' "$FORWARDING_FILE" > "$candidate"
+                else
+                    rstart=$(jq -r '.remote_start' <<<"$rule")
+                    count=$((end-start+1))
+                    [[ $((rstart+count-1)) -le 65535 ]] || { echo "目标端口段会越界，请先修改目标起始端口。"; rm -f "$candidate"; pause; continue; }
+                    jq --arg id "$id" --argjson s "$start" --argjson e "$end" \
+                        '(.rules[]|select(.id==$id)|.listen_start)=$s | (.rules[]|select(.id==$id)|.listen_end)=$e' \
+                        "$FORWARDING_FILE" > "$candidate"
+                fi
+                ;;
+            *) rm -f "$candidate"; continue ;;
+        esac
+
+        if forwarding_apply_state_candidate "$candidate"; then
+            echo -e "${GREEN}✔ 规则已更新。${PLAIN}"
+        fi
+        pause
+    done
+}
+
+forwarding_delete_rule() {
+    forwarding_init_state || return
+    local idx="" rule="" id="" candidate="" yes=""
+    idx=$(forwarding_select_rule_index) || { echo "无效选择。"; pause; return; }
+    rule=$(jq -c ".rules[$idx]" "$FORWARDING_FILE")
+    id=$(jq -r '.id' <<<"$rule")
+    read -rp "确认删除“$(jq -r '.name' <<<"$rule")”？[y/N]: " yes
+    [[ "$yes" =~ ^[Yy]$ ]] || return
+    candidate=$(mktemp "${STATE_DIR}/forwarding.candidate.XXXXXX") || return
+    jq --arg id "$id" '.rules |= map(select(.id != $id))' "$FORWARDING_FILE" > "$candidate" || { rm -f "$candidate"; return; }
+    forwarding_apply_state_candidate "$candidate"
+    pause
+}
+
+forwarding_test_tcp_target() {
+    local host="$1" port="$2" hp=""
+    hp=$(forwarding_format_host_port "$host" "$port")
+    local out=""
+    out=$(curl -v --connect-timeout 3 --max-time 3 "telnet://${hp}" </dev/null 2>&1 || true)
+    if grep -qE 'Connected to .* port|Connected to ' <<<"$out"; then
+        return 0
+    fi
+    return 1
+}
+
+forwarding_test_rule() {
+    forwarding_init_state || return
+    local idx="" rule="" type="" proto="" family="" host="" lp="" rp="" ls="" le="" rs="" re="" tcp_test_port=""
+    idx=$(forwarding_select_rule_index) || { echo "无效选择。"; pause; return; }
+    rule=$(jq -c ".rules[$idx]" "$FORWARDING_FILE")
+    type=$(jq -r '.type' <<<"$rule")
+    proto=$(jq -r '.protocol' <<<"$rule")
+    family=$(jq -r '.listen_family' <<<"$rule")
+    host=$(jq -r '.remote_host' <<<"$rule")
+    if [[ "$type" == "single" ]]; then
+        lp=$(jq -r '.listen_port' <<<"$rule")
+        rp=$(jq -r '.remote_port' <<<"$rule")
+        echo "规则：$(jq -r '.name' <<<"$rule")  ${lp} → ${host}:${rp} (${proto}/${family})"
+        tcp_test_port="$rp"
+    else
+        ls=$(jq -r '.listen_start' <<<"$rule"); le=$(jq -r '.listen_end' <<<"$rule")
+        rs=$(jq -r '.remote_start' <<<"$rule"); re=$((rs+le-ls))
+        echo "规则：$(jq -r '.name' <<<"$rule")  ${ls}-${le} → ${host}:${rs}-${re} (${proto}/${family})"
+        lp="$ls"; tcp_test_port="$rs"
+    fi
+
+    echo ""
+    echo "【服务状态】"
+    if systemctl is-active --quiet "$REALM_SERVICE_NAME"; then
+        echo -e "  Realm : ${GREEN}Running${PLAIN}"
+    else
+        echo -e "  Realm : ${RED}Stopped${PLAIN}"
+    fi
+
+    echo "【监听检查】"
+    if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
+        if ss -H -lntp 2>/dev/null | awk -v p="$lp" '{a=$4; n=split(a,x,":"); if(x[n]==p) ok=1} END{exit !ok}'; then
+            echo -e "  TCP ${lp}: ${GREEN}✓ 已监听${PLAIN}"
+        else
+            echo -e "  TCP ${lp}: ${RED}✗ 未监听${PLAIN}"
+        fi
+    fi
+    if [[ "$proto" == "udp" || "$proto" == "both" ]]; then
+        if ss -H -lnup 2>/dev/null | awk -v p="$lp" '{a=$4; n=split(a,x,":"); if(x[n]==p) ok=1} END{exit !ok}'; then
+            echo -e "  UDP ${lp}: ${GREEN}✓ 已监听${PLAIN}"
+        else
+            echo -e "  UDP ${lp}: ${RED}✗ 未监听${PLAIN}"
+        fi
+    fi
+
+    if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
+        echo "【目标 TCP 连通性】"
+        if forwarding_test_tcp_target "$host" "$tcp_test_port"; then
+            echo -e "  ${host}:${tcp_test_port}: ${GREEN}✓ TCP 可连接${PLAIN}"
+        else
+            echo -e "  ${host}:${tcp_test_port}: ${YELLOW}未能建立 TCP 连接（目标服务可能拒绝探测；请结合实际客户端验证）${PLAIN}"
+        fi
+    fi
+    if [[ "$proto" == "udp" || "$proto" == "both" ]]; then
+        echo -e "${YELLOW}[说明] UDP 没有通用握手，脚本只验证监听状态；最终以真实 UDP 应用流量为准。${PLAIN}"
+    fi
+    pause
+}
+
+forwarding_show_config() {
+    forwarding_init_state || return
+    forwarding_print_rules
+    echo ""
+    echo "Realm 二进制 : ${REALM_BIN}"
+    if [[ -x "$REALM_BIN" ]]; then
+        echo "Realm 版本   : $("$REALM_BIN" --version 2>/dev/null | head -n1)"
+    else
+        echo "Realm 版本   : 未安装"
+    fi
+    echo "Realm 配置   : ${REALM_CONF}"
+    echo "规则状态文件 : ${FORWARDING_FILE}"
+    echo "systemd      : ${REALM_SERVICE_NAME}.service"
+}
+
+uninstall_realm_forwarding() {
+    local yes=""
+    echo -e "${YELLOW}此操作只删除 ss2022.sh 管理的 Realm 转发组件和 forwarding.json；不会删除服务器已有 realm.service 或 /usr/local/bin/realm。${PLAIN}"
+    read -rp "确认卸载 Realm 转发组件？[y/N]: " yes
+    [[ "$yes" =~ ^[Yy]$ ]] || return
+
+    systemctl disable --now "$REALM_SERVICE_NAME" >/dev/null 2>&1 || true
+    rm -f "$REALM_SERVICE" "$REALM_BIN" "$FORWARDING_FILE"
+    rm -rf /etc/ss2022-realm
+    if [[ -f "$REALM_USER_MARKER" ]]; then
+        userdel "$REALM_USER" >/dev/null 2>&1 || true
+        rm -f "$REALM_USER_MARKER"
+    fi
+    getent group "$REALM_GROUP" >/dev/null 2>&1 && groupdel "$REALM_GROUP" >/dev/null 2>&1 || true
+    systemctl daemon-reload || true
+    echo -e "${GREEN}✔ ss2022.sh Realm 转发组件已卸载。${PLAIN}"
+    pause
+}
+
+realm_service_management() {
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ Realm 服务管理 ════════════════════${PLAIN}"
+        echo "  1. 安装 / 重新安装固定版本 Realm v${REALM_VERSION}"
+        echo "  2. 查看服务状态"
+        echo "  3. 查看实时日志"
+        echo "  4. 重启服务"
+        echo "  5. 停止服务"
+        echo "  6. 启动服务"
+        echo "  7. 卸载 Realm 转发组件"
+        echo "  0. 返回"
+        read -rp "请选择 [0-7]: " c
+        case "$c" in
+            1)
+                if install_realm_core; then
+                    forwarding_init_state || true
+                    if [[ $(jq '.rules|length' "$FORWARDING_FILE" 2>/dev/null || echo 0) -gt 0 ]]; then
+                        local tmp=""
+                        tmp=$(mktemp "${STATE_DIR}/forwarding.candidate.XXXXXX") || { pause; continue; }
+                        cp -a "$FORWARDING_FILE" "$tmp"
+                        forwarding_apply_state_candidate "$tmp" || true
+                    fi
+                fi
+                pause
+                ;;
+            2) systemctl --no-pager --full status "$REALM_SERVICE_NAME" 2>/dev/null || echo "未运行"; pause ;;
+            3) journalctl -u "$REALM_SERVICE_NAME" -f -n 30 ;;
+            4) systemctl restart "$REALM_SERVICE_NAME" && echo "已重启" || journalctl -u "$REALM_SERVICE_NAME" -n 30 --no-pager; pause ;;
+            5) systemctl stop "$REALM_SERVICE_NAME" && echo "已停止"; pause ;;
+            6) systemctl start "$REALM_SERVICE_NAME" && echo "已启动" || journalctl -u "$REALM_SERVICE_NAME" -n 30 --no-pager; pause ;;
+            7) uninstall_realm_forwarding ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+forwarding_management() {
+    forwarding_init_state || { pause; return; }
+    while true; do
+        clear
+        forwarding_init_state || return
+        local count="" state="未安装"
+        count=$(jq '.rules|length' "$FORWARDING_FILE")
+        if [[ -x "$REALM_BIN" ]]; then
+            if systemctl is-active --quiet "$REALM_SERVICE_NAME"; then state="Running"; else state="Stopped"; fi
+        fi
+        echo -e "${CYAN}════════════════════ Realm 端口转发 ════════════════════${PLAIN}"
+        echo "Realm     : ${state}"
+        echo "版本      : v${REALM_VERSION}"
+        echo "转发规则  : ${count} 条"
+        echo ""
+        echo "  1. 添加单端口转发"
+        echo "  2. 添加端口段转发"
+        echo "  3. 查看转发规则"
+        echo "  4. 修改转发规则"
+        echo "  5. 删除转发规则"
+        echo "  6. 测试转发规则"
+        echo "  7. Realm 服务管理"
+        echo "  0. 返回"
+        echo -e "${CYAN}═════════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-7]: " c
+        case "$c" in
+            1) forwarding_add_single ;;
+            2) forwarding_add_range ;;
+            3) clear; forwarding_show_config; pause ;;
+            4) forwarding_edit_rule ;;
+            5) forwarding_delete_rule ;;
+            6) forwarding_test_rule ;;
+            7) realm_service_management ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+
 show_service_status() {
     echo ""
     echo -e "${YELLOW}【sing-box】${PLAIN}"
@@ -2777,20 +4962,36 @@ show_service_status() {
     systemctl --no-pager --full status snell-v5 2>/dev/null | head -n 15 || echo "未安装/未加载"
 
     echo ""
+    echo -e "${YELLOW}【Realm 端口转发】${PLAIN}"
+    systemctl --no-pager --full status "$REALM_SERVICE_NAME" 2>/dev/null | head -n 15 || echo "未安装/未加载"
+
+    echo ""
     echo -e "${YELLOW}【监听端口】${PLAIN}"
-    ss -lntup 2>/dev/null | grep -E 'sing-box|xray|snell-server' || echo "未检测到代理监听"
+    ss -lntup 2>/dev/null | grep -E 'sing-box|xray|snell-server|ss2022-realm|realm' || echo "未检测到相关监听"
 }
 
 full_uninstall() {
     local yes=""
-    echo -e "${RED}此操作会删除 sing-box、ss2022-xray、Snell v5 及本脚本管理的全部节点配置；不会删除服务器原有 xray.service。${PLAIN}"
-    read -rp "确认彻底卸载？请输入 YES: " yes
-    [[ "$yes" == "YES" ]] || return
+    echo -e "${RED}========== 完全卸载 ss2022.sh ==========${PLAIN}"
+    echo ""
+    echo -e "${RED}此操作会删除 sing-box、ss2022-xray、Snell v5、ss2022-realm 以及本脚本管理的全部节点/分流/端口转发配置；若 WARP 由本脚本安装，也会一并卸载。不会删除服务器原有 xray.service 或 realm.service。${PLAIN}"
+    echo ""
+    echo -e "${YELLOW}将删除由 ss2022.sh 管理的代理核心、节点配置、分流配置、Realm 转发、Keepalive 与快捷命令。${PLAIN}"
+    echo -e "${GREEN}不会删除服务器原有 xray.service / realm.service 或其它非本脚本管理的软件。${PLAIN}"
+    read -rp "确认彻底卸载？请输入 DELETE: " yes
+    [[ "$yes" == "DELETE" ]] || { echo "已取消。"; sleep 1; return; }
 
-    systemctl disable --now sing-box "$XRAY_SERVICE_NAME" snell-v5 ipv6-keepalive.timer >/dev/null 2>&1 || true
+    systemctl disable --now sing-box "$XRAY_SERVICE_NAME" snell-v5 "$REALM_SERVICE_NAME" ipv6-keepalive.timer >/dev/null 2>&1 || true
     systemctl stop ipv6-keepalive.service >/dev/null 2>&1 || true
 
-    rm -rf /etc/sing-box /etc/snell /etc/ss2022-xray "$STATE_DIR" /usr/local/lib/ss2022
+    if [[ -f "$WARP_MANAGED_MARKER" ]] && command -v warp-cli >/dev/null 2>&1; then
+        warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
+        warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
+        apt-get remove -y cloudflare-warp >/dev/null 2>&1 || true
+        rm -f /etc/apt/sources.list.d/cloudflare-client.list /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+    fi
+
+    rm -rf /etc/sing-box /etc/snell /etc/ss2022-xray /etc/ss2022-realm "$STATE_DIR" /usr/local/lib/ss2022
     rm -f \
         /usr/local/bin/ss2022 \
         /usr/local/bin/proxy \
@@ -2800,6 +5001,7 @@ full_uninstall() {
         "$SINGBOX_SERVICE" \
         "$XRAY_SERVICE" \
         "$SNELL_SERVICE" \
+        "$REALM_SERVICE" \
         /etc/systemd/system/ipv6-keepalive.service \
         /etc/systemd/system/ipv6-keepalive.timer \
         "$FORCE_IPV6_CONF"
@@ -2824,9 +5026,314 @@ full_uninstall() {
         rm -f "$SNELL_USER_MARKER"
     fi
 
+    if [[ -f "$REALM_USER_MARKER" ]]; then
+        userdel "$REALM_USER" >/dev/null 2>&1 || true
+        rm -f "$REALM_USER_MARKER"
+    fi
+
     systemctl daemon-reload || true
     echo -e "${GREEN}✔ 已彻底卸载。${PLAIN}"
     exit 0
+}
+
+
+get_singbox_version_raw() {
+    if [[ -x "$SINGBOX_BIN" ]]; then
+        "$SINGBOX_BIN" version 2>/dev/null | head -n1 | awk '{print $3}'
+    fi
+}
+
+get_xray_version_raw() {
+    if [[ -x "$XRAY_BIN" ]]; then
+        "$XRAY_BIN" version 2>/dev/null | head -n1 | awk '{print $2}'
+    fi
+}
+
+get_snell_version_raw() {
+    [[ -x "$SNELL_BIN" ]] && printf '%s\n' "$SNELL_VERSION" || true
+}
+
+get_realm_version_raw() {
+    if [[ -x "$REALM_BIN" ]]; then
+        "$REALM_BIN" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1
+    fi
+}
+
+component_current_version() {
+    case "$1" in
+        singbox) get_singbox_version_raw ;;
+        xray) get_xray_version_raw ;;
+        snell) get_snell_version_raw ;;
+        realm) get_realm_version_raw ;;
+    esac
+}
+
+component_recommended_version() {
+    case "$1" in
+        singbox) echo "$SINGBOX_VERSION" ;;
+        xray) echo "$XRAY_VERSION" ;;
+        snell) echo "$SNELL_VERSION" ;;
+        realm) echo "$REALM_VERSION" ;;
+    esac
+}
+
+component_label() {
+    case "$1" in
+        singbox) echo "sing-box" ;;
+        xray) echo "Xray-core" ;;
+        snell) echo "Snell Server" ;;
+        realm) echo "Realm" ;;
+    esac
+}
+
+component_bin_path() {
+    case "$1" in
+        singbox) echo "$SINGBOX_BIN" ;;
+        xray) echo "$XRAY_BIN" ;;
+        snell) echo "$SNELL_BIN" ;;
+        realm) echo "$REALM_BIN" ;;
+    esac
+}
+
+component_service_name() {
+    case "$1" in
+        singbox) echo "sing-box" ;;
+        xray) echo "$XRAY_SERVICE_NAME" ;;
+        snell) echo "snell-v5" ;;
+        realm) echo "$REALM_SERVICE_NAME" ;;
+    esac
+}
+
+component_config_exists() {
+    case "$1" in
+        singbox) [[ -f "$SINGBOX_CONF" ]] ;;
+        xray) [[ -f "$XRAY_CONF" ]] ;;
+        snell) [[ -f "$SNELL_CONF" ]] ;;
+        realm) [[ -f "$REALM_CONF" ]] ;;
+    esac
+}
+
+component_validate_existing_config() {
+    local c="$1"
+    case "$c" in
+        singbox)
+            [[ -f "$SINGBOX_CONF" ]] || return 0
+            "$SINGBOX_BIN" check -c "$SINGBOX_CONF"
+            ;;
+        xray)
+            [[ -f "$XRAY_CONF" ]] || return 0
+            "$XRAY_BIN" run -test -format json -config "$XRAY_CONF"
+            ;;
+        snell)
+            [[ -f "$SNELL_CONF" ]] || return 0
+            snell_binary_works "$SNELL_BIN"
+            ;;
+        realm)
+            [[ -f "$REALM_CONF" ]] || return 0
+            "$REALM_BIN" --version >/dev/null 2>&1
+            ;;
+    esac
+}
+
+component_install_recommended() {
+    local c="$1" label bin svc tmp old_active=0 had_bin=0 ok=0
+    label=$(component_label "$c")
+    bin=$(component_bin_path "$c")
+    svc=$(component_service_name "$c")
+    tmp=$(mktemp -d /tmp/ss2022-core-upgrade.XXXXXX) || return 1
+
+    if [[ -x "$bin" ]]; then
+        cp -a "$bin" "$tmp/old.bin" || { rm -rf "$tmp"; return 1; }
+        had_bin=1
+    fi
+    systemctl is-active --quiet "$svc" 2>/dev/null && old_active=1 || true
+
+    echo -e "${YELLOW}>> ${label}: 安装/修复到脚本推荐版本 $(component_recommended_version "$c")...${PLAIN}"
+    case "$c" in
+        singbox) install_singbox_core && ok=1 ;;
+        xray) install_xray_core && ok=1 ;;
+        snell) install_snell_v5_core && write_snell_service && ok=1 ;;
+        realm) install_realm_core && ok=1 ;;
+    esac
+
+    if [[ $ok -eq 1 ]] && ! component_validate_existing_config "$c"; then
+        echo -e "${RED}[错误] 新 ${label} 无法兼容当前配置，开始恢复旧二进制。${PLAIN}"
+        ok=0
+    fi
+
+    if [[ $ok -eq 1 ]] && component_config_exists "$c"; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        if ! systemctl restart "$svc" >/dev/null 2>&1; then
+            echo -e "${RED}[错误] ${label} 新版本启动失败，开始回滚。${PLAIN}"
+            ok=0
+        else
+            sleep 1
+            systemctl is-active --quiet "$svc" || ok=0
+        fi
+    fi
+
+    if [[ $ok -ne 1 ]]; then
+        if [[ $had_bin -eq 1 && -f "$tmp/old.bin" ]]; then
+            install -m 755 "$tmp/old.bin" "$bin" || true
+        elif [[ $had_bin -eq 0 ]]; then
+            rm -f "$bin"
+        fi
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        [[ $old_active -eq 1 ]] && systemctl restart "$svc" >/dev/null 2>&1 || true
+        rm -rf "$tmp"
+        echo -e "${RED}[错误] ${label} 升级/修复失败，已尽力恢复原核心。${PLAIN}"
+        return 1
+    fi
+
+    rm -rf "$tmp"
+    echo -e "${GREEN}✔ ${label} 当前版本: $(component_current_version "$c")${PLAIN}"
+    return 0
+}
+
+fetch_github_latest_tag() {
+    local repo="$1"
+    curl -fsSL --retry 1 --connect-timeout 5 --max-time 12 \
+      -H 'Accept: application/vnd.github+json' \
+      "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null \
+      | jq -r '.tag_name // empty' 2>/dev/null | sed 's/^v//'
+}
+
+show_component_versions() {
+    local sb xr sn re
+    sb=$(get_singbox_version_raw); sb=${sb:-未安装}
+    xr=$(get_xray_version_raw); xr=${xr:-未安装}
+    sn=$(get_snell_version_raw); sn=${sn:-未安装}
+    re=$(get_realm_version_raw); re=${re:-未安装}
+    clear
+    echo -e "${CYAN}════════════════════ 组件版本管理 ════════════════════${PLAIN}"
+    echo "【代理核心】"
+    printf '  sing-box      已安装: %-12s 推荐: %s\n' "$sb" "$SINGBOX_VERSION"
+    printf '  Xray-core     已安装: %-12s 推荐: %s\n' "$xr" "$XRAY_VERSION"
+    printf '  Snell Server  已安装: %-12s 推荐: %s\n' "$sn" "$SNELL_VERSION"
+    echo ""
+    echo "【网络组件】"
+    printf '  Realm         已安装: %-12s 推荐: %s\n' "$re" "$REALM_VERSION"
+    if command -v warp-cli >/dev/null 2>&1; then
+        echo "  Cloudflare WARP: 已安装（版本由 Cloudflare 客户端自身管理）"
+    else
+        echo "  Cloudflare WARP: 未安装"
+    fi
+}
+
+check_upstream_versions() {
+    clear
+    echo -e "${CYAN}════════════════════ 上游版本检查 ════════════════════${PLAIN}"
+    echo "说明：仅查询并提示，不会自动安装官方 Latest。"
+    echo ""
+    local latest current
+    current=$(get_singbox_version_raw); current=${current:-未安装}
+    latest=$(fetch_github_latest_tag 'SagerNet/sing-box'); latest=${latest:-查询失败}
+    printf 'sing-box      当前 %-12s 推荐 %-12s 上游 %s\n' "$current" "$SINGBOX_VERSION" "$latest"
+    current=$(get_xray_version_raw); current=${current:-未安装}
+    latest=$(fetch_github_latest_tag 'XTLS/Xray-core'); latest=${latest:-查询失败}
+    printf 'Xray-core     当前 %-12s 推荐 %-12s 上游 %s\n' "$current" "$XRAY_VERSION" "$latest"
+    current=$(get_snell_version_raw); current=${current:-未安装}
+    printf 'Snell Server  当前 %-12s 推荐 %-12s 上游 %s\n' "$current" "$SNELL_VERSION" "请以 Surge 官方发布为准"
+    current=$(get_realm_version_raw); current=${current:-未安装}
+    latest=$(fetch_github_latest_tag 'zhboner/realm'); latest=${latest:-查询失败}
+    printf 'Realm         当前 %-12s 推荐 %-12s 上游 %s\n' "$current" "$REALM_VERSION" "$latest"
+    echo ""
+    echo -e "${YELLOW}上游 Latest 不代表本脚本已验证。请优先使用脚本推荐版本。${PLAIN}"
+    pause
+}
+
+component_single_menu() {
+    local c="$1" label current recommended choice
+    label=$(component_label "$c")
+    while true; do
+        clear
+        current=$(component_current_version "$c"); current=${current:-未安装}
+        recommended=$(component_recommended_version "$c")
+        echo -e "${CYAN}════════════════════ ${label} ════════════════════${PLAIN}"
+        echo "当前版本 : $current"
+        echo "推荐版本 : $recommended"
+        echo ""
+        echo "  1. 升级 / 重装到推荐版本"
+        echo "  2. 查看当前版本"
+        echo "  0. 返回"
+        read -rp "请选择 [0-2]: " choice
+        case "$choice" in
+            1) component_install_recommended "$c"; pause ;;
+            2) current=$(component_current_version "$c"); echo "${label}: ${current:-未安装}"; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+upgrade_all_to_recommended() {
+    local c current target failed=0
+    for c in singbox xray snell realm; do
+        current=$(component_current_version "$c")
+        target=$(component_recommended_version "$c")
+        if [[ -z "$current" ]]; then
+            case "$c" in
+                singbox) [[ -f "$SINGBOX_CONF" ]] || continue ;;
+                xray) [[ -f "$XRAY_CONF" ]] || continue ;;
+                snell) [[ -f "$SNELL_CONF" ]] || continue ;;
+                realm) [[ -f "$REALM_CONF" || -f "$FORWARDING_FILE" ]] || continue ;;
+            esac
+        fi
+        if [[ "$current" == "$target" ]]; then
+            echo -e "${GREEN}✔ $(component_label "$c") 已是推荐版本 $target${PLAIN}"
+            continue
+        fi
+        component_install_recommended "$c" || failed=1
+    done
+    [[ $failed -eq 0 ]]
+}
+
+component_version_management() {
+    while true; do
+        show_component_versions
+        echo ""
+        echo "  1. sing-box"
+        echo "  2. Xray-core"
+        echo "  3. Snell Server"
+        echo "  4. Realm"
+        echo "  5. 检查官方上游版本（仅提示）"
+        echo "  6. 全部升级到脚本推荐版本"
+        echo "  0. 返回"
+        echo -e "${CYAN}═════════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-6]: " c
+        case "$c" in
+            1) component_single_menu singbox ;;
+            2) component_single_menu xray ;;
+            3) component_single_menu snell ;;
+            4) component_single_menu realm ;;
+            5) check_upstream_versions ;;
+            6) upgrade_all_to_recommended; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+protocol_management() {
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ 协议管理 ════════════════════${PLAIN}"
+        echo "  1. SS2022"
+        echo "  2. SS2022 + ShadowTLS v3（增强伪装）"
+        echo "  3. VLESS Reality"
+        echo "  4. Snell v5"
+        echo "  0. 返回"
+        echo -e "${CYAN}═══════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-4]: " c
+        case "$c" in
+            1) protocol_action_menu "SS2022" deploy_ss2022 update_ss2022 delete_ss2022 ;;
+            2) protocol_action_menu "SS2022 + ShadowTLS v3" deploy_shadowtls update_shadowtls delete_shadowtls ;;
+            3) protocol_action_menu "VLESS Reality" deploy_vless_reality update_vless_reality delete_vless_reality ;;
+            4) protocol_action_menu "Snell v5" deploy_snell_v5 update_snell_v5 delete_snell_v5 ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
 }
 
 service_management() {
@@ -2837,24 +5344,26 @@ service_management() {
         echo "  2. 查看 sing-box 实时日志"
         echo "  3. 查看 ss2022-xray 实时日志"
         echo "  4. 查看 Snell v5 实时日志"
-        echo "  5. 重启 sing-box"
-        echo "  6. 重启 ss2022-xray"
-        echo "  7. 重启 Snell v5"
-        echo "  8. 查看 IPv6 Keepalive 状态"
-        echo "  9. 彻底卸载全部代理组件"
+        echo "  5. 查看 Realm 转发实时日志"
+        echo "  6. 重启 sing-box"
+        echo "  7. 重启 ss2022-xray"
+        echo "  8. 重启 Snell v5"
+        echo "  9. 重启 Realm 转发"
+        echo " 10. 查看 IPv6 Keepalive 状态"
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0-9]: " c
+        read -rp "请选择 [0-10]: " c
         case "$c" in
             1) show_service_status; pause ;;
             2) journalctl -u sing-box -f -n 30 ;;
             3) journalctl -u "$XRAY_SERVICE_NAME" -f -n 30 ;;
             4) journalctl -u snell-v5 -f -n 30 ;;
-            5) if systemctl restart sing-box; then echo -e "${GREEN}✔ sing-box 已重启。${PLAIN}"; else journalctl -u sing-box -n 30 --no-pager; fi; pause ;;
-            6) if systemctl restart "$XRAY_SERVICE_NAME"; then echo -e "${GREEN}✔ ss2022-xray 已重启。${PLAIN}"; else journalctl -u "$XRAY_SERVICE_NAME" -n 30 --no-pager; fi; pause ;;
-            7) if systemctl restart snell-v5; then echo -e "${GREEN}✔ Snell v5 已重启。${PLAIN}"; else journalctl -u snell-v5 -n 30 --no-pager; fi; pause ;;
-            8) systemctl list-timers --all | grep -E 'keepalive|NEXT' || echo "未检测到 Keepalive 定时器。"; pause ;;
-            9) full_uninstall ;;
+            5) journalctl -u "$REALM_SERVICE_NAME" -f -n 30 ;;
+            6) if systemctl restart sing-box; then echo -e "${GREEN}✔ sing-box 已重启。${PLAIN}"; else journalctl -u sing-box -n 30 --no-pager; fi; pause ;;
+            7) if systemctl restart "$XRAY_SERVICE_NAME"; then echo -e "${GREEN}✔ ss2022-xray 已重启。${PLAIN}"; else journalctl -u "$XRAY_SERVICE_NAME" -n 30 --no-pager; fi; pause ;;
+            8) if systemctl restart snell-v5; then echo -e "${GREEN}✔ Snell v5 已重启。${PLAIN}"; else journalctl -u snell-v5 -n 30 --no-pager; fi; pause ;;
+            9) if systemctl restart "$REALM_SERVICE_NAME"; then echo -e "${GREEN}✔ Realm 转发已重启。${PLAIN}"; else journalctl -u "$REALM_SERVICE_NAME" -n 30 --no-pager; fi; pause ;;
+            10) systemctl list-timers --all | grep -E 'keepalive|NEXT' || echo "未检测到 Keepalive 定时器。"; pause ;;
             0) return ;;
             *) sleep 1 ;;
         esac
@@ -2866,23 +5375,25 @@ main() {
 
     while true; do
         show_dashboard
-        echo "  1. SS2022"
-        echo "  2. SS2022 + ShadowTLS v3（增强伪装）"
-        echo "  3. VLESS Reality"
-        echo "  4. Snell v5"
-        echo "  5. 查看当前节点参数与客户端配置"
-        echo "  6. 服务运维管理"
+        echo "  1. 协议管理"
+        echo "  2. 分流管理"
+        echo "  3. 端口转发（Realm）"
+        echo "  4. 查看当前节点参数与客户端配置"
+        echo "  5. 服务运维管理"
+        echo "  6. 组件版本管理"
+        echo -e "${RED}  7. 完全卸载脚本${PLAIN}"
         echo "  0. 退出管理面板"
         echo -e "${CYAN}═════════════════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请输入选项编号 [0-6]: " choice
+        read -rp "请输入选项编号 [0-7]: " choice
 
         case "$choice" in
-            1) protocol_action_menu "SS2022" deploy_ss2022 update_ss2022 delete_ss2022 ;;
-            2) protocol_action_menu "SS2022 + ShadowTLS v3" deploy_shadowtls update_shadowtls delete_shadowtls ;;
-            3) protocol_action_menu "VLESS Reality" deploy_vless_reality update_vless_reality delete_vless_reality ;;
-            4) protocol_action_menu "Snell v5" deploy_snell_v5 update_snell_v5 delete_snell_v5 ;;
-            5) view_config_menu ;;
-            6) service_management ;;
+            1) protocol_management ;;
+            2) routing_management ;;
+            3) forwarding_management ;;
+            4) view_config_menu ;;
+            5) service_management ;;
+            6) component_version_management ;;
+            7) full_uninstall ;;
             0)
                 echo "已安全退出。随时输入 ss2022 唤出！"
                 exit 0
@@ -2894,5 +5405,4 @@ main() {
         esac
     done
 }
-
 main
