@@ -1,88 +1,69 @@
 #!/bin/bash
 # ==============================================================================
-# 项目名称: VPS Bootstrap & SS2022 多协议代理管理脚本
+# 项目名称: vps-bootstrap / ss2022.sh
+# 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.0-dev2
+# 当前版本: v1.8.0-dev4
 #
-# v1.8.0-dev2:
-#   - 新增 Realm L4 端口转发：单端口 / 端口段、TCP / UDP / TCP+UDP、IPv4 / IPv6 / 双栈
-#   - Realm 使用独立命名空间：ss2022-realm.service / /usr/local/lib/ss2022/realm / /etc/ss2022-realm
-#   - 转发规则统一保存于 /etc/ss2022/forwarding.json，支持查看 / 修改 / 删除 / 测试
-#   - 固定 Realm v2.9.6，并使用 GitHub 官方 Release asset digest 做 SHA256 校验
-#   - 不引入 MPTCP、TLS/WS/WSS 隧道、负载均衡、故障转移、流量统计等平台化能力
+# ┌──────────────────────────── 架构总览 ────────────────────────────┐
+# │ 用户菜单                                                         │
+# │   ├─ 协议管理 ────────────────┬─ sing-box: SS2022 / ShadowTLS   │
+# │   │                            ├─ Xray: VLESS Reality             │
+# │   │                            └─ snell-server: Snell v5          │
+# │   ├─ 分流管理 ────────────────┬─ DIRECT                           │
+# │   │                            ├─ WARP Local Proxy                 │
+# │   │                            └─ SS2022 / SOCKS5 落地节点         │
+# │   ├─ 端口转发 ────────────────── Realm                              │
+# │   ├─ 服务运维                                                       │
+# │   ├─ 组件版本管理                                                   │
+# │   └─ 完全卸载                                                       │
+# └───────────────────────────────────────────────────────────────────┘
 #
-# v1.8.0-dev1:
-#   - 新增 VPS 服务端分流：全局默认出口 + 按服务规则覆盖 + IPv4/IPv6 指定
-#   - 新增 Cloudflare 官方 WARP Local Proxy 出口（MASQUE / SOCKS5）
-#   - 新增 SS2022 / SOCKS5 落地节点，支持多个落地节点与单独测试
-#   - 内置 OpenAI、Netflix、YouTube、Google、Telegram、MyTVSuper、Apple TV+、TikTok 规则
-#   - SS2022 / SS2022+ShadowTLS / VLESS Reality 参与服务端分流；Snell v5 保持官方 snell-server，由 Surge Rules 分流
-#   - 分流状态统一保存于 /etc/ss2022/routing.json，并分别生成 sing-box / Xray 路由配置
+# 核心设计原则:
+#   1. Snell 保持官方 snell-server v5，不参与 VPS 服务端分流。
+#   2. 分流状态只有一个事实来源: /etc/ss2022/routing.json。
+#   3. Realm 转发状态只有一个事实来源: /etc/ss2022/forwarding.json。
+#   4. 修改配置先生成候选文件并调用核心自检，通过后才替换正式配置。
+#   5. Xray / Realm 使用 ss2022 独立命名空间，不覆盖服务器已有同名服务。
 #
-# v1.7.0:
-#   - 修复 Xray 临时配置文件无法自动识别 JSON 格式：校验时显式使用 -format json
-#   - Xray 组件全面命名空间隔离：ss2022-xray.service / /usr/local/lib/ss2022/xray / /etc/ss2022-xray/config.json
-#   - 不再覆盖或管理服务器已有的 /usr/local/bin/xray、xray.service、/usr/local/etc/xray/config.json
-#   - VLESS Reality 仍固定使用 Xray-core v26.3.27 + SHA256 校验
+# 代码导航（按文件从上到下）:
+#   [01] 常量与路径
+#   [02] 通用工具与状态面板
+#   [03] 系统网络环境（DNS / 时间同步 / IPv4 / IPv6）
+#   [04] 状态文件与 sing-box 基础设施
+#   [05] 节点参数 / 客户端配置输出
+#   [06] 协议更新与删除
+#   [07] 协议部署、Xray 与 Snell 基础设施
+#   [08] 节点配置查看
+#   [09] 服务端分流（WARP / Chain / Rules）
+#   [10] Realm L4 端口转发
+#   [11] 服务运维与彻底卸载
+#   [12] 组件版本管理
+#   [13] 菜单与程序入口
 #
-# v1.7.0-dev8:
-#   - VLESS Reality 服务端由 sing-box 改为 Xray-core v26.3.27（官方稳定版）
-#   - 规避 sing-box Reality 客户端/服务端互联的已知 verification failed / processed invalid connection 问题
-#   - Xray 固定版本 + SHA256 校验，amd64/arm64
-#   - 旧 sing-box VLESS 可识别并删除；为保证回滚清晰，不做隐式跨核心迁移
-#   - SS2022 / SS2022+ShadowTLS 继续使用 sing-box；Snell v5 保持不变
+# v1.8.0-dev4（本次仅做代码审计/整理，不新增业务功能）:
+#   - 删除无调用的开发残留函数和无用全局变量
+#   - 精简顶部历史注释，增加架构总览和代码导航
+#   - 统一模块分区标题，降低 5000+ 行单文件的阅读成本
+#   - 清理 dev8/dev9 等开发阶段提示，改为面向正式逻辑的描述
+#   - 抽取服务日志/重启公共 helper，减少运维菜单重复代码
 #
-# v1.7.0-dev7:
-#   - 修复 VLESS Reality 服务端 TLS 缺少 server_name 的问题
-#   - tls.server_name 与 reality.handshake.server 始终保持一致
-#   - 避免客户端 SNI 与服务端 Reality 接受的 ServerName 不一致导致 processed invalid connection
+# 版本主线:
+#   v1.7.0       四协议稳定基线
+#   v1.8.0-dev1  服务端分流
+#   v1.8.0-dev2  Realm L4 转发
+#   v1.8.0-dev3  协议/组件/卸载菜单重构
+#   v1.8.0-dev4  代码审计、瘦身与结构化
 #
-# v1.7.0-dev6:
-#   - 修复 VLESS Reality 服务端 inbound 错误写入 network 字段的问题
-#   - sing-box 1.13.20 的 VLESS inbound 不支持 network 字段；仅 VLESS outbound 支持该字段
-#   - 修复后可正常按项更新 Reality SNI，失败时仍保持原配置不变
-#
-# v1.7.0-dev5:
-#   - 修复“更新”仍然进入整套部署问答的问题
-#   - 四种协议的更新统一改为“当前配置 + 按项修改”菜单
-#   - 修改单一参数时不再要求重填网络/端口/SNI/地址等无关参数
-#   - VLESS 可单独修改 Reality SNI，默认保留 UUID / Reality Key / Short ID
-#
-# v1.7.0-dev4:
-#   - 四种代理模式统一改为二级管理菜单：部署 / 更新 / 删除
-#   - 部署：仅用于新建节点；检测到已存在时拒绝覆盖
-#   - 更新：保留现有密钥/UUID/PSK，仅修改端口、网络、SNI、UDP、服务器地址等配置
-#   - 删除：在对应协议菜单内直接删除，不再要求进入服务运维菜单
-#   - VLESS Reality 更新不会重新生成 UUID / Reality Key / Short ID
-#
-# v1.7.0-dev3:
-#   - 节点输出统一增加：通用/分享信息、Surge、Loon、FlClash(Mihomo)、Shadowrocket、二维码
-#   - VLESS Reality 默认握手目标改为 swdist.apple.com，可快捷选择 www.icloud.com 或自定义
-#   - 对客户端不支持的协议明确标注，不生成伪配置
-#
-# v1.7.0-dev2:
-#   - 修复 VLESS Reality 默认握手目标：由 www.microsoft.com 改为 www.cloudflare.com
-#   - VLESS Reality 显式限定 TCP，并提示 Surge 不支持 VLESS
-#
-# v1.7.0-dev1:
-#   - 保留 v1.6.1 SS2022 / IPv4 / IPv6 / 时间同步 / SHA256 / 非 root / 回滚机制
-#   - 新增 SS2022 + ShadowTLS v3（sing-box chained inbound）
-#   - 新增 VLESS Reality（sing-box）
-#   - 新增 Snell v5.0.1（Surge 官方 snell-server，独立 systemd）
-#   - ShadowTLS UDP Relay 可选，启用时使用独立 SS2022 UDP 端口
-#   - sing-box 多协议入口可共存，按 tag 增删，不再互相覆盖
-#
-# 注意:
-#   这是 v1.8.0 分流功能开发版。建议先在测试 VPS 验证，不要直接覆盖 v1.7.0 Release。
+# 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 
-SCRIPT_VERSION="v1.8.0-dev3"
-AUTHOR="DevOps"
+# [01] 常量与路径
+SCRIPT_VERSION="v1.8.0-dev4"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 PLAIN='\033[0m'
 
@@ -158,6 +139,10 @@ SS_KEY=""
 SERVER_HOST=""
 NETWORK_MODE=""
 LISTEN_ADDR=""
+
+# ==============================================================================
+# [02] 通用工具与状态面板
+# ==============================================================================
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -362,6 +347,10 @@ show_dashboard() {
     fi
     echo -e "${CYAN}═════════════════════════════════════════════════════════════════${PLAIN}"
 }
+
+# ==============================================================================
+# [03] 系统网络环境：DNS / 时间同步 / IPv4 / IPv6
+# ==============================================================================
 
 restore_ipv4_apt_and_dns_if_needed() {
     rm -f "$FORCE_IPV6_CONF"
@@ -606,6 +595,10 @@ select_network_mode() {
         esac
     done
 }
+
+# ==============================================================================
+# [04] 状态文件与 sing-box 基础设施
+# ==============================================================================
 
 ensure_state_file() {
     mkdir -p "$STATE_DIR" || return 1
@@ -1154,6 +1147,10 @@ show_qr() {
     fi
 }
 
+# ==============================================================================
+# [05] 节点参数与客户端配置输出
+# ==============================================================================
+
 show_ss_details() {
     local host="$1" port="$2" method="$3" pass="$4"
     local tag="Proxy-SS2022"
@@ -1462,6 +1459,10 @@ protocol_exists_snell() {
     [[ -f "$SNELL_CONF" ]]
 }
 
+# ==============================================================================
+# [06] 协议更新与删除
+# ==============================================================================
+
 update_ss2022() {
     local excluded_tags='["ss-in"]'
     local choice="" current_port current_method current_key current_listen current_host current_network
@@ -1693,7 +1694,7 @@ update_vless_reality() {
     local REALITY_PRIVATE_KEY="" REALITY_PUBLIC_KEY=""
     if ! xray_vless_exists; then
         if json_has_inbound_tag "$TAG_VLESS"; then
-            echo -e "${YELLOW}[旧 sing-box VLESS] dev8 不做隐式跨核心更新。请先删除旧 VLESS，再部署 Xray 版。${PLAIN}"
+            echo -e "${YELLOW}[旧 sing-box VLESS] 当前版本不做隐式跨核心迁移。请先删除旧 VLESS，再部署 Xray 版。${PLAIN}"
         else
             echo -e "${YELLOW}未部署 VLESS Reality，请先选择“部署”。${PLAIN}"
         fi
@@ -1936,6 +1937,10 @@ protocol_action_menu() {
     done
 }
 
+# ==============================================================================
+# [07] 协议部署、Xray 与 Snell 基础设施
+# ==============================================================================
+
 deploy_ss2022() {
     local excluded_tags='["ss-in"]'
     local inbound add_json
@@ -2101,19 +2106,6 @@ deploy_shadowtls() {
     pause
 }
 
-generate_reality_keypair() {
-    local keys private public
-
-    keys=$("$SINGBOX_BIN" generate reality-keypair 2>/dev/null) || return 1
-    private=$(printf '%s\n' "$keys" | awk -F': *' '/PrivateKey/ {print $2; exit}')
-    public=$(printf '%s\n' "$keys" | awk -F': *' '/PublicKey/ {print $2; exit}')
-
-    [[ -n "$private" && -n "$public" ]] || return 1
-    REALITY_PRIVATE_KEY="$private"
-    REALITY_PUBLIC_KEY="$public"
-    return 0
-}
-
 deploy_vless_reality() {
     local vless_port uuid sni short_id reality_sni_choice
     local REALITY_PRIVATE_KEY="" REALITY_PUBLIC_KEY=""
@@ -2122,12 +2114,12 @@ deploy_vless_reality() {
     fi
     if json_has_inbound_tag "$TAG_VLESS"; then
         echo -e "${YELLOW}[检测到旧配置] 当前 VLESS Reality 仍由 sing-box 承载。${PLAIN}"
-        echo -e "${YELLOW}dev8 起 VLESS 改用 Xray；dev9 起使用独立 ss2022-xray 服务。为避免端口冲突和隐式迁移，请先：VLESS Reality → 删除，再重新部署。${PLAIN}"
+        echo -e "${YELLOW}当前版本的 VLESS Reality 使用独立 ss2022-xray 服务。为避免与旧 sing-box VLESS 端口冲突，请先删除旧 VLESS，再重新部署。${PLAIN}"
         pause; return
     fi
     select_network_mode || return
     if [[ -x /usr/local/bin/xray ]] || systemctl cat xray.service >/dev/null 2>&1 || [[ -f /usr/local/etc/xray/config.json ]]; then
-        echo -e "${YELLOW}[提示] 检测到服务器已有 Xray。dev9 使用独立 ss2022-xray 服务、二进制和配置，不会覆盖或重启现有 xray.service。${PLAIN}"
+        echo -e "${YELLOW}[提示] 检测到服务器已有 Xray。本脚本使用独立 ss2022-xray 服务、二进制和配置，不会覆盖或重启现有 xray.service。${PLAIN}"
     fi
     install_xray_core || { pause; return; }
     ask_xray_port "请输入 VLESS Reality 监听端口" "443" || return
@@ -2625,6 +2617,10 @@ CONFIG
     pause
 }
 
+# ==============================================================================
+# [08] 节点配置查看
+# ==============================================================================
+
 view_ss2022_config() {
     local host port method pass listen ip_type
     json_has_inbound_tag "$TAG_SS" || {
@@ -2683,7 +2679,7 @@ view_vless_config() {
     local host port uuid sni private public short_id listen out
     if ! xray_vless_exists; then
         if json_has_inbound_tag "$TAG_VLESS"; then
-            echo -e "${YELLOW}检测到旧 sing-box VLESS Reality。dev8 起请删除后重新部署为 Xray 版。${PLAIN}"
+            echo -e "${YELLOW}检测到旧 sing-box VLESS Reality。当前版本请删除后重新部署为 Xray 版。${PLAIN}"
         else
             echo -e "${YELLOW}未部署 VLESS Reality。${PLAIN}"
         fi
@@ -2773,55 +2769,9 @@ remove_singbox_mode() {
     return 1
 }
 
-remove_protocol_menu() {
-    while true; do
-        clear
-        echo -e "${CYAN}════════════════════ 删除单个协议 ════════════════════${PLAIN}"
-        echo "  1. 删除 SS2022"
-        echo "  2. 删除 SS2022 + ShadowTLS v3"
-        echo "  3. 删除 VLESS Reality"
-        echo "  4. 删除 Snell v5 配置/服务（保留二进制）"
-        echo "  0. 返回"
-        read -rp "请选择 [0-4]: " c
-        case "$c" in
-            1)
-                read -rp "确认删除 SS2022？[y/N]: " yes
-                [[ "$yes" =~ ^[Yy]$ ]] && remove_singbox_mode ss
-                pause
-                ;;
-            2)
-                read -rp "确认删除 SS2022 + ShadowTLS？[y/N]: " yes
-                [[ "$yes" =~ ^[Yy]$ ]] && remove_singbox_mode stls
-                pause
-                ;;
-            3)
-                read -rp "确认删除 VLESS Reality？[y/N]: " yes
-                [[ "$yes" =~ ^[Yy]$ ]] && remove_singbox_mode vless
-                pause
-                ;;
-            4)
-                read -rp "确认删除 Snell v5 配置与服务？[y/N]: " yes
-                if [[ "$yes" =~ ^[Yy]$ ]]; then
-                    systemctl disable --now snell-v5 >/dev/null 2>&1 || true
-                    rm -f "$SNELL_CONF" "$SNELL_SERVICE"
-                    remove_mode_state "snell" || true
-                    systemctl daemon-reload || true
-                    echo -e "${GREEN}✔ Snell v5 节点已删除，二进制保留。${PLAIN}"
-                fi
-                pause
-                ;;
-            0) return ;;
-            *) sleep 1 ;;
-        esac
-    done
-}
 
 # ==============================================================================
-# v1.8.0 分流模块
-# - 适用入口：SS2022 / SS2022+ShadowTLS / VLESS Reality
-# - Snell v5 保持官方 snell-server，不参与服务端分流
-# - 出口：DIRECT / Cloudflare WARP Local Proxy / SS2022 或 SOCKS5 落地节点
-# - 规则：全局默认出口 + 按服务覆盖 + IPv4/IPv6 选择
+# [09] 服务端分流：WARP / Chain / Rules
 # ==============================================================================
 
 routing_init_state() {
@@ -2861,8 +2811,6 @@ EOF
     mv -f "$tmp" "$ROUTING_FILE"
     chmod 600 "$ROUTING_FILE"
 }
-
-
 
 
 routing_commit_state_candidate() {
@@ -2968,12 +2916,6 @@ routing_preset_rule_exists() {
     routing_init_state || return 1
     [[ "$service" != "custom" ]] || return 1
     jq -e --arg service "$service" 'any(.rules[]?; .service==$service)' "$ROUTING_FILE" >/dev/null 2>&1
-}
-
-routing_node_exists() {
-    local id="$1"
-    routing_init_state || return 1
-    jq -e --arg id "$id" '.chain_nodes[]? | select(.id==$id)' "$ROUTING_FILE" >/dev/null 2>&1
 }
 
 
@@ -3944,7 +3886,7 @@ routing_test_effect() {
     fi
     echo ""
     echo -e "${YELLOW}[说明] 规则出口验证会验证“目标出口 + 地址族”是否可用；服务域名匹配仍以运行时规则命中为准。${PLAIN}"
-    echo -e "${YELLOW}WARP Local Proxy 为应用层代理；QUIC/UDP 不作为 v1.8.0-dev1 的 WARP 分流保证范围。${PLAIN}"
+    echo -e "${YELLOW}WARP Local Proxy 为应用层代理；当前实现不保证 QUIC/UDP 经 WARP 分流。${PLAIN}"
 }
 
 routing_management() {
@@ -3986,12 +3928,8 @@ routing_management() {
 }
 
 
-
 # ==============================================================================
-# v1.8.0-dev2 Realm L4 端口转发模块
-# - 只保留核心端口转发：单端口 / 端口段、TCP / UDP / TCP+UDP、IPv4 / IPv6 / 双栈
-# - 不启用 MPTCP / TLS / WS / WSS / Proxy Protocol / 负载均衡 / 故障转移
-# - 独立命名空间，避免覆盖服务器已有 realm.service / /usr/local/bin/realm
+# [10] Realm L4 端口转发
 # ==============================================================================
 
 ensure_realm_user() {
@@ -4948,6 +4886,10 @@ forwarding_management() {
 }
 
 
+# ==============================================================================
+# [11] 服务运维与彻底卸载
+# ==============================================================================
+
 show_service_status() {
     echo ""
     echo -e "${YELLOW}【sing-box】${PLAIN}"
@@ -5036,6 +4978,10 @@ full_uninstall() {
     exit 0
 }
 
+
+# ==============================================================================
+# [12] 组件版本管理
+# ==============================================================================
 
 get_singbox_version_raw() {
     if [[ -x "$SINGBOX_BIN" ]]; then
@@ -5314,6 +5260,10 @@ component_version_management() {
     done
 }
 
+# ==============================================================================
+# [13] 菜单与程序入口
+# ==============================================================================
+
 protocol_management() {
     while true; do
         clear
@@ -5336,6 +5286,21 @@ protocol_management() {
     done
 }
 
+follow_service_log() {
+    local service="$1"
+    journalctl -u "$service" -f -n 30
+}
+
+restart_service_safe() {
+    local service="$1" label="$2"
+    if systemctl restart "$service"; then
+        echo -e "${GREEN}✔ ${label} 已重启。${PLAIN}"
+    else
+        journalctl -u "$service" -n 30 --no-pager 2>/dev/null || true
+        return 1
+    fi
+}
+
 service_management() {
     while true; do
         clear
@@ -5355,14 +5320,14 @@ service_management() {
         read -rp "请选择 [0-10]: " c
         case "$c" in
             1) show_service_status; pause ;;
-            2) journalctl -u sing-box -f -n 30 ;;
-            3) journalctl -u "$XRAY_SERVICE_NAME" -f -n 30 ;;
-            4) journalctl -u snell-v5 -f -n 30 ;;
-            5) journalctl -u "$REALM_SERVICE_NAME" -f -n 30 ;;
-            6) if systemctl restart sing-box; then echo -e "${GREEN}✔ sing-box 已重启。${PLAIN}"; else journalctl -u sing-box -n 30 --no-pager; fi; pause ;;
-            7) if systemctl restart "$XRAY_SERVICE_NAME"; then echo -e "${GREEN}✔ ss2022-xray 已重启。${PLAIN}"; else journalctl -u "$XRAY_SERVICE_NAME" -n 30 --no-pager; fi; pause ;;
-            8) if systemctl restart snell-v5; then echo -e "${GREEN}✔ Snell v5 已重启。${PLAIN}"; else journalctl -u snell-v5 -n 30 --no-pager; fi; pause ;;
-            9) if systemctl restart "$REALM_SERVICE_NAME"; then echo -e "${GREEN}✔ Realm 转发已重启。${PLAIN}"; else journalctl -u "$REALM_SERVICE_NAME" -n 30 --no-pager; fi; pause ;;
+            2) follow_service_log sing-box ;;
+            3) follow_service_log "$XRAY_SERVICE_NAME" ;;
+            4) follow_service_log snell-v5 ;;
+            5) follow_service_log "$REALM_SERVICE_NAME" ;;
+            6) restart_service_safe sing-box "sing-box"; pause ;;
+            7) restart_service_safe "$XRAY_SERVICE_NAME" "ss2022-xray"; pause ;;
+            8) restart_service_safe snell-v5 "Snell v5"; pause ;;
+            9) restart_service_safe "$REALM_SERVICE_NAME" "Realm 转发"; pause ;;
             10) systemctl list-timers --all | grep -E 'keepalive|NEXT' || echo "未检测到 Keepalive 定时器。"; pause ;;
             0) return ;;
             *) sleep 1 ;;
