@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.0-dev13
+# 当前版本: v1.8.0-dev14
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -86,6 +86,12 @@
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
 #
+# v1.8.0-dev14:
+# - Shadowsocks 落地导入不再由 Bash 强制校验 SS2022 Key/Base64 长度；保留解析后的原始 password。
+# - SS2022 落地在 VLESS/Xray 链路中优先使用 Xray 原生 Shadowsocks outbound。
+# - sing-box 本地 Bridge 仅保留给 Xray 不支持、但 sing-box 支持的标准/Legacy Shadowsocks 算法。
+# - 落地节点测试与分流出口测试按实际核心能力选择 Xray 或 sing-box。
+#
 # v1.8.0-dev13:
 #   - 修复 SS2022 EIH / 多用户落地密码被误判为 Key 长度非法
 #   - 支持 iPSK:uPSK 与多级 iPSK:...:uPSK 组合密码
@@ -112,7 +118,7 @@
 # ==============================================================================
 
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.0-dev13"
+SCRIPT_VERSION="v1.8.0-dev14"
 
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
@@ -3120,8 +3126,9 @@ normalize_standard_ss_method() {
     esac
 }
 
-# 标准 Shadowsocks 落地由 sing-box 作为“能力上限”。
-# Xray 只原生支持其中一部分算法；其余算法在 VLESS 路径中通过本地 SOCKS Bridge 交给 sing-box。
+# Shadowsocks 落地能力判断：
+# - SS2022 与常见 AEAD 优先由 Xray 原生直连；
+# - aes-192-gcm / Legacy 等 Xray 不支持的方法，才通过 sing-box 本地 Bridge。
 singbox_supports_standard_ss_method() {
     case "$1" in
         aes-128-gcm|aes-192-gcm|aes-256-gcm|chacha20-ietf-poly1305|xchacha20-ietf-poly1305|\
@@ -3131,8 +3138,9 @@ singbox_supports_standard_ss_method() {
     esac
 }
 
-xray_supports_standard_ss_method() {
+xray_supports_ss_method() {
     case "$1" in
+        2022-blake3-aes-128-gcm|2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305|\
         aes-128-gcm|aes-256-gcm|chacha20-ietf-poly1305|xchacha20-ietf-poly1305) return 0 ;;
         *) return 1 ;;
     esac
@@ -3207,73 +3215,8 @@ chain_node_type_label() {
     esac
 }
 
-ss2022_expected_key_bytes() {
-    case "$1" in
-        2022-blake3-aes-128-gcm) echo 16 ;;
-        2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) echo 32 ;;
-        *) return 1 ;;
-    esac
-}
-
-normalize_ss2022_psk_component() {
-    # SS2022 PSK 规范使用标准 Base64。为了兼容部分分享链接，额外接受
-    # Base64URL 字符和省略的 padding，校验后统一输出标准 Base64。
-    local key="$1" expected_bytes="$2" normalized mod tmp decoded_bytes
-    [[ -n "$key" ]] || return 1
-
-    normalized=${key//-/+}
-    normalized=${normalized//_/\/}
-    [[ "$normalized" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || return 1
-
-    # '=' 只能出现在尾部；若分享链接省略 padding，则补齐。
-    normalized=${normalized%=}
-    normalized=${normalized%=}
-    mod=$(( ${#normalized} % 4 ))
-    [[ $mod -eq 1 ]] && return 1
-    [[ $mod -eq 2 ]] && normalized+="=="
-    [[ $mod -eq 3 ]] && normalized+="="
-
-    tmp=$(mktemp) || return 1
-    if ! printf '%s' "$normalized" | base64 --decode > "$tmp" 2>/dev/null; then
-        rm -f "$tmp"
-        return 1
-    fi
-    decoded_bytes=$(wc -c < "$tmp" | tr -d ' ')
-    [[ "$decoded_bytes" -eq "$expected_bytes" ]] || { rm -f "$tmp"; return 1; }
-
-    # 重新编码，避免 URL-safe / padding 差异传入 sing-box / Xray。
-    SS2022_PSK_COMPONENT_NORMALIZED=$(base64 -w 0 < "$tmp" 2>/dev/null || base64 < "$tmp" | tr -d '\n')
-    rm -f "$tmp"
-    [[ -n "$SS2022_PSK_COMPONENT_NORMALIZED" ]]
-}
-
-normalize_ss2022_outbound_password() {
-    # EIH 客户端密码格式: iPSK:iPSK:...:uPSK。
-    # 单用户场景则只有一个 PSK。每段都必须满足当前 method 的 Key 长度。
-    local method="$1" pass="$2" bytes part normalized="" count=0
-    local -a parts
-    bytes=$(ss2022_expected_key_bytes "$method") || return 1
-    [[ -n "$pass" ]] || return 1
-
-    IFS=':' read -r -a parts <<< "$pass"
-    [[ ${#parts[@]} -ge 1 ]] || return 1
-    for part in "${parts[@]}"; do
-        normalize_ss2022_psk_component "$part" "$bytes" || return 1
-        if [[ -n "$normalized" ]]; then
-            normalized+=":"
-        fi
-        normalized+="$SS2022_PSK_COMPONENT_NORMALIZED"
-        count=$((count+1))
-    done
-
-    SS2022_PASSWORD_NORMALIZED="$normalized"
-    SS2022_PASSWORD_SEGMENTS="$count"
-    return 0
-}
-
-validate_ss2022_outbound() {
-    normalize_ss2022_outbound_password "$1" "$2" >/dev/null
-}
+# 导入的 SS2022 落地节点不在 Bash 层重复校验/重编码 PSK。
+# ss:// 解析后保留 password 原值，由 Xray / sing-box 自身配置校验负责协议合法性。
 
 
 routing_choose_outbound() {
@@ -3439,7 +3382,7 @@ xray_outbound_for_node() {
             local method bridge_required bridge_port
             method=$(jq -r '.method' <<<"$node")
             bridge_required=$(jq -r '.bridge_required // false' <<<"$node")
-            if [[ "$bridge_required" == "true" ]] || ! xray_supports_standard_ss_method "$method"; then
+            if [[ "$bridge_required" == "true" ]] || ! xray_supports_ss_method "$method"; then
                 bridge_port=$(jq -r '.bridge_port // 0' <<<"$node")
                 [[ "$bridge_port" =~ ^[0-9]+$ && "$bridge_port" -gt 0 ]] || return 1
                 jq -nc --arg tag "$tag" --argjson port "$bridge_port" --arg ts "$strategy" '{protocol:"socks",tag:$tag,targetStrategy:$ts,settings:{address:"127.0.0.1",port:$port}}'
@@ -3823,20 +3766,15 @@ chain_add_shadowsocks() {
     echo "密码   : $([[ -n "$pass" ]] && echo '已解析' || echo '解析失败')"
 
     if [[ "$ss_kind" == "ss2022" ]]; then
-        if ! normalize_ss2022_outbound_password "$method" "$pass"; then
-            local expected_bytes
-            expected_bytes=$(ss2022_expected_key_bytes "$method" 2>/dev/null || echo "未知")
-            echo -e "${RED}[错误] SS2022 Key 格式不合法: ${method}${PLAIN}"
-            echo "要求：每个 PSK 都必须是有效 Base64，解码后为 ${expected_bytes} 字节。"
-            echo "兼容：单 PSK，以及 EIH 多用户格式 iPSK:uPSK / iPSK:...:uPSK。"
+        if [[ -z "$pass" ]]; then
+            echo -e "${RED}[错误] ss:// URI 密码解析失败或密码为空。${PLAIN}"
             return 1
         fi
-        pass="$SS2022_PASSWORD_NORMALIZED"
-        if [[ "${SS2022_PASSWORD_SEGMENTS:-1}" -gt 1 ]]; then
-            echo -e "${GREEN}✔ 已识别 SS2022 EIH 多用户密码：${SS2022_PASSWORD_SEGMENTS} 段 PSK。${PLAIN}"
-        else
-            echo -e "${GREEN}✔ SS2022 PSK 长度校验通过。${PLAIN}"
+        if ! xray_supports_ss_method "$method"; then
+            echo -e "${RED}[错误] 当前 Xray 不支持该 SS2022 算法: ${method}${PLAIN}"
+            return 1
         fi
+        echo -e "${GREEN}✔ 已识别 SS2022；保留节点原始 password，由协议核心执行合法性校验。${PLAIN}"
         id="n$(date +%s)${RANDOM}"
         node=$(jq -nc --arg id "$id" --arg name "$name" --arg server "$server" --argjson port "$port" --arg method "$method" --arg pass "$pass" \
             '{id:$id,name:$name,type:"ss2022",server:$server,port:$port,method:$method,password:$pass}')
@@ -3844,6 +3782,9 @@ chain_add_shadowsocks() {
         jq --argjson n "$node" '.chain_nodes += [$n]' "$ROUTING_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
         routing_commit_state_candidate "$tmp" || return 1
         echo -e "${GREEN}✔ Shadowsocks 落地节点 ${name} 已添加（SS2022）。${PLAIN}"
+        if xray_vless_exists; then
+            echo -e "${GREEN}  VLESS/Xray: Xray 原生直连${PLAIN}"
+        fi
         return 0
     fi
 
@@ -3864,7 +3805,7 @@ chain_add_shadowsocks() {
     fi
 
     # Xray 不原生支持的标准 SS 算法，通过 sing-box 本地 SOCKS Bridge 兼容。
-    if ! xray_supports_standard_ss_method "$method"; then
+    if ! xray_supports_ss_method "$method"; then
         bridge_required=true
         bridge_port=$(allocate_ss_bridge_port) || {
             echo -e "${RED}[错误] 无法分配本地 SS Bridge 端口。${PLAIN}"
@@ -3961,10 +3902,10 @@ test_shadowsocks_node_with_singbox() {
 test_shadowsocks_node_with_xray() {
     local node="$1" family="${2:-default}" port cfg pid out rc=1 n=19180 url method strategy="AsIs"
     url=$(ip_echo_url_for_family "$family")
-    [[ -x "$XRAY_BIN" ]] || { echo -e "${YELLOW}[提示] 未安装可用的 Xray/sing-box，无法执行 Shadowsocks 落地实连测试。${PLAIN}"; return 1; }
+    [[ -x "$XRAY_BIN" ]] || { echo -e "${YELLOW}[提示] 未安装 Xray，无法使用 Xray 执行 Shadowsocks 落地实连测试。${PLAIN}"; return 1; }
     method=$(jq -r '.method' <<<"$node")
-    xray_supports_standard_ss_method "$method" || {
-        echo -e "${YELLOW}[提示] ${method} 需要 sing-box 才能测试；当前 sing-box 未安装。${PLAIN}"
+    xray_supports_ss_method "$method" || {
+        echo -e "${YELLOW}[提示] Xray 不原生支持 ${method}，应改由 sing-box 测试。${PLAIN}"
         return 1
     }
     [[ "$family" == "ipv4" ]] && strategy="ForceIPv4"
@@ -3987,6 +3928,25 @@ test_shadowsocks_node_with_xray() {
     echo -e "${RED}[错误] Shadowsocks 落地节点测试失败。${PLAIN}"; tail -n 10 /tmp/ss2022-xray-chain-test.log 2>/dev/null || true; return 1
 }
 
+
+test_shadowsocks_node_auto() {
+    local node="$1" family="${2:-default}" method
+    method=$(jq -r '.method' <<<"$node")
+
+    # 能由 Xray 原生处理时优先用 Xray 测试，和 VLESS 实际链式路径保持一致。
+    if [[ -x "$XRAY_BIN" ]] && xray_supports_ss_method "$method"; then
+        test_shadowsocks_node_with_xray "$node" "$family"
+        return $?
+    fi
+    if [[ -x "$SINGBOX_BIN" ]]; then
+        test_shadowsocks_node_with_singbox "$node" "$family"
+        return $?
+    fi
+
+    echo -e "${YELLOW}[提示] 当前没有可用于 ${method} 的 Shadowsocks 核心。${PLAIN}"
+    return 1
+}
+
 chain_test_node() {
     chain_select_id || return 1
     local node type server port user pass out
@@ -3994,15 +3954,8 @@ chain_test_node() {
     type=$(jq -r '.type' <<<"$node")
     echo -e "${YELLOW}>> 测试 $(jq -r '.name' <<<"$node")...${PLAIN}"
     case "$type" in
-        ss2022)
-            test_shadowsocks_node_with_singbox "$node" default
-            ;;
-        shadowsocks)
-            if [[ -x "$SINGBOX_BIN" ]]; then
-                test_shadowsocks_node_with_singbox "$node" default
-            else
-                test_shadowsocks_node_with_xray "$node" default
-            fi
+        ss2022|shadowsocks)
+            test_shadowsocks_node_auto "$node" default
             ;;
         socks5)
             server=$(jq -r '.server' <<<"$node"); port=$(jq -r '.port' <<<"$node"); user=$(jq -r '.username // ""' <<<"$node"); pass=$(jq -r '.password // ""' <<<"$node")
@@ -4294,7 +4247,7 @@ routing_test_exit_ref() {
                 else out=$(curl -fsS --connect-timeout 8 --max-time 15 --socks5-hostname "${server}:${sport}" "$url" 2>/dev/null) && rc=0; fi
                 ;;
             ss2022|shadowsocks)
-                test_shadowsocks_node_with_singbox "$node" "$family" && return 0 || return 1
+                test_shadowsocks_node_auto "$node" "$family" && return 0 || return 1
                 ;;
             *)
                 return 1
