@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.0-dev19
+# 当前版本: v1.8.0-dev20
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -86,6 +86,12 @@
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
 #
+# v1.8.0-dev20:
+#   - 修复服务器测试工具对第三方脚本 exit code 的误判
+#   - IP质量 / 流媒体 / AI 测试先下载到临时文件，再执行，下载失败与脚本运行结果分离
+#   - 第三方检测脚本完成后即使返回非 0，也不再额外显示“执行失败”
+#   - AutoTrace 同步取消对第三方返回码的二次错误判定
+#
 # v1.8.0-dev19:
 #   - 四种协议节点支持自定义节点名称，直接回车使用原默认名称
 #   - 节点名称保存到 /etc/ss2022/state.json，并用于 URI / Surge / Loon / Mihomo / 二维码参数
@@ -155,12 +161,13 @@
 #   v1.8.0-dev17 WARP 三种出口模式固定可选 / 按 VPS 网络自动推荐
 #   v1.8.0-dev18 服务器测试工具正式接入
 #   v1.8.0-dev19 协议节点自定义名称 / 旧节点在线改名
+#   v1.8.0-dev20 第三方测试脚本返回码误判修复
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.0-dev19"
+SCRIPT_VERSION="v1.8.0-dev20"
 
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
@@ -6442,6 +6449,41 @@ show_external_test_source() {
     echo ""
 }
 
+run_external_curl_test() {
+    local label="$1"
+    local url="$2"
+    shift 2
+
+    local tmp=""
+    tmp=$(mktemp /tmp/ss2022-external-test.XXXXXX.sh) || {
+        echo -e "${RED}[错误] 无法创建临时测试文件。${PLAIN}"
+        return 1
+    }
+
+    if ! curl -fLsS --retry 2 --retry-delay 1 \
+        --connect-timeout 10 --max-time 60 \
+        "$url" -o "$tmp"; then
+        rm -f "$tmp"
+        echo -e "${RED}[错误] ${label}脚本下载失败。${PLAIN}"
+        return 1
+    fi
+
+    if [[ ! -s "$tmp" ]]; then
+        rm -f "$tmp"
+        echo -e "${RED}[错误] ${label}脚本下载结果为空。${PLAIN}"
+        return 1
+    fi
+
+    chmod 700 "$tmp"
+
+    # 第三方检测脚本可能用非 0 返回码表达内部检测状态。
+    # 这里不把它二次解释成“脚本执行失败”；实际检测结果以第三方输出为准。
+    bash "$tmp" "$@" || true
+
+    rm -f "$tmp"
+    return 0
+}
+
 test_ip_quality() {
     clear
     show_external_test_source "IP 质量测试" "IP.Check.Place"
@@ -6452,8 +6494,7 @@ test_ip_quality() {
         return
     }
 
-    bash <(curl -Ls https://IP.Check.Place) || \
-        echo -e "${RED}[错误] IP 质量测试脚本执行失败。${PLAIN}"
+    run_external_curl_test "IP 质量测试" "https://IP.Check.Place"
 
     echo ""
     pause
@@ -6482,7 +6523,8 @@ test_return_route() {
         -O "$tmp" \
         "https://raw.githubusercontent.com/Chennhaoo/Shell_Bash/master/AutoTrace.sh"; then
         chmod +x "$tmp"
-        bash "$tmp" || echo -e "${RED}[错误] AutoTrace 执行失败。${PLAIN}"
+        # AutoTrace 的返回码由第三方脚本自行定义，不在外层二次判定。
+        bash "$tmp" || true
     else
         echo -e "${RED}[错误] AutoTrace 下载失败。${PLAIN}"
     fi
@@ -6504,9 +6546,9 @@ test_streaming_unlock() {
         return
     }
 
-    bash <(curl -L -s \
-        "https://github.com/1-stream/RegionRestrictionCheck/raw/main/check.sh") || \
-        echo -e "${RED}[错误] 流媒体解锁测试脚本执行失败。${PLAIN}"
+    run_external_curl_test \
+        "流媒体解锁测试" \
+        "https://github.com/1-stream/RegionRestrictionCheck/raw/main/check.sh"
 
     echo ""
     pause
@@ -6527,9 +6569,10 @@ test_ai_unlock() {
         return
     }
 
-    bash <(curl -sL \
-        "https://raw.githubusercontent.com/adsorgcn/vpscheck/main/vpscheck.sh") -r 5 || \
-        echo -e "${RED}[错误] AI 工具测试脚本执行失败。${PLAIN}"
+    run_external_curl_test \
+        "AI 工具测试" \
+        "https://raw.githubusercontent.com/adsorgcn/vpscheck/main/vpscheck.sh" \
+        -r 5
 
     echo ""
     pause
