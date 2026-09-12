@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.0-dev4
+# 当前版本: v1.8.0-dev7
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -12,10 +12,12 @@
 # │   │                            └─ snell-server: Snell v5          │
 # │   ├─ 分流管理 ────────────────┬─ DIRECT                           │
 # │   │                            ├─ WARP Local Proxy                 │
-# │   │                            └─ SS2022 / SOCKS5 落地节点         │
+# │   │                            └─ SS2022 / 标准SS / SOCKS5 落地   │
 # │   ├─ 端口转发 ────────────────── Realm                              │
-# │   ├─ 服务运维                                                       │
+# │   ├─ 协议运维                                                       │
 # │   ├─ 组件版本管理                                                   │
+# │   ├─ 服务器管理工具                                                 │
+# │   ├─ 服务器测试管理                                                 │
 # │   └─ 完全卸载                                                       │
 # └───────────────────────────────────────────────────────────────────┘
 #
@@ -39,14 +41,20 @@
 #   [10] Realm L4 端口转发
 #   [11] 服务运维与彻底卸载
 #   [12] 组件版本管理
-#   [13] 菜单与程序入口
+#   [13] 菜单与程序入口（含服务器工具/测试预留入口）
 #
-# v1.8.0-dev4（本次仅做代码审计/整理，不新增业务功能）:
-#   - 删除无调用的开发残留函数和无用全局变量
-#   - 精简顶部历史注释，增加架构总览和代码导航
-#   - 统一模块分区标题，降低 5000+ 行单文件的阅读成本
-#   - 清理 dev8/dev9 等开发阶段提示，改为面向正式逻辑的描述
-#   - 抽取服务日志/重启公共 helper，减少运维菜单重复代码
+# v1.8.0-dev6:
+#   - 落地节点新增标准 Shadowsocks
+#   - 支持标准 ss:// URI 与手动输入
+#   - 菜单文案去除不必要的“代理”字样，统一使用“协议 / 落地节点”术语
+#   - “服务运维管理”更名为“协议运维管理”，为后续“服务器管理工具”留出独立边界
+#   - 标准 SS 仅开放 sing-box / Xray 都兼容的 AEAD 算法，拒绝 SIP003 插件节点
+#
+# v1.8.0-dev7:
+#   - 主菜单新增“服务器管理工具”固定入口
+#   - 主菜单新增“服务器测试管理”固定入口
+#   - 服务器测试预留 IP质量 / 路由 / 流媒体解锁 / AI工具 四类入口
+#   - 修复 Realm 服务管理函数命名残留，避免菜单调用不存在的函数
 #
 # 版本主线:
 #   v1.7.0       四协议稳定基线
@@ -54,12 +62,15 @@
 #   v1.8.0-dev2  Realm L4 转发
 #   v1.8.0-dev3  协议/组件/卸载菜单重构
 #   v1.8.0-dev4  代码审计、瘦身与结构化
+#   v1.8.0-dev5  标准 Shadowsocks 落地节点
+#   v1.8.0-dev6  菜单术语整理 / 协议运维边界
+#   v1.8.0-dev7  服务器管理 / 测试菜单定型
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.0-dev4"
+SCRIPT_VERSION="v1.8.0-dev7"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -330,7 +341,7 @@ show_dashboard() {
     fi
 
     echo -e "${CYAN}═════════════════════════════════════════════════════════════════${PLAIN}"
-    echo -e "      SS2022 多协议代理管理脚本 ${SCRIPT_VERSION}"
+    echo -e "      SS2022 多协议管理脚本 ${SCRIPT_VERSION}"
     echo -e "      快捷命令: ${GREEN}ss2022${PLAIN} 或 ${GREEN}proxy${PLAIN}"
     echo -e "${CYAN}═════════════════════════════════════════════════════════════════${PLAIN}"
     echo -e "  系统信息: ${sys_info}"
@@ -2271,7 +2282,7 @@ ask_xray_port() {
         validate_port_number "$input" || { echo -e "${RED}输入无效，请输入 1-65535。${PLAIN}"; continue; }
         if [[ -n "$current_port" && "$input" == "$current_port" ]]; then PORT="$input"; return 0; fi
         if xray_port_conflict_configured "$input" no; then
-            echo -e "${RED}[错误] 端口 ${input} 已被现有代理配置占用。${PLAIN}"; continue
+            echo -e "${RED}[错误] 端口 ${input} 已被现有协议配置占用。${PLAIN}"; continue
         fi
         pid=$(systemctl show -p MainPID --value "$XRAY_SERVICE_NAME" 2>/dev/null || true)
         if port_in_use_by_other_process "$input" "$pid" >/tmp/ss2022-port-conflict.$$ 2>/dev/null; then
@@ -2999,21 +3010,40 @@ base64url_decode() {
 }
 
 parse_ss_uri() {
-    local uri="$1" body userinfo hostport decoded host port method pass
-    uri=${uri#ss://}
+    # 兼容三类常见 Shadowsocks URI:
+    #   1) SIP002: ss://BASE64URL(method:password)@host:port
+    #   2) 明文 userinfo: ss://method:password@host:port
+    #   3) 旧格式: ss://BASE64(method:password@host:port)
+    #
+    # query/fragment 不参与核心解析；若 query 中含 plugin=，由调用方决定是否接受。
+    local raw="$1" uri query="" userinfo hostport decoded host port method pass full
+    [[ "$raw" == ss://* ]] || return 1
+    uri=${raw#ss://}
     uri=${uri%%#*}
-    uri=${uri%%\?*}
-    [[ "$uri" == *"@"* ]] || return 1
-    userinfo=${uri%@*}
-    hostport=${uri##*@}
-    if [[ "$userinfo" == *:* ]]; then
-        decoded=$(url_decode_simple "$userinfo")
-    else
-        decoded=$(base64url_decode "$userinfo") || return 1
+    if [[ "$uri" == *"?"* ]]; then
+        query=${uri#*\?}
+        uri=${uri%%\?*}
     fi
+
+    if [[ "$uri" == *"@"* ]]; then
+        userinfo=${uri%@*}
+        hostport=${uri##*@}
+        if [[ "$userinfo" == *:* ]]; then
+            decoded=$(url_decode_simple "$userinfo")
+        else
+            decoded=$(base64url_decode "$userinfo") || return 1
+        fi
+    else
+        full=$(base64url_decode "$uri") || return 1
+        [[ "$full" == *"@"* ]] || return 1
+        decoded=${full%@*}
+        hostport=${full##*@}
+    fi
+
     method=${decoded%%:*}
     pass=${decoded#*:}
     [[ "$decoded" == *:* && -n "$method" && -n "$pass" ]] || return 1
+
     if [[ "$hostport" =~ ^\[([^]]+)\]:([0-9]+)$ ]]; then
         host=${BASH_REMATCH[1]}; port=${BASH_REMATCH[2]}
     elif [[ "$hostport" =~ ^([^:]+):([0-9]+)$ ]]; then
@@ -3022,7 +3052,38 @@ parse_ss_uri() {
         return 1
     fi
     validate_port_number "$port" || return 1
-    CHAIN_SERVER="$host"; CHAIN_PORT="$port"; CHAIN_METHOD="$method"; CHAIN_PASSWORD="$pass"
+
+    CHAIN_SERVER="$host"
+    CHAIN_PORT="$port"
+    CHAIN_METHOD="$method"
+    CHAIN_PASSWORD="$pass"
+    CHAIN_SS_QUERY="$query"
+}
+
+normalize_standard_ss_method() {
+    case "$1" in
+        chacha20-poly1305) echo "chacha20-ietf-poly1305" ;;
+        xchacha20-poly1305) echo "xchacha20-ietf-poly1305" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+validate_standard_ss_outbound() {
+    local method="$1" pass="$2"
+    case "$method" in
+        aes-128-gcm|aes-256-gcm|chacha20-ietf-poly1305|xchacha20-ietf-poly1305) ;;
+        *) return 1 ;;
+    esac
+    [[ -n "$pass" ]]
+}
+
+chain_node_type_label() {
+    case "$1" in
+        ss2022) echo "SS2022" ;;
+        shadowsocks) echo "标准SS" ;;
+        socks5) echo "SOCKS5" ;;
+        *) echo "$1" ;;
+    esac
 }
 
 validate_ss2022_outbound() {
@@ -3052,7 +3113,7 @@ routing_choose_outbound() {
     while [[ $i -lt $count ]]; do
         name=$(jq -r ".[$i].name" <<<"$nodes")
         type=$(jq -r ".[$i].type" <<<"$nodes")
-        printf '  %d. %s [%s]\n' "$((i+3))" "$name" "$type"
+        printf '  %d. %s [%s]\n' "$((i+3))" "$name" "$(chain_node_type_label "$type")"
         i=$((i+1))
     done
     read -rp "请选择: " choice
@@ -3106,11 +3167,18 @@ build_singbox_routing_candidate() {
         node=$(jq -c ".[$i]" <<<"$nodes")
         type=$(jq -r '.type' <<<"$node")
         tag="route-chain-$(jq -r '.id' <<<"$node")"
-        if [[ "$type" == "ss2022" ]]; then
-            outbounds=$(jq -c --arg tag "$tag" --arg server "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" '. + [{type:"shadowsocks",tag:$tag,server:$server,server_port:$port,method:$method,password:$pass}]' <<<"$outbounds")
-        else
-            outbounds=$(jq -c --arg tag "$tag" --arg server "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg user "$(jq -r '.username // ""' <<<"$node")" --arg pass "$(jq -r '.password // ""' <<<"$node")" '. + [({type:"socks",tag:$tag,server:$server,server_port:$port} + (if $user!="" then {username:$user,password:$pass} else {} end))]' <<<"$outbounds")
-        fi
+        case "$type" in
+            ss2022|shadowsocks)
+                outbounds=$(jq -c --arg tag "$tag" --arg server "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" '. + [{type:"shadowsocks",tag:$tag,server:$server,server_port:$port,method:$method,password:$pass}]' <<<"$outbounds")
+                ;;
+            socks5)
+                outbounds=$(jq -c --arg tag "$tag" --arg server "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg user "$(jq -r '.username // ""' <<<"$node")" --arg pass "$(jq -r '.password // ""' <<<"$node")" '. + [({type:"socks",tag:$tag,server:$server,server_port:$port} + (if $user!="" then {username:$user,password:$pass} else {} end))]' <<<"$outbounds")
+                ;;
+            *)
+                echo -e "${RED}[错误] 未知落地节点类型: ${type}${PLAIN}" >&2
+                return 1
+                ;;
+        esac
         i=$((i+1))
     done
 
@@ -3172,11 +3240,17 @@ xray_outbound_for_node() {
     type=$(jq -r '.type' <<<"$node")
     [[ "$family" == "ipv4" ]] && strategy="ForceIPv4"
     [[ "$family" == "ipv6" ]] && strategy="ForceIPv6"
-    if [[ "$type" == "ss2022" ]]; then
-        jq -nc --arg tag "$tag" --arg address "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" --arg ts "$strategy" '{protocol:"shadowsocks",tag:$tag,targetStrategy:$ts,settings:{address:$address,port:$port,method:$method,password:$pass}}'
-    else
-        jq -nc --arg tag "$tag" --arg address "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg user "$(jq -r '.username // ""' <<<"$node")" --arg pass "$(jq -r '.password // ""' <<<"$node")" --arg ts "$strategy" '{protocol:"socks",tag:$tag,targetStrategy:$ts,settings:({address:$address,port:$port} + (if $user!="" then {user:$user,pass:$pass} else {} end))}'
-    fi
+    case "$type" in
+        ss2022|shadowsocks)
+            jq -nc --arg tag "$tag" --arg address "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" --arg ts "$strategy" '{protocol:"shadowsocks",tag:$tag,targetStrategy:$ts,settings:{address:$address,port:$port,method:$method,password:$pass}}'
+            ;;
+        socks5)
+            jq -nc --arg tag "$tag" --arg address "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg user "$(jq -r '.username // ""' <<<"$node")" --arg pass "$(jq -r '.password // ""' <<<"$node")" --arg ts "$strategy" '{protocol:"socks",tag:$tag,targetStrategy:$ts,settings:({address:$address,port:$port} + (if $user!="" then {user:$user,pass:$pass} else {} end))}'
+            ;;
+        *)
+            return 1
+            ;;
+    esac
 }
 
 xray_direct_outbound() {
@@ -3484,9 +3558,78 @@ chain_add_ss2022() {
     echo -e "${GREEN}✔ SS2022 落地节点 ${name} 已添加。${PLAIN}"
 }
 
+chain_add_shadowsocks() {
+    local name mode uri server port method pass id node tmp
+    read -rp "节点名称（例如 US-SS）: " name
+    [[ -n "$name" ]] || return 1
+    if routing_node_name_exists "$name"; then
+        echo -e "${RED}[错误] 落地节点名称 ${name} 已存在，请使用唯一名称。${PLAIN}"
+        return 1
+    fi
+
+    echo "  1. 粘贴 ss:// URI"
+    echo "  2. 手动输入"
+    read -rp "请选择 [1-2，默认 1]: " mode
+    mode=${mode:-1}
+
+    if [[ "$mode" == "1" ]]; then
+        read -rp "请粘贴标准 Shadowsocks ss:// URI: " uri
+        if ! parse_ss_uri "$uri"; then
+            echo -e "${RED}[错误] 无法解析该 ss:// URI。${PLAIN}"
+            return 1
+        fi
+        if [[ "${CHAIN_SS_QUERY:-}" == *"plugin="* ]]; then
+            echo -e "${RED}[错误] 当前标准 SS 落地不支持 SIP003 插件（如 v2ray-plugin / obfs）。${PLAIN}"
+            echo -e "${YELLOW}[原因] 落地节点必须同时兼容 sing-box 与 Xray，避免不同入口行为不一致。${PLAIN}"
+            return 1
+        fi
+        server="$CHAIN_SERVER"
+        port="$CHAIN_PORT"
+        method="$CHAIN_METHOD"
+        pass="$CHAIN_PASSWORD"
+    else
+        read -rp "服务器地址/域名: " server
+        read -rp "端口: " port
+        validate_port_number "$port" || { echo -e "${RED}[错误] 端口无效。${PLAIN}"; return 1; }
+        echo "请选择标准 Shadowsocks 加密算法："
+        echo "  1. aes-128-gcm"
+        echo "  2. aes-256-gcm"
+        echo "  3. chacha20-ietf-poly1305"
+        echo "  4. xchacha20-ietf-poly1305"
+        read -rp "请选择 [1-4]: " mode
+        case "$mode" in
+            1) method="aes-128-gcm" ;;
+            2) method="aes-256-gcm" ;;
+            3) method="chacha20-ietf-poly1305" ;;
+            4) method="xchacha20-ietf-poly1305" ;;
+            *) return 1 ;;
+        esac
+        read -rsp "Shadowsocks 密码: " pass
+        echo ""
+    fi
+
+    method=$(normalize_standard_ss_method "$method")
+    if ! validate_standard_ss_outbound "$method" "$pass"; then
+        echo -e "${RED}[错误] 不支持的标准 SS 算法或密码为空。${PLAIN}"
+        echo "支持: aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305 / xchacha20-ietf-poly1305"
+        return 1
+    fi
+    if [[ ${#pass} -lt 16 ]]; then
+        echo -e "${YELLOW}[提示] 当前密码少于 16 个字符；节点仍可使用，但建议落地端设置更强密码。${PLAIN}"
+    fi
+
+    id="n$(date +%s)${RANDOM}"
+    node=$(jq -nc --arg id "$id" --arg name "$name" --arg server "$server" --argjson port "$port" --arg method "$method" --arg pass "$pass" \
+        '{id:$id,name:$name,type:"shadowsocks",server:$server,port:$port,method:$method,password:$pass}')
+    tmp=$(mktemp "${STATE_DIR}/routing.json.tmp.XXXXXX") || return 1
+    jq --argjson n "$node" '.chain_nodes += [$n]' "$ROUTING_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+    routing_commit_state_candidate "$tmp" || return 1
+    echo -e "${GREEN}✔ 标准 Shadowsocks 落地节点 ${name} 已添加。${PLAIN}"
+}
+
 chain_add_socks5() {
     local name server port auth user="" pass="" id node tmp
-    echo -e "${YELLOW}[提示] SOCKS5 本身不加密；公网落地优先建议使用 SS2022，SOCKS5 仅用于可信或已受保护的链路。${PLAIN}"
+    echo -e "${YELLOW}[提示] SOCKS5 本身不加密；公网落地优先建议使用 Shadowsocks，SOCKS5 仅用于可信或已受保护的链路。${PLAIN}"
     read -rp "节点名称（例如 HK-SOCKS）: " name
     [[ -n "$name" ]] || return 1
     if routing_node_name_exists "$name"; then echo -e "${RED}[错误] 落地节点名称 ${name} 已存在，请使用唯一名称。${PLAIN}"; return 1; fi
@@ -3512,7 +3655,7 @@ chain_list_nodes() {
     i=0
     while [[ $i -lt $count ]]; do
         node=$(jq -c ".chain_nodes[$i]" "$ROUTING_FILE")
-        printf '  %d. %s [%s] %s:%s\n' "$((i+1))" "$(jq -r '.name' <<<"$node")" "$(jq -r '.type' <<<"$node")" "$(jq -r '.server' <<<"$node")" "$(jq -r '.port' <<<"$node")"
+        printf '  %d. %s [%s] %s:%s\n' "$((i+1))" "$(jq -r '.name' <<<"$node")" "$(chain_node_type_label "$(jq -r '.type' <<<"$node")")" "$(jq -r '.server' <<<"$node")" "$(jq -r '.port' <<<"$node")"
         i=$((i+1))
     done
 }
@@ -3536,10 +3679,10 @@ ip_echo_url_for_family() {
     esac
 }
 
-test_ss2022_node_with_singbox() {
+test_shadowsocks_node_with_singbox() {
     local node="$1" family="${2:-default}" port cfg pid out rc=1 n=19080 url
     url=$(ip_echo_url_for_family "$family")
-    [[ -x "$SINGBOX_BIN" ]] || { echo -e "${YELLOW}[提示] 未安装 sing-box，无法执行 SS2022 实连测试。${PLAIN}"; return 1; }
+    [[ -x "$SINGBOX_BIN" ]] || { echo -e "${YELLOW}[提示] 未安装 sing-box，无法执行 Shadowsocks 落地实连测试。${PLAIN}"; return 1; }
     while ss -H -ltn 2>/dev/null | grep -q ":${n} "; do n=$((n+1)); [[ $n -lt 19150 ]] || return 1; done
     port=$n
     cfg=$(mktemp /tmp/ss2022-chain-test.XXXXXX.json) || return 1
@@ -3550,7 +3693,7 @@ test_ss2022_node_with_singbox() {
     out=$(curl -fsS --connect-timeout 8 --max-time 15 --socks5-hostname "127.0.0.1:${port}" "$url" 2>/dev/null) && rc=0
     kill "$pid" >/dev/null 2>&1 || true; wait "$pid" 2>/dev/null || true; rm -f "$cfg"
     if [[ $rc -eq 0 ]]; then echo -e "${GREEN}✔ 落地节点可用，出口 IP: ${out}${PLAIN}"; return 0; fi
-    echo -e "${RED}[错误] SS2022 落地节点测试失败。${PLAIN}"; tail -n 10 /tmp/ss2022-chain-test.log 2>/dev/null || true; return 1
+    echo -e "${RED}[错误] Shadowsocks 落地节点测试失败。${PLAIN}"; tail -n 10 /tmp/ss2022-chain-test.log 2>/dev/null || true; return 1
 }
 
 chain_test_node() {
@@ -3559,17 +3702,24 @@ chain_test_node() {
     node=$(jq -c --arg id "$SELECTED_NODE_ID" '.chain_nodes[]|select(.id==$id)' "$ROUTING_FILE")
     type=$(jq -r '.type' <<<"$node")
     echo -e "${YELLOW}>> 测试 $(jq -r '.name' <<<"$node")...${PLAIN}"
-    if [[ "$type" == "ss2022" ]]; then
-        test_ss2022_node_with_singbox "$node" default
-    else
-        server=$(jq -r '.server' <<<"$node"); port=$(jq -r '.port' <<<"$node"); user=$(jq -r '.username // ""' <<<"$node"); pass=$(jq -r '.password // ""' <<<"$node")
-        if [[ -n "$user" ]]; then
-            out=$(curl -fsS --connect-timeout 8 --max-time 15 --proxy-user "${user}:${pass}" --socks5-hostname "${server}:${port}" https://api.ipify.org 2>/dev/null) || { echo -e "${RED}[错误] SOCKS5 测试失败。${PLAIN}"; return 1; }
-        else
-            out=$(curl -fsS --connect-timeout 8 --max-time 15 --socks5-hostname "${server}:${port}" https://api.ipify.org 2>/dev/null) || { echo -e "${RED}[错误] SOCKS5 测试失败。${PLAIN}"; return 1; }
-        fi
-        echo -e "${GREEN}✔ 落地节点可用，出口 IP: ${out}${PLAIN}"
-    fi
+    case "$type" in
+        ss2022|shadowsocks)
+            test_shadowsocks_node_with_singbox "$node" default
+            ;;
+        socks5)
+            server=$(jq -r '.server' <<<"$node"); port=$(jq -r '.port' <<<"$node"); user=$(jq -r '.username // ""' <<<"$node"); pass=$(jq -r '.password // ""' <<<"$node")
+            if [[ -n "$user" ]]; then
+                out=$(curl -fsS --connect-timeout 8 --max-time 15 --proxy-user "${user}:${pass}" --socks5-hostname "${server}:${port}" https://api.ipify.org 2>/dev/null) || { echo -e "${RED}[错误] SOCKS5 测试失败。${PLAIN}"; return 1; }
+            else
+                out=$(curl -fsS --connect-timeout 8 --max-time 15 --socks5-hostname "${server}:${port}" https://api.ipify.org 2>/dev/null) || { echo -e "${RED}[错误] SOCKS5 测试失败。${PLAIN}"; return 1; }
+            fi
+            echo -e "${GREEN}✔ 落地节点可用，出口 IP: ${out}${PLAIN}"
+            ;;
+        *)
+            echo -e "${RED}[错误] 未知落地节点类型: ${type}${PLAIN}"
+            return 1
+            ;;
+    esac
 }
 
 chain_delete_node() {
@@ -3600,7 +3750,7 @@ chain_management() {
         clear; routing_init_state || return
         local def count
         def=$(jq -r '.default_outbound' "$ROUTING_FILE"); count=$(jq '.chain_nodes|length' "$ROUTING_FILE")
-        echo -e "${CYAN}════════════════ 链式代理管理 ════════════════${PLAIN}"
+        echo -e "${CYAN}════════════════ 落地节点管理 ════════════════${PLAIN}"
         echo "默认出口 : $(routing_outbound_label "$def")"
         echo "落地节点 : ${count} 个"
         echo ""
@@ -3614,10 +3764,12 @@ chain_management() {
         case "$c" in
             1)
                 echo "  1. SS2022"
-                echo "  2. SOCKS5"
-                read -rp "节点类型 [1-2]: " t
+                echo "  2. 标准 Shadowsocks"
+                echo "  3. SOCKS5"
+                read -rp "节点类型 [1-3]: " t
                 [[ "$t" == "1" ]] && chain_add_ss2022
-                [[ "$t" == "2" ]] && chain_add_socks5
+                [[ "$t" == "2" ]] && chain_add_shadowsocks
+                [[ "$t" == "3" ]] && chain_add_socks5
                 pause ;;
             2) chain_list_nodes; pause ;;
             3) chain_delete_node; pause ;;
@@ -3839,13 +3991,19 @@ routing_test_exit_ref() {
         node=$(jq -c --arg id "$id" '.chain_nodes[]? | select(.id==$id)' "$ROUTING_FILE")
         [[ -n "$node" ]] || return 1
         type=$(jq -r '.type' <<<"$node")
-        if [[ "$type" == "socks5" ]]; then
-            server=$(jq -r '.server' <<<"$node"); sport=$(jq -r '.port' <<<"$node"); user=$(jq -r '.username // ""' <<<"$node"); pass=$(jq -r '.password // ""' <<<"$node")
-            if [[ -n "$user" ]]; then out=$(curl -fsS --connect-timeout 8 --max-time 15 --proxy-user "${user}:${pass}" --socks5-hostname "${server}:${sport}" "$url" 2>/dev/null) && rc=0
-            else out=$(curl -fsS --connect-timeout 8 --max-time 15 --socks5-hostname "${server}:${sport}" "$url" 2>/dev/null) && rc=0; fi
-        else
-            test_ss2022_node_with_singbox "$node" "$family" && return 0 || return 1
-        fi
+        case "$type" in
+            socks5)
+                server=$(jq -r '.server' <<<"$node"); sport=$(jq -r '.port' <<<"$node"); user=$(jq -r '.username // ""' <<<"$node"); pass=$(jq -r '.password // ""' <<<"$node")
+                if [[ -n "$user" ]]; then out=$(curl -fsS --connect-timeout 8 --max-time 15 --proxy-user "${user}:${pass}" --socks5-hostname "${server}:${sport}" "$url" 2>/dev/null) && rc=0
+                else out=$(curl -fsS --connect-timeout 8 --max-time 15 --socks5-hostname "${server}:${sport}" "$url" 2>/dev/null) && rc=0; fi
+                ;;
+            ss2022|shadowsocks)
+                test_shadowsocks_node_with_singbox "$node" "$family" && return 0 || return 1
+                ;;
+            *)
+                return 1
+                ;;
+        esac
     fi
     if [[ $rc -eq 0 ]]; then echo -e "${GREEN}✔ ${label} / ${family}: ${out}${PLAIN}"; return 0; fi
     echo -e "${RED}✘ ${label} / ${family}: 测试失败${PLAIN}"; return 1
@@ -3908,7 +4066,7 @@ routing_management() {
         echo "规则     : ${rules} 条"
         echo ""
         echo "  1. WARP 出口管理"
-        echo "  2. 链式代理管理"
+        echo "  2. 落地节点管理"
         echo "  3. 分流规则管理"
         echo "  4. 查看当前分流配置"
         echo "  5. 测试分流效果"
@@ -4918,7 +5076,7 @@ full_uninstall() {
     echo ""
     echo -e "${RED}此操作会删除 sing-box、ss2022-xray、Snell v5、ss2022-realm 以及本脚本管理的全部节点/分流/端口转发配置；若 WARP 由本脚本安装，也会一并卸载。不会删除服务器原有 xray.service 或 realm.service。${PLAIN}"
     echo ""
-    echo -e "${YELLOW}将删除由 ss2022.sh 管理的代理核心、节点配置、分流配置、Realm 转发、Keepalive 与快捷命令。${PLAIN}"
+    echo -e "${YELLOW}将删除由 ss2022.sh 管理的协议核心、节点配置、分流配置、Realm 转发、Keepalive 与快捷命令。${PLAIN}"
     echo -e "${GREEN}不会删除服务器原有 xray.service / realm.service 或其它非本脚本管理的软件。${PLAIN}"
     read -rp "确认彻底卸载？请输入 DELETE: " yes
     [[ "$yes" == "DELETE" ]] || { echo "已取消。"; sleep 1; return; }
@@ -5152,7 +5310,7 @@ show_component_versions() {
     re=$(get_realm_version_raw); re=${re:-未安装}
     clear
     echo -e "${CYAN}════════════════════ 组件版本管理 ════════════════════${PLAIN}"
-    echo "【代理核心】"
+    echo "【协议核心】"
     printf '  sing-box      已安装: %-12s 推荐: %s\n' "$sb" "$SINGBOX_VERSION"
     printf '  Xray-core     已安装: %-12s 推荐: %s\n' "$xr" "$XRAY_VERSION"
     printf '  Snell Server  已安装: %-12s 推荐: %s\n' "$sn" "$SNELL_VERSION"
@@ -5301,10 +5459,47 @@ restart_service_safe() {
     fi
 }
 
-service_management() {
+server_management_tools() {
     while true; do
         clear
-        echo -e "${CYAN}════════════════════ 服务运维管理 ════════════════════${PLAIN}"
+        echo -e "${CYAN}════════════════════ 服务器管理工具 ════════════════════${PLAIN}"
+        echo -e "${YELLOW}当前仅建立固定菜单入口，具体工具将在后续按需接入。${PLAIN}"
+        echo ""
+        echo "  0. 返回"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0]: " c
+        case "$c" in
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+server_test_management() {
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ 服务器测试管理 ════════════════════${PLAIN}"
+        echo -e "${YELLOW}以下为固定测试分类，具体测试脚本将在后续逐项接入。${PLAIN}"
+        echo ""
+        echo "  1. IP 质量测试（待接入）"
+        echo "  2. 路由测试（待接入）"
+        echo "  3. 流媒体解锁测试（待接入）"
+        echo "  4. AI 工具测试（待接入）"
+        echo "  0. 返回"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-4]: " c
+        case "$c" in
+            0) return ;;
+            1|2|3|4) echo -e "${YELLOW}该测试功能尚未接入。${PLAIN}"; pause ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+protocol_operations_management() {
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ 协议运维管理 ════════════════════${PLAIN}"
         echo "  1. 查看全部服务状态与监听端口"
         echo "  2. 查看 sing-box 实时日志"
         echo "  3. 查看 ss2022-xray 实时日志"
@@ -5344,21 +5539,25 @@ main() {
         echo "  2. 分流管理"
         echo "  3. 端口转发（Realm）"
         echo "  4. 查看当前节点参数与客户端配置"
-        echo "  5. 服务运维管理"
+        echo "  5. 协议运维管理"
         echo "  6. 组件版本管理"
-        echo -e "${RED}  7. 完全卸载脚本${PLAIN}"
+        echo "  7. 服务器管理工具"
+        echo "  8. 服务器测试管理"
+        echo -e "${RED}  9. 完全卸载脚本${PLAIN}"
         echo "  0. 退出管理面板"
         echo -e "${CYAN}═════════════════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请输入选项编号 [0-7]: " choice
+        read -rp "请输入选项编号 [0-9]: " choice
 
         case "$choice" in
             1) protocol_management ;;
             2) routing_management ;;
             3) forwarding_management ;;
             4) view_config_menu ;;
-            5) service_management ;;
+            5) protocol_operations_management ;;
             6) component_version_management ;;
-            7) full_uninstall ;;
+            7) server_management_tools ;;
+            8) server_test_management ;;
+            9) full_uninstall ;;
             0)
                 echo "已安全退出。随时输入 ss2022 唤出！"
                 exit 0
