@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.0-dev26
+# 当前版本: v1.8.0-dev27
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,13 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.8.0-dev27:
+#   - “查看端口占用”新增“释放指定端口”
+#   - 释放前识别监听进程、PID、systemd 服务及 Docker 容器映射
+#   - 支持停止服务、停止并禁用服务、停止 Docker 容器、结束监听进程
+#   - 当前 SSH 会话所用端口禁止释放，避免远程失联
+#   - 直接结束进程优先 SIGTERM；仍未退出时需再次输入 KILL 才执行 SIGKILL
 #
 # v1.8.0-dev26:
 #   - 系统信息内存 / 虚拟内存单位去除 Gi / Mi 中的 i，统一显示 G / M
@@ -210,12 +217,14 @@
 #   v1.8.0-dev23 工具菜单实测收口 / AI 测试替换
 #   v1.8.0-dev24 系统信息展示优化
 #   v1.8.0-dev25 系统信息主机名置顶
+#   v1.8.0-dev26 系统信息月流量统计 / 内存单位优化
+#   v1.8.0-dev27 端口占用释放工具
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.0-dev26"
+SCRIPT_VERSION="v1.8.0-dev27"
 
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
@@ -7238,6 +7247,386 @@ server_tool_port_usage_detail() {
     fi
 }
 
+server_tool_port_listener_lines() {
+    local port="$1"
+
+    command -v ss >/dev/null 2>&1 || return 1
+    ss -H -lntup 2>/dev/null | awk -v p="$port" '
+    {
+        addr=$5
+        n=split(addr,a,":")
+        if (a[n] == p) print
+    }'
+}
+
+server_tool_port_listener_pids() {
+    local port="$1"
+    local lines
+
+    lines=$(server_tool_port_listener_lines "$port" 2>/dev/null || true)
+    [[ -n "$lines" ]] || return 0
+
+    printf '%s\n' "$lines" \
+        | grep -oE 'pid=[0-9]+' 2>/dev/null \
+        | cut -d= -f2 \
+        | sort -nu
+}
+
+server_tool_pid_systemd_unit() {
+    local pid="$1"
+    local unit=""
+
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+
+    if [[ -r "/proc/${pid}/cgroup" ]]; then
+        unit=$(sed -nE 's#.*[/]([^/]+\.service)(/.*)?$#\1#p' "/proc/${pid}/cgroup" 2>/dev/null | head -n1)
+    fi
+
+    if [[ -z "$unit" ]] && command -v systemctl >/dev/null 2>&1; then
+        unit=$(systemctl status "$pid" --no-pager 2>/dev/null \
+            | sed -nE 's/^[[:space:]]*●[[:space:]]+([^[:space:]]+\.service).*/\1/p' \
+            | head -n1)
+    fi
+
+    [[ -n "$unit" ]] && printf '%s\n' "$unit"
+}
+
+server_tool_port_docker_containers() {
+    local port="$1"
+
+    command -v docker >/dev/null 2>&1 || return 0
+    docker info >/dev/null 2>&1 || return 0
+
+    docker ps --format '{{.ID}}\t{{.Names}}\t{{.Ports}}' 2>/dev/null \
+        | awk -F'\t' -v p="$port" '
+          $3 ~ ("0\\.0\\.0\\.0:" p "->") ||
+          $3 ~ ("\\[::\\]:" p "->") ||
+          $3 ~ ("127\\.0\\.0\\.1:" p "->") {
+              print
+          }'
+}
+
+server_tool_port_is_current_ssh() {
+    local port="$1"
+    local ssh_port=""
+
+    [[ -n "${SSH_CONNECTION:-}" ]] || return 1
+    ssh_port=$(awk '{print $4}' <<<"$SSH_CONNECTION")
+    [[ "$ssh_port" == "$port" ]]
+}
+
+server_tool_port_release_show_targets() {
+    local port="$1"
+    local pids pid comm args unit docker_lines lines
+
+    echo -e "${CYAN}══════════════ 端口 ${port} 当前占用 ══════════════${PLAIN}"
+
+    lines=$(server_tool_port_listener_lines "$port" 2>/dev/null || true)
+    if [[ -z "$lines" ]]; then
+        echo -e "${GREEN}当前没有发现监听进程，端口 ${port} 已经空闲。${PLAIN}"
+        return 1
+    fi
+
+    printf '%s\n' "$lines"
+    echo ""
+
+    pids=$(server_tool_port_listener_pids "$port" 2>/dev/null || true)
+    if [[ -n "$pids" ]]; then
+        echo -e "${YELLOW}监听进程:${PLAIN}"
+        while read -r pid; do
+            [[ -n "$pid" ]] || continue
+            comm=$(ps -p "$pid" -o comm= 2>/dev/null | xargs || true)
+            args=$(ps -p "$pid" -o args= 2>/dev/null | xargs || true)
+            unit=$(server_tool_pid_systemd_unit "$pid" 2>/dev/null || true)
+
+            echo "  PID     : ${pid}"
+            echo "  进程    : ${comm:-未知}"
+            [[ -n "$unit" ]] && echo "  服务    : ${unit}"
+            echo "  命令    : ${args:-未知}"
+            echo ""
+        done <<<"$pids"
+    else
+        echo -e "${YELLOW}[提示] ss 没有返回可识别 PID，可能是权限、内核或容器网络限制。${PLAIN}"
+        echo ""
+    fi
+
+    docker_lines=$(server_tool_port_docker_containers "$port" 2>/dev/null || true)
+    if [[ -n "$docker_lines" ]]; then
+        echo -e "${YELLOW}Docker 容器端口映射:${PLAIN}"
+        while IFS=$'\t' read -r cid cname cports; do
+            echo "  容器    : ${cname} (${cid})"
+            echo "  映射    : ${cports}"
+        done <<<"$docker_lines"
+        echo ""
+    fi
+
+    return 0
+}
+
+server_tool_port_stop_systemd_units() {
+    local port="$1"
+    local disable="${2:-no}"
+    local pids pid unit
+    local -A seen_units=()
+    local found=0 failed=0
+
+    command -v systemctl >/dev/null 2>&1 || {
+        echo -e "${YELLOW}[提示] 当前系统没有 systemctl，无法按 systemd 服务停止。${PLAIN}"
+        return 1
+    }
+
+    pids=$(server_tool_port_listener_pids "$port" 2>/dev/null || true)
+    [[ -n "$pids" ]] || {
+        echo -e "${YELLOW}没有发现可识别的监听 PID。${PLAIN}"
+        return 1
+    }
+
+    while read -r pid; do
+        [[ -n "$pid" ]] || continue
+        unit=$(server_tool_pid_systemd_unit "$pid" 2>/dev/null || true)
+        [[ -n "$unit" ]] || continue
+        [[ -n "${seen_units[$unit]:-}" ]] && continue
+        seen_units["$unit"]=1
+        found=1
+
+        case "$unit" in
+            ssh.service|sshd.service)
+                echo -e "${RED}[拒绝] 不允许通过端口释放工具停止 SSH 服务：${unit}${PLAIN}"
+                failed=1
+                continue
+                ;;
+        esac
+
+        echo -e "${YELLOW}>> 处理服务 ${unit}...${PLAIN}"
+        if [[ "$disable" == "yes" ]]; then
+            if systemctl disable --now "$unit"; then
+                echo -e "${GREEN}✔ ${unit} 已停止并禁用开机自启。${PLAIN}"
+            else
+                echo -e "${RED}[错误] ${unit} 停止/禁用失败。${PLAIN}"
+                failed=1
+            fi
+        else
+            if systemctl stop "$unit"; then
+                echo -e "${GREEN}✔ ${unit} 已停止。${PLAIN}"
+            else
+                echo -e "${RED}[错误] ${unit} 停止失败。${PLAIN}"
+                failed=1
+            fi
+        fi
+    done <<<"$pids"
+
+    [[ $found -eq 1 ]] || {
+        echo -e "${YELLOW}没有检测到对应的 systemd 服务。${PLAIN}"
+        return 1
+    }
+
+    sleep 1
+    if [[ -n "$(server_tool_port_listener_lines "$port" 2>/dev/null || true)" ]]; then
+        echo -e "${YELLOW}[提示] 端口 ${port} 仍有监听进程，请重新查看占用详情。${PLAIN}"
+        return 1
+    fi
+
+    [[ $failed -eq 0 ]]
+}
+
+server_tool_port_stop_docker() {
+    local port="$1"
+    local docker_lines cid cname cports
+    local found=0 failed=0
+
+    docker_lines=$(server_tool_port_docker_containers "$port" 2>/dev/null || true)
+    [[ -n "$docker_lines" ]] || {
+        echo -e "${YELLOW}没有发现映射端口 ${port} 的 Docker 容器。${PLAIN}"
+        return 1
+    }
+
+    while IFS=$'\t' read -r cid cname cports; do
+        [[ -n "$cid" ]] || continue
+        found=1
+        echo -e "${YELLOW}>> 停止 Docker 容器 ${cname} (${cid})...${PLAIN}"
+        if docker stop "$cid"; then
+            echo -e "${GREEN}✔ 容器 ${cname} 已停止。${PLAIN}"
+        else
+            echo -e "${RED}[错误] 容器 ${cname} 停止失败。${PLAIN}"
+            failed=1
+        fi
+    done <<<"$docker_lines"
+
+    sleep 1
+    if [[ -n "$(server_tool_port_listener_lines "$port" 2>/dev/null || true)" ]]; then
+        echo -e "${YELLOW}[提示] 端口 ${port} 仍有监听进程。${PLAIN}"
+        return 1
+    fi
+
+    [[ $found -eq 1 && $failed -eq 0 ]]
+}
+
+server_tool_port_terminate_processes() {
+    local port="$1"
+    local pids pid comm confirm
+    local -a targets=()
+    local -a remaining=()
+
+    pids=$(server_tool_port_listener_pids "$port" 2>/dev/null || true)
+    [[ -n "$pids" ]] || {
+        echo -e "${YELLOW}没有发现可结束的监听 PID。${PLAIN}"
+        return 1
+    }
+
+    while read -r pid; do
+        [[ -n "$pid" ]] || continue
+
+        if [[ "$pid" == "1" || "$pid" == "$$" || "$pid" == "$PPID" ]]; then
+            echo -e "${RED}[拒绝] PID ${pid} 属于关键/当前进程，不允许结束。${PLAIN}"
+            continue
+        fi
+
+        comm=$(ps -p "$pid" -o comm= 2>/dev/null | xargs || true)
+        case "$comm" in
+            sshd|systemd|init)
+                echo -e "${RED}[拒绝] 不允许直接结束关键进程 ${comm} (PID ${pid})。${PLAIN}"
+                continue
+                ;;
+        esac
+
+        targets+=("$pid")
+    done <<<"$pids"
+
+    [[ ${#targets[@]} -gt 0 ]] || {
+        echo -e "${RED}[错误] 没有安全可结束的监听进程。${PLAIN}"
+        return 1
+    }
+
+    echo ""
+    echo -e "${YELLOW}[警告] 将直接结束以下 PID：${targets[*]}${PLAIN}"
+    echo "优先发送 SIGTERM。"
+    read -rp "确认直接结束进程？请输入 RELEASE: " confirm
+    [[ "$confirm" == "RELEASE" ]] || {
+        echo "已取消。"
+        return 0
+    }
+
+    for pid in "${targets[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+
+    sleep 2
+
+    for pid in "${targets[@]}"; do
+        kill -0 "$pid" 2>/dev/null && remaining+=("$pid")
+    done
+
+    if [[ ${#remaining[@]} -gt 0 ]]; then
+        echo -e "${YELLOW}[提示] PID ${remaining[*]} 在 SIGTERM 后仍未退出。${PLAIN}"
+        read -rp "如确认强制结束，请输入 KILL: " confirm
+        if [[ "$confirm" == "KILL" ]]; then
+            for pid in "${remaining[@]}"; do
+                kill -9 "$pid" 2>/dev/null || true
+            done
+            sleep 1
+        else
+            echo "已取消强制结束。"
+        fi
+    fi
+
+    if [[ -z "$(server_tool_port_listener_lines "$port" 2>/dev/null || true)" ]]; then
+        echo -e "${GREEN}✔ 端口 ${port} 已释放。${PLAIN}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}[提示] 端口 ${port} 仍被占用。若进程自动重启，通常说明背后还有 systemd / Docker / Supervisor 等守护机制。${PLAIN}"
+    return 1
+}
+
+server_tool_port_release() {
+    local port c
+    local docker_lines pids pid unit has_unit=0
+
+    read -rp "请输入要释放的端口号: " port
+    if ! validate_port_number "$port"; then
+        echo -e "${RED}端口无效。${PLAIN}"
+        pause
+        return
+    fi
+
+    if server_tool_port_is_current_ssh "$port"; then
+        echo -e "${RED}════════════════ 安全保护 ════════════════${PLAIN}"
+        echo -e "${RED}[拒绝] 端口 ${port} 正是当前 SSH 会话使用的服务器端口。${PLAIN}"
+        echo -e "${YELLOW}为了避免把当前远程连接直接断开，本工具不会释放该端口。${PLAIN}"
+        pause
+        return
+    fi
+
+    clear
+    if ! server_tool_port_release_show_targets "$port"; then
+        pause
+        return
+    fi
+
+    pids=$(server_tool_port_listener_pids "$port" 2>/dev/null || true)
+    while read -r pid; do
+        [[ -n "$pid" ]] || continue
+        unit=$(server_tool_pid_systemd_unit "$pid" 2>/dev/null || true)
+        if [[ -n "$unit" && "$unit" != "ssh.service" && "$unit" != "sshd.service" ]]; then
+            has_unit=1
+            break
+        fi
+    done <<<"$pids"
+
+    docker_lines=$(server_tool_port_docker_containers "$port" 2>/dev/null || true)
+
+    echo "请选择释放方式："
+    if [[ $has_unit -eq 1 ]]; then
+        echo "  1. 停止对应 systemd 服务"
+        echo "  2. 停止并禁用对应 systemd 服务"
+    else
+        echo "  1. 停止对应 systemd 服务（未检测到）"
+        echo "  2. 停止并禁用对应 systemd 服务（未检测到）"
+    fi
+
+    if [[ -n "$docker_lines" ]]; then
+        echo "  3. 停止对应 Docker 容器"
+    else
+        echo "  3. 停止对应 Docker 容器（未检测到）"
+    fi
+
+    echo "  4. 直接结束监听进程"
+    echo "  0. 取消"
+    read -rp "请选择 [0-4]: " c
+
+    case "$c" in
+        1)
+            server_tool_port_stop_systemd_units "$port" "no"
+            ;;
+        2)
+            echo -e "${YELLOW}[注意] 该操作会同时取消对应服务的开机自启。${PLAIN}"
+            read -rp "确认继续？请输入 DISABLE: " c
+            [[ "$c" == "DISABLE" ]] && server_tool_port_stop_systemd_units "$port" "yes"
+            ;;
+        3)
+            server_tool_port_stop_docker "$port"
+            ;;
+        4)
+            server_tool_port_terminate_processes "$port"
+            ;;
+        0)
+            return
+            ;;
+        *)
+            echo -e "${RED}输入无效。${PLAIN}"
+            ;;
+    esac
+
+    echo ""
+    if [[ -n "$(server_tool_port_listener_lines "$port" 2>/dev/null || true)" ]]; then
+        echo -e "${YELLOW}端口 ${port} 当前仍有监听：${PLAIN}"
+        server_tool_port_listener_lines "$port"
+    else
+        echo -e "${GREEN}✔ 端口 ${port} 当前已空闲。${PLAIN}"
+    fi
+    pause
+}
+
 server_tool_port_usage() {
     local c port
     while true; do
@@ -7245,9 +7634,10 @@ server_tool_port_usage() {
         echo -e "${CYAN}════════════════════ 端口占用 ════════════════════${PLAIN}"
         echo "  1. 查看全部监听端口"
         echo "  2. 查询指定端口"
+        echo "  3. 释放指定端口"
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0-2]: " c
+        read -rp "请选择 [0-3]: " c
         case "$c" in
             1)
                 clear
@@ -7264,6 +7654,9 @@ server_tool_port_usage() {
                 clear
                 server_tool_port_usage_detail "$port"
                 pause
+                ;;
+            3)
+                server_tool_port_release
                 ;;
             0) return ;;
             *) sleep 1 ;;
