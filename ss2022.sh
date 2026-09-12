@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.0-dev21
+# 当前版本: v1.8.0-dev22
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,14 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.8.0-dev22:
+#   - 服务器管理工具新增 TG-BOT 月流量监控 / 分级预警 / 可选自动关机
+#   - 流量统计状态持久化，VPS 重启后累计值不清零；支持自定义每月重置日
+#   - 端口占用查看增强：协议 / 监听地址 / PID / 进程，Docker 环境显示容器端口映射
+#   - 系统信息新增公网 IPv4 / IPv6、IP 性质、ISP/ASN、IP 危险性评分
+#   - IP 性质使用轻量 IP 元数据判断；IP 危险性优先显示 Scamalytics 0-100 风险分
+#   - 服务器管理工具菜单重新排序，把日常高频项目放在前面
 #
 # v1.8.0-dev21:
 #   - 完善“服务器管理工具”菜单，参考 kejilion.sh 常用系统工具但按本项目安全策略重写
@@ -172,12 +180,13 @@
 #   v1.8.0-dev19 协议节点自定义名称 / 旧节点在线改名
 #   v1.8.0-dev20 第三方测试脚本返回码误判修复
 #   v1.8.0-dev21 服务器管理工具轻量化完善
+#   v1.8.0-dev22 TG-BOT 流量预警 / 端口占用增强 / IP 信息增强
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.0-dev21"
+SCRIPT_VERSION="v1.8.0-dev22"
 
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
@@ -247,6 +256,13 @@ STATE_FILE="${STATE_DIR}/state.json"
 ROUTING_FILE="${STATE_DIR}/routing.json"
 WARP_DEFAULT_PORT=40000
 WARP_MANAGED_MARKER="${STATE_DIR}/warp-package-managed"
+
+# ----------------------------- TG-BOT 流量监控 ---------------------------------
+TG_MONITOR_CONF="${STATE_DIR}/tg-monitor.conf"
+TG_MONITOR_STATE="${STATE_DIR}/tg-monitor.state"
+TG_MONITOR_WORKER="/usr/local/lib/ss2022/tg-traffic-monitor.sh"
+TG_MONITOR_SERVICE="/etc/systemd/system/ss2022-tg-monitor.service"
+TG_MONITOR_TIMER="/etc/systemd/system/ss2022-tg-monitor.timer"
 
 # ----------------------------- sing-box tag -----------------------------------
 TAG_SS="ss-in"
@@ -6421,13 +6437,88 @@ server_tool_pkg_manager() {
     fi
 }
 
+server_tool_get_ip_profile() {
+    local ipv4="$1" ipv6="$2" target meta hosting proxy mobile org asn isp
+    local scam_html score risk_label
+
+    SERVER_INFO_IPV4="$ipv4"
+    SERVER_INFO_IPV6="$ipv6"
+    SERVER_INFO_IP_TYPE="未知"
+    SERVER_INFO_IP_RISK="未获取"
+    SERVER_INFO_ISP="未知"
+    SERVER_INFO_ASN="未知"
+
+    target="$ipv4"
+    [[ -n "$target" ]] || target="$ipv6"
+    [[ -n "$target" ]] || return 0
+
+    # ip-api 免费接口用于轻量判定 hosting / proxy / mobile；查询失败时保持“未知”。
+    meta=$(curl -fsS --connect-timeout 3 --max-time 5 \
+        "http://ip-api.com/json/${target}?fields=status,message,isp,org,as,hosting,proxy,mobile,query" \
+        2>/dev/null || true)
+
+    if [[ -n "$meta" ]] && jq -e '.status=="success"' >/dev/null 2>&1 <<<"$meta"; then
+        hosting=$(jq -r '.hosting // false' <<<"$meta")
+        proxy=$(jq -r '.proxy // false' <<<"$meta")
+        mobile=$(jq -r '.mobile // false' <<<"$meta")
+        org=$(jq -r '.org // empty' <<<"$meta")
+        isp=$(jq -r '.isp // empty' <<<"$meta")
+        asn=$(jq -r '.as // empty' <<<"$meta")
+
+        SERVER_INFO_ISP="${isp:-${org:-未知}}"
+        SERVER_INFO_ASN="${asn:-未知}"
+
+        if [[ "$hosting" == "true" ]]; then
+            SERVER_INFO_IP_TYPE="数据中心"
+        elif [[ "$mobile" == "true" ]]; then
+            SERVER_INFO_IP_TYPE="移动网络"
+        elif [[ "$proxy" == "true" ]]; then
+            SERVER_INFO_IP_TYPE="代理/VPN"
+        else
+            SERVER_INFO_IP_TYPE="宽带/其他"
+        fi
+    fi
+
+    # Scamalytics 网页公开查询结果中包含 Fraud Score；失败时不影响系统信息展示。
+    scam_html=$(curl -A "Mozilla/5.0" -fsSL --connect-timeout 3 --max-time 6 \
+        "https://scamalytics.com/ip/${target}" 2>/dev/null || true)
+
+    if [[ -n "$scam_html" ]]; then
+        score=$(printf '%s' "$scam_html" \
+            | tr '\n' ' ' \
+            | grep -oE '"score"[[:space:]]*:[[:space:]]*"?[0-9]{1,3}"?' \
+            | head -n1 \
+            | grep -oE '[0-9]{1,3}' || true)
+
+        if [[ -z "$score" ]]; then
+            score=$(printf '%s' "$scam_html" \
+                | tr '\n' ' ' \
+                | sed -nE 's/.*Fraud Score:[[:space:]]*([0-9]{1,3}).*/\1/p' \
+                | head -n1 || true)
+        fi
+
+        if [[ "$score" =~ ^[0-9]+$ ]] && [[ "$score" -le 100 ]]; then
+            if [[ "$score" -le 19 ]]; then
+                risk_label="低风险"
+            elif [[ "$score" -le 59 ]]; then
+                risk_label="中等风险"
+            elif [[ "$score" -le 89 ]]; then
+                risk_label="高风险"
+            else
+                risk_label="极高风险"
+            fi
+            SERVER_INFO_IP_RISK="${score}/100（${risk_label}）"
+        fi
+    fi
+}
+
 server_tool_system_info() {
     local cpu cores mem_total mem_used swap_total swap_used disk_used disk_total
-    local uptime_text timezone dns congestion qdisc os_info
+    local uptime_text timezone dns congestion qdisc os_info ipv4 ipv6
 
     clear
     os_info=$(get_sys_info)
-    cpu=$(awk -F: '/model name|Hardware|Processor/ {gsub(/^[ 	]+/,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null)
+    cpu=$(awk -F: '/model name|Hardware|Processor/ {gsub(/^[ \t]+/,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null)
     cpu=${cpu:-$(uname -m)}
     cores=$(nproc 2>/dev/null || echo "?")
     mem_total=$(free -h 2>/dev/null | awk '/^Mem:/ {print $2}')
@@ -6442,21 +6533,27 @@ server_tool_system_info() {
     congestion=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
     qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
 
+    ipv4=$(curl -4fsS --connect-timeout 2 --max-time 4 https://api4.ipify.org 2>/dev/null || true)
+    ipv6=$(curl -6fsS --connect-timeout 2 --max-time 4 https://api6.ipify.org 2>/dev/null || true)
+    server_tool_get_ip_profile "$ipv4" "$ipv6"
+
     echo -e "${CYAN}════════════════════ 系统信息 ════════════════════${PLAIN}"
-    echo "  系统      : ${os_info}"
-    echo "  CPU       : ${cpu}"
-    echo "  CPU 核心  : ${cores}"
-    echo "  内存      : ${mem_used:-?} / ${mem_total:-?}"
-    echo "  Swap      : ${swap_used:-?} / ${swap_total:-?}"
-    echo "  根分区    : ${disk_used:-?} / ${disk_total:-?}"
-    echo "  运行时间  : ${uptime_text:-未知}"
-    echo "  时区      : ${timezone:-未知}"
-    echo "  DNS       : ${dns:-未检测到}"
-    echo "  TCP拥塞   : ${congestion}"
-    echo "  qdisc     : ${qdisc}"
-    echo ""
-    echo -e "${YELLOW}监听端口摘要:${PLAIN}"
-    ss -H -lntu 2>/dev/null | awk '{print "  " $1 "  " $5}' | head -n 30 || true
+    echo "  系统       : ${os_info}"
+    echo "  CPU        : ${cpu}"
+    echo "  CPU 核心   : ${cores}"
+    echo "  内存       : ${mem_used:-?} / ${mem_total:-?}"
+    echo "  Swap       : ${swap_used:-?} / ${swap_total:-?}"
+    echo "  根分区     : ${disk_used:-?} / ${disk_total:-?}"
+    echo "  运行时间   : ${uptime_text:-未知}"
+    echo "  时区       : ${timezone:-未知}"
+    echo "  IPv4 地址  : ${ipv4:-无 IPv4}"
+    echo "  IPv6 地址  : ${ipv6:-无 IPv6}"
+    echo "  ISP / ASN  : ${SERVER_INFO_ISP} / ${SERVER_INFO_ASN}"
+    echo "  IP 性质    : ${SERVER_INFO_IP_TYPE}"
+    echo "  IP 危险性  : ${SERVER_INFO_IP_RISK}"
+    echo "  DNS        : ${dns:-未检测到}"
+    echo "  TCP 拥塞   : ${congestion}"
+    echo "  qdisc      : ${qdisc}"
     echo -e "${CYAN}═══════════════════════════════════════════════════${PLAIN}"
 }
 
@@ -6819,29 +6916,106 @@ server_tool_ip_priority_management() {
     done
 }
 
-server_tool_port_usage() {
-    local port
-    clear
-    echo -e "${CYAN}════════════════════ 端口占用 ════════════════════${PLAIN}"
-    echo -e "${YELLOW}当前监听端口:${PLAIN}"
-    ss -lntup 2>/dev/null || true
-    echo ""
-    read -rp "输入端口号可进一步筛选，直接回车返回: " port
-    [[ -z "$port" ]] && return
-    if ! validate_port_number "$port"; then
-        echo -e "${RED}端口无效。${PLAIN}"
-        pause
-        return
+server_tool_port_usage_show_all() {
+    echo -e "${YELLOW}当前 TCP / UDP 监听端口:${PLAIN}"
+    if command -v ss >/dev/null 2>&1; then
+        ss -H -lntup 2>/dev/null | awk '
+        {
+            proto=$1
+            local_addr=$5
+            proc=""
+            for (i=6;i<=NF;i++) proc=proc $i " "
+            printf "  %-5s %-30s %s\n", proto, local_addr, proc
+        }'
+    else
+        echo "  未找到 ss 命令。"
     fi
-    echo ""
-    ss -lntup 2>/dev/null | awk -v p="$port" '
-        NR==1 {print; next}
+
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        echo ""
+        echo -e "${YELLOW}Docker 容器端口映射:${PLAIN}"
+        docker ps --format '  {{.Names}}\t{{.Ports}}' 2>/dev/null || true
+    fi
+}
+
+server_tool_port_usage_detail() {
+    local port="$1" found=0
+
+    echo -e "${CYAN}══════════════ 端口 ${port} 占用详情 ══════════════${PLAIN}"
+
+    if command -v ss >/dev/null 2>&1; then
+        local lines
+        lines=$(ss -H -lntup 2>/dev/null | awk -v p="$port" '
         {
             addr=$5
             n=split(addr,a,":")
             if (a[n] == p) print
-        }'
-    pause
+        }')
+        if [[ -n "$lines" ]]; then
+            found=1
+            printf '%s\n' "$lines"
+        fi
+    fi
+
+    if command -v lsof >/dev/null 2>&1; then
+        local lsof_out
+        lsof_out=$(lsof -nP -i ":${port}" 2>/dev/null || true)
+        if [[ -n "$lsof_out" ]]; then
+            found=1
+            echo ""
+            echo -e "${YELLOW}进程详情:${PLAIN}"
+            printf '%s\n' "$lsof_out"
+        fi
+    fi
+
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        local docker_out
+        docker_out=$(docker ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null \
+            | awk -F'\t' -v p="$port" '$2 ~ ("[:]" p "->") || $2 ~ ("0\\.0\\.0\\.0:" p "->") || $2 ~ ("\\[::\\]:" p "->") {print}')
+        if [[ -n "$docker_out" ]]; then
+            found=1
+            echo ""
+            echo -e "${YELLOW}Docker 容器:${PLAIN}"
+            printf '  %s\n' "$docker_out"
+        fi
+    fi
+
+    if [[ $found -eq 0 ]]; then
+        echo -e "${GREEN}未发现端口 ${port} 被监听占用。${PLAIN}"
+    fi
+}
+
+server_tool_port_usage() {
+    local c port
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ 端口占用 ════════════════════${PLAIN}"
+        echo "  1. 查看全部监听端口"
+        echo "  2. 查询指定端口"
+        echo "  0. 返回"
+        echo -e "${CYAN}═══════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-2]: " c
+        case "$c" in
+            1)
+                clear
+                server_tool_port_usage_show_all
+                pause
+                ;;
+            2)
+                read -rp "请输入端口号: " port
+                if ! validate_port_number "$port"; then
+                    echo -e "${RED}端口无效。${PLAIN}"
+                    pause
+                    continue
+                fi
+                clear
+                server_tool_port_usage_detail "$port"
+                pause
+                ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
 }
 
 server_tool_timezone_management() {
@@ -7007,6 +7181,490 @@ server_tool_ssh_management() {
     done
 }
 
+server_tool_tg_monitor_ensure_worker() {
+    install -d -m 755 /usr/local/lib/ss2022 || return 1
+    mkdir -p "$STATE_DIR" || return 1
+    chmod 700 "$STATE_DIR"
+
+    cat > "$TG_MONITOR_WORKER" <<'TGWORKER'
+#!/bin/bash
+set -u
+
+CONF="/etc/ss2022/tg-monitor.conf"
+STATE="/etc/ss2022/tg-monitor.state"
+LOCK="/run/ss2022-tg-monitor.lock"
+
+[[ -f "$CONF" ]] || exit 0
+# shellcheck disable=SC1090
+source "$CONF"
+
+exec 9>"$LOCK" || exit 1
+flock -n 9 || exit 0
+
+send_tg() {
+    local msg="$1"
+    [[ -n "${TG_BOT_TOKEN:-}" && -n "${TG_CHAT_ID:-}" ]] || return 0
+    curl -fsS --connect-timeout 5 --max-time 10 \
+        -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+        --data-urlencode "chat_id=${TG_CHAT_ID}" \
+        --data-urlencode "text=${msg}" >/dev/null 2>&1 || true
+}
+
+traffic_bytes() {
+    awk '
+    BEGIN { rx=0; tx=0 }
+    {
+        iface=$1
+        gsub(":","",iface)
+        if (iface ~ /^(eth|ens|enp|eno|venet|bond)[A-Za-z0-9_.-]*$/) {
+            rx += $2
+            tx += $10
+        }
+    }
+    END { printf "%.0f %.0f\n", rx, tx }
+    ' /proc/net/dev
+}
+
+period_key() {
+    local day now_day current previous
+    day="${RESET_DAY:-1}"
+    now_day=$(date +%d | sed 's/^0//')
+    current=$(date +%Y-%m)
+
+    if [[ "$now_day" -ge "$day" ]]; then
+        printf '%s' "$current"
+    else
+        previous=$(date -d '1 month ago' +%Y-%m 2>/dev/null || date +%Y-%m)
+        printf '%s' "$previous"
+    fi
+}
+
+human_gb() {
+    awk -v b="$1" 'BEGIN { printf "%.2f", b/1073741824 }'
+}
+
+percent_of() {
+    local bytes="$1" limit_gb="$2"
+    if [[ ! "$limit_gb" =~ ^[0-9]+$ ]] || [[ "$limit_gb" -le 0 ]]; then
+        echo 0
+        return
+    fi
+    awk -v b="$bytes" -v g="$limit_gb" 'BEGIN { printf "%.0f", (b/(g*1073741824))*100 }'
+}
+
+CURRENT_RX=0
+CURRENT_TX=0
+read -r CURRENT_RX CURRENT_TX < <(traffic_bytes)
+
+PERIOD="$(period_key)"
+LAST_RX=0
+LAST_TX=0
+TOTAL_RX=0
+TOTAL_TX=0
+STATE_PERIOD=""
+RX_WARN1=0
+RX_WARN2=0
+RX_CRITICAL=0
+TX_WARN1=0
+TX_WARN2=0
+TX_CRITICAL=0
+
+if [[ -f "$STATE" ]]; then
+    # 该状态文件由 root 管理且仅包含整数/周期字符串。
+    # shellcheck disable=SC1090
+    source "$STATE"
+fi
+
+if [[ "$STATE_PERIOD" != "$PERIOD" ]]; then
+    STATE_PERIOD="$PERIOD"
+    LAST_RX="$CURRENT_RX"
+    LAST_TX="$CURRENT_TX"
+    TOTAL_RX=0
+    TOTAL_TX=0
+    RX_WARN1=0
+    RX_WARN2=0
+    RX_CRITICAL=0
+    TX_WARN1=0
+    TX_WARN2=0
+    TX_CRITICAL=0
+else
+    if [[ "$CURRENT_RX" -ge "$LAST_RX" ]]; then
+        TOTAL_RX=$((TOTAL_RX + CURRENT_RX - LAST_RX))
+    else
+        # 网卡计数因 VPS 重启/网卡重置归零：保留历史累计，并把重启后的当前值作为新增量。
+        TOTAL_RX=$((TOTAL_RX + CURRENT_RX))
+    fi
+
+    if [[ "$CURRENT_TX" -ge "$LAST_TX" ]]; then
+        TOTAL_TX=$((TOTAL_TX + CURRENT_TX - LAST_TX))
+    else
+        TOTAL_TX=$((TOTAL_TX + CURRENT_TX))
+    fi
+
+    LAST_RX="$CURRENT_RX"
+    LAST_TX="$CURRENT_TX"
+fi
+
+HOST_LABEL="${HOST_LABEL:-$(hostname)}"
+WARN1_PERCENT="${WARN1_PERCENT:-80}"
+WARN2_PERCENT="${WARN2_PERCENT:-90}"
+AUTO_SHUTDOWN="${AUTO_SHUTDOWN:-no}"
+
+rx_percent=$(percent_of "$TOTAL_RX" "${RX_LIMIT_GB:-0}")
+tx_percent=$(percent_of "$TOTAL_TX" "${TX_LIMIT_GB:-0}")
+rx_gb=$(human_gb "$TOTAL_RX")
+tx_gb=$(human_gb "$TOTAL_TX")
+
+notify_threshold() {
+    local direction="$1" percent="$2" used_gb="$3" limit="$4"
+    local warn1_var warn2_var critical_var
+    if [[ "$direction" == "入站" ]]; then
+        warn1_var="RX_WARN1"; warn2_var="RX_WARN2"; critical_var="RX_CRITICAL"
+    else
+        warn1_var="TX_WARN1"; warn2_var="TX_WARN2"; critical_var="TX_CRITICAL"
+    fi
+
+    [[ "$limit" =~ ^[0-9]+$ && "$limit" -gt 0 ]] || return 0
+
+    if [[ "$percent" -ge 100 && "${!critical_var}" -eq 0 ]]; then
+        printf -v "$critical_var" '%s' 1
+        send_tg "🚨 ${HOST_LABEL}
+${direction}流量已达到 ${used_gb} GB / ${limit} GB（${percent}%）
+已达到流量上限。"
+    elif [[ "$percent" -ge "$WARN2_PERCENT" && "${!warn2_var}" -eq 0 ]]; then
+        printf -v "$warn2_var" '%s' 1
+        send_tg "⚠️ ${HOST_LABEL}
+${direction}流量已达到 ${used_gb} GB / ${limit} GB（${percent}%）
+已达到第二预警线 ${WARN2_PERCENT}%。"
+    elif [[ "$percent" -ge "$WARN1_PERCENT" && "${!warn1_var}" -eq 0 ]]; then
+        printf -v "$warn1_var" '%s' 1
+        send_tg "⚠️ ${HOST_LABEL}
+${direction}流量已达到 ${used_gb} GB / ${limit} GB（${percent}%）
+已达到第一预警线 ${WARN1_PERCENT}%。"
+    fi
+}
+
+notify_threshold "入站" "$rx_percent" "$rx_gb" "${RX_LIMIT_GB:-0}"
+notify_threshold "出站" "$tx_percent" "$tx_gb" "${TX_LIMIT_GB:-0}"
+
+tmp="${STATE}.tmp.$$"
+umask 077
+cat > "$tmp" <<EOF
+STATE_PERIOD='${STATE_PERIOD}'
+LAST_RX=${LAST_RX}
+LAST_TX=${LAST_TX}
+TOTAL_RX=${TOTAL_RX}
+TOTAL_TX=${TOTAL_TX}
+RX_WARN1=${RX_WARN1}
+RX_WARN2=${RX_WARN2}
+RX_CRITICAL=${RX_CRITICAL}
+TX_WARN1=${TX_WARN1}
+TX_WARN2=${TX_WARN2}
+TX_CRITICAL=${TX_CRITICAL}
+EOF
+mv -f "$tmp" "$STATE"
+chmod 600 "$STATE"
+
+shutdown_needed=0
+if [[ "${RX_LIMIT_GB:-0}" =~ ^[0-9]+$ && "${RX_LIMIT_GB:-0}" -gt 0 && "$rx_percent" -ge 100 ]]; then
+    shutdown_needed=1
+fi
+if [[ "${TX_LIMIT_GB:-0}" =~ ^[0-9]+$ && "${TX_LIMIT_GB:-0}" -gt 0 && "$tx_percent" -ge 100 ]]; then
+    shutdown_needed=1
+fi
+
+if [[ "$shutdown_needed" -eq 1 && "$AUTO_SHUTDOWN" == "yes" ]]; then
+    send_tg "⛔ ${HOST_LABEL}
+流量达到设定上限，服务器即将自动关机。"
+    sync
+    shutdown -h now
+fi
+TGWORKER
+
+    chmod 700 "$TG_MONITOR_WORKER"
+
+    cat > "$TG_MONITOR_SERVICE" <<EOF
+[Unit]
+Description=ss2022 TG-BOT Traffic Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${TG_MONITOR_WORKER}
+EOF
+
+    cat > "$TG_MONITOR_TIMER" <<'EOF'
+[Unit]
+Description=Run ss2022 TG-BOT Traffic Monitor Every Minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=5s
+Persistent=true
+Unit=ss2022-tg-monitor.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload || return 1
+}
+
+server_tool_tg_monitor_send_test() {
+    local token chat_id host
+    [[ -f "$TG_MONITOR_CONF" ]] || {
+        echo -e "${YELLOW}尚未配置 TG-BOT 流量监控。${PLAIN}"
+        return 1
+    }
+
+    # shellcheck disable=SC1090
+    source "$TG_MONITOR_CONF"
+    token="${TG_BOT_TOKEN:-}"
+    chat_id="${TG_CHAT_ID:-}"
+    host="${HOST_LABEL:-$(hostname)}"
+
+    if curl -fsS --connect-timeout 5 --max-time 10 \
+        -X POST "https://api.telegram.org/bot${token}/sendMessage" \
+        --data-urlencode "chat_id=${chat_id}" \
+        --data-urlencode "text=✅ ${host}：ss2022 TG-BOT 流量监控测试消息发送成功。" \
+        >/dev/null 2>&1; then
+        echo -e "${GREEN}✔ Telegram 测试消息已发送。${PLAIN}"
+        return 0
+    fi
+
+    echo -e "${RED}[错误] Telegram 消息发送失败，请检查 Bot Token、Chat ID 和服务器网络。${PLAIN}"
+    return 1
+}
+
+server_tool_tg_monitor_configure() {
+    local token chat_id rx_limit tx_limit reset_day warn1 warn2 auto_shutdown host_label
+    local current_token="" current_chat="" ans
+
+    if [[ -f "$TG_MONITOR_CONF" ]]; then
+        # shellcheck disable=SC1090
+        source "$TG_MONITOR_CONF"
+        current_token="${TG_BOT_TOKEN:-}"
+        current_chat="${TG_CHAT_ID:-}"
+    fi
+
+    clear
+    echo -e "${CYAN}════════════ TG-BOT 流量监控配置 ════════════${PLAIN}"
+    echo "说明："
+    echo "  - 每分钟累计公网网卡收发流量；累计状态写入磁盘，重启 VPS 后不会清零。"
+    echo "  - 默认在 80% / 90% / 100% 三个阶段发送 Telegram 预警。"
+    echo "  - 达到 100% 后可选择自动关机。"
+    echo "  - 新启用时从当前流量计数作为起点，只统计启用后的流量。"
+    echo ""
+
+    if [[ -n "$current_token" ]]; then
+        read -rp "Telegram Bot Token [回车保持现有 Token]: " token
+        token=${token:-$current_token}
+    else
+        read -rp "Telegram Bot Token: " token
+    fi
+
+    if [[ ! "$token" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then
+        echo -e "${RED}[错误] Bot Token 格式不正确。${PLAIN}"
+        pause
+        return
+    fi
+
+    if [[ -n "$current_chat" ]]; then
+        read -rp "Telegram Chat ID [回车保持: ${current_chat}]: " chat_id
+        chat_id=${chat_id:-$current_chat}
+    else
+        read -rp "Telegram Chat ID: " chat_id
+    fi
+
+    if [[ ! "$chat_id" =~ ^-?[0-9]+$ ]]; then
+        echo -e "${RED}[错误] Chat ID 应为数字，可为负数（群组）。${PLAIN}"
+        pause
+        return
+    fi
+
+    read -rp "每月入站流量上限 GB [默认 1000，0=不限制]: " rx_limit
+    rx_limit=${rx_limit:-1000}
+    read -rp "每月出站流量上限 GB [默认 1000，0=不限制]: " tx_limit
+    tx_limit=${tx_limit:-1000}
+    read -rp "每月流量重置日 [默认 1，范围 1-28]: " reset_day
+    reset_day=${reset_day:-1}
+    read -rp "第一预警百分比 [默认 80]: " warn1
+    warn1=${warn1:-80}
+    read -rp "第二预警百分比 [默认 90]: " warn2
+    warn2=${warn2:-90}
+
+    for n in "$rx_limit" "$tx_limit" "$reset_day" "$warn1" "$warn2"; do
+        [[ "$n" =~ ^[0-9]+$ ]] || {
+            echo -e "${RED}[错误] 阈值必须为整数。${PLAIN}"
+            pause
+            return
+        }
+    done
+
+    if [[ "$reset_day" -lt 1 || "$reset_day" -gt 28 ]]; then
+        echo -e "${RED}[错误] 重置日必须为 1-28。${PLAIN}"
+        pause
+        return
+    fi
+
+    if [[ "$warn1" -lt 1 || "$warn1" -ge "$warn2" || "$warn2" -ge 100 ]]; then
+        echo -e "${RED}[错误] 预警比例必须满足 1 <= 第一预警 < 第二预警 < 100。${PLAIN}"
+        pause
+        return
+    fi
+
+    read -rp "达到 100% 后自动关机？[y/N]: " ans
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+        auto_shutdown="yes"
+        echo -e "${YELLOW}[警告] 自动关机启用后，达到任一启用的流量上限会执行 shutdown -h now。${PLAIN}"
+        read -rp "再次确认启用自动关机？[y/N]: " ans
+        [[ "$ans" =~ ^[Yy]$ ]] || auto_shutdown="no"
+    else
+        auto_shutdown="no"
+    fi
+
+    host_label=$(hostname 2>/dev/null || echo "VPS")
+
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+    umask 077
+    cat > "$TG_MONITOR_CONF" <<EOF
+TG_BOT_TOKEN='${token}'
+TG_CHAT_ID='${chat_id}'
+HOST_LABEL='${host_label}'
+RX_LIMIT_GB=${rx_limit}
+TX_LIMIT_GB=${tx_limit}
+RESET_DAY=${reset_day}
+WARN1_PERCENT=${warn1}
+WARN2_PERCENT=${warn2}
+AUTO_SHUTDOWN='${auto_shutdown}'
+EOF
+    chmod 600 "$TG_MONITOR_CONF"
+
+    server_tool_tg_monitor_ensure_worker || {
+        echo -e "${RED}[错误] TG-BOT 监控服务生成失败。${PLAIN}"
+        pause
+        return
+    }
+
+    systemctl enable --now ss2022-tg-monitor.timer >/dev/null 2>&1 || {
+        echo -e "${RED}[错误] TG-BOT 监控 timer 启动失败。${PLAIN}"
+        pause
+        return
+    }
+
+    # 立即运行一次，建立初始状态。
+    systemctl start ss2022-tg-monitor.service >/dev/null 2>&1 || true
+
+    echo -e "${GREEN}✔ TG-BOT 流量监控已启用。${PLAIN}"
+    server_tool_tg_monitor_send_test
+    pause
+}
+
+server_tool_tg_monitor_status() {
+    local enabled="未启用" rx_limit="-" tx_limit="-" reset_day="-" warn1="-" warn2="-" auto="-"
+    local total_rx=0 total_tx=0 period="-" rx_gb tx_gb token_masked="-"
+
+    [[ -f "$TG_MONITOR_CONF" ]] && {
+        # shellcheck disable=SC1090
+        source "$TG_MONITOR_CONF"
+        rx_limit="${RX_LIMIT_GB:-0}"
+        tx_limit="${TX_LIMIT_GB:-0}"
+        reset_day="${RESET_DAY:-1}"
+        warn1="${WARN1_PERCENT:-80}"
+        warn2="${WARN2_PERCENT:-90}"
+        auto="${AUTO_SHUTDOWN:-no}"
+        if [[ -n "${TG_BOT_TOKEN:-}" ]]; then
+            token_masked="${TG_BOT_TOKEN:0:6}******"
+        fi
+    }
+
+    [[ -f "$TG_MONITOR_STATE" ]] && {
+        # shellcheck disable=SC1090
+        source "$TG_MONITOR_STATE"
+        total_rx="${TOTAL_RX:-0}"
+        total_tx="${TOTAL_TX:-0}"
+        period="${STATE_PERIOD:--}"
+    }
+
+    if systemctl is-active --quiet ss2022-tg-monitor.timer 2>/dev/null; then
+        enabled="运行中"
+    elif systemctl is-enabled --quiet ss2022-tg-monitor.timer 2>/dev/null; then
+        enabled="已启用但未运行"
+    fi
+
+    rx_gb=$(awk -v b="$total_rx" 'BEGIN {printf "%.2f", b/1073741824}')
+    tx_gb=$(awk -v b="$total_tx" 'BEGIN {printf "%.2f", b/1073741824}')
+
+    clear
+    echo -e "${CYAN}════════════ TG-BOT 流量监控状态 ════════════${PLAIN}"
+    echo "  状态         : ${enabled}"
+    echo "  统计周期     : ${period} / 每月 ${reset_day} 日重置"
+    echo "  当前入站累计 : ${rx_gb} GB / ${rx_limit} GB"
+    echo "  当前出站累计 : ${tx_gb} GB / ${tx_limit} GB"
+    echo "  TG Token     : ${token_masked}"
+    echo "  Chat ID      : ${TG_CHAT_ID:--}"
+    echo "  预警线       : ${warn1}% / ${warn2}% / 100%"
+    echo "  自动关机     : $([[ "$auto" == "yes" ]] && echo "开启" || echo "关闭")"
+    echo -e "${CYAN}═══════════════════════════════════════════════${PLAIN}"
+}
+
+server_tool_tg_monitor_disable() {
+    local ans
+    read -rp "确认停用 TG-BOT 流量监控？配置和累计数据会保留。[y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || return 0
+
+    systemctl disable --now ss2022-tg-monitor.timer >/dev/null 2>&1 || true
+    echo -e "${GREEN}✔ TG-BOT 流量监控已停用。${PLAIN}"
+}
+
+server_tool_tg_monitor_reset() {
+    local ans
+    read -rp "确认清零当前累计流量和预警状态？[y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || return 0
+    rm -f "$TG_MONITOR_STATE"
+    systemctl start ss2022-tg-monitor.service >/dev/null 2>&1 || true
+    echo -e "${GREEN}✔ 流量累计已重新从当前时刻开始统计。${PLAIN}"
+}
+
+server_tool_tg_monitor_remove() {
+    local ans
+    read -rp "确认彻底删除 TG-BOT 流量监控配置、Token 和累计数据？[y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || return 0
+
+    systemctl disable --now ss2022-tg-monitor.timer >/dev/null 2>&1 || true
+    rm -f "$TG_MONITOR_TIMER" "$TG_MONITOR_SERVICE" "$TG_MONITOR_WORKER" \
+          "$TG_MONITOR_CONF" "$TG_MONITOR_STATE"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    echo -e "${GREEN}✔ TG-BOT 流量监控已彻底删除。${PLAIN}"
+}
+
+server_tool_tg_monitor_management() {
+    local c
+    while true; do
+        server_tool_tg_monitor_status
+        echo ""
+        echo "  1. 配置 / 启用监控"
+        echo "  2. 发送 TG 测试消息"
+        echo "  3. 清零流量累计"
+        echo "  4. 停用监控（保留配置）"
+        echo "  5. 删除监控配置"
+        echo "  0. 返回"
+        read -rp "请选择 [0-5]: " c
+        case "$c" in
+            1) server_tool_tg_monitor_configure ;;
+            2) server_tool_tg_monitor_send_test; pause ;;
+            3) server_tool_tg_monitor_reset; pause ;;
+            4) server_tool_tg_monitor_disable; pause ;;
+            5) server_tool_tg_monitor_remove; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
 server_tool_hostname_change() {
     local current new ans
     current=$(hostname 2>/dev/null || true)
@@ -7059,31 +7717,33 @@ server_management_tools() {
         clear
         echo -e "${CYAN}════════════════════ 服务器管理工具 ════════════════════${PLAIN}"
         echo "  1. 系统信息"
-        echo "  2. 系统更新 / 清理"
-        echo "  3. Swap 虚拟内存"
-        echo "  4. BBR 加速"
-        echo "  5. DNS 管理"
-        echo "  6. IPv4 / IPv6 优先级"
-        echo "  7. 查看端口占用"
-        echo "  8. 系统时区"
-        echo "  9. SSH 端口管理"
-        echo " 10. 修改主机名"
-        echo " 11. 重启服务器"
+        echo "  2. 查看端口占用"
+        echo "  3. TG-BOT 流量监控 / 预警 / 自动关机"
+        echo "  4. 系统更新 / 清理"
+        echo "  5. Swap 虚拟内存"
+        echo "  6. BBR 加速"
+        echo "  7. DNS 管理"
+        echo "  8. IPv4 / IPv6 优先级"
+        echo "  9. 系统时区"
+        echo " 10. SSH 端口管理"
+        echo " 11. 修改主机名"
+        echo " 12. 重启服务器"
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0-11]: " c
+        read -rp "请选择 [0-12]: " c
         case "$c" in
             1) server_tool_system_info; pause ;;
-            2) server_tool_system_update ;;
-            3) server_tool_swap_management ;;
-            4) server_tool_bbr_management ;;
-            5) server_tool_dns_management ;;
-            6) server_tool_ip_priority_management ;;
-            7) server_tool_port_usage ;;
-            8) server_tool_timezone_management ;;
-            9) server_tool_ssh_management ;;
-            10) server_tool_hostname_change ;;
-            11) server_tool_reboot ;;
+            2) server_tool_port_usage ;;
+            3) server_tool_tg_monitor_management ;;
+            4) server_tool_system_update ;;
+            5) server_tool_swap_management ;;
+            6) server_tool_bbr_management ;;
+            7) server_tool_dns_management ;;
+            8) server_tool_ip_priority_management ;;
+            9) server_tool_timezone_management ;;
+            10) server_tool_ssh_management ;;
+            11) server_tool_hostname_change ;;
+            12) server_tool_reboot ;;
             0) return ;;
             *) sleep 1 ;;
         esac
