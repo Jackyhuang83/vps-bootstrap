@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.0-dev17
+# 当前版本: v1.8.0-dev19
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -86,6 +86,19 @@
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
 #
+# v1.8.0-dev19:
+#   - 四种协议节点支持自定义节点名称，直接回车使用原默认名称
+#   - 节点名称保存到 /etc/ss2022/state.json，并用于 URI / Surge / Loon / Mihomo / 二维码参数
+#   - 已部署旧节点可在“查看节点配置 -> 修改节点名称”中直接改名，无需重装
+#   - state.json 更新改为字段合并，修改端口/地址/SNI/密钥时不会丢失自定义节点名称
+#
+# v1.8.0-dev18:
+#   - 正式接入服务器测试管理：IP 质量 / 回程路由 / 流媒体解锁 / AI 工具
+#   - IP 质量使用 IP.Check.Place
+#   - 回程路由使用 Chennhaoo/AutoTrace
+#   - 流媒体解锁使用 1-stream/RegionRestrictionCheck
+#   - AI 工具使用 adsorgcn/vpscheck，仅运行 AI 服务检测（-r 5）
+#
 # v1.8.0-dev17:
 #   - WARP 出口模式菜单固定提供：仅 IPv4 / 仅 IPv6 / IPv4+IPv6 双栈
 #   - IPv4-only VPS 默认推荐“仅 WARP IPv6”，但仍允许用户主动选择“仅 WARP IPv4”
@@ -140,12 +153,14 @@
 #   v1.8.0-dev15 WARP IPv4/IPv6 双栈补全
 #   v1.8.0-dev16 WARP 单地址族出口强制（IPv6-only / IPv4-only / 双栈）
 #   v1.8.0-dev17 WARP 三种出口模式固定可选 / 按 VPS 网络自动推荐
+#   v1.8.0-dev18 服务器测试工具正式接入
+#   v1.8.0-dev19 协议节点自定义名称 / 旧节点在线改名
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.0-dev17"
+SCRIPT_VERSION="v1.8.0-dev19"
 
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
@@ -231,6 +246,7 @@ SS_KEY=""
 SERVER_HOST=""
 NETWORK_MODE=""
 LISTEN_ADDR=""
+NODE_NAME=""
 
 # ==============================================================================
 # [02] 通用工具与状态面板
@@ -708,7 +724,7 @@ save_mode_state() {
     ensure_state_file || return 1
     tmp=$(mktemp "${STATE_DIR}/state.json.tmp.XXXXXX") || return 1
     chmod 600 "$tmp"
-    if ! jq --arg mode "$mode" --argjson obj "$object_json" '.[$mode] = $obj' "$STATE_FILE" > "$tmp"; then
+    if ! jq --arg mode "$mode" --argjson obj "$object_json" '.[$mode] = ((.[$mode] // {}) + $obj)' "$STATE_FILE" > "$tmp"; then
         rm -f "$tmp"
         return 1
     fi
@@ -733,6 +749,141 @@ get_mode_state_field() {
     local mode="$1" field="$2"
     [[ -f "$STATE_FILE" ]] || return 1
     jq -r --arg mode "$mode" --arg field "$field" '.[$mode][$field] // empty' "$STATE_FILE" 2>/dev/null
+}
+
+default_node_name() {
+    case "$1" in
+        ss)        printf '%s' "Proxy-SS2022" ;;
+        shadowtls) printf '%s' "Proxy-SS2022-ShadowTLS" ;;
+        vless)     printf '%s' "Proxy-VLESS-Reality" ;;
+        snell)     printf '%s' "Proxy-Snell-v5" ;;
+        *)         printf '%s' "Proxy-Node" ;;
+    esac
+}
+
+get_node_name() {
+    local mode="$1"
+    local name=""
+
+    name=$(get_mode_state_field "$mode" "name" 2>/dev/null || true)
+    if [[ -n "$name" ]]; then
+        printf '%s' "$name"
+    else
+        default_node_name "$mode"
+    fi
+}
+
+validate_node_name() {
+    local name="$1"
+
+    [[ -n "$name" ]] || return 1
+    [[ ${#name} -le 64 ]] || return 1
+
+    case "$name" in
+        *$'\n'*|*$'\r'*|*'='*|*','*|*'"'*|*'\'*)
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
+ask_node_name() {
+    local mode="$1"
+    local current="${2:-}"
+    local default input=""
+
+    default=${current:-$(default_node_name "$mode")}
+
+    while true; do
+        read -rp "节点名称 [默认: ${default}]: " input
+        input=${input:-$default}
+
+        if validate_node_name "$input"; then
+            NODE_NAME="$input"
+            return 0
+        fi
+
+        echo -e "${RED}节点名称无效：不能为空、最多 64 个字符，且不能包含 = , \" 或反斜杠。${PLAIN}"
+    done
+}
+
+protocol_mode_exists() {
+    case "$1" in
+        ss) json_has_inbound_tag "$TAG_SS" ;;
+        shadowtls) json_has_inbound_tag "$TAG_STLS" ;;
+        vless) xray_vless_exists ;;
+        snell) protocol_exists_snell ;;
+        *) return 1 ;;
+    esac
+}
+
+rename_node_name() {
+    local mode="$1"
+    local label="$2"
+    local current=""
+
+    if ! protocol_mode_exists "$mode"; then
+        echo -e "${YELLOW}${label} 尚未部署。${PLAIN}"
+        return 1
+    fi
+
+    current=$(get_node_name "$mode")
+    echo -e "当前节点名称: ${GREEN}${current}${PLAIN}"
+    ask_node_name "$mode" "$current" || return 1
+
+    if save_mode_state "$mode" "$(jq -n --arg name "$NODE_NAME" '{name:$name}')"; then
+        echo -e "${GREEN}✔ ${label} 节点名称已修改为: ${NODE_NAME}${PLAIN}"
+        echo -e "${YELLOW}提示: 仅修改客户端导出名称，不需要重启代理服务。${PLAIN}"
+        return 0
+    fi
+
+    echo -e "${RED}[错误] 节点名称保存失败。${PLAIN}"
+    return 1
+}
+
+node_name_management() {
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ 修改节点名称 ════════════════════${PLAIN}"
+
+        if protocol_mode_exists ss; then
+            echo -e "  1. SS2022                  [${GREEN}$(get_node_name ss)${PLAIN}]"
+        else
+            echo "  1. SS2022                  [未部署]"
+        fi
+
+        if protocol_mode_exists shadowtls; then
+            echo -e "  2. SS2022 + ShadowTLS v3   [${GREEN}$(get_node_name shadowtls)${PLAIN}]"
+        else
+            echo "  2. SS2022 + ShadowTLS v3   [未部署]"
+        fi
+
+        if protocol_mode_exists vless; then
+            echo -e "  3. VLESS Reality           [${GREEN}$(get_node_name vless)${PLAIN}]"
+        else
+            echo "  3. VLESS Reality           [未部署]"
+        fi
+
+        if protocol_mode_exists snell; then
+            echo -e "  4. Snell v5                [${GREEN}$(get_node_name snell)${PLAIN}]"
+        else
+            echo "  4. Snell v5                [未部署]"
+        fi
+
+        echo "  0. 返回"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-4]: " c
+
+        case "$c" in
+            1) rename_node_name "ss" "SS2022"; pause ;;
+            2) rename_node_name "shadowtls" "SS2022 + ShadowTLS v3"; pause ;;
+            3) rename_node_name "vless" "VLESS Reality"; pause ;;
+            4) rename_node_name "snell" "Snell v5"; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
 }
 
 ensure_singbox_user() {
@@ -1245,7 +1396,7 @@ show_qr() {
 
 show_ss_details() {
     local host="$1" port="$2" method="$3" pass="$4"
-    local tag="Proxy-SS2022"
+    local tag="${5:-$(default_node_name ss)}"
     local url_host method_enc pass_enc tag_enc ss_url
 
     url_host=$(format_host_for_uri "$host")
@@ -1256,6 +1407,7 @@ show_ss_details() {
 
     echo ""
     echo -e "${CYAN}════════════════════ SS2022 节点配置 ════════════════════${PLAIN}"
+    echo -e "  节点名称: ${GREEN}${tag}${PLAIN}"
     echo -e "  地址: ${CYAN}${host}${PLAIN}"
     echo -e "  端口: ${CYAN}${port}${PLAIN}"
     echo -e "  加密: ${CYAN}${method}${PLAIN}"
@@ -1292,7 +1444,7 @@ YAML
 
 show_shadowtls_details() {
     local host="$1" port="$2" method="$3" ss_pass="$4" stls_pass="$5" sni="$6" udp_enabled="$7" udp_port="$8"
-    local tag="Proxy-SS2022-ShadowTLS"
+    local tag="${9:-$(default_node_name shadowtls)}"
     local surge_udp="udp-relay=false" loon_udp="udp=false" mihomo_udp="false"
     local qr_payload
 
@@ -1305,6 +1457,7 @@ show_shadowtls_details() {
 
     echo ""
     echo -e "${CYAN}════════════════ SS2022 + ShadowTLS v3 配置 ════════════════${PLAIN}"
+    echo -e "  节点名称: ${GREEN}${tag}${PLAIN}"
     echo -e "  地址: ${CYAN}${host}${PLAIN}"
     echo -e "  TCP端口: ${CYAN}${port}${PLAIN}"
     echo -e "  SS2022加密: ${CYAN}${method}${PLAIN}"
@@ -1373,7 +1526,7 @@ YAML
         echo "UDP: 关闭"
     fi
     echo ""
-    qr_payload=$(jq -cn --arg type "ss2022-shadowtls" --arg server "$host" --argjson port "$port" --arg cipher "$method" --arg password "$ss_pass" --arg stls_password "$stls_pass" --arg sni "$sni" --arg udp "$udp_enabled" --arg udp_port "$udp_port" '{type:$type,server:$server,port:$port,cipher:$cipher,password:$password,shadow_tls:{version:3,password:$stls_password,sni:$sni},udp:($udp=="true"),udp_port:(if $udp_port=="" then null else ($udp_port|tonumber) end)}')
+    qr_payload=$(jq -cn --arg type "ss2022-shadowtls" --arg name "$tag" --arg server "$host" --argjson port "$port" --arg cipher "$method" --arg password "$ss_pass" --arg stls_password "$stls_pass" --arg sni "$sni" --arg udp "$udp_enabled" --arg udp_port "$udp_port" '{type:$type,name:$name,server:$server,port:$port,cipher:$cipher,password:$password,shadow_tls:{version:3,password:$stls_password,sni:$sni},udp:($udp=="true"),udp_port:(if $udp_port=="" then null else ($udp_port|tonumber) end)}')
     show_qr "$qr_payload"
     echo -e "${YELLOW}[二维码说明] SS2022+ShadowTLS 尚无统一跨客户端 URI；二维码保存完整参数，客户端仍应使用上面的对应格式。${PLAIN}"
     echo -e "${CYAN}════════════════════════════════════════════════════════════${PLAIN}"
@@ -1381,7 +1534,8 @@ YAML
 
 show_vless_details() {
     local host="$1" port="$2" uuid="$3" sni="$4" public_key="$5" short_id="$6"
-    local url_host tag="Proxy-VLESS-Reality"
+    local tag="${7:-$(default_node_name vless)}"
+    local url_host
     local tag_enc vless_uri
 
     url_host=$(format_host_for_uri "$host")
@@ -1390,6 +1544,7 @@ show_vless_details() {
 
     echo ""
     echo -e "${CYAN}════════════════════ VLESS Reality 配置 ════════════════════${PLAIN}"
+    echo -e "  节点名称: ${GREEN}${tag}${PLAIN}"
     echo -e "  地址: ${CYAN}${host}${PLAIN}"
     echo -e "  端口: ${CYAN}${port}${PLAIN}"
     echo -e "  UUID: ${CYAN}${uuid}${PLAIN}"
@@ -1442,12 +1597,13 @@ YAML
 
 show_snell_details() {
     local host="$1" port="$2" psk="$3"
-    local tag="Proxy-Snell-v5"
+    local tag="${4:-$(default_node_name snell)}"
     local surge_line qr_payload
     surge_line="${tag} = snell, ${host}, ${port}, psk=\"${psk}\", version=5, reuse=true, tfo=true"
 
     echo ""
     echo -e "${CYAN}════════════════════ Snell v5 配置 ════════════════════${PLAIN}"
+    echo -e "  节点名称: ${GREEN}${tag}${PLAIN}"
     echo -e "  地址: ${CYAN}${host}${PLAIN}"
     echo -e "  端口: ${CYAN}${port}${PLAIN}"
     echo -e "  PSK : ${CYAN}${psk}${PLAIN}"
@@ -1488,7 +1644,7 @@ YAML
     echo "版本: 5"
     echo "UDP: 开启"
     echo ""
-    qr_payload=$(jq -cn --arg type "snell" --arg server "$host" --argjson port "$port" --arg psk "$psk" '{type:$type,server:$server,port:$port,psk:$psk,version:5,udp:true}')
+    qr_payload=$(jq -cn --arg type "snell" --arg name "$tag" --arg server "$host" --argjson port "$port" --arg psk "$psk" '{type:$type,name:$name,server:$server,port:$port,psk:$psk,version:5,udp:true}')
     show_qr "$qr_payload"
     echo -e "${YELLOW}[二维码说明] Snell 没有统一的跨客户端分享 URI；二维码保存完整参数。${PLAIN}"
     echo -e "${CYAN}═════════════════════════════════════════════════════════${PLAIN}"
@@ -2049,6 +2205,7 @@ deploy_ss2022() {
     ask_singbox_port "请输入 SS2022 监听端口" "58588" "$excluded_tags" || return
     get_ss_cipher_and_key || { pause; return; }
     ask_server_host
+    ask_node_name "ss" || return
 
     inbound=$(jq -n \
         --arg listen "$LISTEN_ADDR" \
@@ -2068,8 +2225,8 @@ deploy_ss2022() {
     if update_singbox_inbounds "$excluded_tags" "$add_json"; then
         apply_routing_config >/dev/null 2>&1 || echo -e "${YELLOW}[提示] 节点已部署，但现有分流配置未能自动应用，请进入“分流管理”重新应用。${PLAIN}"
         echo -e "${GREEN}✔ SS2022 部署成功。${PLAIN}"
-        save_mode_state "ss" "$(jq -n --arg host "$SERVER_HOST" --arg network "$NETWORK_MODE" '{host:$host,network:$network}')" || true
-        show_ss_details "$SERVER_HOST" "$PORT" "$METHOD" "$SS_KEY"
+        save_mode_state "ss" "$(jq -n --arg host "$SERVER_HOST" --arg network "$NETWORK_MODE" --arg name "$NODE_NAME" '{host:$host,network:$network,name:$name}')" || true
+        show_ss_details "$SERVER_HOST" "$PORT" "$METHOD" "$SS_KEY" "$NODE_NAME"
     else
         journalctl -u sing-box -n 30 --no-pager 2>/dev/null || true
     fi
@@ -2137,6 +2294,7 @@ deploy_shadowtls() {
     fi
 
     ask_server_host
+    ask_node_name "shadowtls" || return
 
     outer=$(jq -n \
         --arg listen "$LISTEN_ADDR" \
@@ -2190,8 +2348,8 @@ deploy_shadowtls() {
     if update_singbox_inbounds "$excluded_tags" "$add_json"; then
         apply_routing_config >/dev/null 2>&1 || echo -e "${YELLOW}[提示] 节点已部署，但现有分流配置未能自动应用，请进入“分流管理”重新应用。${PLAIN}"
         echo -e "${GREEN}✔ SS2022 + ShadowTLS v3 部署成功。${PLAIN}"
-        save_mode_state "shadowtls" "$(jq -n --arg host "$SERVER_HOST" --arg network "$NETWORK_MODE" '{host:$host,network:$network}')" || true
-        show_shadowtls_details "$SERVER_HOST" "$tcp_port" "$METHOD" "$SS_KEY" "$stls_pass" "$sni" "$udp_enabled" "$udp_port"
+        save_mode_state "shadowtls" "$(jq -n --arg host "$SERVER_HOST" --arg network "$NETWORK_MODE" --arg name "$NODE_NAME" '{host:$host,network:$network,name:$name}')" || true
+        show_shadowtls_details "$SERVER_HOST" "$tcp_port" "$METHOD" "$SS_KEY" "$stls_pass" "$sni" "$udp_enabled" "$udp_port" "$NODE_NAME"
     else
         journalctl -u sing-box -n 30 --no-pager 2>/dev/null || true
     fi
@@ -2239,11 +2397,12 @@ deploy_vless_reality() {
         *) sni="swdist.apple.com" ;;
     esac
     ask_server_host
+    ask_node_name "vless" || return
     if write_xray_vless_config "$LISTEN_ADDR" "$vless_port" "$uuid" "$sni" "$REALITY_PRIVATE_KEY" "$short_id"; then
-        save_mode_state "vless" "$(jq -n --arg host "$SERVER_HOST" --arg network "$NETWORK_MODE" --arg public_key "$REALITY_PUBLIC_KEY" '{host:$host,network:$network,public_key:$public_key,core:"xray"}')" || true
+        save_mode_state "vless" "$(jq -n --arg host "$SERVER_HOST" --arg network "$NETWORK_MODE" --arg public_key "$REALITY_PUBLIC_KEY" --arg name "$NODE_NAME" '{host:$host,network:$network,public_key:$public_key,core:"xray",name:$name}')" || true
         apply_routing_config >/dev/null 2>&1 || echo -e "${YELLOW}[提示] VLESS 已部署，但现有分流配置未能自动应用。${PLAIN}"
         echo -e "${GREEN}✔ VLESS Reality (Xray) 部署成功。${PLAIN}"
-        show_vless_details "$SERVER_HOST" "$vless_port" "$uuid" "$sni" "$REALITY_PUBLIC_KEY" "$short_id"
+        show_vless_details "$SERVER_HOST" "$vless_port" "$uuid" "$sni" "$REALITY_PUBLIC_KEY" "$short_id" "$NODE_NAME"
     else
         journalctl -u "$XRAY_SERVICE_NAME" -n 30 --no-pager 2>/dev/null || true
     fi
@@ -2691,6 +2850,7 @@ deploy_snell_v5() {
     fi
 
     ask_server_host
+    ask_node_name "snell" || return
 
     tmp=$(mktemp "/etc/snell-v5.conf.tmp.XXXXXX") || return
     chmod 600 "$tmp"
@@ -2705,8 +2865,8 @@ CONFIG
 
     if apply_snell_config "$tmp"; then
         echo -e "${GREEN}✔ Snell v5 部署成功。${PLAIN}"
-        save_mode_state "snell" "$(jq -n --arg host "$SERVER_HOST" --arg network "$NETWORK_MODE" '{host:$host,network:$network}')" || true
-        show_snell_details "$SERVER_HOST" "$snell_port" "$psk"
+        save_mode_state "snell" "$(jq -n --arg host "$SERVER_HOST" --arg network "$NETWORK_MODE" --arg name "$NODE_NAME" '{host:$host,network:$network,name:$name}')" || true
+        show_snell_details "$SERVER_HOST" "$snell_port" "$psk" "$NODE_NAME"
     else
         journalctl -u snell-v5 -n 30 --no-pager 2>/dev/null || true
     fi
@@ -2718,7 +2878,7 @@ CONFIG
 # ==============================================================================
 
 view_ss2022_config() {
-    local host port method pass listen ip_type
+    local host port method pass listen ip_type name
     json_has_inbound_tag "$TAG_SS" || {
         echo -e "${YELLOW}未部署 SS2022。${PLAIN}"
         return
@@ -2737,11 +2897,12 @@ view_ss2022_config() {
             host=$(get_public_ipv4 2>/dev/null || echo "请填写服务器地址")
         fi
     fi
-    show_ss_details "$host" "$port" "$method" "$pass"
+    name=$(get_node_name "ss")
+    show_ss_details "$host" "$port" "$method" "$pass" "$name"
 }
 
 view_shadowtls_config() {
-    local host port method ss_pass stls_pass sni listen udp_enabled="false" udp_port=""
+    local host port method ss_pass stls_pass sni listen udp_enabled="false" udp_port="" name
 
     json_has_inbound_tag "$TAG_STLS" || {
         echo -e "${YELLOW}未部署 SS2022 + ShadowTLS。${PLAIN}"
@@ -2768,11 +2929,12 @@ view_shadowtls_config() {
             host=$(get_public_ipv4 2>/dev/null || echo "请填写服务器地址")
         fi
     fi
-    show_shadowtls_details "$host" "$port" "$method" "$ss_pass" "$stls_pass" "$sni" "$udp_enabled" "$udp_port"
+    name=$(get_node_name "shadowtls")
+    show_shadowtls_details "$host" "$port" "$method" "$ss_pass" "$stls_pass" "$sni" "$udp_enabled" "$udp_port" "$name"
 }
 
 view_vless_config() {
-    local host port uuid sni private public short_id listen out
+    local host port uuid sni private public short_id listen out name
     if ! xray_vless_exists; then
         if json_has_inbound_tag "$TAG_VLESS"; then
             echo -e "${YELLOW}检测到旧 sing-box VLESS Reality。当前版本请删除后重新部署为 Xray 版。${PLAIN}"
@@ -2797,11 +2959,12 @@ view_vless_config() {
 ' "$out" | awk -F': *' '/^Public key:/ {print $2; exit}')
     fi
     if [[ -z "$host" ]]; then if [[ "$listen" == "::" ]]; then host=$(get_global_ipv6 2>/dev/null || echo "请填写IPv6地址"); else host=$(get_public_ipv4 2>/dev/null || echo "请填写服务器地址"); fi; fi
-    show_vless_details "$host" "$port" "$uuid" "$sni" "$public" "$short_id"
+    name=$(get_node_name "vless")
+    show_vless_details "$host" "$port" "$uuid" "$sni" "$public" "$short_id" "$name"
 }
 
 view_snell_config() {
-    local host port psk listen
+    local host port psk listen name
 
     [[ -f "$SNELL_CONF" ]] || {
         echo -e "${YELLOW}未部署 Snell v5。${PLAIN}"
@@ -2820,7 +2983,8 @@ view_snell_config() {
             host=$(get_public_ipv4 2>/dev/null || echo "请填写服务器地址")
         fi
     fi
-    show_snell_details "$host" "$port" "$psk"
+    name=$(get_node_name "snell")
+    show_snell_details "$host" "$port" "$psk" "$name"
 }
 
 view_config_menu() {
@@ -2831,14 +2995,16 @@ view_config_menu() {
         echo "  2. SS2022 + ShadowTLS v3"
         echo "  3. VLESS Reality"
         echo "  4. Snell v5"
+        echo "  5. 修改节点名称"
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0-4]: " c
+        read -rp "请选择 [0-5]: " c
         case "$c" in
             1) view_ss2022_config; pause ;;
             2) view_shadowtls_config; pause ;;
             3) view_vless_config; pause ;;
             4) view_snell_config; pause ;;
+            5) node_name_management ;;
             0) return ;;
             *) echo -e "${RED}输入无效。${PLAIN}"; sleep 1 ;;
         esac
@@ -6240,22 +6406,152 @@ server_management_tools() {
     done
 }
 
+ensure_test_dependency() {
+    local cmd="$1"
+    local pkg="${2:-$1}"
+
+    command -v "$cmd" >/dev/null 2>&1 && return 0
+
+    echo -e "${YELLOW}>> 缺少 ${cmd}，正在安装 ${pkg}...${PLAIN}"
+
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -y >/dev/null 2>&1 || return 1
+        apt-get install -y "$pkg" >/dev/null 2>&1 || return 1
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y "$pkg" >/dev/null 2>&1 || return 1
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y "$pkg" >/dev/null 2>&1 || return 1
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache "$pkg" >/dev/null 2>&1 || return 1
+    else
+        echo -e "${RED}[错误] 未识别包管理器，请手动安装 ${pkg}。${PLAIN}"
+        return 1
+    fi
+
+    command -v "$cmd" >/dev/null 2>&1
+}
+
+show_external_test_source() {
+    local name="$1"
+    local source="$2"
+
+    echo ""
+    echo -e "${CYAN}════════════════════ ${name} ════════════════════${PLAIN}"
+    echo -e "${YELLOW}测试来源: ${source}${PLAIN}"
+    echo -e "${YELLOW}说明: 以下功能调用第三方开源测试脚本，仅用于检测，不修改 ss2022 协议或分流配置。${PLAIN}"
+    echo ""
+}
+
+test_ip_quality() {
+    clear
+    show_external_test_source "IP 质量测试" "IP.Check.Place"
+
+    ensure_test_dependency curl curl || {
+        echo -e "${RED}[错误] curl 安装失败。${PLAIN}"
+        pause
+        return
+    }
+
+    bash <(curl -Ls https://IP.Check.Place) || \
+        echo -e "${RED}[错误] IP 质量测试脚本执行失败。${PLAIN}"
+
+    echo ""
+    pause
+}
+
+test_return_route() {
+    local tmp=""
+    clear
+    show_external_test_source \
+        "回程路由测试" \
+        "https://github.com/Chennhaoo/Shell_Bash/blob/master/AutoTrace.sh"
+
+    ensure_test_dependency wget wget || {
+        echo -e "${RED}[错误] wget 安装失败。${PLAIN}"
+        pause
+        return
+    }
+
+    tmp=$(mktemp /tmp/ss2022-autotrace.XXXXXX.sh) || {
+        echo -e "${RED}[错误] 无法创建临时文件。${PLAIN}"
+        pause
+        return
+    }
+
+    if wget -q --no-check-certificate \
+        -O "$tmp" \
+        "https://raw.githubusercontent.com/Chennhaoo/Shell_Bash/master/AutoTrace.sh"; then
+        chmod +x "$tmp"
+        bash "$tmp" || echo -e "${RED}[错误] AutoTrace 执行失败。${PLAIN}"
+    else
+        echo -e "${RED}[错误] AutoTrace 下载失败。${PLAIN}"
+    fi
+
+    rm -f "$tmp"
+    echo ""
+    pause
+}
+
+test_streaming_unlock() {
+    clear
+    show_external_test_source \
+        "流媒体解锁测试" \
+        "https://github.com/1-stream/RegionRestrictionCheck"
+
+    ensure_test_dependency curl curl || {
+        echo -e "${RED}[错误] curl 安装失败。${PLAIN}"
+        pause
+        return
+    }
+
+    bash <(curl -L -s \
+        "https://github.com/1-stream/RegionRestrictionCheck/raw/main/check.sh") || \
+        echo -e "${RED}[错误] 流媒体解锁测试脚本执行失败。${PLAIN}"
+
+    echo ""
+    pause
+}
+
+test_ai_unlock() {
+    clear
+    show_external_test_source \
+        "AI 工具测试" \
+        "https://github.com/adsorgcn/vpscheck"
+
+    echo -e "${CYAN}检测范围: ChatGPT / OpenAI API / Gemini / Claude / Copilot / Grok / Perplexity / Mistral / Poe / Sora / DeepSeek / Kimi 等${PLAIN}"
+    echo ""
+
+    ensure_test_dependency curl curl || {
+        echo -e "${RED}[错误] curl 安装失败。${PLAIN}"
+        pause
+        return
+    }
+
+    bash <(curl -sL \
+        "https://raw.githubusercontent.com/adsorgcn/vpscheck/main/vpscheck.sh") -r 5 || \
+        echo -e "${RED}[错误] AI 工具测试脚本执行失败。${PLAIN}"
+
+    echo ""
+    pause
+}
+
 server_test_management() {
     while true; do
         clear
         echo -e "${CYAN}════════════════════ 服务器测试管理 ════════════════════${PLAIN}"
-        echo -e "${YELLOW}以下为固定测试分类，具体测试脚本将在后续逐项接入。${PLAIN}"
-        echo ""
-        echo "  1. IP 质量测试（待接入）"
-        echo "  2. 路由测试（待接入）"
-        echo "  3. 流媒体解锁测试（待接入）"
-        echo "  4. AI 工具测试（待接入）"
+        echo "  1. IP 质量测试"
+        echo "  2. 回程路由测试"
+        echo "  3. 流媒体解锁测试"
+        echo "  4. AI 工具测试"
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
         read -rp "请选择 [0-4]: " c
         case "$c" in
+            1) test_ip_quality ;;
+            2) test_return_route ;;
+            3) test_streaming_unlock ;;
+            4) test_ai_unlock ;;
             0) return ;;
-            1|2|3|4) echo -e "${YELLOW}该测试功能尚未接入。${PLAIN}"; pause ;;
             *) sleep 1 ;;
         esac
     done
