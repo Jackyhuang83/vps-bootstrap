@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.0-dev9
+# 当前版本: v1.8.0-dev10
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -69,6 +69,14 @@
 #   - 服务器管理 / 测试前移为 7 / 8
 #   - 脚本自更新移至 9，与完全卸载 / 退出归入脚本自身管理区
 #
+# v1.8.0-dev10:
+#   - 标准 Shadowsocks 扩展至 sing-box 支持的 AEAD / 兼容旧算法
+#   - Xray 原生支持的标准 SS 继续直连，避免额外本机转发
+#   - Xray 不支持的标准 SS 自动使用 sing-box 本地 SOCKS Bridge
+#   - VLESS 已部署且缺少 sing-box 时，先说明原因并征得确认后自动安装
+#   - 先添加落地、后部署 VLESS 的场景也会自动补齐 Bridge 依赖
+#   - 标准 SS 解析错误提示拆分为“算法不支持 / 密码解析失败”
+#
 # 版本主线:
 #   v1.7.0       四协议稳定基线
 #   v1.8.0-dev1  服务端分流
@@ -80,12 +88,13 @@
 #   v1.8.0-dev7  服务器管理 / 测试菜单定型
 #   v1.8.0-dev8  GitHub 脚本自更新
 #   v1.8.0-dev9  主菜单三段式定型
+#   v1.8.0-dev10 标准 Shadowsocks 扩展算法 + Xray/sing-box 按需 Bridge
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.0-dev9"
+SCRIPT_VERSION="v1.8.0-dev10"
 
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
@@ -2153,6 +2162,10 @@ deploy_vless_reality() {
     if [[ -x /usr/local/bin/xray ]] || systemctl cat xray.service >/dev/null 2>&1 || [[ -f /usr/local/etc/xray/config.json ]]; then
         echo -e "${YELLOW}[提示] 检测到服务器已有 Xray。本脚本使用独立 ss2022-xray 服务、二进制和配置，不会覆盖或重启现有 xray.service。${PLAIN}"
     fi
+    # 如果之前已经添加了 Xray 不原生支持的标准 SS 落地节点，VLESS 部署前补齐 sing-box Bridge 依赖。
+    if routing_has_bridge_nodes; then
+        ensure_existing_bridges_for_vless || { pause; return; }
+    fi
     install_xray_core || { pause; return; }
     ask_xray_port "请输入 VLESS Reality 监听端口" "443" || return
     vless_port="$PORT"
@@ -3089,13 +3102,83 @@ normalize_standard_ss_method() {
     esac
 }
 
-validate_standard_ss_outbound() {
-    local method="$1" pass="$2"
-    case "$method" in
-        aes-128-gcm|aes-256-gcm|chacha20-ietf-poly1305|xchacha20-ietf-poly1305) ;;
+# 标准 Shadowsocks 落地由 sing-box 作为“能力上限”。
+# Xray 只原生支持其中一部分算法；其余算法在 VLESS 路径中通过本地 SOCKS Bridge 交给 sing-box。
+singbox_supports_standard_ss_method() {
+    case "$1" in
+        aes-128-gcm|aes-192-gcm|aes-256-gcm|chacha20-ietf-poly1305|xchacha20-ietf-poly1305|\
+        aes-128-ctr|aes-192-ctr|aes-256-ctr|aes-128-cfb|aes-192-cfb|aes-256-cfb|\
+        rc4-md5|chacha20-ietf|xchacha20) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+xray_supports_standard_ss_method() {
+    case "$1" in
+        aes-128-gcm|aes-256-gcm|chacha20-ietf-poly1305|xchacha20-ietf-poly1305) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+standard_ss_method_is_legacy() {
+    case "$1" in
+        aes-128-ctr|aes-192-ctr|aes-256-ctr|aes-128-cfb|aes-192-cfb|aes-256-cfb|rc4-md5|chacha20-ietf|xchacha20) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+validate_standard_ss_outbound() {
+    local method="$1" pass="$2"
+    singbox_supports_standard_ss_method "$method" || return 1
     [[ -n "$pass" ]]
+}
+
+# 为需要 sing-box Bridge 的标准 SS 节点分配稳定的本地 SOCKS 端口。
+# 40000 预留给 WARP；Bridge 使用 41000-41999。
+allocate_ss_bridge_port() {
+    local p used
+    routing_init_state || return 1
+    for p in $(seq 41000 41999); do
+        used=$(jq -r --argjson p "$p" 'any(.chain_nodes[]?; (.bridge_port // 0) == $p)' "$ROUTING_FILE" 2>/dev/null || echo false)
+        [[ "$used" == "true" ]] && continue
+        if command -v ss >/dev/null 2>&1 && ss -lntH 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$p$"; then
+            continue
+        fi
+        echo "$p"
+        return 0
+    done
+    return 1
+}
+
+routing_has_bridge_nodes() {
+    [[ -f "$ROUTING_FILE" ]] || return 1
+    jq -e 'any(.chain_nodes[]?; .type=="shadowsocks" and (.bridge_required // false)==true)' "$ROUTING_FILE" >/dev/null 2>&1
+}
+
+# 当 VLESS/Xray 需要使用 Xray 不支持的标准 SS 算法时，sing-box 是必要依赖。
+# 不静默安装：第一次明确告诉用户原因并确认。
+ensure_singbox_for_ss_bridge() {
+    [[ -x "$SINGBOX_BIN" && -f "$SINGBOX_CONF" ]] && return 0
+
+    echo -e "${YELLOW}========================================${PLAIN}"
+    echo -e "${YELLOW} 需要安装 sing-box（本地 SS Bridge）${PLAIN}"
+    echo -e "${YELLOW}========================================${PLAIN}"
+    echo "当前标准 Shadowsocks 落地算法无法由 Xray 原生连接。"
+    echo "VLESS Reality 需要通过本机 SOCKS Bridge 交给 sing-box 转发。"
+    echo ""
+    echo "将安装 sing-box ${SINGBOX_VERSION}，仅作为本脚本组件使用。"
+    echo "不会因此额外开放公网 SS2022 端口。"
+    local ans
+    read -rp "是否继续安装？[y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || {
+        echo -e "${YELLOW}[取消] 未安装 sing-box，标准 SS 落地节点未添加。${PLAIN}"
+        return 1
+    }
+
+    install_singbox_core || return 1
+    ensure_base_singbox_config || return 1
+    echo -e "${GREEN}✔ sing-box 已安装，本地 Bridge 依赖就绪。${PLAIN}"
+    return 0
 }
 
 chain_node_type_label() {
@@ -3172,7 +3255,7 @@ routing_choose_ip_family() {
 }
 
 build_singbox_routing_candidate() {
-    local output="$1" outbounds='[]' rules='[{"action":"sniff","timeout":"300ms"}]' nodes count i node type tag ref default_ref default_tag port
+    local output="$1" outbounds='[]' rules='[{"action":"sniff","timeout":"300ms"}]' bridge_inbounds='[]' nodes count i node type tag ref default_ref default_tag port
     local rule_count r rmatch family outbound domains suffix keywords ips part action
     [[ -f "$SINGBOX_CONF" && -x "$SINGBOX_BIN" ]] || return 2
     routing_init_state || return 1
@@ -3191,6 +3274,17 @@ build_singbox_routing_candidate() {
         case "$type" in
             ss2022|shadowsocks)
                 outbounds=$(jq -c --arg tag "$tag" --arg server "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" '. + [{type:"shadowsocks",tag:$tag,server:$server,server_port:$port,method:$method,password:$pass}]' <<<"$outbounds")
+                if [[ "$type" == "shadowsocks" && "$(jq -r '.bridge_required // false' <<<"$node")" == "true" ]]; then
+                    local bridge_port bridge_tag
+                    bridge_port=$(jq -r '.bridge_port // 0' <<<"$node")
+                    [[ "$bridge_port" =~ ^[0-9]+$ && "$bridge_port" -gt 0 ]] || {
+                        echo -e "${RED}[错误] 标准 SS 节点缺少有效 bridge_port。${PLAIN}" >&2
+                        return 1
+                    }
+                    bridge_tag="route-bridge-in-$(jq -r '.id' <<<"$node")"
+                    bridge_inbounds=$(jq -c --arg tag "$bridge_tag" --argjson p "$bridge_port" '. + [{type:"socks",tag:$tag,listen:"127.0.0.1",listen_port:$p}]' <<<"$bridge_inbounds")
+                    rules=$(jq -c --arg inbound "$bridge_tag" --arg out "$tag" '. + [{inbound:[$inbound],action:"route",outbound:$out}]' <<<"$rules")
+                fi
                 ;;
             socks5)
                 outbounds=$(jq -c --arg tag "$tag" --arg server "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg user "$(jq -r '.username // ""' <<<"$node")" --arg pass "$(jq -r '.password // ""' <<<"$node")" '. + [({type:"socks",tag:$tag,server:$server,server_port:$port} + (if $user!="" then {username:$user,password:$pass} else {} end))]' <<<"$outbounds")
@@ -3243,11 +3337,12 @@ build_singbox_routing_candidate() {
 
     default_ref=$(jq -r '.default_outbound' "$ROUTING_FILE")
     default_tag=$(routing_tag_singbox "$default_ref")
-    jq --argjson outs "$outbounds" --argjson rules "$rules" --arg final "$default_tag" '
+    jq --argjson outs "$outbounds" --argjson rules "$rules" --argjson bridges "$bridge_inbounds" --arg final "$default_tag" '
       .dns = (.dns // {}) |
       .dns.servers = ((.dns.servers // []) as $servers |
         if any($servers[]?; .tag == "local-dns") then $servers
         else $servers + [{type:"local",tag:"local-dns"}] end) |
+      .inbounds = (((.inbounds // []) | map(select(((.tag // "") | startswith("route-bridge-in-")) | not))) + $bridges) |
       .outbounds = $outs |
       .route = (.route // {}) |
       .route.rules = $rules |
@@ -3262,8 +3357,20 @@ xray_outbound_for_node() {
     [[ "$family" == "ipv4" ]] && strategy="ForceIPv4"
     [[ "$family" == "ipv6" ]] && strategy="ForceIPv6"
     case "$type" in
-        ss2022|shadowsocks)
+        ss2022)
             jq -nc --arg tag "$tag" --arg address "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" --arg ts "$strategy" '{protocol:"shadowsocks",tag:$tag,targetStrategy:$ts,settings:{address:$address,port:$port,method:$method,password:$pass}}'
+            ;;
+        shadowsocks)
+            local method bridge_required bridge_port
+            method=$(jq -r '.method' <<<"$node")
+            bridge_required=$(jq -r '.bridge_required // false' <<<"$node")
+            if [[ "$bridge_required" == "true" ]] || ! xray_supports_standard_ss_method "$method"; then
+                bridge_port=$(jq -r '.bridge_port // 0' <<<"$node")
+                [[ "$bridge_port" =~ ^[0-9]+$ && "$bridge_port" -gt 0 ]] || return 1
+                jq -nc --arg tag "$tag" --argjson port "$bridge_port" --arg ts "$strategy" '{protocol:"socks",tag:$tag,targetStrategy:$ts,settings:{address:"127.0.0.1",port:$port}}'
+            else
+                jq -nc --arg tag "$tag" --arg address "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$method" --arg pass "$(jq -r '.password' <<<"$node")" --arg ts "$strategy" '{protocol:"shadowsocks",tag:$tag,targetStrategy:$ts,settings:{address:$address,port:$port,method:$method,password:$pass}}'
+            fi
             ;;
         socks5)
             jq -nc --arg tag "$tag" --arg address "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg user "$(jq -r '.username // ""' <<<"$node")" --arg pass "$(jq -r '.password // ""' <<<"$node")" --arg ts "$strategy" '{protocol:"socks",tag:$tag,targetStrategy:$ts,settings:({address:$address,port:$port} + (if $user!="" then {user:$user,pass:$pass} else {} end))}'
@@ -3287,6 +3394,14 @@ xray_warp_outbound() {
     [[ "$family" == "ipv6" ]] && ts="ForceIPv6"
     port=$(warp_proxy_port)
     jq -nc --arg tag "$tag" --argjson port "$port" --arg ts "$ts" '{protocol:"socks",tag:$tag,targetStrategy:$ts,settings:{address:"127.0.0.1",port:$port}}'
+}
+
+# VLESS 部署完成后，如果已有标准 SS 节点需要 Bridge，则确保 sing-box 依赖存在。
+ensure_existing_bridges_for_vless() {
+    routing_init_state || return 1
+    routing_has_bridge_nodes || return 0
+    [[ -x "$SINGBOX_BIN" && -f "$SINGBOX_CONF" ]] && return 0
+    ensure_singbox_for_ss_bridge
 }
 
 build_xray_routing_candidate() {
@@ -3580,7 +3695,7 @@ chain_add_ss2022() {
 }
 
 chain_add_shadowsocks() {
-    local name mode uri server port method pass id node tmp
+    local name mode uri server port method pass id node tmp bridge_required=false bridge_port=0
     read -rp "节点名称（例如 US-SS）: " name
     [[ -n "$name" ]] || return 1
     if routing_node_name_exists "$name"; then
@@ -3600,8 +3715,7 @@ chain_add_shadowsocks() {
             return 1
         fi
         if [[ "${CHAIN_SS_QUERY:-}" == *"plugin="* ]]; then
-            echo -e "${RED}[错误] 当前标准 SS 落地不支持 SIP003 插件（如 v2ray-plugin / obfs）。${PLAIN}"
-            echo -e "${YELLOW}[原因] 落地节点必须同时兼容 sing-box 与 Xray，避免不同入口行为不一致。${PLAIN}"
+            echo -e "${RED}[错误] 当前标准 SS 落地暂不支持 SIP003 插件（如 v2ray-plugin / obfs）。${PLAIN}"
             return 1
         fi
         server="$CHAIN_SERVER"
@@ -3614,15 +3728,35 @@ chain_add_shadowsocks() {
         validate_port_number "$port" || { echo -e "${RED}[错误] 端口无效。${PLAIN}"; return 1; }
         echo "请选择标准 Shadowsocks 加密算法："
         echo "  1. aes-128-gcm"
-        echo "  2. aes-256-gcm"
-        echo "  3. chacha20-ietf-poly1305"
-        echo "  4. xchacha20-ietf-poly1305"
-        read -rp "请选择 [1-4]: " mode
+        echo "  2. aes-192-gcm"
+        echo "  3. aes-256-gcm"
+        echo "  4. chacha20-ietf-poly1305"
+        echo "  5. xchacha20-ietf-poly1305"
+        echo "  6. aes-128-ctr          [兼容旧算法]"
+        echo "  7. aes-192-ctr          [兼容旧算法]"
+        echo "  8. aes-256-ctr          [兼容旧算法]"
+        echo "  9. aes-128-cfb          [兼容旧算法]"
+        echo " 10. aes-192-cfb          [兼容旧算法]"
+        echo " 11. aes-256-cfb          [兼容旧算法]"
+        echo " 12. rc4-md5              [兼容旧算法]"
+        echo " 13. chacha20-ietf        [兼容旧算法]"
+        echo " 14. xchacha20            [兼容旧算法]"
+        read -rp "请选择 [1-14]: " mode
         case "$mode" in
             1) method="aes-128-gcm" ;;
-            2) method="aes-256-gcm" ;;
-            3) method="chacha20-ietf-poly1305" ;;
-            4) method="xchacha20-ietf-poly1305" ;;
+            2) method="aes-192-gcm" ;;
+            3) method="aes-256-gcm" ;;
+            4) method="chacha20-ietf-poly1305" ;;
+            5) method="xchacha20-ietf-poly1305" ;;
+            6) method="aes-128-ctr" ;;
+            7) method="aes-192-ctr" ;;
+            8) method="aes-256-ctr" ;;
+            9) method="aes-128-cfb" ;;
+            10) method="aes-192-cfb" ;;
+            11) method="aes-256-cfb" ;;
+            12) method="rc4-md5" ;;
+            13) method="chacha20-ietf" ;;
+            14) method="xchacha20" ;;
             *) return 1 ;;
         esac
         read -rsp "Shadowsocks 密码: " pass
@@ -3630,22 +3764,54 @@ chain_add_shadowsocks() {
     fi
 
     method=$(normalize_standard_ss_method "$method")
-    if ! validate_standard_ss_outbound "$method" "$pass"; then
-        echo -e "${RED}[错误] 不支持的标准 SS 算法或密码为空。${PLAIN}"
-        echo "支持: aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305 / xchacha20-ietf-poly1305"
+    echo ""
+    echo "检测到 Shadowsocks 节点："
+    echo "服务器 : ${server}"
+    echo "端口   : ${port}"
+    echo "算法   : ${method}"
+    echo "密码   : $([[ -n "$pass" ]] && echo '已解析' || echo '解析失败')"
+
+    if ! singbox_supports_standard_ss_method "$method"; then
+        echo -e "${RED}[错误] 当前 sing-box 不支持该标准 SS 算法: ${method}${PLAIN}"
         return 1
+    fi
+    if [[ -z "$pass" ]]; then
+        echo -e "${RED}[错误] ss:// URI 密码解析失败或密码为空。${PLAIN}"
+        return 1
+    fi
+
+    if standard_ss_method_is_legacy "$method"; then
+        echo -e "${YELLOW}[提示] ${method} 属于兼容旧算法；可用于既有节点，新部署建议优先使用 AEAD/SS2022。${PLAIN}"
     fi
     if [[ ${#pass} -lt 16 ]]; then
         echo -e "${YELLOW}[提示] 当前密码少于 16 个字符；节点仍可使用，但建议落地端设置更强密码。${PLAIN}"
     fi
 
+    # Xray 不原生支持的标准 SS 算法，通过 sing-box 本地 SOCKS Bridge 兼容。
+    if ! xray_supports_standard_ss_method "$method"; then
+        bridge_required=true
+        bridge_port=$(allocate_ss_bridge_port) || {
+            echo -e "${RED}[错误] 无法分配本地 SS Bridge 端口。${PLAIN}"
+            return 1
+        }
+        echo -e "${YELLOW}[提示] Xray 不原生支持 ${method}；VLESS 路径将自动使用 sing-box 本地 Bridge（127.0.0.1:${bridge_port}）。${PLAIN}"
+        if xray_vless_exists && [[ ! -x "$SINGBOX_BIN" || ! -f "$SINGBOX_CONF" ]]; then
+            ensure_singbox_for_ss_bridge || return 1
+        fi
+    fi
+
     id="n$(date +%s)${RANDOM}"
-    node=$(jq -nc --arg id "$id" --arg name "$name" --arg server "$server" --argjson port "$port" --arg method "$method" --arg pass "$pass" \
-        '{id:$id,name:$name,type:"shadowsocks",server:$server,port:$port,method:$method,password:$pass}')
+    node=$(jq -nc --arg id "$id" --arg name "$name" --arg server "$server" --argjson port "$port" --arg method "$method" --arg pass "$pass" --argjson bridge "$bridge_required" --argjson bport "$bridge_port" \
+        '{id:$id,name:$name,type:"shadowsocks",server:$server,port:$port,method:$method,password:$pass,bridge_required:$bridge,bridge_port:(if $bridge then $bport else null end)}')
     tmp=$(mktemp "${STATE_DIR}/routing.json.tmp.XXXXXX") || return 1
     jq --argjson n "$node" '.chain_nodes += [$n]' "$ROUTING_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
     routing_commit_state_candidate "$tmp" || return 1
     echo -e "${GREEN}✔ 标准 Shadowsocks 落地节点 ${name} 已添加。${PLAIN}"
+    if [[ "$bridge_required" == "true" ]]; then
+        echo -e "${GREEN}  VLESS/Xray: 本地 sing-box Bridge${PLAIN}"
+    else
+        echo -e "${GREEN}  VLESS/Xray: Xray 原生直连${PLAIN}"
+    fi
 }
 
 chain_add_socks5() {
@@ -3717,6 +3883,35 @@ test_shadowsocks_node_with_singbox() {
     echo -e "${RED}[错误] Shadowsocks 落地节点测试失败。${PLAIN}"; tail -n 10 /tmp/ss2022-chain-test.log 2>/dev/null || true; return 1
 }
 
+test_shadowsocks_node_with_xray() {
+    local node="$1" family="${2:-default}" port cfg pid out rc=1 n=19180 url method strategy="AsIs"
+    url=$(ip_echo_url_for_family "$family")
+    [[ -x "$XRAY_BIN" ]] || { echo -e "${YELLOW}[提示] 未安装可用的 Xray/sing-box，无法执行 Shadowsocks 落地实连测试。${PLAIN}"; return 1; }
+    method=$(jq -r '.method' <<<"$node")
+    xray_supports_standard_ss_method "$method" || {
+        echo -e "${YELLOW}[提示] ${method} 需要 sing-box 才能测试；当前 sing-box 未安装。${PLAIN}"
+        return 1
+    }
+    [[ "$family" == "ipv4" ]] && strategy="ForceIPv4"
+    [[ "$family" == "ipv6" ]] && strategy="ForceIPv6"
+    while ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${n}$"; do n=$((n+1)); [[ $n -lt 19250 ]] || return 1; done
+    port=$n
+    cfg=$(mktemp /tmp/ss2022-xray-chain-test.XXXXXX.json) || return 1
+    jq -n --arg server "$(jq -r '.server' <<<"$node")" --argjson sport "$(jq -r '.port' <<<"$node")" --arg method "$method" --arg pass "$(jq -r '.password' <<<"$node")" --argjson lp "$port" --arg ts "$strategy" '{
+      log:{loglevel:"warning"},
+      inbounds:[{listen:"127.0.0.1",port:$lp,protocol:"socks",tag:"test-in",settings:{auth:"noauth",udp:true}}],
+      outbounds:[{protocol:"shadowsocks",tag:"test-out",targetStrategy:$ts,settings:{address:$server,port:$sport,method:$method,password:$pass}}],
+      routing:{rules:[{type:"field",inboundTag:["test-in"],outboundTag:"test-out"}]}
+    }' > "$cfg"
+    "$XRAY_BIN" run -test -format json -config "$cfg" >/dev/null 2>&1 || { rm -f "$cfg"; return 1; }
+    "$XRAY_BIN" run -format json -config "$cfg" >/tmp/ss2022-xray-chain-test.log 2>&1 & pid=$!
+    sleep 1
+    out=$(curl -fsS --connect-timeout 8 --max-time 15 --socks5-hostname "127.0.0.1:${port}" "$url" 2>/dev/null) && rc=0
+    kill "$pid" >/dev/null 2>&1 || true; wait "$pid" 2>/dev/null || true; rm -f "$cfg"
+    if [[ $rc -eq 0 ]]; then echo -e "${GREEN}✔ 落地节点可用，出口 IP: ${out}${PLAIN}"; return 0; fi
+    echo -e "${RED}[错误] Shadowsocks 落地节点测试失败。${PLAIN}"; tail -n 10 /tmp/ss2022-xray-chain-test.log 2>/dev/null || true; return 1
+}
+
 chain_test_node() {
     chain_select_id || return 1
     local node type server port user pass out
@@ -3724,8 +3919,15 @@ chain_test_node() {
     type=$(jq -r '.type' <<<"$node")
     echo -e "${YELLOW}>> 测试 $(jq -r '.name' <<<"$node")...${PLAIN}"
     case "$type" in
-        ss2022|shadowsocks)
+        ss2022)
             test_shadowsocks_node_with_singbox "$node" default
+            ;;
+        shadowsocks)
+            if [[ -x "$SINGBOX_BIN" ]]; then
+                test_shadowsocks_node_with_singbox "$node" default
+            else
+                test_shadowsocks_node_with_xray "$node" default
+            fi
             ;;
         socks5)
             server=$(jq -r '.server' <<<"$node"); port=$(jq -r '.port' <<<"$node"); user=$(jq -r '.username // ""' <<<"$node"); pass=$(jq -r '.password // ""' <<<"$node")
