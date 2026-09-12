@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.0-dev25
+# 当前版本: v1.8.0-dev26
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,12 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.8.0-dev26:
+#   - 系统信息内存 / 虚拟内存单位去除 Gi / Mi 中的 i，统一显示 G / M
+#   - 系统信息入站 / 出站流量改为按自然月累计
+#   - 月流量状态持久化到 /etc/ss2022，VPS 重启后继续累计
+#   - 每月 1 日自动进入新的统计周期
 #
 # v1.8.0-dev25:
 #   - 系统信息页面将“主机名”移动到第一行显示
@@ -209,7 +215,7 @@
 # ==============================================================================
 
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.0-dev25"
+SCRIPT_VERSION="v1.8.0-dev26"
 
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
@@ -283,6 +289,7 @@ WARP_MANAGED_MARKER="${STATE_DIR}/warp-package-managed"
 # ----------------------------- TG-BOT 流量监控 ---------------------------------
 TG_MONITOR_CONF="${STATE_DIR}/tg-monitor.conf"
 TG_MONITOR_STATE="${STATE_DIR}/tg-monitor.state"
+SYSTEM_INFO_TRAFFIC_STATE="${STATE_DIR}/system-info-traffic.state"
 TG_MONITOR_WORKER="/usr/local/lib/ss2022/tg-traffic-monitor.sh"
 TG_MONITOR_SERVICE="/etc/systemd/system/ss2022-tg-monitor.service"
 TG_MONITOR_TIMER="/etc/systemd/system/ss2022-tg-monitor.timer"
@@ -6605,6 +6612,78 @@ server_tool_public_traffic_bytes() {
     printf '%s %s\n' "$total_rx" "$total_tx"
 }
 
+server_tool_monthly_traffic_bytes() {
+    local raw current_rx current_tx month
+    local state_month="" last_rx=0 last_tx=0 total_rx=0 total_tx=0
+    local tmp
+
+    mkdir -p "$STATE_DIR" || {
+        echo "0 0"
+        return
+    }
+    chmod 700 "$STATE_DIR"
+
+    raw=$(server_tool_public_traffic_bytes)
+    current_rx=$(awk '{print $1}' <<<"$raw")
+    current_tx=$(awk '{print $2}' <<<"$raw")
+    [[ "$current_rx" =~ ^[0-9]+$ ]] || current_rx=0
+    [[ "$current_tx" =~ ^[0-9]+$ ]] || current_tx=0
+
+    month=$(date +%Y-%m)
+
+    if [[ -f "$SYSTEM_INFO_TRAFFIC_STATE" ]]; then
+        state_month=$(awk -F= '$1=="MONTH" {gsub(/\047/,"",$2); print $2}' "$SYSTEM_INFO_TRAFFIC_STATE" 2>/dev/null)
+        last_rx=$(awk -F= '$1=="LAST_RX" {print $2}' "$SYSTEM_INFO_TRAFFIC_STATE" 2>/dev/null)
+        last_tx=$(awk -F= '$1=="LAST_TX" {print $2}' "$SYSTEM_INFO_TRAFFIC_STATE" 2>/dev/null)
+        total_rx=$(awk -F= '$1=="TOTAL_RX" {print $2}' "$SYSTEM_INFO_TRAFFIC_STATE" 2>/dev/null)
+        total_tx=$(awk -F= '$1=="TOTAL_TX" {print $2}' "$SYSTEM_INFO_TRAFFIC_STATE" 2>/dev/null)
+    fi
+
+    [[ "$last_rx" =~ ^[0-9]+$ ]] || last_rx=0
+    [[ "$last_tx" =~ ^[0-9]+$ ]] || last_tx=0
+    [[ "$total_rx" =~ ^[0-9]+$ ]] || total_rx=0
+    [[ "$total_tx" =~ ^[0-9]+$ ]] || total_tx=0
+
+    if [[ "$state_month" != "$month" ]]; then
+        # 新月份从当前时刻重新开始累计。
+        state_month="$month"
+        last_rx="$current_rx"
+        last_tx="$current_tx"
+        total_rx=0
+        total_tx=0
+    else
+        if [[ "$current_rx" -ge "$last_rx" ]]; then
+            total_rx=$((total_rx + current_rx - last_rx))
+        else
+            # VPS 重启或网卡计数归零：保留当月累计，并把当前值作为重启后的新增量。
+            total_rx=$((total_rx + current_rx))
+        fi
+
+        if [[ "$current_tx" -ge "$last_tx" ]]; then
+            total_tx=$((total_tx + current_tx - last_tx))
+        else
+            total_tx=$((total_tx + current_tx))
+        fi
+
+        last_rx="$current_rx"
+        last_tx="$current_tx"
+    fi
+
+    tmp="${SYSTEM_INFO_TRAFFIC_STATE}.tmp.$$"
+    umask 077
+    cat > "$tmp" <<EOF
+MONTH='${state_month}'
+LAST_RX=${last_rx}
+LAST_TX=${last_tx}
+TOTAL_RX=${total_rx}
+TOTAL_TX=${total_tx}
+EOF
+    mv -f "$tmp" "$SYSTEM_INFO_TRAFFIC_STATE"
+    chmod 600 "$SYSTEM_INFO_TRAFFIC_STATE"
+
+    printf '%s %s\n' "$total_rx" "$total_tx"
+}
+
 server_tool_system_info() {
     local cpu cores mem_total mem_used swap_total swap_used disk_used disk_total
     local uptime_days timezone dns congestion qdisc os_info ipv4 ipv6 hostname_text
@@ -6627,6 +6706,22 @@ server_tool_system_info() {
     mem_used=$(free -h 2>/dev/null | awk '/^Mem:/ {print $3}')
     swap_total=$(free -h 2>/dev/null | awk '/^Swap:/ {print $2}')
     swap_used=$(free -h 2>/dev/null | awk '/^Swap:/ {print $3}')
+    mem_total=${mem_total//Gi/G}
+    mem_total=${mem_total//Mi/M}
+    mem_total=${mem_total//Ki/K}
+    mem_total=${mem_total//Ti/T}
+    mem_used=${mem_used//Gi/G}
+    mem_used=${mem_used//Mi/M}
+    mem_used=${mem_used//Ki/K}
+    mem_used=${mem_used//Ti/T}
+    swap_total=${swap_total//Gi/G}
+    swap_total=${swap_total//Mi/M}
+    swap_total=${swap_total//Ki/K}
+    swap_total=${swap_total//Ti/T}
+    swap_used=${swap_used//Gi/G}
+    swap_used=${swap_used//Mi/M}
+    swap_used=${swap_used//Ki/K}
+    swap_used=${swap_used//Ti/T}
     disk_used=$(df -h / 2>/dev/null | awk 'NR==2 {print $3}')
     disk_total=$(df -h / 2>/dev/null | awk 'NR==2 {print $2}')
 
@@ -6639,7 +6734,7 @@ server_tool_system_info() {
     qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
     hostname_text=$(hostname 2>/dev/null || echo "未知")
 
-    traffic_pair=$(server_tool_public_traffic_bytes)
+    traffic_pair=$(server_tool_monthly_traffic_bytes)
     traffic_rx=$(awk '{print $1}' <<<"$traffic_pair")
     traffic_tx=$(awk '{print $2}' <<<"$traffic_pair")
 
@@ -6656,8 +6751,8 @@ server_tool_system_info() {
     echo "  虚拟内存   : ${swap_used:-?} / ${swap_total:-?}"
     echo "  硬盘占用   : ${disk_used:-?} / ${disk_total:-?}"
     echo "  运行时间   : ${uptime_days} 天"
-    echo "  入站流量   : $(server_tool_format_bytes "${traffic_rx:-0}")"
-    echo "  出站流量   : $(server_tool_format_bytes "${traffic_tx:-0}")"
+    echo "  入站流量   : $(server_tool_format_bytes "${traffic_rx:-0}")（本月）"
+    echo "  出站流量   : $(server_tool_format_bytes "${traffic_tx:-0}")（本月）"
     echo "  时区       : ${timezone:-未知}"
     echo "  IPv4 地址  : ${ipv4:-无 IPv4}"
     echo "  IPv6 地址  : ${ipv6:-无 IPv6}"
