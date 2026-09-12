@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.0-dev7
+# 当前版本: v1.8.0-dev8
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -16,6 +16,7 @@
 # │   ├─ 端口转发 ────────────────── Realm                              │
 # │   ├─ 协议运维                                                       │
 # │   ├─ 组件版本管理                                                   │
+# │   ├─ 脚本自更新
 # │   ├─ 服务器管理工具                                                 │
 # │   ├─ 服务器测试管理                                                 │
 # │   └─ 完全卸载                                                       │
@@ -41,7 +42,8 @@
 #   [10] Realm L4 端口转发
 #   [11] 服务运维与彻底卸载
 #   [12] 组件版本管理
-#   [13] 菜单与程序入口（含服务器工具/测试预留入口）
+#   [13] 脚本自更新
+#   [14] 菜单与程序入口（含服务器工具/测试预留入口）
 #
 # v1.8.0-dev6:
 #   - 落地节点新增标准 Shadowsocks
@@ -56,6 +58,12 @@
 #   - 服务器测试预留 IP质量 / 路由 / 流媒体解锁 / AI工具 四类入口
 #   - 修复 Realm 服务管理函数命名残留，避免菜单调用不存在的函数
 #
+# v1.8.0-dev8:
+#   - 主菜单新增“检查脚本更新”
+#   - 支持从 GitHub main 检查并自更新 /usr/local/bin/ss2022
+#   - 同时比较版本号与 SHA256，开发期同版本内容变化也能识别
+#   - 更新前执行 Bash 语法与项目标识检查，并保留最近一次脚本备份
+#
 # 版本主线:
 #   v1.7.0       四协议稳定基线
 #   v1.8.0-dev1  服务端分流
@@ -65,12 +73,19 @@
 #   v1.8.0-dev5  标准 Shadowsocks 落地节点
 #   v1.8.0-dev6  菜单术语整理 / 协议运维边界
 #   v1.8.0-dev7  服务器管理 / 测试菜单定型
+#   v1.8.0-dev8  GitHub 脚本自更新
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.0-dev7"
+SCRIPT_VERSION="v1.8.0-dev8"
+
+# ----------------------------- 脚本自更新 --------------------------------------
+SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
+SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
+SCRIPT_PROXY_LINK="/usr/local/bin/proxy"
+SCRIPT_BACKUP_PATH="/usr/local/bin/ss2022.bak"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -5419,7 +5434,147 @@ component_version_management() {
 }
 
 # ==============================================================================
-# [13] 菜单与程序入口
+# [13] 脚本自更新
+# ==============================================================================
+
+extract_script_version() {
+    local file="$1"
+    sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' "$file" 2>/dev/null | head -n1
+}
+
+script_source_path() {
+    local src="${BASH_SOURCE[0]}"
+    readlink -f "$src" 2>/dev/null || printf '%s\n' "$src"
+}
+
+check_script_update() {
+    clear
+    echo -e "${CYAN}════════════════════ 检查脚本更新 ════════════════════${PLAIN}"
+    echo "更新源 : ${SCRIPT_UPDATE_URL}"
+    echo "当前版 : ${SCRIPT_VERSION}"
+    echo ""
+
+    command -v curl >/dev/null 2>&1 || {
+        echo -e "${RED}[错误] 未检测到 curl，无法检查更新。${PLAIN}"
+        pause
+        return
+    }
+
+    local tmp remote_version local_file local_hash remote_hash cache_bust
+    tmp=$(mktemp /tmp/ss2022-update.XXXXXX.sh) || {
+        echo -e "${RED}[错误] 无法创建临时文件。${PLAIN}"
+        pause
+        return
+    }
+    cache_bust=$(date +%s)
+
+    echo -e "${YELLOW}>> 正在从 GitHub main 获取最新脚本...${PLAIN}"
+    if ! curl -fsSL --retry 2 --retry-delay 1 --connect-timeout 8 --max-time 60 \
+        -H 'Cache-Control: no-cache' \
+        "${SCRIPT_UPDATE_URL}?t=${cache_bust}" -o "$tmp"; then
+        rm -f "$tmp"
+        echo -e "${RED}[错误] 下载 GitHub 最新脚本失败。${PLAIN}"
+        pause
+        return
+    fi
+
+    # 只接受本项目脚本，避免 URL / CDN 异常返回 HTML 或其它内容后被直接执行。
+    if ! grep -q '^# 项目名称: vps-bootstrap / ss2022.sh$' "$tmp"; then
+        rm -f "$tmp"
+        echo -e "${RED}[错误] 下载内容不是有效的 vps-bootstrap/ss2022.sh，已拒绝更新。${PLAIN}"
+        pause
+        return
+    fi
+    if ! bash -n "$tmp"; then
+        rm -f "$tmp"
+        echo -e "${RED}[错误] GitHub 脚本未通过 Bash 语法检查，已拒绝更新。${PLAIN}"
+        pause
+        return
+    fi
+
+    remote_version=$(extract_script_version "$tmp")
+    if [[ -z "$remote_version" ]]; then
+        rm -f "$tmp"
+        echo -e "${RED}[错误] 无法读取远程 SCRIPT_VERSION，已拒绝更新。${PLAIN}"
+        pause
+        return
+    fi
+
+    local_file="$SCRIPT_INSTALL_PATH"
+    [[ -f "$local_file" ]] || local_file=$(script_source_path)
+    local_hash=$(sha256sum "$local_file" 2>/dev/null | awk '{print $1}')
+    remote_hash=$(sha256sum "$tmp" | awk '{print $1}')
+
+    echo "远程版 : ${remote_version}"
+    echo "当前SHA : ${local_hash:-无法读取}"
+    echo "远程SHA : ${remote_hash}"
+    echo ""
+
+    if [[ -n "$local_hash" && "$local_hash" == "$remote_hash" ]]; then
+        rm -f "$tmp"
+        echo -e "${GREEN}✔ 当前脚本已与 GitHub main 完全一致。${PLAIN}"
+        pause
+        return
+    fi
+
+    if [[ "$remote_version" == "$SCRIPT_VERSION" ]]; then
+        echo -e "${YELLOW}检测到同版本号内容更新：${SCRIPT_VERSION}${PLAIN}"
+        echo "这通常发生在开发测试阶段，GitHub main 内容已变化但版本号尚未递增。"
+    else
+        echo -e "${GREEN}检测到脚本更新：${SCRIPT_VERSION} → ${remote_version}${PLAIN}"
+    fi
+    echo ""
+    echo "更新将："
+    echo "  1. 备份当前脚本到 ${SCRIPT_BACKUP_PATH}"
+    echo "  2. 安装 GitHub main 最新脚本到 ${SCRIPT_INSTALL_PATH}"
+    echo "  3. 保持 ${SCRIPT_PROXY_LINK} 快捷命令"
+    echo "  4. 自动重新进入新版管理面板"
+    echo ""
+
+    local ans
+    read -rp "确认更新？[y/N]: " ans
+    if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+        rm -f "$tmp"
+        echo "已取消更新。"
+        pause
+        return
+    fi
+
+    # 覆盖前保存最近一个版本。安装失败时立即恢复。
+    if [[ -f "$SCRIPT_INSTALL_PATH" ]]; then
+        cp -a "$SCRIPT_INSTALL_PATH" "$SCRIPT_BACKUP_PATH" || {
+            rm -f "$tmp"
+            echo -e "${RED}[错误] 无法备份当前脚本，已取消更新。${PLAIN}"
+            pause
+            return
+        }
+    fi
+
+    if ! install -m 0755 "$tmp" "$SCRIPT_INSTALL_PATH"; then
+        [[ -f "$SCRIPT_BACKUP_PATH" ]] && install -m 0755 "$SCRIPT_BACKUP_PATH" "$SCRIPT_INSTALL_PATH" 2>/dev/null || true
+        rm -f "$tmp"
+        echo -e "${RED}[错误] 新脚本安装失败，已尝试恢复旧版本。${PLAIN}"
+        pause
+        return
+    fi
+    rm -f "$tmp"
+
+    if ! bash -n "$SCRIPT_INSTALL_PATH"; then
+        echo -e "${RED}[错误] 安装后的脚本语法校验失败，正在恢复旧版本。${PLAIN}"
+        [[ -f "$SCRIPT_BACKUP_PATH" ]] && install -m 0755 "$SCRIPT_BACKUP_PATH" "$SCRIPT_INSTALL_PATH" 2>/dev/null || true
+        pause
+        return
+    fi
+
+    ln -sf "$SCRIPT_INSTALL_PATH" "$SCRIPT_PROXY_LINK" || true
+    echo -e "${GREEN}✔ 脚本更新完成：$(extract_script_version "$SCRIPT_INSTALL_PATH")${PLAIN}"
+    echo "正在重新进入新版管理面板..."
+    sleep 1
+    exec "$SCRIPT_INSTALL_PATH"
+}
+
+# ==============================================================================
+# [14] 菜单与程序入口
 # ==============================================================================
 
 protocol_management() {
@@ -5541,12 +5696,13 @@ main() {
         echo "  4. 查看当前节点参数与客户端配置"
         echo "  5. 协议运维管理"
         echo "  6. 组件版本管理"
-        echo "  7. 服务器管理工具"
-        echo "  8. 服务器测试管理"
-        echo -e "${RED}  9. 完全卸载脚本${PLAIN}"
+        echo "  7. 检查脚本更新"
+        echo "  8. 服务器管理工具"
+        echo "  9. 服务器测试管理"
+        echo -e "${RED} 10. 完全卸载脚本${PLAIN}"
         echo "  0. 退出管理面板"
         echo -e "${CYAN}═════════════════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请输入选项编号 [0-9]: " choice
+        read -rp "请输入选项编号 [0-10]: " choice
 
         case "$choice" in
             1) protocol_management ;;
@@ -5555,9 +5711,10 @@ main() {
             4) view_config_menu ;;
             5) protocol_operations_management ;;
             6) component_version_management ;;
-            7) server_management_tools ;;
-            8) server_test_management ;;
-            9) full_uninstall ;;
+            7) check_script_update ;;
+            8) server_management_tools ;;
+            9) server_test_management ;;
+            10) full_uninstall ;;
             0)
                 echo "已安全退出。随时输入 ss2022 唤出！"
                 exit 0
