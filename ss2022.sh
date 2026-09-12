@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.0-dev20
+# 当前版本: v1.8.0-dev21
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -86,6 +86,15 @@
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
 #
+# v1.8.0-dev21:
+#   - 完善“服务器管理工具”菜单，参考 kejilion.sh 常用系统工具但按本项目安全策略重写
+#   - 新增系统信息、系统更新/清理、Swap、BBR、DNS、IPv4/IPv6 优先级、端口占用
+#   - 新增时区、SSH 端口安全新增、主机名修改、服务器重启
+#   - DNS 不锁死 resolv.conf；systemd-resolved 使用独立 drop-in，可恢复
+#   - Swap 仅管理 /swapfile，不清理服务器已有其他 Swap
+#   - BBR 仅启用当前内核已支持的原生 BBR，不自动更换内核
+#   - SSH 新端口部署保留现有端口，先 sshd -t 校验，再 reload，降低远程失联风险
+#
 # v1.8.0-dev20:
 #   - 修复服务器测试工具对第三方脚本 exit code 的误判
 #   - IP质量 / 流媒体 / AI 测试先下载到临时文件，再执行，下载失败与脚本运行结果分离
@@ -162,12 +171,13 @@
 #   v1.8.0-dev18 服务器测试工具正式接入
 #   v1.8.0-dev19 协议节点自定义名称 / 旧节点在线改名
 #   v1.8.0-dev20 第三方测试脚本返回码误判修复
+#   v1.8.0-dev21 服务器管理工具轻量化完善
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.0-dev20"
+SCRIPT_VERSION="v1.8.0-dev21"
 
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
@@ -6397,16 +6407,683 @@ restart_service_safe() {
     fi
 }
 
+server_tool_pkg_manager() {
+    if command -v apt-get >/dev/null 2>&1; then
+        echo "apt"
+    elif command -v dnf >/dev/null 2>&1; then
+        echo "dnf"
+    elif command -v yum >/dev/null 2>&1; then
+        echo "yum"
+    elif command -v apk >/dev/null 2>&1; then
+        echo "apk"
+    else
+        echo "unknown"
+    fi
+}
+
+server_tool_system_info() {
+    local cpu cores mem_total mem_used swap_total swap_used disk_used disk_total
+    local uptime_text timezone dns congestion qdisc os_info
+
+    clear
+    os_info=$(get_sys_info)
+    cpu=$(awk -F: '/model name|Hardware|Processor/ {gsub(/^[ 	]+/,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null)
+    cpu=${cpu:-$(uname -m)}
+    cores=$(nproc 2>/dev/null || echo "?")
+    mem_total=$(free -h 2>/dev/null | awk '/^Mem:/ {print $2}')
+    mem_used=$(free -h 2>/dev/null | awk '/^Mem:/ {print $3}')
+    swap_total=$(free -h 2>/dev/null | awk '/^Swap:/ {print $2}')
+    swap_used=$(free -h 2>/dev/null | awk '/^Swap:/ {print $3}')
+    disk_used=$(df -h / 2>/dev/null | awk 'NR==2 {print $3}')
+    disk_total=$(df -h / 2>/dev/null | awk 'NR==2 {print $2}')
+    uptime_text=$(uptime -p 2>/dev/null || uptime 2>/dev/null)
+    timezone=$(timedatectl show -p Timezone --value 2>/dev/null || date +%Z)
+    dns=$(awk '/^[[:space:]]*nameserver[[:space:]]+/ {print $2}' /etc/resolv.conf 2>/dev/null | paste -sd ',' -)
+    congestion=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
+
+    echo -e "${CYAN}════════════════════ 系统信息 ════════════════════${PLAIN}"
+    echo "  系统      : ${os_info}"
+    echo "  CPU       : ${cpu}"
+    echo "  CPU 核心  : ${cores}"
+    echo "  内存      : ${mem_used:-?} / ${mem_total:-?}"
+    echo "  Swap      : ${swap_used:-?} / ${swap_total:-?}"
+    echo "  根分区    : ${disk_used:-?} / ${disk_total:-?}"
+    echo "  运行时间  : ${uptime_text:-未知}"
+    echo "  时区      : ${timezone:-未知}"
+    echo "  DNS       : ${dns:-未检测到}"
+    echo "  TCP拥塞   : ${congestion}"
+    echo "  qdisc     : ${qdisc}"
+    echo ""
+    echo -e "${YELLOW}监听端口摘要:${PLAIN}"
+    ss -H -lntu 2>/dev/null | awk '{print "  " $1 "  " $5}' | head -n 30 || true
+    echo -e "${CYAN}═══════════════════════════════════════════════════${PLAIN}"
+}
+
+server_tool_system_update() {
+    local pm action
+    pm=$(server_tool_pkg_manager)
+
+    clear
+    echo -e "${CYAN}════════════════ 系统更新 / 清理 ════════════════${PLAIN}"
+    echo "  1. 更新系统软件包"
+    echo "  2. 清理无用软件包与缓存"
+    echo "  3. 更新 + 清理"
+    echo "  0. 返回"
+    read -rp "请选择 [0-3]: " action
+
+    [[ "$action" == "0" ]] && return
+
+    if [[ "$pm" == "unknown" ]]; then
+        echo -e "${RED}[错误] 未识别当前系统包管理器。${PLAIN}"
+        pause
+        return
+    fi
+
+    if [[ "$action" == "1" || "$action" == "3" ]]; then
+        echo -e "${YELLOW}>> 正在更新系统软件包...${PLAIN}"
+        case "$pm" in
+            apt)
+                DEBIAN_FRONTEND=noninteractive apt-get update -y &&
+                DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y
+                ;;
+            dnf) dnf upgrade -y ;;
+            yum) yum update -y ;;
+            apk) apk update && apk upgrade ;;
+        esac
+    fi
+
+    if [[ "$action" == "2" || "$action" == "3" ]]; then
+        echo -e "${YELLOW}>> 正在清理无用软件包与包管理器缓存...${PLAIN}"
+        case "$pm" in
+            apt)
+                DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y
+                apt-get clean
+                apt-get autoclean
+                ;;
+            dnf)
+                dnf autoremove -y || true
+                dnf clean all
+                ;;
+            yum)
+                yum autoremove -y || true
+                yum clean all
+                ;;
+            apk)
+                apk cache clean
+                ;;
+        esac
+    fi
+
+    echo -e "${GREEN}✔ 操作完成。${PLAIN}"
+    pause
+}
+
+server_tool_swap_status() {
+    echo -e "${YELLOW}当前内存 / Swap:${PLAIN}"
+    free -h 2>/dev/null || true
+    echo ""
+    swapon --show 2>/dev/null || true
+}
+
+server_tool_swap_create() {
+    local size_mb="$1"
+
+    if ! [[ "$size_mb" =~ ^[0-9]+$ ]] || [[ "$size_mb" -lt 256 ]] || [[ "$size_mb" -gt 32768 ]]; then
+        echo -e "${RED}[错误] Swap 大小必须在 256-32768 MB。${PLAIN}"
+        return 1
+    fi
+
+    if swapon --show=NAME --noheadings 2>/dev/null | grep -qx '/swapfile'; then
+        swapoff /swapfile || return 1
+    fi
+
+    rm -f /swapfile
+
+    echo -e "${YELLOW}>> 创建 ${size_mb} MB /swapfile...${PLAIN}"
+    if command -v fallocate >/dev/null 2>&1; then
+        fallocate -l "${size_mb}M" /swapfile || return 1
+    else
+        dd if=/dev/zero of=/swapfile bs=1M count="$size_mb" status=progress || return 1
+    fi
+
+    chmod 600 /swapfile
+    mkswap /swapfile >/dev/null || { rm -f /swapfile; return 1; }
+    swapon /swapfile || { rm -f /swapfile; return 1; }
+
+    sed -i '\|^/swapfile[[:space:]]|d' /etc/fstab
+    echo '/swapfile none swap sw 0 0' >> /etc/fstab
+
+    echo -e "${GREEN}✔ /swapfile 已启用。${PLAIN}"
+}
+
+server_tool_swap_remove() {
+    local ans=""
+    if [[ ! -f /swapfile ]] && ! grep -qE '^/swapfile[[:space:]]' /etc/fstab 2>/dev/null; then
+        echo -e "${YELLOW}未检测到由本工具管理的 /swapfile。${PLAIN}"
+        return 0
+    fi
+
+    read -rp "确认删除 /swapfile？不会影响其他 Swap。[y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || return 0
+
+    swapoff /swapfile >/dev/null 2>&1 || true
+    sed -i '\|^/swapfile[[:space:]]|d' /etc/fstab
+    rm -f /swapfile
+    echo -e "${GREEN}✔ /swapfile 已删除。${PLAIN}"
+}
+
+server_tool_swap_management() {
+    local c custom
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ Swap 管理 ════════════════════${PLAIN}"
+        server_tool_swap_status
+        echo ""
+        echo "  1. 设置 512 MB"
+        echo "  2. 设置 1 GB"
+        echo "  3. 设置 2 GB"
+        echo "  4. 设置 4 GB"
+        echo "  5. 自定义大小"
+        echo "  6. 删除 /swapfile"
+        echo "  0. 返回"
+        read -rp "请选择 [0-6]: " c
+        case "$c" in
+            1) server_tool_swap_create 512; pause ;;
+            2) server_tool_swap_create 1024; pause ;;
+            3) server_tool_swap_create 2048; pause ;;
+            4) server_tool_swap_create 4096; pause ;;
+            5)
+                read -rp "请输入 Swap 大小（MB，256-32768）: " custom
+                server_tool_swap_create "$custom"
+                pause
+                ;;
+            6) server_tool_swap_remove; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+server_tool_bbr_status() {
+    local available current qdisc
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+    current=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || true)
+    echo "当前算法 : ${current:-未知}"
+    echo "可用算法 : ${available:-未知}"
+    echo "当前 qdisc: ${qdisc:-未知}"
+}
+
+server_tool_bbr_enable() {
+    local available
+    modprobe tcp_bbr >/dev/null 2>&1 || true
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+
+    if ! grep -qw bbr <<<"$available"; then
+        echo -e "${RED}[错误] 当前内核没有提供 BBR。${PLAIN}"
+        echo -e "${YELLOW}本脚本不会为了 BBR 自动替换 VPS 内核。${PLAIN}"
+        return 1
+    fi
+
+    mkdir -p /etc/sysctl.d
+    cat > /etc/sysctl.d/99-ss2022-bbr.conf <<'EOF'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+
+    sysctl -p /etc/sysctl.d/99-ss2022-bbr.conf >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1 || return 1
+
+    if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]]; then
+        echo -e "${GREEN}✔ BBR 已启用。${PLAIN}"
+        return 0
+    fi
+
+    echo -e "${RED}[错误] BBR 参数写入后未生效。${PLAIN}"
+    return 1
+}
+
+server_tool_bbr_disable() {
+    local available fallback="cubic"
+    rm -f /etc/sysctl.d/99-ss2022-bbr.conf
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+    grep -qw cubic <<<"$available" || fallback=$(awk '{print $1}' <<<"$available")
+    [[ -n "$fallback" ]] || fallback="reno"
+
+    sysctl -w "net.ipv4.tcp_congestion_control=${fallback}" >/dev/null 2>&1 || true
+    if grep -qw fq_codel <<<"$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"; then
+        :
+    else
+        sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1 || true
+    fi
+    echo -e "${GREEN}✔ 已移除本脚本 BBR 持久化配置；当前算法: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 未知)${PLAIN}"
+}
+
+server_tool_bbr_management() {
+    local c
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ BBR 管理 ════════════════════${PLAIN}"
+        server_tool_bbr_status
+        echo ""
+        echo "  1. 启用当前内核原生 BBR"
+        echo "  2. 移除本脚本 BBR 配置"
+        echo "  0. 返回"
+        read -rp "请选择 [0-2]: " c
+        case "$c" in
+            1) server_tool_bbr_enable; pause ;;
+            2) server_tool_bbr_disable; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+server_tool_dns_show() {
+    echo -e "${YELLOW}当前 /etc/resolv.conf:${PLAIN}"
+    cat /etc/resolv.conf 2>/dev/null || true
+}
+
+server_tool_dns_apply() {
+    local dns4="$1" dns6="$2"
+    local resolved_dropin="/etc/systemd/resolved.conf.d/99-ss2022-dns.conf"
+    local backup="${STATE_DIR}/resolv.conf.server-tools.bak"
+
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+
+    if [[ -L /etc/resolv.conf ]] && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        mkdir -p /etc/systemd/resolved.conf.d
+        cat > "$resolved_dropin" <<EOF
+[Resolve]
+DNS=${dns4} ${dns6}
+FallbackDNS=
+EOF
+        systemctl restart systemd-resolved || {
+            rm -f "$resolved_dropin"
+            systemctl restart systemd-resolved >/dev/null 2>&1 || true
+            return 1
+        }
+        echo -e "${GREEN}✔ DNS 已通过 systemd-resolved drop-in 更新。${PLAIN}"
+        return 0
+    fi
+
+    if [[ -L /etc/resolv.conf ]]; then
+        echo -e "${RED}[错误] /etc/resolv.conf 是符号链接，但未检测到可管理的 systemd-resolved。${PLAIN}"
+        echo -e "${YELLOW}为避免破坏 NetworkManager 或其他网络管理器，本工具不会强制覆盖。${PLAIN}"
+        return 1
+    fi
+
+    if [[ ! -f "$backup" && -f /etc/resolv.conf ]]; then
+        cp -a /etc/resolv.conf "$backup" || return 1
+        chmod 600 "$backup"
+    fi
+
+    cat > /etc/resolv.conf <<EOF
+nameserver $(awk '{print $1}' <<<"$dns4")
+nameserver $(awk '{print $2}' <<<"$dns4")
+nameserver $(awk '{print $1}' <<<"$dns6")
+nameserver $(awk '{print $2}' <<<"$dns6")
+options timeout:2 attempts:2
+EOF
+
+    echo -e "${GREEN}✔ DNS 已更新。${PLAIN}"
+}
+
+server_tool_dns_restore() {
+    local resolved_dropin="/etc/systemd/resolved.conf.d/99-ss2022-dns.conf"
+    local backup="${STATE_DIR}/resolv.conf.server-tools.bak"
+
+    if [[ -f "$resolved_dropin" ]]; then
+        rm -f "$resolved_dropin"
+        systemctl restart systemd-resolved >/dev/null 2>&1 || true
+        echo -e "${GREEN}✔ 已移除本脚本的 systemd-resolved DNS 配置。${PLAIN}"
+        return 0
+    fi
+
+    if [[ -f "$backup" && ! -L /etc/resolv.conf ]]; then
+        cp -af "$backup" /etc/resolv.conf
+        rm -f "$backup"
+        echo -e "${GREEN}✔ 已恢复修改前的 DNS 配置。${PLAIN}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}没有找到本工具可恢复的 DNS 备份。${PLAIN}"
+}
+
+server_tool_dns_management() {
+    local c
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ DNS 管理 ════════════════════${PLAIN}"
+        server_tool_dns_show
+        echo ""
+        echo "  1. Cloudflare + Google"
+        echo "     IPv4: 1.1.1.1 / 8.8.8.8"
+        echo "     IPv6: 2606:4700:4700::1111 / 2001:4860:4860::8888"
+        echo "  2. Quad9 + Cloudflare"
+        echo "     IPv4: 9.9.9.9 / 1.1.1.1"
+        echo "     IPv6: 2620:fe::fe / 2606:4700:4700::1111"
+        echo "  3. 阿里 DNS + DNSPod"
+        echo "     IPv4: 223.5.5.5 / 119.29.29.29"
+        echo "     IPv6: 2400:3200::1 / 2402:4e00::"
+        echo "  4. 恢复修改前 DNS"
+        echo "  0. 返回"
+        read -rp "请选择 [0-4]: " c
+        case "$c" in
+            1) server_tool_dns_apply "1.1.1.1 8.8.8.8" "2606:4700:4700::1111 2001:4860:4860::8888"; pause ;;
+            2) server_tool_dns_apply "9.9.9.9 1.1.1.1" "2620:fe::fe 2606:4700:4700::1111"; pause ;;
+            3) server_tool_dns_apply "223.5.5.5 119.29.29.29" "2400:3200::1 2402:4e00::"; pause ;;
+            4) server_tool_dns_restore; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+server_tool_ip_priority_status() {
+    if grep -q '^precedence ::ffff:0:0/96[[:space:]]\+100[[:space:]]*# ss2022-prefer-ipv4$' /etc/gai.conf 2>/dev/null; then
+        echo "当前模式: IPv4 优先"
+    else
+        echo "当前模式: 系统默认（通常 IPv6 优先）"
+    fi
+}
+
+server_tool_ip_priority_management() {
+    local c
+    while true; do
+        clear
+        echo -e "${CYAN}════════════ IPv4 / IPv6 优先级 ════════════${PLAIN}"
+        server_tool_ip_priority_status
+        echo ""
+        echo "  1. 设置 IPv4 优先"
+        echo "  2. 恢复系统默认优先级"
+        echo "  0. 返回"
+        read -rp "请选择 [0-2]: " c
+        case "$c" in
+            1)
+                touch /etc/gai.conf
+                sed -i '/# ss2022-prefer-ipv4$/d' /etc/gai.conf
+                echo 'precedence ::ffff:0:0/96  100 # ss2022-prefer-ipv4' >> /etc/gai.conf
+                echo -e "${GREEN}✔ 已设置 IPv4 优先。${PLAIN}"
+                pause
+                ;;
+            2)
+                [[ -f /etc/gai.conf ]] && sed -i '/# ss2022-prefer-ipv4$/d' /etc/gai.conf
+                echo -e "${GREEN}✔ 已恢复系统默认地址优先级。${PLAIN}"
+                pause
+                ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+server_tool_port_usage() {
+    local port
+    clear
+    echo -e "${CYAN}════════════════════ 端口占用 ════════════════════${PLAIN}"
+    echo -e "${YELLOW}当前监听端口:${PLAIN}"
+    ss -lntup 2>/dev/null || true
+    echo ""
+    read -rp "输入端口号可进一步筛选，直接回车返回: " port
+    [[ -z "$port" ]] && return
+    if ! validate_port_number "$port"; then
+        echo -e "${RED}端口无效。${PLAIN}"
+        pause
+        return
+    fi
+    echo ""
+    ss -lntup 2>/dev/null | awk -v p="$port" '
+        NR==1 {print; next}
+        {
+            addr=$5
+            n=split(addr,a,":")
+            if (a[n] == p) print
+        }'
+    pause
+}
+
+server_tool_timezone_management() {
+    local c zone
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ 时区管理 ════════════════════${PLAIN}"
+        echo "当前时区: $(timedatectl show -p Timezone --value 2>/dev/null || date +%Z)"
+        echo ""
+        echo "  1. UTC"
+        echo "  2. Asia/Shanghai"
+        echo "  3. Asia/Tokyo"
+        echo "  4. America/Los_Angeles"
+        echo "  5. Europe/London"
+        echo "  6. 自定义 IANA 时区"
+        echo "  0. 返回"
+        read -rp "请选择 [0-6]: " c
+        case "$c" in
+            1) zone="UTC" ;;
+            2) zone="Asia/Shanghai" ;;
+            3) zone="Asia/Tokyo" ;;
+            4) zone="America/Los_Angeles" ;;
+            5) zone="Europe/London" ;;
+            6)
+                read -rp "请输入时区，例如 Asia/Singapore: " zone
+                ;;
+            0) return ;;
+            *) sleep 1; continue ;;
+        esac
+
+        if command -v timedatectl >/dev/null 2>&1 && timedatectl list-timezones 2>/dev/null | grep -Fxq "$zone"; then
+            timedatectl set-timezone "$zone" &&
+                echo -e "${GREEN}✔ 时区已设置为 ${zone}。${PLAIN}"
+        elif [[ -e "/usr/share/zoneinfo/${zone}" ]]; then
+            ln -sf "/usr/share/zoneinfo/${zone}" /etc/localtime
+            echo "$zone" > /etc/timezone 2>/dev/null || true
+            echo -e "${GREEN}✔ 时区已设置为 ${zone}。${PLAIN}"
+        else
+            echo -e "${RED}[错误] 无效时区: ${zone}${PLAIN}"
+        fi
+        pause
+    done
+}
+
+server_tool_ssh_ports() {
+    if command -v sshd >/dev/null 2>&1; then
+        sshd -T 2>/dev/null | awk '$1=="port" {print $2}' | sort -nu
+    fi
+}
+
+server_tool_ssh_add_port() {
+    local new_port old_ports tmp_conf target_conf service_name backup
+    local include_dir="/etc/ssh/sshd_config.d"
+    local dropin="${include_dir}/99-ss2022-port.conf"
+
+    command -v sshd >/dev/null 2>&1 || {
+        echo -e "${RED}[错误] 未找到 sshd。${PLAIN}"
+        return 1
+    }
+
+    old_ports=$(server_tool_ssh_ports)
+    echo "当前 SSH 端口: $(tr '
+' ' ' <<<"$old_ports")"
+    read -rp "请输入要新增的 SSH 端口: " new_port
+    validate_port_number "$new_port" || {
+        echo -e "${RED}[错误] 端口无效。${PLAIN}"
+        return 1
+    }
+
+    if grep -qx "$new_port" <<<"$old_ports"; then
+        echo -e "${YELLOW}该端口已经是 SSH 监听端口。${PLAIN}"
+        return 0
+    fi
+
+    if port_in_use_by_other_process "$new_port" "" >/tmp/ss2022-ssh-port.$$ 2>/dev/null; then
+        echo -e "${RED}[错误] 端口 ${new_port} 已被其他进程占用。${PLAIN}"
+        cat /tmp/ss2022-ssh-port.$$ 2>/dev/null || true
+        rm -f /tmp/ss2022-ssh-port.$$
+        return 1
+    fi
+    rm -f /tmp/ss2022-ssh-port.$$ 2>/dev/null || true
+
+    echo -e "${YELLOW}[安全策略] 新端口会与现有 SSH 端口同时保留，不会直接删除旧端口。${PLAIN}"
+    echo -e "${YELLOW}还需确认云厂商安全组/防火墙已放行 ${new_port}/TCP。${PLAIN}"
+    local ans
+    read -rp "确认新增？[y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || return 0
+
+    mkdir -p "$include_dir"
+    backup="${dropin}.bak.$(date +%Y%m%d-%H%M%S)"
+    [[ -f "$dropin" ]] && cp -a "$dropin" "$backup"
+
+    {
+        echo "# Managed by ss2022.sh - preserve existing SSH ports"
+        while read -r p; do
+            [[ -n "$p" ]] && echo "Port $p"
+        done <<<"$old_ports"
+        echo "Port $new_port"
+    } > "$dropin"
+
+    if ! sshd -t; then
+        echo -e "${RED}[错误] sshd 配置校验失败，正在回滚。${PLAIN}"
+        if [[ -f "$backup" ]]; then
+            mv -f "$backup" "$dropin"
+        else
+            rm -f "$dropin"
+        fi
+        sshd -t >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    if systemctl list-unit-files 2>/dev/null | grep -q '^ssh\.service'; then
+        service_name="ssh"
+    else
+        service_name="sshd"
+    fi
+
+    if ! systemctl reload "$service_name" 2>/dev/null; then
+        echo -e "${RED}[错误] SSH reload 失败，正在回滚。${PLAIN}"
+        if [[ -f "$backup" ]]; then
+            mv -f "$backup" "$dropin"
+        else
+            rm -f "$dropin"
+        fi
+        systemctl reload "$service_name" >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    sleep 1
+    if ss -H -lnt 2>/dev/null | awk -v p="$new_port" '
+        {
+            addr=$4
+            n=split(addr,a,":")
+            if (a[n] == p) found=1
+        }
+        END {exit !found}
+    '; then
+        echo -e "${GREEN}✔ SSH 已新增端口 ${new_port}，旧端口继续保留。${PLAIN}"
+        echo -e "${YELLOW}请先新开一个 SSH 会话验证 ${new_port} 可登录，再考虑手工移除旧端口。${PLAIN}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}[警告] sshd 配置已通过，但暂未检测到 ${new_port} 正在监听。请不要关闭当前 SSH 会话。${PLAIN}"
+    return 1
+}
+
+server_tool_ssh_management() {
+    local c
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ SSH 端口 ════════════════════${PLAIN}"
+        echo "当前端口:"
+        server_tool_ssh_ports | sed 's/^/  - /'
+        echo ""
+        echo "  1. 安全新增 SSH 端口（保留旧端口）"
+        echo "  0. 返回"
+        read -rp "请选择 [0-1]: " c
+        case "$c" in
+            1) server_tool_ssh_add_port; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+server_tool_hostname_change() {
+    local current new ans
+    current=$(hostname 2>/dev/null || true)
+    clear
+    echo -e "${CYAN}════════════════════ 修改主机名 ════════════════════${PLAIN}"
+    echo "当前主机名: ${current}"
+    read -rp "请输入新主机名: " new
+
+    if ! [[ "$new" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,62}$ ]] || [[ "$new" == *".."* ]] || [[ "$new" == *"." ]]; then
+        echo -e "${RED}[错误] 主机名格式无效。${PLAIN}"
+        pause
+        return
+    fi
+
+    read -rp "确认修改为 ${new}？[y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || return
+
+    if command -v hostnamectl >/dev/null 2>&1; then
+        hostnamectl set-hostname "$new" || { pause; return; }
+    else
+        echo "$new" > /etc/hostname
+        hostname "$new" || true
+    fi
+
+    if [[ -f /etc/hosts ]]; then
+        if grep -qE '^127\.0\.1\.1[[:space:]]+' /etc/hosts; then
+            sed -i -E "s/^127\.0\.1\.1[[:space:]].*/127.0.1.1	${new}/" /etc/hosts
+        else
+            printf '127.0.1.1	%s
+' "$new" >> /etc/hosts
+        fi
+    fi
+
+    echo -e "${GREEN}✔ 主机名已修改为 ${new}。${PLAIN}"
+    pause
+}
+
+server_tool_reboot() {
+    local ans
+    clear
+    echo -e "${YELLOW}[警告] 服务器将立即重启，当前 SSH 会话会断开。${PLAIN}"
+    read -rp "确认重启？请输入 y: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || return
+    sync
+    reboot
+}
+
 server_management_tools() {
     while true; do
         clear
         echo -e "${CYAN}════════════════════ 服务器管理工具 ════════════════════${PLAIN}"
-        echo -e "${YELLOW}当前仅建立固定菜单入口，具体工具将在后续按需接入。${PLAIN}"
-        echo ""
+        echo "  1. 系统信息"
+        echo "  2. 系统更新 / 清理"
+        echo "  3. Swap 虚拟内存"
+        echo "  4. BBR 加速"
+        echo "  5. DNS 管理"
+        echo "  6. IPv4 / IPv6 优先级"
+        echo "  7. 查看端口占用"
+        echo "  8. 系统时区"
+        echo "  9. SSH 端口管理"
+        echo " 10. 修改主机名"
+        echo " 11. 重启服务器"
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0]: " c
+        read -rp "请选择 [0-11]: " c
         case "$c" in
+            1) server_tool_system_info; pause ;;
+            2) server_tool_system_update ;;
+            3) server_tool_swap_management ;;
+            4) server_tool_bbr_management ;;
+            5) server_tool_dns_management ;;
+            6) server_tool_ip_priority_management ;;
+            7) server_tool_port_usage ;;
+            8) server_tool_timezone_management ;;
+            9) server_tool_ssh_management ;;
+            10) server_tool_hostname_change ;;
+            11) server_tool_reboot ;;
             0) return ;;
             *) sleep 1 ;;
         esac
