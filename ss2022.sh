@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.0-dev8
+# 当前版本: v1.8.0-dev9
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -64,6 +64,11 @@
 #   - 同时比较版本号与 SHA256，开发期同版本内容变化也能识别
 #   - 更新前执行 Bash 语法与项目标识检查，并保留最近一次脚本备份
 #
+# v1.8.0-dev9:
+#   - 主菜单按三类重新分组并增加虚线分隔
+#   - 服务器管理 / 测试前移为 7 / 8
+#   - 脚本自更新移至 9，与完全卸载 / 退出归入脚本自身管理区
+#
 # 版本主线:
 #   v1.7.0       四协议稳定基线
 #   v1.8.0-dev1  服务端分流
@@ -74,12 +79,13 @@
 #   v1.8.0-dev6  菜单术语整理 / 协议运维边界
 #   v1.8.0-dev7  服务器管理 / 测试菜单定型
 #   v1.8.0-dev8  GitHub 脚本自更新
+#   v1.8.0-dev9  主菜单三段式定型
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.0-dev8"
+SCRIPT_VERSION="v1.8.0-dev9"
 
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
@@ -5696,9 +5702,11 @@ main() {
         echo "  4. 查看当前节点参数与客户端配置"
         echo "  5. 协议运维管理"
         echo "  6. 组件版本管理"
-        echo "  7. 检查脚本更新"
-        echo "  8. 服务器管理工具"
-        echo "  9. 服务器测试管理"
+        echo "  - - - - - - - - - - - - - - - -"
+        echo "  7. 服务器管理工具"
+        echo "  8. 服务器测试管理"
+        echo "  - - - - - - - - - - - - - - - -"
+        echo "  9. 检查脚本更新"
         echo -e "${RED} 10. 完全卸载脚本${PLAIN}"
         echo "  0. 退出管理面板"
         echo -e "${CYAN}═════════════════════════════════════════════════════════════════${PLAIN}"
@@ -5711,9 +5719,9 @@ main() {
             4) view_config_menu ;;
             5) protocol_operations_management ;;
             6) component_version_management ;;
-            7) check_script_update ;;
-            8) server_management_tools ;;
-            9) server_test_management ;;
+            7) server_management_tools ;;
+            8) server_test_management ;;
+            9) check_script_update ;;
             10) full_uninstall ;;
             0)
                 echo "已安全退出。随时输入 ss2022 唤出！"
