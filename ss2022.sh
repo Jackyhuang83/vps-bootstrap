@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.0-dev22
+# 当前版本: v1.8.0-dev23
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,15 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.8.0-dev23:
+#   - 系统信息增加 CPU 当前平均频率显示
+#   - 删除“修改主机名”工具项
+#   - 服务器重启改为输入 REBOOT 明文确认，避免误触
+#   - DNS 管理增加自定义 DNS，支持厂商解锁 DNS 与多个 IPv4/IPv6 地址
+#   - TG-BOT 自动关机阈值独立配置，默认 95%，不再写死 100%
+#   - AI 工具测试切换到 oneclickvirt/ecs 使用的 UnlockTests AI-only 模块
+#   - AI 测试临时下载对应架构二进制，测试后删除，不常驻安装
 #
 # v1.8.0-dev22:
 #   - 服务器管理工具新增 TG-BOT 月流量监控 / 分级预警 / 可选自动关机
@@ -181,12 +190,13 @@
 #   v1.8.0-dev20 第三方测试脚本返回码误判修复
 #   v1.8.0-dev21 服务器管理工具轻量化完善
 #   v1.8.0-dev22 TG-BOT 流量预警 / 端口占用增强 / IP 信息增强
+#   v1.8.0-dev23 工具菜单实测收口 / AI 测试替换
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.0-dev22"
+SCRIPT_VERSION="v1.8.0-dev23"
 
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
@@ -6521,6 +6531,13 @@ server_tool_system_info() {
     cpu=$(awk -F: '/model name|Hardware|Processor/ {gsub(/^[ \t]+/,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null)
     cpu=${cpu:-$(uname -m)}
     cores=$(nproc 2>/dev/null || echo "?")
+    local cpu_mhz cpu_ghz
+    cpu_mhz=$(awk -F: '/cpu MHz/ {gsub(/^[ \t]+/,"",$2); sum+=$2; n++} END {if (n>0) printf "%.0f", sum/n}' /proc/cpuinfo 2>/dev/null)
+    if [[ "$cpu_mhz" =~ ^[0-9]+$ ]] && [[ "$cpu_mhz" -gt 0 ]]; then
+        cpu_ghz=$(awk -v mhz="$cpu_mhz" 'BEGIN {printf "%.2f", mhz/1000}')
+    else
+        cpu_ghz=""
+    fi
     mem_total=$(free -h 2>/dev/null | awk '/^Mem:/ {print $2}')
     mem_used=$(free -h 2>/dev/null | awk '/^Mem:/ {print $3}')
     swap_total=$(free -h 2>/dev/null | awk '/^Swap:/ {print $2}')
@@ -6540,7 +6557,7 @@ server_tool_system_info() {
     echo -e "${CYAN}════════════════════ 系统信息 ════════════════════${PLAIN}"
     echo "  系统       : ${os_info}"
     echo "  CPU        : ${cpu}"
-    echo "  CPU 核心   : ${cores}"
+    echo "  CPU 核心   : ${cores}$([[ -n "$cpu_ghz" ]] && printf " 核 @ %s GHz" "$cpu_ghz" || printf " 核")"
     echo "  内存       : ${mem_used:-?} / ${mem_total:-?}"
     echo "  Swap       : ${swap_used:-?} / ${swap_total:-?}"
     echo "  根分区     : ${disk_used:-?} / ${disk_total:-?}"
@@ -6782,9 +6799,37 @@ server_tool_dns_show() {
 }
 
 server_tool_dns_apply() {
-    local dns4="$1" dns6="$2"
+    local dns_list="$1"
     local resolved_dropin="/etc/systemd/resolved.conf.d/99-ss2022-dns.conf"
     local backup="${STATE_DIR}/resolv.conf.server-tools.bak"
+    local dns="" valid_list=""
+
+    for dns in $dns_list; do
+        dns=${dns//,/}
+        [[ -n "$dns" ]] || continue
+
+        if [[ "$dns" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            local IFS=.
+            read -r a b c d <<<"$dns"
+            if (( a <= 255 && b <= 255 && c <= 255 && d <= 255 )); then
+                valid_list+="${dns} "
+            else
+                echo -e "${RED}[错误] 无效 IPv4 DNS: ${dns}${PLAIN}"
+                return 1
+            fi
+        elif [[ "$dns" =~ ^[0-9A-Fa-f:]+$ && "$dns" == *:* ]]; then
+            valid_list+="${dns} "
+        else
+            echo -e "${RED}[错误] 无效 DNS 地址: ${dns}${PLAIN}"
+            return 1
+        fi
+    done
+
+    valid_list=${valid_list% }
+    [[ -n "$valid_list" ]] || {
+        echo -e "${RED}[错误] 未提供有效 DNS 地址。${PLAIN}"
+        return 1
+    }
 
     mkdir -p "$STATE_DIR"
     chmod 700 "$STATE_DIR"
@@ -6793,15 +6838,15 @@ server_tool_dns_apply() {
         mkdir -p /etc/systemd/resolved.conf.d
         cat > "$resolved_dropin" <<EOF
 [Resolve]
-DNS=${dns4} ${dns6}
+DNS=${valid_list}
 FallbackDNS=
 EOF
-        systemctl restart systemd-resolved || {
+        if ! systemctl restart systemd-resolved; then
             rm -f "$resolved_dropin"
             systemctl restart systemd-resolved >/dev/null 2>&1 || true
             return 1
-        }
-        echo -e "${GREEN}✔ DNS 已通过 systemd-resolved drop-in 更新。${PLAIN}"
+        fi
+        echo -e "${GREEN}✔ DNS 已通过 systemd-resolved 更新：${valid_list}${PLAIN}"
         return 0
     fi
 
@@ -6816,15 +6861,13 @@ EOF
         chmod 600 "$backup"
     fi
 
-    cat > /etc/resolv.conf <<EOF
-nameserver $(awk '{print $1}' <<<"$dns4")
-nameserver $(awk '{print $2}' <<<"$dns4")
-nameserver $(awk '{print $1}' <<<"$dns6")
-nameserver $(awk '{print $2}' <<<"$dns6")
-options timeout:2 attempts:2
-EOF
+    : > /etc/resolv.conf
+    for dns in $valid_list; do
+        printf 'nameserver %s\n' "$dns" >> /etc/resolv.conf
+    done
+    printf '%s\n' 'options timeout:2 attempts:2' >> /etc/resolv.conf
 
-    echo -e "${GREEN}✔ DNS 已更新。${PLAIN}"
+    echo -e "${GREEN}✔ DNS 已更新：${valid_list}${PLAIN}"
 }
 
 server_tool_dns_restore() {
@@ -6849,29 +6892,48 @@ server_tool_dns_restore() {
 }
 
 server_tool_dns_management() {
-    local c
+    local c custom_dns
     while true; do
         clear
         echo -e "${CYAN}════════════════════ DNS 管理 ════════════════════${PLAIN}"
         server_tool_dns_show
         echo ""
         echo "  1. Cloudflare + Google"
-        echo "     IPv4: 1.1.1.1 / 8.8.8.8"
-        echo "     IPv6: 2606:4700:4700::1111 / 2001:4860:4860::8888"
+        echo "     1.1.1.1 / 8.8.8.8 / 2606:4700:4700::1111 / 2001:4860:4860::8888"
         echo "  2. Quad9 + Cloudflare"
-        echo "     IPv4: 9.9.9.9 / 1.1.1.1"
-        echo "     IPv6: 2620:fe::fe / 2606:4700:4700::1111"
+        echo "     9.9.9.9 / 1.1.1.1 / 2620:fe::fe / 2606:4700:4700::1111"
         echo "  3. 阿里 DNS + DNSPod"
-        echo "     IPv4: 223.5.5.5 / 119.29.29.29"
-        echo "     IPv6: 2400:3200::1 / 2402:4e00::"
-        echo "  4. 恢复修改前 DNS"
+        echo "     223.5.5.5 / 119.29.29.29 / 2400:3200::1 / 2402:4e00::"
+        echo "  4. 自定义 DNS（支持解锁 DNS）"
+        echo "  5. 恢复修改前 DNS"
         echo "  0. 返回"
-        read -rp "请选择 [0-4]: " c
+        read -rp "请选择 [0-5]: " c
         case "$c" in
-            1) server_tool_dns_apply "1.1.1.1 8.8.8.8" "2606:4700:4700::1111 2001:4860:4860::8888"; pause ;;
-            2) server_tool_dns_apply "9.9.9.9 1.1.1.1" "2620:fe::fe 2606:4700:4700::1111"; pause ;;
-            3) server_tool_dns_apply "223.5.5.5 119.29.29.29" "2400:3200::1 2402:4e00::"; pause ;;
-            4) server_tool_dns_restore; pause ;;
+            1)
+                server_tool_dns_apply "1.1.1.1 8.8.8.8 2606:4700:4700::1111 2001:4860:4860::8888"
+                pause
+                ;;
+            2)
+                server_tool_dns_apply "9.9.9.9 1.1.1.1 2620:fe::fe 2606:4700:4700::1111"
+                pause
+                ;;
+            3)
+                server_tool_dns_apply "223.5.5.5 119.29.29.29 2400:3200::1 2402:4e00::"
+                pause
+                ;;
+            4)
+                echo ""
+                echo "请输入厂商提供的 DNS IP。"
+                echo "支持 IPv4 / IPv6；多个地址使用空格分隔。"
+                echo "示例: 1.2.3.4 5.6.7.8"
+                read -rp "自定义 DNS: " custom_dns
+                [[ -n "$custom_dns" ]] && server_tool_dns_apply "$custom_dns"
+                pause
+                ;;
+            5)
+                server_tool_dns_restore
+                pause
+                ;;
             0) return ;;
             *) sleep 1 ;;
         esac
@@ -7309,6 +7371,7 @@ HOST_LABEL="${HOST_LABEL:-$(hostname)}"
 WARN1_PERCENT="${WARN1_PERCENT:-80}"
 WARN2_PERCENT="${WARN2_PERCENT:-90}"
 AUTO_SHUTDOWN="${AUTO_SHUTDOWN:-no}"
+SHUTDOWN_PERCENT="${SHUTDOWN_PERCENT:-95}"
 
 rx_percent=$(percent_of "$TOTAL_RX" "${RX_LIMIT_GB:-0}")
 tx_percent=$(percent_of "$TOTAL_TX" "${TX_LIMIT_GB:-0}")
@@ -7366,16 +7429,16 @@ mv -f "$tmp" "$STATE"
 chmod 600 "$STATE"
 
 shutdown_needed=0
-if [[ "${RX_LIMIT_GB:-0}" =~ ^[0-9]+$ && "${RX_LIMIT_GB:-0}" -gt 0 && "$rx_percent" -ge 100 ]]; then
+if [[ "${RX_LIMIT_GB:-0}" =~ ^[0-9]+$ && "${RX_LIMIT_GB:-0}" -gt 0 && "$rx_percent" -ge "$SHUTDOWN_PERCENT" ]]; then
     shutdown_needed=1
 fi
-if [[ "${TX_LIMIT_GB:-0}" =~ ^[0-9]+$ && "${TX_LIMIT_GB:-0}" -gt 0 && "$tx_percent" -ge 100 ]]; then
+if [[ "${TX_LIMIT_GB:-0}" =~ ^[0-9]+$ && "${TX_LIMIT_GB:-0}" -gt 0 && "$tx_percent" -ge "$SHUTDOWN_PERCENT" ]]; then
     shutdown_needed=1
 fi
 
 if [[ "$shutdown_needed" -eq 1 && "$AUTO_SHUTDOWN" == "yes" ]]; then
     send_tg "⛔ ${HOST_LABEL}
-流量达到设定上限，服务器即将自动关机。"
+流量达到自动关机阈值 ${SHUTDOWN_PERCENT}%，服务器即将自动关机。"
     sync
     shutdown -h now
 fi
@@ -7439,7 +7502,7 @@ server_tool_tg_monitor_send_test() {
 }
 
 server_tool_tg_monitor_configure() {
-    local token chat_id rx_limit tx_limit reset_day warn1 warn2 auto_shutdown host_label
+    local token chat_id rx_limit tx_limit reset_day warn1 warn2 shutdown_percent auto_shutdown host_label
     local current_token="" current_chat="" ans
 
     if [[ -f "$TG_MONITOR_CONF" ]]; then
@@ -7454,7 +7517,7 @@ server_tool_tg_monitor_configure() {
     echo "说明："
     echo "  - 每分钟累计公网网卡收发流量；累计状态写入磁盘，重启 VPS 后不会清零。"
     echo "  - 默认在 80% / 90% / 100% 三个阶段发送 Telegram 预警。"
-    echo "  - 达到 100% 后可选择自动关机。"
+    echo "  - 自动关机阈值独立配置，默认 95%。"
     echo "  - 新启用时从当前流量计数作为起点，只统计启用后的流量。"
     echo ""
 
@@ -7494,8 +7557,10 @@ server_tool_tg_monitor_configure() {
     warn1=${warn1:-80}
     read -rp "第二预警百分比 [默认 90]: " warn2
     warn2=${warn2:-90}
+    read -rp "自动关机阈值百分比 [默认 95]: " shutdown_percent
+    shutdown_percent=${shutdown_percent:-95}
 
-    for n in "$rx_limit" "$tx_limit" "$reset_day" "$warn1" "$warn2"; do
+    for n in "$rx_limit" "$tx_limit" "$reset_day" "$warn1" "$warn2" "$shutdown_percent"; do
         [[ "$n" =~ ^[0-9]+$ ]] || {
             echo -e "${RED}[错误] 阈值必须为整数。${PLAIN}"
             pause
@@ -7515,10 +7580,16 @@ server_tool_tg_monitor_configure() {
         return
     fi
 
-    read -rp "达到 100% 后自动关机？[y/N]: " ans
+    if [[ "$shutdown_percent" -lt 1 || "$shutdown_percent" -gt 100 ]]; then
+        echo -e "${RED}[错误] 自动关机阈值必须在 1-100%。${PLAIN}"
+        pause
+        return
+    fi
+
+    read -rp "达到 ${shutdown_percent}% 后自动关机？[y/N]: " ans
     if [[ "$ans" =~ ^[Yy]$ ]]; then
         auto_shutdown="yes"
-        echo -e "${YELLOW}[警告] 自动关机启用后，达到任一启用的流量上限会执行 shutdown -h now。${PLAIN}"
+        echo -e "${YELLOW}[警告] 自动关机启用后，任一启用方向达到 ${shutdown_percent}% 会执行 shutdown -h now。${PLAIN}"
         read -rp "再次确认启用自动关机？[y/N]: " ans
         [[ "$ans" =~ ^[Yy]$ ]] || auto_shutdown="no"
     else
@@ -7539,6 +7610,7 @@ TX_LIMIT_GB=${tx_limit}
 RESET_DAY=${reset_day}
 WARN1_PERCENT=${warn1}
 WARN2_PERCENT=${warn2}
+SHUTDOWN_PERCENT=${shutdown_percent}
 AUTO_SHUTDOWN='${auto_shutdown}'
 EOF
     chmod 600 "$TG_MONITOR_CONF"
@@ -7564,7 +7636,7 @@ EOF
 }
 
 server_tool_tg_monitor_status() {
-    local enabled="未启用" rx_limit="-" tx_limit="-" reset_day="-" warn1="-" warn2="-" auto="-"
+    local enabled="未启用" rx_limit="-" tx_limit="-" reset_day="-" warn1="-" warn2="-" shutdown_percent="95" auto="-"
     local total_rx=0 total_tx=0 period="-" rx_gb tx_gb token_masked="-"
 
     [[ -f "$TG_MONITOR_CONF" ]] && {
@@ -7575,6 +7647,7 @@ server_tool_tg_monitor_status() {
         reset_day="${RESET_DAY:-1}"
         warn1="${WARN1_PERCENT:-80}"
         warn2="${WARN2_PERCENT:-90}"
+        shutdown_percent="${SHUTDOWN_PERCENT:-95}"
         auto="${AUTO_SHUTDOWN:-no}"
         if [[ -n "${TG_BOT_TOKEN:-}" ]]; then
             token_masked="${TG_BOT_TOKEN:0:6}******"
@@ -7607,6 +7680,7 @@ server_tool_tg_monitor_status() {
     echo "  TG Token     : ${token_masked}"
     echo "  Chat ID      : ${TG_CHAT_ID:--}"
     echo "  预警线       : ${warn1}% / ${warn2}% / 100%"
+    echo "  关机阈值     : ${shutdown_percent}%"
     echo "  自动关机     : $([[ "$auto" == "yes" ]] && echo "开启" || echo "关闭")"
     echo -e "${CYAN}═══════════════════════════════════════════════${PLAIN}"
 }
@@ -7665,49 +7739,19 @@ server_tool_tg_monitor_management() {
     done
 }
 
-server_tool_hostname_change() {
-    local current new ans
-    current=$(hostname 2>/dev/null || true)
-    clear
-    echo -e "${CYAN}════════════════════ 修改主机名 ════════════════════${PLAIN}"
-    echo "当前主机名: ${current}"
-    read -rp "请输入新主机名: " new
-
-    if ! [[ "$new" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,62}$ ]] || [[ "$new" == *".."* ]] || [[ "$new" == *"." ]]; then
-        echo -e "${RED}[错误] 主机名格式无效。${PLAIN}"
-        pause
-        return
-    fi
-
-    read -rp "确认修改为 ${new}？[y/N]: " ans
-    [[ "$ans" =~ ^[Yy]$ ]] || return
-
-    if command -v hostnamectl >/dev/null 2>&1; then
-        hostnamectl set-hostname "$new" || { pause; return; }
-    else
-        echo "$new" > /etc/hostname
-        hostname "$new" || true
-    fi
-
-    if [[ -f /etc/hosts ]]; then
-        if grep -qE '^127\.0\.1\.1[[:space:]]+' /etc/hosts; then
-            sed -i -E "s/^127\.0\.1\.1[[:space:]].*/127.0.1.1	${new}/" /etc/hosts
-        else
-            printf '127.0.1.1	%s
-' "$new" >> /etc/hosts
-        fi
-    fi
-
-    echo -e "${GREEN}✔ 主机名已修改为 ${new}。${PLAIN}"
-    pause
-}
-
 server_tool_reboot() {
     local ans
     clear
-    echo -e "${YELLOW}[警告] 服务器将立即重启，当前 SSH 会话会断开。${PLAIN}"
-    read -rp "确认重启？请输入 y: " ans
-    [[ "$ans" =~ ^[Yy]$ ]] || return
+    echo -e "${RED}════════════════════ 重启服务器 ════════════════════${PLAIN}"
+    echo -e "${YELLOW}[警告] 重启会立即中断当前 SSH 会话和正在运行的任务。${PLAIN}"
+    echo ""
+    echo "为避免误触，请完整输入：REBOOT"
+    read -rp "确认字符: " ans
+    [[ "$ans" == "REBOOT" ]] || {
+        echo "已取消重启。"
+        pause
+        return
+    }
     sync
     reboot
 }
@@ -7726,11 +7770,10 @@ server_management_tools() {
         echo "  8. IPv4 / IPv6 优先级"
         echo "  9. 系统时区"
         echo " 10. SSH 端口管理"
-        echo " 11. 修改主机名"
-        echo " 12. 重启服务器"
+        echo " 11. 重启服务器"
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0-12]: " c
+        read -rp "请选择 [0-11]: " c
         case "$c" in
             1) server_tool_system_info; pause ;;
             2) server_tool_port_usage ;;
@@ -7742,8 +7785,7 @@ server_management_tools() {
             8) server_tool_ip_priority_management ;;
             9) server_tool_timezone_management ;;
             10) server_tool_ssh_management ;;
-            11) server_tool_hostname_change ;;
-            12) server_tool_reboot ;;
+            11) server_tool_reboot ;;
             0) return ;;
             *) sleep 1 ;;
         esac
@@ -7892,12 +7934,15 @@ test_streaming_unlock() {
 }
 
 test_ai_unlock() {
+    local arch asset tmp url
+
     clear
     show_external_test_source \
         "AI 工具测试" \
-        "https://github.com/adsorgcn/vpscheck"
+        "https://github.com/oneclickvirt/UnlockTests（oneclickvirt/ecs 使用的解锁模块）"
 
-    echo -e "${CYAN}检测范围: ChatGPT / OpenAI API / Gemini / Claude / Copilot / Grok / Perplexity / Mistral / Poe / Sora / DeepSeek / Kimi 等${PLAIN}"
+    echo -e "${CYAN}检测模式: AI-only（ChatGPT / Gemini / Claude / Copilot / Grok / Perplexity / Poe 等）${PLAIN}"
+    echo -e "${YELLOW}说明: 区分 YES / NO / Restricted / Banned / RateLimited / TIMEOUT / DNS失败等状态。${PLAIN}"
     echo ""
 
     ensure_test_dependency curl curl || {
@@ -7906,11 +7951,43 @@ test_ai_unlock() {
         return
     }
 
-    run_external_curl_test \
-        "AI 工具测试" \
-        "https://raw.githubusercontent.com/adsorgcn/vpscheck/main/vpscheck.sh" \
-        -r 5
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64|amd64) asset="ut-linux-amd64" ;;
+        aarch64|arm64) asset="ut-linux-arm64" ;;
+        i386|i686) asset="ut-linux-386" ;;
+        armv7l|armv7*) asset="ut-linux-arm" ;;
+        *)
+            echo -e "${RED}[错误] 当前 CPU 架构暂未在本菜单中适配: ${arch}${PLAIN}"
+            pause
+            return
+            ;;
+    esac
 
+    tmp=$(mktemp /tmp/ss2022-unlocktests.XXXXXX) || {
+        echo -e "${RED}[错误] 无法创建临时测试文件。${PLAIN}"
+        pause
+        return
+    }
+
+    url="https://github.com/oneclickvirt/UnlockTests/releases/download/output/${asset}"
+
+    echo -e "${YELLOW}>> 下载 UnlockTests ${asset}...${PLAIN}"
+    if ! curl -fL --retry 2 --retry-delay 1 \
+        --connect-timeout 10 --max-time 120 \
+        "$url" -o "$tmp"; then
+        rm -f "$tmp"
+        echo -e "${RED}[错误] AI 测试组件下载失败。${PLAIN}"
+        pause
+        return
+    fi
+
+    chmod 700 "$tmp"
+
+    # -f 21 = 仅 AI 平台；关闭进度条以便终端输出更清晰。
+    "$tmp" -L zh -f 21 -b=false || true
+
+    rm -f "$tmp"
     echo ""
     pause
 }
