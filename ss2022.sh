@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.0-dev23
+# 当前版本: v1.8.0-dev24
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,14 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.8.0-dev24:
+#   - 系统信息运行时间统一改为“X 天”，不再显示 weeks
+#   - 系统信息增加公网流量入站 / 出站累计
+#   - 系统信息增加 IP 地理位置（国家 / 地区 / 城市）
+#   - “根分区”更名为“硬盘占用”，“Swap”更名为“虚拟内存”
+#   - TCP 拥塞算法与 qdisc 合并显示为“网络算法”
+#   - 系统信息底部增加主机名
 #
 # v1.8.0-dev23:
 #   - 系统信息增加 CPU 当前平均频率显示
@@ -191,12 +199,13 @@
 #   v1.8.0-dev21 服务器管理工具轻量化完善
 #   v1.8.0-dev22 TG-BOT 流量预警 / 端口占用增强 / IP 信息增强
 #   v1.8.0-dev23 工具菜单实测收口 / AI 测试替换
+#   v1.8.0-dev24 系统信息展示优化
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.0-dev23"
+SCRIPT_VERSION="v1.8.0-dev24"
 
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
@@ -6448,7 +6457,7 @@ server_tool_pkg_manager() {
 }
 
 server_tool_get_ip_profile() {
-    local ipv4="$1" ipv6="$2" target meta hosting proxy mobile org asn isp
+    local ipv4="$1" ipv6="$2" target meta hosting proxy mobile org asn isp country region city location
     local scam_html score risk_label
 
     SERVER_INFO_IPV4="$ipv4"
@@ -6457,6 +6466,7 @@ server_tool_get_ip_profile() {
     SERVER_INFO_IP_RISK="未获取"
     SERVER_INFO_ISP="未知"
     SERVER_INFO_ASN="未知"
+    SERVER_INFO_LOCATION="未知"
 
     target="$ipv4"
     [[ -n "$target" ]] || target="$ipv6"
@@ -6464,7 +6474,7 @@ server_tool_get_ip_profile() {
 
     # ip-api 免费接口用于轻量判定 hosting / proxy / mobile；查询失败时保持“未知”。
     meta=$(curl -fsS --connect-timeout 3 --max-time 5 \
-        "http://ip-api.com/json/${target}?fields=status,message,isp,org,as,hosting,proxy,mobile,query" \
+        "http://ip-api.com/json/${target}?fields=status,message,country,regionName,city,isp,org,as,hosting,proxy,mobile,query" \
         2>/dev/null || true)
 
     if [[ -n "$meta" ]] && jq -e '.status=="success"' >/dev/null 2>&1 <<<"$meta"; then
@@ -6474,9 +6484,18 @@ server_tool_get_ip_profile() {
         org=$(jq -r '.org // empty' <<<"$meta")
         isp=$(jq -r '.isp // empty' <<<"$meta")
         asn=$(jq -r '.as // empty' <<<"$meta")
+        country=$(jq -r '.country // empty' <<<"$meta")
+        region=$(jq -r '.regionName // empty' <<<"$meta")
+        city=$(jq -r '.city // empty' <<<"$meta")
 
         SERVER_INFO_ISP="${isp:-${org:-未知}}"
         SERVER_INFO_ASN="${asn:-未知}"
+
+        location=""
+        [[ -n "$country" ]] && location="$country"
+        [[ -n "$region" ]] && location="${location:+${location} / }${region}"
+        [[ -n "$city" ]] && location="${location:+${location} / }${city}"
+        SERVER_INFO_LOCATION="${location:-未知}"
 
         if [[ "$hosting" == "true" ]]; then
             SERVER_INFO_IP_TYPE="数据中心"
@@ -6522,33 +6541,103 @@ server_tool_get_ip_profile() {
     fi
 }
 
+server_tool_format_bytes() {
+    local bytes="${1:-0}"
+    awk -v b="$bytes" 'BEGIN {
+        if (b >= 1099511627776) printf "%.2f TB", b/1099511627776;
+        else if (b >= 1073741824) printf "%.2f GB", b/1073741824;
+        else if (b >= 1048576) printf "%.2f MB", b/1048576;
+        else if (b >= 1024) printf "%.2f KB", b/1024;
+        else printf "%.0f B", b;
+    }'
+}
+
+server_tool_public_traffic_bytes() {
+    local iface4 iface6 iface path rx tx
+    local total_rx=0 total_tx=0
+    local -A seen=()
+
+    iface4=$(ip -4 route show default 2>/dev/null | awk '
+        {
+            for (i=1;i<=NF;i++) if ($i=="dev" && (i+1)<=NF) {print $(i+1); exit}
+        }')
+    iface6=$(ip -6 route show default 2>/dev/null | awk '
+        {
+            for (i=1;i<=NF;i++) if ($i=="dev" && (i+1)<=NF) {print $(i+1); exit}
+        }')
+
+    for iface in "$iface4" "$iface6"; do
+        [[ -n "$iface" ]] || continue
+        [[ -n "${seen[$iface]:-}" ]] && continue
+        seen[$iface]=1
+        path="/sys/class/net/${iface}/statistics"
+        [[ -r "${path}/rx_bytes" && -r "${path}/tx_bytes" ]] || continue
+        rx=$(cat "${path}/rx_bytes" 2>/dev/null || echo 0)
+        tx=$(cat "${path}/tx_bytes" 2>/dev/null || echo 0)
+        [[ "$rx" =~ ^[0-9]+$ ]] || rx=0
+        [[ "$tx" =~ ^[0-9]+$ ]] || tx=0
+        total_rx=$((total_rx + rx))
+        total_tx=$((total_tx + tx))
+    done
+
+    # 极少数环境没有默认路由设备时，回退到常见公网接口。
+    if [[ ${#seen[@]} -eq 0 ]]; then
+        for path in /sys/class/net/*; do
+            [[ -d "$path/statistics" ]] || continue
+            iface=${path##*/}
+            case "$iface" in
+                lo|docker*|br-*|veth*|tun*|tap*|wg*|warp*|tailscale*) continue ;;
+            esac
+            [[ "$iface" =~ ^(eth|ens|enp|eno|venet|bond) ]] || continue
+            rx=$(cat "$path/statistics/rx_bytes" 2>/dev/null || echo 0)
+            tx=$(cat "$path/statistics/tx_bytes" 2>/dev/null || echo 0)
+            [[ "$rx" =~ ^[0-9]+$ ]] || rx=0
+            [[ "$tx" =~ ^[0-9]+$ ]] || tx=0
+            total_rx=$((total_rx + rx))
+            total_tx=$((total_tx + tx))
+        done
+    fi
+
+    printf '%s %s\n' "$total_rx" "$total_tx"
+}
+
 server_tool_system_info() {
     local cpu cores mem_total mem_used swap_total swap_used disk_used disk_total
-    local uptime_text timezone dns congestion qdisc os_info ipv4 ipv6
+    local uptime_days timezone dns congestion qdisc os_info ipv4 ipv6 hostname_text
+    local cpu_mhz cpu_ghz traffic_rx traffic_tx traffic_pair
 
     clear
     os_info=$(get_sys_info)
     cpu=$(awk -F: '/model name|Hardware|Processor/ {gsub(/^[ \t]+/,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null)
     cpu=${cpu:-$(uname -m)}
     cores=$(nproc 2>/dev/null || echo "?")
-    local cpu_mhz cpu_ghz
+
     cpu_mhz=$(awk -F: '/cpu MHz/ {gsub(/^[ \t]+/,"",$2); sum+=$2; n++} END {if (n>0) printf "%.0f", sum/n}' /proc/cpuinfo 2>/dev/null)
     if [[ "$cpu_mhz" =~ ^[0-9]+$ ]] && [[ "$cpu_mhz" -gt 0 ]]; then
         cpu_ghz=$(awk -v mhz="$cpu_mhz" 'BEGIN {printf "%.2f", mhz/1000}')
     else
         cpu_ghz=""
     fi
+
     mem_total=$(free -h 2>/dev/null | awk '/^Mem:/ {print $2}')
     mem_used=$(free -h 2>/dev/null | awk '/^Mem:/ {print $3}')
     swap_total=$(free -h 2>/dev/null | awk '/^Swap:/ {print $2}')
     swap_used=$(free -h 2>/dev/null | awk '/^Swap:/ {print $3}')
     disk_used=$(df -h / 2>/dev/null | awk 'NR==2 {print $3}')
     disk_total=$(df -h / 2>/dev/null | awk 'NR==2 {print $2}')
-    uptime_text=$(uptime -p 2>/dev/null || uptime 2>/dev/null)
+
+    uptime_days=$(awk '{printf "%d", $1/86400}' /proc/uptime 2>/dev/null)
+    [[ "$uptime_days" =~ ^[0-9]+$ ]] || uptime_days=0
+
     timezone=$(timedatectl show -p Timezone --value 2>/dev/null || date +%Z)
     dns=$(awk '/^[[:space:]]*nameserver[[:space:]]+/ {print $2}' /etc/resolv.conf 2>/dev/null | paste -sd ',' -)
     congestion=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
     qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
+    hostname_text=$(hostname 2>/dev/null || echo "未知")
+
+    traffic_pair=$(server_tool_public_traffic_bytes)
+    traffic_rx=$(awk '{print $1}' <<<"$traffic_pair")
+    traffic_tx=$(awk '{print $2}' <<<"$traffic_pair")
 
     ipv4=$(curl -4fsS --connect-timeout 2 --max-time 4 https://api4.ipify.org 2>/dev/null || true)
     ipv6=$(curl -6fsS --connect-timeout 2 --max-time 4 https://api6.ipify.org 2>/dev/null || true)
@@ -6559,18 +6648,21 @@ server_tool_system_info() {
     echo "  CPU        : ${cpu}"
     echo "  CPU 核心   : ${cores}$([[ -n "$cpu_ghz" ]] && printf " 核 @ %s GHz" "$cpu_ghz" || printf " 核")"
     echo "  内存       : ${mem_used:-?} / ${mem_total:-?}"
-    echo "  Swap       : ${swap_used:-?} / ${swap_total:-?}"
-    echo "  根分区     : ${disk_used:-?} / ${disk_total:-?}"
-    echo "  运行时间   : ${uptime_text:-未知}"
+    echo "  虚拟内存   : ${swap_used:-?} / ${swap_total:-?}"
+    echo "  硬盘占用   : ${disk_used:-?} / ${disk_total:-?}"
+    echo "  运行时间   : ${uptime_days} 天"
+    echo "  流量入站   : $(server_tool_format_bytes "${traffic_rx:-0}")"
+    echo "  流量出站   : $(server_tool_format_bytes "${traffic_tx:-0}")"
     echo "  时区       : ${timezone:-未知}"
     echo "  IPv4 地址  : ${ipv4:-无 IPv4}"
     echo "  IPv6 地址  : ${ipv6:-无 IPv6}"
+    echo "  地理位置   : ${SERVER_INFO_LOCATION}"
     echo "  ISP / ASN  : ${SERVER_INFO_ISP} / ${SERVER_INFO_ASN}"
     echo "  IP 性质    : ${SERVER_INFO_IP_TYPE}"
     echo "  IP 危险性  : ${SERVER_INFO_IP_RISK}"
     echo "  DNS        : ${dns:-未检测到}"
-    echo "  TCP 拥塞   : ${congestion}"
-    echo "  qdisc      : ${qdisc}"
+    echo "  网络算法   : ${congestion} ${qdisc}"
+    echo "  主机名     : ${hostname_text}"
     echo -e "${CYAN}═══════════════════════════════════════════════════${PLAIN}"
 }
 
