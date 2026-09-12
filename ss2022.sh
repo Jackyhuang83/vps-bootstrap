@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.0-dev10
+# 当前版本: v1.8.0-dev12
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -12,7 +12,7 @@
 # │   │                            └─ snell-server: Snell v5          │
 # │   ├─ 分流管理 ────────────────┬─ DIRECT                           │
 # │   │                            ├─ WARP Local Proxy                 │
-# │   │                            └─ SS2022 / 标准SS / SOCKS5 落地   │
+# │   │                            └─ Shadowsocks / SOCKS5 落地   │
 # │   ├─ 端口转发 ────────────────── Realm                              │
 # │   ├─ 协议运维                                                       │
 # │   ├─ 组件版本管理                                                   │
@@ -46,7 +46,7 @@
 #   [14] 菜单与程序入口（含服务器工具/测试预留入口）
 #
 # v1.8.0-dev6:
-#   - 落地节点新增标准 Shadowsocks
+#   - 落地节点支持 Shadowsocks（SS2022 / 标准 SS 自动识别）
 #   - 支持标准 ss:// URI 与手动输入
 #   - 菜单文案去除不必要的“代理”字样，统一使用“协议 / 落地节点”术语
 #   - “服务运维管理”更名为“协议运维管理”，为后续“服务器管理工具”留出独立边界
@@ -77,6 +77,15 @@
 #   - 先添加落地、后部署 VLESS 的场景也会自动补齐 Bridge 依赖
 #   - 标准 SS 解析错误提示拆分为“算法不支持 / 密码解析失败”
 #
+# v1.8.0-dev11:
+#   - ss:// 导入自动识别标准 Shadowsocks / SS2022
+#
+# v1.8.0-dev12:
+#   - 落地节点入口合并为 Shadowsocks / SOCKS5
+#   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
+#   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
+#   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
 # 版本主线:
 #   v1.7.0       四协议稳定基线
 #   v1.8.0-dev1  服务端分流
@@ -89,12 +98,14 @@
 #   v1.8.0-dev8  GitHub 脚本自更新
 #   v1.8.0-dev9  主菜单三段式定型
 #   v1.8.0-dev10 标准 Shadowsocks 扩展算法 + Xray/sing-box 按需 Bridge
+#   v1.8.0-dev11 ss:// 导入自动识别标准 SS / SS2022
+#   v1.8.0-dev12 落地节点 Shadowsocks 入口合并
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.0-dev10"
+SCRIPT_VERSION="v1.8.0-dev12"
 
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
@@ -3183,8 +3194,7 @@ ensure_singbox_for_ss_bridge() {
 
 chain_node_type_label() {
     case "$1" in
-        ss2022) echo "SS2022" ;;
-        shadowsocks) echo "标准SS" ;;
+        ss2022|shadowsocks) echo "Shadowsocks" ;;
         socks5) echo "SOCKS5" ;;
         *) echo "$1" ;;
     esac
@@ -3655,47 +3665,8 @@ warp_management() {
     done
 }
 
-chain_add_ss2022() {
-    local name mode uri server port method pass id node
-    read -rp "节点名称（例如 US-LA）: " name
-    [[ -n "$name" ]] || return 1
-    if routing_node_name_exists "$name"; then echo -e "${RED}[错误] 落地节点名称 ${name} 已存在，请使用唯一名称。${PLAIN}"; return 1; fi
-    echo "  1. 粘贴 ss:// URI"
-    echo "  2. 手动输入"
-    read -rp "请选择 [1-2，默认 1]: " mode
-    mode=${mode:-1}
-    if [[ "$mode" == "1" ]]; then
-        read -rp "请粘贴 SS2022 ss:// URI: " uri
-        if ! parse_ss_uri "$uri"; then echo -e "${RED}[错误] 无法解析该 ss:// URI。${PLAIN}"; return 1; fi
-        server="$CHAIN_SERVER"; port="$CHAIN_PORT"; method="$CHAIN_METHOD"; pass="$CHAIN_PASSWORD"
-    else
-        read -rp "服务器地址/域名: " server
-        read -rp "端口: " port
-        validate_port_number "$port" || { echo -e "${RED}[错误] 端口无效。${PLAIN}"; return 1; }
-        echo "  1. 2022-blake3-aes-128-gcm"
-        echo "  2. 2022-blake3-aes-256-gcm"
-        echo "  3. 2022-blake3-chacha20-poly1305"
-        read -rp "加密算法 [1-3]: " mode
-        case "$mode" in
-            1) method="2022-blake3-aes-128-gcm" ;;
-            2) method="2022-blake3-aes-256-gcm" ;;
-            3) method="2022-blake3-chacha20-poly1305" ;;
-            *) return 1 ;;
-        esac
-        read -rp "SS2022 Key: " pass
-    fi
-    if ! validate_ss2022_outbound "$method" "$pass"; then echo -e "${RED}[错误] SS2022 加密算法或 Key 长度不合法。${PLAIN}"; return 1; fi
-    id="n$(date +%s)${RANDOM}"
-    node=$(jq -nc --arg id "$id" --arg name "$name" --arg server "$server" --argjson port "$port" --arg method "$method" --arg pass "$pass" '{id:$id,name:$name,type:"ss2022",server:$server,port:$port,method:$method,password:$pass}')
-    local tmp
-    tmp=$(mktemp "${STATE_DIR}/routing.json.tmp.XXXXXX") || return 1
-    jq --argjson n "$node" '.chain_nodes += [$n]' "$ROUTING_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
-    routing_commit_state_candidate "$tmp" || return 1
-    echo -e "${GREEN}✔ SS2022 落地节点 ${name} 已添加。${PLAIN}"
-}
-
 chain_add_shadowsocks() {
-    local name mode uri server port method pass id node tmp bridge_required=false bridge_port=0
+    local name mode uri server port method pass id node tmp bridge_required=false bridge_port=0 ss_kind="standard"
     read -rp "节点名称（例如 US-SS）: " name
     [[ -n "$name" ]] || return 1
     if routing_node_name_exists "$name"; then
@@ -3703,19 +3674,19 @@ chain_add_shadowsocks() {
         return 1
     fi
 
-    echo "  1. 粘贴 ss:// URI"
+    echo "  1. 粘贴 ss:// URI（自动识别 SS2022 / 标准 Shadowsocks）"
     echo "  2. 手动输入"
     read -rp "请选择 [1-2，默认 1]: " mode
     mode=${mode:-1}
 
     if [[ "$mode" == "1" ]]; then
-        read -rp "请粘贴标准 Shadowsocks ss:// URI: " uri
+        read -rp "请粘贴 Shadowsocks ss:// URI: " uri
         if ! parse_ss_uri "$uri"; then
             echo -e "${RED}[错误] 无法解析该 ss:// URI。${PLAIN}"
             return 1
         fi
         if [[ "${CHAIN_SS_QUERY:-}" == *"plugin="* ]]; then
-            echo -e "${RED}[错误] 当前标准 SS 落地暂不支持 SIP003 插件（如 v2ray-plugin / obfs）。${PLAIN}"
+            echo -e "${RED}[错误] 当前 Shadowsocks 落地暂不支持 SIP003 插件（如 v2ray-plugin / obfs）。${PLAIN}"
             return 1
         fi
         server="$CHAIN_SERVER"
@@ -3726,53 +3697,83 @@ chain_add_shadowsocks() {
         read -rp "服务器地址/域名: " server
         read -rp "端口: " port
         validate_port_number "$port" || { echo -e "${RED}[错误] 端口无效。${PLAIN}"; return 1; }
-        echo "请选择标准 Shadowsocks 加密算法："
-        echo "  1. aes-128-gcm"
-        echo "  2. aes-192-gcm"
-        echo "  3. aes-256-gcm"
-        echo "  4. chacha20-ietf-poly1305"
-        echo "  5. xchacha20-ietf-poly1305"
-        echo "  6. aes-128-ctr          [兼容旧算法]"
-        echo "  7. aes-192-ctr          [兼容旧算法]"
-        echo "  8. aes-256-ctr          [兼容旧算法]"
-        echo "  9. aes-128-cfb          [兼容旧算法]"
-        echo " 10. aes-192-cfb          [兼容旧算法]"
-        echo " 11. aes-256-cfb          [兼容旧算法]"
-        echo " 12. rc4-md5              [兼容旧算法]"
-        echo " 13. chacha20-ietf        [兼容旧算法]"
-        echo " 14. xchacha20            [兼容旧算法]"
-        read -rp "请选择 [1-14]: " mode
+        echo "请选择 Shadowsocks 加密算法："
+        echo ""
+        echo "【SS2022】"
+        echo "  1. 2022-blake3-aes-128-gcm"
+        echo "  2. 2022-blake3-aes-256-gcm"
+        echo "  3. 2022-blake3-chacha20-poly1305"
+        echo ""
+        echo "【标准 AEAD】"
+        echo "  4. aes-128-gcm"
+        echo "  5. aes-192-gcm"
+        echo "  6. aes-256-gcm"
+        echo "  7. chacha20-ietf-poly1305"
+        echo "  8. xchacha20-ietf-poly1305"
+        echo ""
+        echo "【兼容旧算法】"
+        echo "  9. aes-128-ctr"
+        echo " 10. aes-192-ctr"
+        echo " 11. aes-256-ctr"
+        echo " 12. aes-128-cfb"
+        echo " 13. aes-192-cfb"
+        echo " 14. aes-256-cfb"
+        echo " 15. rc4-md5"
+        echo " 16. chacha20-ietf"
+        echo " 17. xchacha20"
+        read -rp "请选择 [1-17]: " mode
         case "$mode" in
-            1) method="aes-128-gcm" ;;
-            2) method="aes-192-gcm" ;;
-            3) method="aes-256-gcm" ;;
-            4) method="chacha20-ietf-poly1305" ;;
-            5) method="xchacha20-ietf-poly1305" ;;
-            6) method="aes-128-ctr" ;;
-            7) method="aes-192-ctr" ;;
-            8) method="aes-256-ctr" ;;
-            9) method="aes-128-cfb" ;;
-            10) method="aes-192-cfb" ;;
-            11) method="aes-256-cfb" ;;
-            12) method="rc4-md5" ;;
-            13) method="chacha20-ietf" ;;
-            14) method="xchacha20" ;;
+            1) method="2022-blake3-aes-128-gcm" ;;
+            2) method="2022-blake3-aes-256-gcm" ;;
+            3) method="2022-blake3-chacha20-poly1305" ;;
+            4) method="aes-128-gcm" ;;
+            5) method="aes-192-gcm" ;;
+            6) method="aes-256-gcm" ;;
+            7) method="chacha20-ietf-poly1305" ;;
+            8) method="xchacha20-ietf-poly1305" ;;
+            9) method="aes-128-ctr" ;;
+            10) method="aes-192-ctr" ;;
+            11) method="aes-256-ctr" ;;
+            12) method="aes-128-cfb" ;;
+            13) method="aes-192-cfb" ;;
+            14) method="aes-256-cfb" ;;
+            15) method="rc4-md5" ;;
+            16) method="chacha20-ietf" ;;
+            17) method="xchacha20" ;;
             *) return 1 ;;
         esac
-        read -rsp "Shadowsocks 密码: " pass
+        read -rsp "Shadowsocks 密码 / Key: " pass
         echo ""
     fi
 
     method=$(normalize_standard_ss_method "$method")
+    [[ "$method" == 2022-blake3-* ]] && ss_kind="ss2022"
+
     echo ""
     echo "检测到 Shadowsocks 节点："
     echo "服务器 : ${server}"
     echo "端口   : ${port}"
     echo "算法   : ${method}"
+    echo "类型   : $([[ "$ss_kind" == "ss2022" ]] && echo 'SS2022' || echo '标准 Shadowsocks')"
     echo "密码   : $([[ -n "$pass" ]] && echo '已解析' || echo '解析失败')"
 
+    if [[ "$ss_kind" == "ss2022" ]]; then
+        if ! validate_ss2022_outbound "$method" "$pass"; then
+            echo -e "${RED}[错误] SS2022 算法或 Key 长度不合法: ${method}${PLAIN}"
+            return 1
+        fi
+        id="n$(date +%s)${RANDOM}"
+        node=$(jq -nc --arg id "$id" --arg name "$name" --arg server "$server" --argjson port "$port" --arg method "$method" --arg pass "$pass" \
+            '{id:$id,name:$name,type:"ss2022",server:$server,port:$port,method:$method,password:$pass}')
+        tmp=$(mktemp "${STATE_DIR}/routing.json.tmp.XXXXXX") || return 1
+        jq --argjson n "$node" '.chain_nodes += [$n]' "$ROUTING_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+        routing_commit_state_candidate "$tmp" || return 1
+        echo -e "${GREEN}✔ Shadowsocks 落地节点 ${name} 已添加（SS2022）。${PLAIN}"
+        return 0
+    fi
+
     if ! singbox_supports_standard_ss_method "$method"; then
-        echo -e "${RED}[错误] 当前 sing-box 不支持该标准 SS 算法: ${method}${PLAIN}"
+        echo -e "${RED}[错误] 当前 sing-box 不支持该标准 Shadowsocks 算法: ${method}${PLAIN}"
         return 1
     fi
     if [[ -z "$pass" ]]; then
@@ -3806,14 +3807,13 @@ chain_add_shadowsocks() {
     tmp=$(mktemp "${STATE_DIR}/routing.json.tmp.XXXXXX") || return 1
     jq --argjson n "$node" '.chain_nodes += [$n]' "$ROUTING_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
     routing_commit_state_candidate "$tmp" || return 1
-    echo -e "${GREEN}✔ 标准 Shadowsocks 落地节点 ${name} 已添加。${PLAIN}"
+    echo -e "${GREEN}✔ Shadowsocks 落地节点 ${name} 已添加（标准 Shadowsocks）。${PLAIN}"
     if [[ "$bridge_required" == "true" ]]; then
         echo -e "${GREEN}  VLESS/Xray: 本地 sing-box Bridge${PLAIN}"
     else
         echo -e "${GREEN}  VLESS/Xray: Xray 原生直连${PLAIN}"
     fi
 }
-
 chain_add_socks5() {
     local name server port auth user="" pass="" id node tmp
     echo -e "${YELLOW}[提示] SOCKS5 本身不加密；公网落地优先建议使用 Shadowsocks，SOCKS5 仅用于可信或已受保护的链路。${PLAIN}"
@@ -3986,13 +3986,11 @@ chain_management() {
         read -rp "请选择 [0-5]: " c
         case "$c" in
             1)
-                echo "  1. SS2022"
-                echo "  2. 标准 Shadowsocks"
-                echo "  3. SOCKS5"
-                read -rp "节点类型 [1-3]: " t
-                [[ "$t" == "1" ]] && chain_add_ss2022
-                [[ "$t" == "2" ]] && chain_add_shadowsocks
-                [[ "$t" == "3" ]] && chain_add_socks5
+                echo "  1. Shadowsocks（自动识别 SS2022 / 标准 SS）"
+                echo "  2. SOCKS5"
+                read -rp "节点类型 [1-2]: " t
+                [[ "$t" == "1" ]] && chain_add_shadowsocks
+                [[ "$t" == "2" ]] && chain_add_socks5
                 pause ;;
             2) chain_list_nodes; pause ;;
             3) chain_delete_node; pause ;;
