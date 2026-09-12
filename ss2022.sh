@@ -1,431 +1,807 @@
-
-新版本已经输出，版本是 v1.8.0-dev15。
-
-这版正式加入你刚才说的 WARP 双栈补全模型：
-
-IPv4-only VPS
-├─ DIRECT → 保留 VPS 原生 IPv4
-└─ WARP   → 推荐补 IPv6
-
-IPv6-only VPS
-├─ DIRECT → 保留 VPS 原生 IPv6
-└─ WARP   → 推荐补 IPv4
-
-双栈 VPS
-├─ DIRECT → VPS 原生 IPv4 / IPv6
-└─ WARP   → 可选额外 IPv4 / IPv6 出口
-Cloudflare 的 Local Proxy 模式只处理显式送入代理的流量，其余系统流量继续走正常 Internet 连接，所以这个设计不会像全局 Tunnel 那样接管 VPS 默认出口。
-
-dev15 具体增加了这些功能
-WARP 菜单现在会先自动检测：
-
-VPS 原生网络：
-IPv4 : 可用
-IPv6 : 不可用
-
-推荐模式：
-IPv4-only：WARP 补充 IPv6
-
-DIRECT → VPS 原生 IPv4
-WARP   → 推荐仅 IPv6（按分流规则调用）
-如果是 IPv6-only，则反过来显示：
-
-DIRECT → VPS 原生 IPv6
-WARP   → 推荐仅 IPv4（按分流规则调用）
-分流规则里如果你选择：
-
-出口：WARP
-脚本会自动推荐缺失的协议族。例如你现在这台 IPv4-only VPS：
-
-请选择 IP 地址族：
-
-1. 默认（不强制）
-2. 仅 IPv4
-3. 仅 IPv6（WARP 补全推荐）
-
-请选择 [1-3，默认 3]:
-直接回车就是 IPv6。
-
-WARP 测试也改成分别测试：
-
-✔ WARP IPv4: x.x.x.x
-✔ WARP IPv6: 2606:xxxx:xxxx::xxxx
-因此以后不会只显示一个 WARP IP，看不出到底 IPv6 有没有补成功。
-
-另外，如果在这种单栈补全场景里误操作：
-
-全局默认出口 → WARP
-脚本现在会警告：
-
-当前 WARP 被识别为“IPv4-only：WARP 补充 IPv6”。
-
-将 WARP 设为全局默认出口会让所有未命中特殊规则的流量都经过 WARP。
-
-如果你的目标只是补全缺失的地址族，
-建议保持默认出口为 DIRECT，
-只在分流规则中选择 WARP。
-这样比较符合我们现在确定的原则：
-
-DIRECT 永远保留 VPS 原生出口；WARP 是补充出口，由分流规则按需调用。
-
-另外也专门处理了 IPv6-only VPS 首次安装 WARP 的情况，包括 IPv6 APT 环境初始化。
-
-已验证：
-
-Bash 语法                     ✅
-SCRIPT_VERSION                ✅ dev15
-主菜单启动/退出                ✅
-WARP IPv6 推荐逻辑             ✅
-WARP IPv4 推荐逻辑             ✅
-DIRECT 默认地址族              ✅
-routing.json 新字段兼容         ✅
-重复函数检查                   ✅
-SHA256：
-
-c1571babcd5786678689f2e94588b4b97bc931afc4cb898fd42053b056ecf759
-下载 ss2022.sh v1.8.0-dev15
-
-也准备了标准文件名：
-
-下载 ss2022.sh
-
-你上传覆盖 GitHub main/ss2022.sh 后，测试机直接：
-
-ss2022
-→ 9. 检查脚本更新
-然后你这台 IPv4-only VPS 最值得先测的就是：
-
-分流管理
-→ WARP 出口管理
-→ 安装 / 配置 WARP 双栈补全
-看看它是否正确识别成：
-
-IPv4-only：WARP 补充 IPv6
-以及最终 WARP IPv6 是否能拿到 Cloudflare IPv6。
-
-
-ss2022-v1.8.0-dev15.sh
-程式碼
-
-
-ss2022.sh
-程式碼
-
-
-通过测试我发现，我输入1以后它没有选择让我选择只安装Warp IPV6,直接给我把warp ip4和ipv6全安装了，最后现实的也是warp ipv4地址和warp ipv6地址，这个不是我想要的哦！Local Proxy: 127.0.0.1:40000
-状态: 未就绪
-
-  1. 安装 / 配置 WARP 双栈补全（Local Proxy）
-  2. 测试 WARP IPv4 / IPv6 出口
-  3. 重新检测 VPS 原生 IPv4 / IPv6
-  4. 重连 WARP
-  5. 重新注册 WARP
-  6. 卸载 WARP
-  0. 返回
-请选择 [0-6]: 1
-══════════════ WARP 双栈补全检测 ══════════════
-VPS 原生网络：
-  IPv4 : 可用
-  IPv6 : 不可用
-推荐模式：IPv4-only：WARP 补充 IPv6
-  DIRECT → VPS 原生 IPv4
-  WARP   → 推荐仅 IPv6（按分流规则调用）
-
-
-你这个判断是对的，dev15 只做到了“推荐补 IPv6”，并没有真正把 WARP 限制成 IPv6-only 出口，所以它还会测试并显示 WARP IPv4，这和你的目标不一致。
-
-我已经改成 v1.8.0-dev16。
-
-需要先说明一个底层事实：Cloudflare 官方 Local Proxy 本身没有“只安装 IPv6 WARP”或“只安装 IPv4 WARP”的独立安装模式；同一个 Local Proxy 可能同时具备 IPv4/IPv6 能力。官方定义的是“哪些流量送进本地代理”，并没有按地址族关闭其中一半的安装参数。
-
-所以 dev16 改成由 ss2022.sh 路由层严格限制地址族。
-
-你这台 IPv4-only VPS 现在进入：
-
-分流管理
-→ WARP 出口管理
-→ 1. 安装 / 配置 WARP 出口模式
-会看到：
-
-请选择 WARP 实际出口模式：
-
-1. 仅启用 WARP IPv6（推荐；VPS IPv4 继续 DIRECT）
-2. WARP IPv4 + IPv6 双栈
-0. 取消
-
-请选择 [0-2，默认 1]:
-你直接回车就是：
-
-WARP → 仅 IPv6
-DIRECT → VPS 原生 IPv4
-而且这次不是单纯提示，脚本会真正约束：
-
-WARP 分流规则自动固定 IPv6
-
-不再让你给 WARP 规则选择 IPv4
-
-状态页显示 WARP IPv4：未启用（IPv4 保持 DIRECT）
-
-测试只测试 WARP IPv6
-
-单地址族 WARP 禁止设置为全局默认出口
-
-Xray 强制使用 route-warp-v6
-
-sing-box DNS/路由强制 ipv6_only
-
-反过来，IPv6-only VPS 会自动推荐：
-
-1. 仅启用 WARP IPv4（推荐；VPS IPv6 继续 DIRECT）
-我也分别做了两套模拟：
-
-IPv4-only → WARP IPv6 only   ✅
-IPv6-only → WARP IPv4 only   ✅
-Xray 地址族强制              ✅
-sing-box 地址族强制          ✅
-主菜单启动/退出              ✅
-Bash 语法                    ✅
-SHA256：
-
-d094b7cb1f4a75c4f36d265e8359102fdb851b04916e0f7fb893a9cdd446bbee
-下载 ss2022.sh v1.8.0-dev16
-
-下载标准文件名 ss2022.sh
-
-你从 dev15 升到 dev16 后，不用先卸载现在的 WARP。直接：
-
-ss2022
-→ 2. 分流管理
-→ WARP 出口管理
-→ 1. 安装 / 配置 WARP 出口模式
-→ 1. 仅启用 WARP IPv6
-即可把现有 WARP 改成我们脚本层面的 IPv6-only 出口模式。
-
-
-ss2022-v1.8.0-dev16.sh
-程式碼
-
-
-ss2022.sh
-程式碼
-
-
-你这个没有补充仅WARP IPv4选项啊？请补充
-请选择 WARP 实际出口模式：
-
-1. 仅启用 WARP IPv6（推荐；VPS IPv4 继续 DIRECT）
-2. WARP IPv4 + IPv6 双栈
-0. 取消
-
-请选择 [0-2，默认 1]:
-
-对，这一项应该始终保留。我已经补成 v1.8.0-dev17。
-
-现在无论 VPS 是 IPv4-only、IPv6-only 还是双栈，WARP 都固定提供三种实际出口模式：
-
-请选择 WARP 实际出口模式：
-
-  1. 仅启用 WARP IPv4
-  2. 仅启用 WARP IPv6（推荐；VPS IPv4 继续 DIRECT）
-  3. WARP IPv4 + IPv6 双栈
-  0. 取消
-
-推荐：仅 WARP IPv6；VPS 原生 IPv4 继续 DIRECT
-
-请选择 [0-3，默认 2]:
-你当前这台 IPv4-only VPS 默认回车仍然选择 2，但现在可以主动选：
-
-1 → 仅 WARP IPv4
-2 → 仅 WARP IPv6
-3 → WARP IPv4 + IPv6
-IPv6-only VPS 则自动把 1 标成推荐；双栈 VPS自动把 3 标成推荐。三种模式的底层路由限制、状态页和出口测试逻辑都已经存在，不是只增加一个菜单选项。
-
-我已经验证：
-
-IPv4-only 默认回车 → ipv6_only ✅
-IPv6-only 默认回车 → ipv4_only ✅
-双栈默认回车       → dual      ✅
-IPv4-only 手动选 1 → ipv4_only ✅
-Bash 语法           ✅
-主菜单 smoke test   ✅
-版本显示 dev17      ✅
-SHA256：
-
-523a5c622b44072de314f9e4c2b42c5179f7a4befff8fbfdd21000fdd1bd4019
-下载 ss2022.sh v1.8.0-dev17
-
-下载标准文件名 ss2022.sh
-
-你上传覆盖 GitHub main 后，直接用 9. 检查脚本更新 升级即可。
-
-
-ss2022-v1.8.0-dev17.sh
-程式碼
-
-
-ss2022.sh
-程式碼
-
-
-
-資料庫
-/
-vps-bootstrap
-/
-ss2022-v1.8.0-dev17.sh
-
-
-1
-2
-3
-4
-5
-6
-7
-8
-9
-10
-11
-12
-13
-14
-15
-16
-17
-18
-19
-20
-21
-22
-23
-24
-25
-26
-27
-28
-29
-30
-31
-32
-33
-34
-35
-36
-37
-38
-39
-40
-41
-42
-43
-44
-45
-46
-47
-48
-49
-50
-51
-52
-53
-54
-55
-56
-57
-58
-59
-60
-61
-62
-63
-64
-65
-66
-67
-68
-69
-70
-71
-72
-73
-74
-75
-76
-77
 #!/bin/bash
 # ==============================================================================
-# 项目名称: vps-bootstrap / ss2022.sh
-# 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
-# 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.0-dev17
+# vps-bootstrap / ss2022.sh
+# v1.8.0-dev17 / dev18 -> v1.8.0-dev19 综合升级补丁
 #
-# ┌──────────────────────────── 架构总览 ────────────────────────────┐
-# │ 用户菜单                                                         │
-# │   ├─ 协议管理 ────────────────┬─ sing-box: SS2022 / ShadowTLS   │
-# │   │                            ├─ Xray: VLESS Reality             │
-# │   │                            └─ snell-server: Snell v5          │
-# │   ├─ 分流管理 ────────────────┬─ DIRECT                           │
-# │   │                            ├─ WARP Local Proxy / 双栈补全      │
-# │   │                            └─ Shadowsocks / SOCKS5 落地   │
-# │   ├─ 端口转发 ────────────────── Realm                              │
-# │   ├─ 协议运维                                                       │
-# │   ├─ 组件版本管理                                                   │
-# │   ├─ 脚本自更新
-# │   ├─ 服务器管理工具                                                 │
-# │   ├─ 服务器测试管理                                                 │
-# │   └─ 完全卸载                                                       │
-# └───────────────────────────────────────────────────────────────────┘
+# dev19:
+#   1) 若当前仍为 dev17，自动补齐 dev18 的“服务器测试管理”四项测试
+#   2) 四种协议节点支持自定义节点名称
+#   3) 节点名称保存到 /etc/ss2022/state.json
+#   4) 查看节点配置时复用已保存名称
+#   5) 已部署旧节点可直接改名，不需要重新部署
 #
-# 核心设计原则:
-#   1. Snell 保持官方 snell-server v5，不参与 VPS 服务端分流。
-#   2. 分流状态只有一个事实来源: /etc/ss2022/routing.json。
-#   3. Realm 转发状态只有一个事实来源: /etc/ss2022/forwarding.json。
-#   4. 修改配置先生成候选文件并调用核心自检，通过后才替换正式配置。
-#   5. Xray / Realm 使用 ss2022 独立命名空间，不覆盖服务器已有同名服务。
+# 默认节点名:
+#   SS2022                  -> Proxy-SS2022
+#   SS2022 + ShadowTLS v3   -> Proxy-SS2022-ShadowTLS
+#   VLESS Reality           -> Proxy-VLESS-Reality
+#   Snell v5                -> Proxy-Snell-v5
 #
-# 代码导航（按文件从上到下）:
-#   [01] 常量与路径
-#   [02] 通用工具与状态面板
-#   [03] 系统网络环境（DNS / 时间同步 / IPv4 / IPv6）
-#   [04] 状态文件与 sing-box 基础设施
-#   [05] 节点参数 / 客户端配置输出
-#   [06] 协议更新与删除
-#   [07] 协议部署、Xray 与 Snell 基础设施
-#   [08] 节点配置查看
-#   [09] 服务端分流（WARP / Chain / Rules）
-#   [10] Realm L4 端口转发
-#   [11] 服务运维与彻底卸载
-#   [12] 组件版本管理
-#   [13] 脚本自更新
-#   [14] 菜单与程序入口（含服务器工具/测试预留入口）
+# 用法:
+#   bash ss2022-v1.8.0-dev19-patch.sh
+# 或:
+#   bash ss2022-v1.8.0-dev19-patch.sh /path/to/ss2022.sh
 #
-# v1.8.0-dev6:
-#   - 落地节点支持 Shadowsocks（SS2022 / 标准 SS 自动识别）
-#   - 支持标准 ss:// URI 与手动输入
-#   - 菜单文案去除不必要的“代理”字样，统一使用“协议 / 落地节点”术语
-#   - “服务运维管理”更名为“协议运维管理”，为后续“服务器管理工具”留出独立边界
-#   - 标准 SS 仅开放 sing-box / Xray 都兼容的 AEAD 算法，拒绝 SIP003 插件节点
+# 默认目标:
+#   /usr/local/bin/ss2022
+# ==============================================================================
+
+set -euo pipefail
+
+TARGET="${1:-/usr/local/bin/ss2022}"
+BACKUP="${TARGET}.bak-dev19-$(date +%Y%m%d-%H%M%S)"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+PLAIN='\033[0m'
+
+die() {
+    echo -e "${RED}[错误] $*${PLAIN}" >&2
+    exit 1
+}
+
+[[ -f "$TARGET" ]] || die "未找到目标脚本: $TARGET"
+grep -q '项目名称: vps-bootstrap / ss2022.sh' "$TARGET" || die "目标文件不是 vps-bootstrap / ss2022.sh"
+
+CURRENT_VERSION=$(grep -E '^SCRIPT_VERSION=' "$TARGET" | head -n1 | cut -d'"' -f2)
+case "$CURRENT_VERSION" in
+    v1.8.0-dev17|v1.8.0-dev18)
+        ;;
+    v1.8.0-dev19)
+        echo -e "${YELLOW}[提示] 当前已经是 v1.8.0-dev19，无需重复升级。${PLAIN}"
+        exit 0
+        ;;
+    *)
+        die "当前版本为 ${CURRENT_VERSION:-未知}。本补丁仅支持 v1.8.0-dev17 / dev18。"
+        ;;
+esac
+
+cp -a "$TARGET" "$BACKUP"
+echo -e "${GREEN}✔ 已备份: ${BACKUP}${PLAIN}"
+
+python3 - "$TARGET" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+
+
+def fail(msg):
+    raise SystemExit(msg)
+
+
+def patch_function(name, mutator):
+    global text
+    pattern = re.compile(
+        rf'^{re.escape(name)}\(\) \{{.*?(?=^[A-Za-z_][A-Za-z0-9_]*\(\) \{{|\Z)',
+        re.MULTILINE | re.DOTALL,
+    )
+    match = pattern.search(text)
+    if not match:
+        fail(f"无法定位函数: {name}()")
+    old = match.group(0)
+    new = mutator(old)
+    text = text[:match.start()] + new + text[match.end():]
+
+
+# -----------------------------------------------------------------------------
+# 版本号 / changelog
+# -----------------------------------------------------------------------------
+text = re.sub(
+    r'^# 当前版本: v1\.8\.0-dev(?:17|18)$',
+    '# 当前版本: v1.8.0-dev19',
+    text,
+    count=1,
+    flags=re.MULTILINE,
+)
+text = re.sub(
+    r'^SCRIPT_VERSION="v1\.8\.0-dev(?:17|18)"$',
+    'SCRIPT_VERSION="v1.8.0-dev19"',
+    text,
+    count=1,
+    flags=re.MULTILINE,
+)
+
+DEV19_LOG = """# v1.8.0-dev19:
+#   - 四种协议节点统一支持自定义节点名称
+#   - 默认名称保持旧版风格：Proxy-SS2022 / Proxy-SS2022-ShadowTLS / Proxy-VLESS-Reality / Proxy-Snell-v5
+#   - 节点名称保存到 /etc/ss2022/state.json，查看配置时持续复用
+#   - state.json 的 save_mode_state 改为字段合并，更新协议参数时不会丢失节点名称
+#   - “查看节点配置”新增“修改节点名称”，已部署旧节点无需重装即可改名
+#   - 节点名称同步用于 URI fragment、Surge/Loon、Mihomo/FlClash 与二维码内容
 #
-# v1.8.0-dev7:
-#   - 主菜单新增“服务器管理工具”固定入口
-#   - 主菜单新增“服务器测试管理”固定入口
-#   - 服务器测试预留 IP质量 / 路由 / 流媒体解锁 / AI工具 四类入口
-#   - 修复 Realm 服务管理函数命名残留，避免菜单调用不存在的函数
-#
-# v1.8.0-dev8:
-#   - 主菜单新增“检查脚本更新”
-#   - 支持从 GitHub main 检查并自更新 /usr/local/bin/ss2022
-#   - 同时比较版本号与 SHA256，开发期同版本内容变化也能识别
-#   - 更新前执行 Bash 语法与项目标识检查，并保留最近一次脚本备份
-#
-# v1.8.0-dev9:
-#   - 主菜单按三类重新分组并增加虚线分隔
-#   - 服务器管理 / 测试前移为 7 / 8
-#   - 脚本自更新移至 9，与完全卸载 / 退出归入脚本自身管理区
-#
-# v1.8.0-dev10:
-#   - 标准 Shadowsocks 扩展至 sing-box 支持的 AEAD / 兼容旧算法
-#   - Xray 原生支持的标准 SS 继续直连，避免额外本机转发
-#   - Xray 不支持的标准 SS 自动使用 sing-box 本地 SOCKS Bridge
-#   - VLESS 已部署且缺少 sing-box 时，先说明原因并征得确认后自动安装
-#   - 先添加落地、后部署 VLESS 的场景也会自动补齐 Bridge 依赖
+"""
+if DEV19_LOG not in text:
+    marker = None
+    for candidate in ('# v1.8.0-dev18:\n', '# v1.8.0-dev17:\n'):
+        if candidate in text:
+            marker = candidate
+            break
+    if marker is None:
+        fail('无法定位 changelog 插入点')
+    text = text.replace(marker, DEV19_LOG + marker, 1)
+
+line17 = '#   v1.8.0-dev17 WARP 三种出口模式固定可选 / 按 VPS 网络自动推荐\n'
+line18 = '#   v1.8.0-dev18 服务器测试工具正式接入\n'
+line19 = '#   v1.8.0-dev19 协议节点自定义名称 / 旧节点在线改名\n'
+if line17 in text:
+    if line18 not in text:
+        text = text.replace(line17, line17 + line18, 1)
+    if line19 not in text:
+        text = text.replace(line18, line18 + line19, 1)
+
+
+# -----------------------------------------------------------------------------
+# dev17 -> 补齐 dev18 服务器测试管理
+# -----------------------------------------------------------------------------
+if 'test_ai_unlock() {' not in text:
+    server_test_block = r'''ensure_test_dependency() {
+    local cmd="$1"
+    local pkg="${2:-$1}"
+
+    command -v "$cmd" >/dev/null 2>&1 && return 0
+
+    echo -e "${YELLOW}>> 缺少 ${cmd}，正在安装 ${pkg}...${PLAIN}"
+
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -y >/dev/null 2>&1 || return 1
+        apt-get install -y "$pkg" >/dev/null 2>&1 || return 1
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y "$pkg" >/dev/null 2>&1 || return 1
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y "$pkg" >/dev/null 2>&1 || return 1
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache "$pkg" >/dev/null 2>&1 || return 1
+    else
+        echo -e "${RED}[错误] 未识别包管理器，请手动安装 ${pkg}。${PLAIN}"
+        return 1
+    fi
+
+    command -v "$cmd" >/dev/null 2>&1
+}
+
+show_external_test_source() {
+    local name="$1"
+    local source="$2"
+
+    echo ""
+    echo -e "${CYAN}════════════════════ ${name} ════════════════════${PLAIN}"
+    echo -e "${YELLOW}测试来源: ${source}${PLAIN}"
+    echo -e "${YELLOW}说明: 以下功能调用第三方开源测试脚本，仅用于检测，不修改 ss2022 协议/分流配置。${PLAIN}"
+    echo ""
+}
+
+test_ip_quality() {
+    clear
+    show_external_test_source "IP 质量测试" "IP.Check.Place"
+
+    ensure_test_dependency curl curl || {
+        echo -e "${RED}[错误] curl 安装失败。${PLAIN}"
+        pause
+        return
+    }
+
+    bash <(curl -fsSL https://IP.Check.Place) || \
+        echo -e "${RED}[错误] IP 质量测试脚本执行失败。${PLAIN}"
+
+    echo ""
+    pause
+}
+
+test_return_route() {
+    local tmp=""
+    clear
+    show_external_test_source \
+        "回程路由测试" \
+        "https://github.com/Chennhaoo/Shell_Bash/blob/master/AutoTrace.sh"
+
+    ensure_test_dependency wget wget || {
+        echo -e "${RED}[错误] wget 安装失败。${PLAIN}"
+        pause
+        return
+    }
+
+    tmp=$(mktemp /tmp/ss2022-autotrace.XXXXXX.sh) || {
+        echo -e "${RED}[错误] 无法创建临时文件。${PLAIN}"
+        pause
+        return
+    }
+
+    if wget -q --no-check-certificate \
+        -O "$tmp" \
+        "https://raw.githubusercontent.com/Chennhaoo/Shell_Bash/master/AutoTrace.sh"; then
+        chmod +x "$tmp"
+        bash "$tmp" || \
+            echo -e "${RED}[错误] AutoTrace 执行失败。${PLAIN}"
+    else
+        echo -e "${RED}[错误] AutoTrace 下载失败。${PLAIN}"
+    fi
+
+    rm -f "$tmp"
+    echo ""
+    pause
+}
+
+test_streaming_unlock() {
+    clear
+    show_external_test_source \
+        "流媒体解锁测试" \
+        "https://github.com/1-stream/RegionRestrictionCheck"
+
+    ensure_test_dependency curl curl || {
+        echo -e "${RED}[错误] curl 安装失败。${PLAIN}"
+        pause
+        return
+    }
+
+    bash <(curl -fsSL \
+        "https://github.com/1-stream/RegionRestrictionCheck/raw/main/check.sh") || \
+        echo -e "${RED}[错误] 流媒体解锁测试脚本执行失败。${PLAIN}"
+
+    echo ""
+    pause
+}
+
+test_ai_unlock() {
+    clear
+    show_external_test_source \
+        "AI 工具测试" \
+        "https://github.com/adsorgcn/vpscheck"
+
+    echo -e "${CYAN}检测范围: ChatGPT / OpenAI API / Gemini / Claude / Copilot / Grok / Perplexity / Mistral / Poe / Sora / DeepSeek / Kimi 等${PLAIN}"
+    echo ""
+
+    ensure_test_dependency curl curl || {
+        echo -e "${RED}[错误] curl 安装失败。${PLAIN}"
+        pause
+        return
+    }
+
+    bash <(curl -fsSL \
+        "https://raw.githubusercontent.com/adsorgcn/vpscheck/main/vpscheck.sh") -r 5 || \
+        echo -e "${RED}[错误] AI 工具测试脚本执行失败。${PLAIN}"
+
+    echo ""
+    pause
+}
+
+server_test_management() {
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ 服务器测试管理 ════════════════════${PLAIN}"
+        echo "  1. IP 质量测试"
+        echo "  2. 回程路由测试"
+        echo "  3. 流媒体解锁测试"
+        echo "  4. AI 工具测试"
+        echo "  0. 返回"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-4]: " c
+        case "$c" in
+            1) test_ip_quality ;;
+            2) test_return_route ;;
+            3) test_streaming_unlock ;;
+            4) test_ai_unlock ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+'''
+    pattern = re.compile(
+        r'^server_test_management\(\) \{.*?(?=^protocol_operations_management\(\) \{)',
+        re.MULTILINE | re.DOTALL,
+    )
+    if not pattern.search(text):
+        fail('无法定位 server_test_management()，无法从 dev17 补齐服务器测试')
+    text = pattern.sub(server_test_block, text, count=1)
+
+
+# -----------------------------------------------------------------------------
+# state.json 改为字段合并；后续更新协议时不会擦掉 name
+# -----------------------------------------------------------------------------
+old_save = "'.[$mode] = $obj'"
+new_save = "'.[$mode] = ((.[$mode] // {}) + $obj)'"
+if old_save in text:
+    text = text.replace(old_save, new_save, 1)
+elif new_save not in text:
+    fail('无法修改 save_mode_state() 合并逻辑')
+
+
+# -----------------------------------------------------------------------------
+# 节点名称公共函数
+# -----------------------------------------------------------------------------
+if 'default_node_name() {' not in text:
+    helpers = r'''default_node_name() {
+    case "$1" in
+        ss)        printf '%s' "Proxy-SS2022" ;;
+        shadowtls) printf '%s' "Proxy-SS2022-ShadowTLS" ;;
+        vless)     printf '%s' "Proxy-VLESS-Reality" ;;
+        snell)     printf '%s' "Proxy-Snell-v5" ;;
+        *)         printf '%s' "Proxy-Node" ;;
+    esac
+}
+
+get_node_name() {
+    local mode="$1"
+    local name=""
+
+    name=$(get_mode_state_field "$mode" "name" 2>/dev/null || true)
+    if [[ -n "$name" ]]; then
+        printf '%s' "$name"
+    else
+        default_node_name "$mode"
+    fi
+}
+
+validate_node_name() {
+    local name="$1"
+
+    [[ -n "$name" ]] || return 1
+    [[ ${#name} -le 64 ]] || return 1
+
+    # 兼容 Surge/Loon 左侧名称、YAML 双引号与 URI fragment。
+    case "$name" in
+        *$'\n'*|*$'\r'*|*'='*|*','*|*'"'*|*'\\'*)
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
+ask_node_name() {
+    local mode="$1"
+    local current="${2:-}"
+    local default input=""
+
+    default=${current:-$(default_node_name "$mode")}
+
+    while true; do
+        read -rp "节点名称 [默认: ${default}]: " input
+        input=${input:-$default}
+
+        if validate_node_name "$input"; then
+            NODE_NAME="$input"
+            return 0
+        fi
+
+        echo -e "${RED}节点名称无效：不能为空、最多 64 个字符，且不能包含 = , \" 或反斜杠。${PLAIN}"
+    done
+}
+
+protocol_mode_exists() {
+    case "$1" in
+        ss)        json_has_inbound_tag "$TAG_SS" ;;
+        shadowtls) json_has_inbound_tag "$TAG_STLS" ;;
+        vless)     xray_vless_exists ;;
+        snell)     protocol_exists_snell ;;
+        *)         return 1 ;;
+    esac
+}
+
+rename_node_name() {
+    local mode="$1"
+    local label="$2"
+    local current=""
+
+    if ! protocol_mode_exists "$mode"; then
+        echo -e "${YELLOW}${label} 尚未部署。${PLAIN}"
+        return 1
+    fi
+
+    current=$(get_node_name "$mode")
+    echo -e "当前节点名称: ${GREEN}${current}${PLAIN}"
+    ask_node_name "$mode" "$current" || return 1
+
+    if save_mode_state "$mode" "$(jq -n --arg name "$NODE_NAME" '{name:$name}')"; then
+        echo -e "${GREEN}✔ ${label} 节点名称已修改为: ${NODE_NAME}${PLAIN}"
+        echo -e "${YELLOW}提示: 仅修改客户端导出名称，不需要重启代理服务。${PLAIN}"
+        return 0
+    fi
+
+    echo -e "${RED}[错误] 节点名称保存失败。${PLAIN}"
+    return 1
+}
+
+node_name_management() {
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ 修改节点名称 ════════════════════${PLAIN}"
+
+        if protocol_mode_exists ss; then
+            echo -e "  1. SS2022                  [${GREEN}$(get_node_name ss)${PLAIN}]"
+        else
+            echo "  1. SS2022                  [未部署]"
+        fi
+
+        if protocol_mode_exists shadowtls; then
+            echo -e "  2. SS2022 + ShadowTLS v3   [${GREEN}$(get_node_name shadowtls)${PLAIN}]"
+        else
+            echo "  2. SS2022 + ShadowTLS v3   [未部署]"
+        fi
+
+        if protocol_mode_exists vless; then
+            echo -e "  3. VLESS Reality           [${GREEN}$(get_node_name vless)${PLAIN}]"
+        else
+            echo "  3. VLESS Reality           [未部署]"
+        fi
+
+        if protocol_mode_exists snell; then
+            echo -e "  4. Snell v5                [${GREEN}$(get_node_name snell)${PLAIN}]"
+        else
+            echo "  4. Snell v5                [未部署]"
+        fi
+
+        echo "  0. 返回"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-4]: " c
+
+        case "$c" in
+            1) rename_node_name "ss" "SS2022"; pause ;;
+            2) rename_node_name "shadowtls" "SS2022 + ShadowTLS v3"; pause ;;
+            3) rename_node_name "vless" "VLESS Reality"; pause ;;
+            4) rename_node_name "snell" "Snell v5"; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+'''
+    pattern = re.compile(
+        r'^(get_mode_state_field\(\) \{.*?^\}\n\n)(?=ensure_singbox_user\(\) \{)',
+        re.MULTILINE | re.DOTALL,
+    )
+    match = pattern.search(text)
+    if not match:
+        fail('无法定位 get_mode_state_field() 后的插入位置')
+    text = text[:match.end()] + helpers + text[match.end():]
+
+if 'NODE_NAME=""' not in text:
+    marker = 'LISTEN_ADDR=""\n'
+    if marker not in text:
+        fail('无法定位全局临时参数 LISTEN_ADDR')
+    text = text.replace(marker, marker + 'NODE_NAME=""\n', 1)
+
+
+# -----------------------------------------------------------------------------
+# 四种客户端配置输出函数：tag 改为可传入名称
+# -----------------------------------------------------------------------------
+def patch_show_ss(block):
+    if 'local tag="Proxy-SS2022"' in block:
+        block = block.replace(
+            '    local tag="Proxy-SS2022"\n',
+            '    local tag="${5:-$(default_node_name ss)}"\n',
+            1,
+        )
+    heading = '    echo -e "${CYAN}════════════════════ SS2022 节点配置 ════════════════════${PLAIN}"\n'
+    if '  节点名称:' not in block and heading in block:
+        block = block.replace(
+            heading,
+            heading + '    echo -e "  节点名称: ${GREEN}${tag}${PLAIN}"\n',
+            1,
+        )
+    return block
+
+
+def patch_show_shadowtls(block):
+    if 'local tag="Proxy-SS2022-ShadowTLS"' in block:
+        block = block.replace(
+            '    local tag="Proxy-SS2022-ShadowTLS"\n',
+            '    local tag="${9:-$(default_node_name shadowtls)}"\n',
+            1,
+        )
+    heading = '    echo -e "${CYAN}════════════════ SS2022 + ShadowTLS v3 配置 ════════════════${PLAIN}"\n'
+    if '  节点名称:' not in block and heading in block:
+        block = block.replace(
+            heading,
+            heading + '    echo -e "  节点名称: ${GREEN}${tag}${PLAIN}"\n',
+            1,
+        )
+    block = block.replace(
+        '--arg type "ss2022-shadowtls" --arg server "$host"',
+        '--arg name "$tag" --arg type "ss2022-shadowtls" --arg server "$host"',
+        1,
+    )
+    block = block.replace(
+        "'{type:$type,server:$server,port:$port,cipher:$cipher,password:$password,shadow_tls:",
+        "'{name:$name,type:$type,server:$server,port:$port,cipher:$cipher,password:$password,shadow_tls:",
+        1,
+    )
+    return block
+
+
+def patch_show_vless(block):
+    if 'local url_host tag="Proxy-VLESS-Reality"' in block:
+        block = block.replace(
+            '    local url_host tag="Proxy-VLESS-Reality"\n',
+            '    local tag="${7:-$(default_node_name vless)}"\n    local url_host\n',
+            1,
+        )
+    heading = '    echo -e "${CYAN}════════════════════ VLESS Reality 配置 ════════════════════${PLAIN}"\n'
+    if '  节点名称:' not in block and heading in block:
+        block = block.replace(
+            heading,
+            heading + '    echo -e "  节点名称: ${GREEN}${tag}${PLAIN}"\n',
+            1,
+        )
+    return block
+
+
+def patch_show_snell(block):
+    if 'local tag="Proxy-Snell-v5"' in block:
+        block = block.replace(
+            '    local tag="Proxy-Snell-v5"\n',
+            '    local tag="${4:-$(default_node_name snell)}"\n',
+            1,
+        )
+    heading = '    echo -e "${CYAN}════════════════════ Snell v5 配置 ════════════════════${PLAIN}"\n'
+    if '  节点名称:' not in block and heading in block:
+        block = block.replace(
+            heading,
+            heading + '    echo -e "  节点名称: ${GREEN}${tag}${PLAIN}"\n',
+            1,
+        )
+    block = block.replace(
+        '--arg type "snell" --arg server "$host"',
+        '--arg name "$tag" --arg type "snell" --arg server "$host"',
+        1,
+    )
+    block = block.replace(
+        "'{type:$type,server:$server,port:$port,psk:$psk,version:5,udp:true}'",
+        "'{name:$name,type:$type,server:$server,port:$port,psk:$psk,version:5,udp:true}'",
+        1,
+    )
+    return block
+
+
+patch_function('show_ss_details', patch_show_ss)
+patch_function('show_shadowtls_details', patch_show_shadowtls)
+patch_function('show_vless_details', patch_show_vless)
+patch_function('show_snell_details', patch_show_snell)
+
+
+# -----------------------------------------------------------------------------
+# 部署流程：安装时询问名称、保存 name、首次输出使用该名称
+# -----------------------------------------------------------------------------
+def deploy_ss(block):
+    if 'ask_node_name "ss"' not in block:
+        block = block.replace(
+            '    ask_server_host\n',
+            '    ask_server_host\n    ask_node_name "ss" || return\n',
+            1,
+        )
+    block = block.replace(
+        "save_mode_state \"ss\" \"$(jq -n --arg host \"$SERVER_HOST\" --arg network \"$NETWORK_MODE\" '{host:$host,network:$network}')\"",
+        "save_mode_state \"ss\" \"$(jq -n --arg host \"$SERVER_HOST\" --arg network \"$NETWORK_MODE\" --arg name \"$NODE_NAME\" '{host:$host,network:$network,name:$name}')\"",
+        1,
+    )
+    block = block.replace(
+        'show_ss_details "$SERVER_HOST" "$PORT" "$METHOD" "$SS_KEY"',
+        'show_ss_details "$SERVER_HOST" "$PORT" "$METHOD" "$SS_KEY" "$NODE_NAME"',
+        1,
+    )
+    return block
+
+
+def deploy_shadow(block):
+    if 'ask_node_name "shadowtls"' not in block:
+        block = block.replace(
+            '    ask_server_host\n',
+            '    ask_server_host\n    ask_node_name "shadowtls" || return\n',
+            1,
+        )
+    block = block.replace(
+        "save_mode_state \"shadowtls\" \"$(jq -n --arg host \"$SERVER_HOST\" --arg network \"$NETWORK_MODE\" '{host:$host,network:$network}')\"",
+        "save_mode_state \"shadowtls\" \"$(jq -n --arg host \"$SERVER_HOST\" --arg network \"$NETWORK_MODE\" --arg name \"$NODE_NAME\" '{host:$host,network:$network,name:$name}')\"",
+        1,
+    )
+    block = block.replace(
+        'show_shadowtls_details "$SERVER_HOST" "$tcp_port" "$METHOD" "$SS_KEY" "$stls_pass" "$sni" "$udp_enabled" "$udp_port"',
+        'show_shadowtls_details "$SERVER_HOST" "$tcp_port" "$METHOD" "$SS_KEY" "$stls_pass" "$sni" "$udp_enabled" "$udp_port" "$NODE_NAME"',
+        1,
+    )
+    return block
+
+
+def deploy_vless(block):
+    if 'ask_node_name "vless"' not in block:
+        block = block.replace(
+            '    ask_server_host\n',
+            '    ask_server_host\n    ask_node_name "vless" || return\n',
+            1,
+        )
+    block = block.replace(
+        "save_mode_state \"vless\" \"$(jq -n --arg host \"$SERVER_HOST\" --arg network \"$NETWORK_MODE\" --arg public_key \"$REALITY_PUBLIC_KEY\" '{host:$host,network:$network,public_key:$public_key,core:\"xray\"}')\"",
+        "save_mode_state \"vless\" \"$(jq -n --arg host \"$SERVER_HOST\" --arg network \"$NETWORK_MODE\" --arg public_key \"$REALITY_PUBLIC_KEY\" --arg name \"$NODE_NAME\" '{host:$host,network:$network,public_key:$public_key,core:\"xray\",name:$name}')\"",
+        1,
+    )
+    block = block.replace(
+        'show_vless_details "$SERVER_HOST" "$vless_port" "$uuid" "$sni" "$REALITY_PUBLIC_KEY" "$short_id"',
+        'show_vless_details "$SERVER_HOST" "$vless_port" "$uuid" "$sni" "$REALITY_PUBLIC_KEY" "$short_id" "$NODE_NAME"',
+        1,
+    )
+    return block
+
+
+def deploy_snell(block):
+    if 'ask_node_name "snell"' not in block:
+        block = block.replace(
+            '    ask_server_host\n',
+            '    ask_server_host\n    ask_node_name "snell" || return\n',
+            1,
+        )
+    block = block.replace(
+        "save_mode_state \"snell\" \"$(jq -n --arg host \"$SERVER_HOST\" --arg network \"$NETWORK_MODE\" '{host:$host,network:$network}')\"",
+        "save_mode_state \"snell\" \"$(jq -n --arg host \"$SERVER_HOST\" --arg network \"$NETWORK_MODE\" --arg name \"$NODE_NAME\" '{host:$host,network:$network,name:$name}')\"",
+        1,
+    )
+    block = block.replace(
+        'show_snell_details "$SERVER_HOST" "$snell_port" "$psk"',
+        'show_snell_details "$SERVER_HOST" "$snell_port" "$psk" "$NODE_NAME"',
+        1,
+    )
+    return block
+
+
+patch_function('deploy_ss2022', deploy_ss)
+patch_function('deploy_shadowtls', deploy_shadow)
+patch_function('deploy_vless_reality', deploy_vless)
+patch_function('deploy_snell_v5', deploy_snell)
+
+
+# -----------------------------------------------------------------------------
+# 查看配置：读取已保存名称；旧节点无 name 时回退到默认名
+# -----------------------------------------------------------------------------
+def view_ss(block):
+    block = block.replace(
+        '    local host port method pass listen ip_type\n',
+        '    local host port method pass listen ip_type name\n',
+        1,
+    )
+    if 'name=$(get_node_name "ss")' not in block:
+        block = block.replace(
+            '    show_ss_details "$host" "$port" "$method" "$pass"\n',
+            '    name=$(get_node_name "ss")\n    show_ss_details "$host" "$port" "$method" "$pass" "$name"\n',
+            1,
+        )
+    return block
+
+
+def view_shadow(block):
+    block = block.replace(
+        '    local host port method ss_pass stls_pass sni listen udp_enabled="false" udp_port=""\n',
+        '    local host port method ss_pass stls_pass sni listen udp_enabled="false" udp_port="" name\n',
+        1,
+    )
+    if 'name=$(get_node_name "shadowtls")' not in block:
+        block = block.replace(
+            '    show_shadowtls_details "$host" "$port" "$method" "$ss_pass" "$stls_pass" "$sni" "$udp_enabled" "$udp_port"\n',
+            '    name=$(get_node_name "shadowtls")\n    show_shadowtls_details "$host" "$port" "$method" "$ss_pass" "$stls_pass" "$sni" "$udp_enabled" "$udp_port" "$name"\n',
+            1,
+        )
+    return block
+
+
+def view_vless(block):
+    block = block.replace(
+        '    local host port uuid sni private public short_id listen out\n',
+        '    local host port uuid sni private public short_id listen out name\n',
+        1,
+    )
+    if 'name=$(get_node_name "vless")' not in block:
+        block = block.replace(
+            '    show_vless_details "$host" "$port" "$uuid" "$sni" "$public" "$short_id"\n',
+            '    name=$(get_node_name "vless")\n    show_vless_details "$host" "$port" "$uuid" "$sni" "$public" "$short_id" "$name"\n',
+            1,
+        )
+    return block
+
+
+def view_snell(block):
+    block = block.replace(
+        '    local host port psk listen\n',
+        '    local host port psk listen name\n',
+        1,
+    )
+    if 'name=$(get_node_name "snell")' not in block:
+        block = block.replace(
+            '    show_snell_details "$host" "$port" "$psk"\n',
+            '    name=$(get_node_name "snell")\n    show_snell_details "$host" "$port" "$psk" "$name"\n',
+            1,
+        )
+    return block
+
+
+patch_function('view_ss2022_config', view_ss)
+patch_function('view_shadowtls_config', view_shadow)
+patch_function('view_vless_config', view_vless)
+patch_function('view_snell_config', view_snell)
+
+
+# -----------------------------------------------------------------------------
+# 查看节点配置菜单：新增“修改节点名称”
+# -----------------------------------------------------------------------------
+def patch_view_menu(block):
+    if '5. 修改节点名称' in block:
+        return block
+
+    block = block.replace(
+        '        echo "  4. Snell v5"\n        echo "  0. 返回"\n',
+        '        echo "  4. Snell v5"\n        echo "  5. 修改节点名称"\n        echo "  0. 返回"\n',
+        1,
+    )
+    block = block.replace(
+        '        read -rp "请选择 [0-4]: " c\n',
+        '        read -rp "请选择 [0-5]: " c\n',
+        1,
+    )
+    block = block.replace(
+        '            4) view_snell_config; pause ;;\n            0) return ;;\n',
+        '            4) view_snell_config; pause ;;\n            5) node_name_management ;;\n            0) return ;;\n',
+        1,
+    )
+    return block
+
+
+patch_function('view_config_menu', patch_view_menu)
+
+
+# -----------------------------------------------------------------------------
+# 结构校验
+# -----------------------------------------------------------------------------
+required = [
+    'SCRIPT_VERSION="v1.8.0-dev19"',
+    'default_node_name() {',
+    'ask_node_name() {',
+    'node_name_management() {',
+    'local tag="${5:-$(default_node_name ss)}"',
+    'local tag="${9:-$(default_node_name shadowtls)}"',
+    'local tag="${7:-$(default_node_name vless)}"',
+    'local tag="${4:-$(default_node_name snell)}"',
+    'ask_node_name "ss" || return',
+    'ask_node_name "shadowtls" || return',
+    'ask_node_name "vless" || return',
+    'ask_node_name "snell" || return',
+    '5. 修改节点名称',
+    'test_ai_unlock() {',
+]
+missing = [item for item in required if item not in text]
+if missing:
+    fail('修改后结构校验失败，缺少: ' + ' | '.join(missing))
+
+path.write_text(text, encoding='utf-8')
+PY
+
+chmod +x "$TARGET"
+
+if ! bash -n "$TARGET"; then
+    echo -e "${RED}[错误] 修改后的主脚本 Bash 语法检查失败，正在恢复备份。${PLAIN}"
+    cp -af "$BACKUP" "$TARGET"
+    exit 1
+fi
+
+if command -v shellcheck >/dev/null 2>&1; then
+    if ! shellcheck --severity=error "$TARGET"; then
+        echo -e "${RED}[错误] ShellCheck(error) 未通过，正在恢复备份。${PLAIN}"
+        cp -af "$BACKUP" "$TARGET"
+        exit 1
+    fi
+fi
+
+echo -e "${GREEN}✔ 已升级到 v1.8.0-dev19。${PLAIN}"
+echo ""
+echo "新增节点名称逻辑："
+echo "  SS2022                默认: Proxy-SS2022"
+echo "  SS2022 + ShadowTLS     默认: Proxy-SS2022-ShadowTLS"
+echo "  VLESS Reality          默认: Proxy-VLESS-Reality"
+echo "  Snell v5               默认: Proxy-Snell-v5"
+echo ""
+echo "新部署协议时会询问节点名称，直接回车使用默认值。"
+echo "已部署旧节点可进入："
+echo "  查看节点配置 -> 5. 修改节点名称"
+echo ""
+echo -e "${YELLOW}备份文件: ${BACKUP}${PLAIN}"
