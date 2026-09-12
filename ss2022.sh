@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.0-dev28
+# 当前版本: v1.8.0-dev29
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,12 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.8.0-dev29:
+#   - 修复脚本自更新检查混用“当前运行脚本”和 /usr/local/bin/ss2022 导致的误判
+#   - 更新界面分别显示当前运行版本、系统安装版本、GitHub main 远程版本
+#   - 当前运行脚本与远程一致、但系统安装版本落后时，可同步安装到 /usr/local/bin/ss2022
+#   - 增加版本新旧比较；GitHub main 比当前运行版本旧时明确提示并拒绝自动降级
 #
 # v1.8.0-dev28:
 #   - “释放指定端口”进入后先显示全部监听端口，便于选择目标端口
@@ -224,12 +230,13 @@
 #   v1.8.0-dev26 系统信息月流量统计 / 内存单位优化
 #   v1.8.0-dev27 端口占用释放工具
 #   v1.8.0-dev28 端口释放交互优化
+#   v1.8.0-dev29 脚本自更新版本判断修复
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.0-dev28"
+SCRIPT_VERSION="v1.8.0-dev29"
 
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
@@ -6300,11 +6307,88 @@ script_source_path() {
     readlink -f "$src" 2>/dev/null || printf '%s\n' "$src"
 }
 
+compare_script_versions() {
+    # 输出：
+    #   equal         两版本相同
+    #   remote_newer  第二个版本更新
+    #   remote_older  第二个版本更旧
+    #   unknown       无法按 vX.Y.Z[-devN] 规则比较
+    local current="$1"
+    local remote="$2"
+    local c_major c_minor c_patch c_dev r_major r_minor r_patch r_dev
+    local c_is_dev=0 r_is_dev=0
+
+    if [[ "$current" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)(-dev([0-9]+))?$ ]]; then
+        c_major="${BASH_REMATCH[1]}"
+        c_minor="${BASH_REMATCH[2]}"
+        c_patch="${BASH_REMATCH[3]}"
+        if [[ -n "${BASH_REMATCH[4]:-}" ]]; then
+            c_is_dev=1
+            c_dev="${BASH_REMATCH[5]}"
+        else
+            c_dev=0
+        fi
+    else
+        echo "unknown"
+        return
+    fi
+
+    if [[ "$remote" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)(-dev([0-9]+))?$ ]]; then
+        r_major="${BASH_REMATCH[1]}"
+        r_minor="${BASH_REMATCH[2]}"
+        r_patch="${BASH_REMATCH[3]}"
+        if [[ -n "${BASH_REMATCH[4]:-}" ]]; then
+            r_is_dev=1
+            r_dev="${BASH_REMATCH[5]}"
+        else
+            r_dev=0
+        fi
+    else
+        echo "unknown"
+        return
+    fi
+
+    local c r
+    for c_r in major minor patch; do
+        case "$c_r" in
+            major) c="$c_major"; r="$r_major" ;;
+            minor) c="$c_minor"; r="$r_minor" ;;
+            patch) c="$c_patch"; r="$r_patch" ;;
+        esac
+        if (( 10#$r > 10#$c )); then
+            echo "remote_newer"
+            return
+        elif (( 10#$r < 10#$c )); then
+            echo "remote_older"
+            return
+        fi
+    done
+
+    # 同一正式版本号下：正式版 > dev 版。
+    if (( c_is_dev == 1 && r_is_dev == 0 )); then
+        echo "remote_newer"
+        return
+    elif (( c_is_dev == 0 && r_is_dev == 1 )); then
+        echo "remote_older"
+        return
+    elif (( c_is_dev == 0 && r_is_dev == 0 )); then
+        echo "equal"
+        return
+    fi
+
+    if (( 10#$r_dev > 10#$c_dev )); then
+        echo "remote_newer"
+    elif (( 10#$r_dev < 10#$c_dev )); then
+        echo "remote_older"
+    else
+        echo "equal"
+    fi
+}
+
 check_script_update() {
     clear
     echo -e "${CYAN}════════════════════ 检查脚本更新 ════════════════════${PLAIN}"
     echo "更新源 : ${SCRIPT_UPDATE_URL}"
-    echo "当前版 : ${SCRIPT_VERSION}"
     echo ""
 
     command -v curl >/dev/null 2>&1 || {
@@ -6313,7 +6397,25 @@ check_script_update() {
         return
     }
 
-    local tmp remote_version local_file local_hash remote_hash cache_bust
+    local tmp remote_version running_file running_version installed_version
+    local running_hash installed_hash remote_hash cache_bust relation
+    local install_reason=""
+    local ans
+
+    running_file=$(script_source_path)
+    running_version=$(extract_script_version "$running_file")
+    [[ -n "$running_version" ]] || running_version="$SCRIPT_VERSION"
+
+    if [[ -f "$SCRIPT_INSTALL_PATH" ]]; then
+        installed_version=$(extract_script_version "$SCRIPT_INSTALL_PATH")
+        installed_hash=$(sha256sum "$SCRIPT_INSTALL_PATH" 2>/dev/null | awk '{print $1}')
+    else
+        installed_version="未安装"
+        installed_hash=""
+    fi
+
+    running_hash=$(sha256sum "$running_file" 2>/dev/null | awk '{print $1}')
+
     tmp=$(mktemp /tmp/ss2022-update.XXXXXX.sh) || {
         echo -e "${RED}[错误] 无法创建临时文件。${PLAIN}"
         pause
@@ -6353,39 +6455,72 @@ check_script_update() {
         return
     fi
 
-    local_file="$SCRIPT_INSTALL_PATH"
-    [[ -f "$local_file" ]] || local_file=$(script_source_path)
-    local_hash=$(sha256sum "$local_file" 2>/dev/null | awk '{print $1}')
     remote_hash=$(sha256sum "$tmp" | awk '{print $1}')
+    relation=$(compare_script_versions "$running_version" "$remote_version")
 
-    echo "远程版 : ${remote_version}"
-    echo "当前SHA : ${local_hash:-无法读取}"
-    echo "远程SHA : ${remote_hash}"
+    echo "当前运行 : ${running_version}"
+    echo "系统安装 : ${installed_version}"
+    echo "GitHub main: ${remote_version}"
+    echo ""
+    echo "运行 SHA : ${running_hash:-无法读取}"
+    echo "安装 SHA : ${installed_hash:-未安装}"
+    echo "远程 SHA : ${remote_hash}"
     echo ""
 
-    if [[ -n "$local_hash" && "$local_hash" == "$remote_hash" ]]; then
-        rm -f "$tmp"
-        echo -e "${GREEN}✔ 当前脚本已与 GitHub main 完全一致。${PLAIN}"
-        pause
-        return
+    # 情况 1：当前正在运行的文件与 GitHub main 完全一致。
+    if [[ -n "$running_hash" && "$running_hash" == "$remote_hash" ]]; then
+        if [[ -n "$installed_hash" && "$installed_hash" == "$remote_hash" ]]; then
+            rm -f "$tmp"
+            echo -e "${GREEN}✔ 当前运行脚本、系统安装脚本与 GitHub main 完全一致。${PLAIN}"
+            pause
+            return
+        fi
+
+        echo -e "${YELLOW}当前运行脚本已与 GitHub main 一致，但系统安装版本仍不一致。${PLAIN}"
+        echo "可以把当前 GitHub main 版本同步安装到：${SCRIPT_INSTALL_PATH}"
+        install_reason="sync_install"
+    else
+        case "$relation" in
+            remote_newer)
+                echo -e "${GREEN}检测到脚本更新：${running_version} → ${remote_version}${PLAIN}"
+                install_reason="remote_newer"
+                ;;
+            remote_older)
+                rm -f "$tmp"
+                echo -e "${YELLOW}GitHub main 版本比当前运行版本更旧：${remote_version} < ${running_version}${PLAIN}"
+                echo "为避免误降级，本工具不会自动覆盖当前版本。"
+                echo ""
+                echo "如果你刚从测试文件运行了新版，请先把新版 ss2022.sh 提交到 GitHub main，"
+                echo "之后再使用“检查脚本更新”。"
+                pause
+                return
+                ;;
+            equal)
+                echo -e "${YELLOW}检测到同版本号内容变化：${running_version}${PLAIN}"
+                echo "版本号相同，但当前运行文件与 GitHub main 的 SHA256 不同。"
+                install_reason="same_version_changed"
+                ;;
+            *)
+                echo -e "${YELLOW}检测到脚本内容不同，但无法可靠判断版本新旧。${PLAIN}"
+                echo "当前运行：${running_version}"
+                echo "GitHub main：${remote_version}"
+                echo "为避免误降级，默认不自动覆盖。"
+                rm -f "$tmp"
+                pause
+                return
+                ;;
+        esac
     fi
 
-    if [[ "$remote_version" == "$SCRIPT_VERSION" ]]; then
-        echo -e "${YELLOW}检测到同版本号内容更新：${SCRIPT_VERSION}${PLAIN}"
-        echo "这通常发生在开发测试阶段，GitHub main 内容已变化但版本号尚未递增。"
-    else
-        echo -e "${GREEN}检测到脚本更新：${SCRIPT_VERSION} → ${remote_version}${PLAIN}"
-    fi
     echo ""
     echo "更新将："
-    echo "  1. 备份当前脚本到 ${SCRIPT_BACKUP_PATH}"
-    echo "  2. 安装 GitHub main 最新脚本到 ${SCRIPT_INSTALL_PATH}"
+    echo "  1. 备份当前系统安装脚本到 ${SCRIPT_BACKUP_PATH}"
+    echo "  2. 安装 GitHub main 脚本到 ${SCRIPT_INSTALL_PATH}"
     echo "  3. 保持 ${SCRIPT_PROXY_LINK} 快捷命令"
-    echo "  4. 自动重新进入新版管理面板"
+    echo "  4. 自动重新进入安装后的管理面板"
     echo ""
 
-    local ans
-    read -rp "确认更新？[y/N]: " ans
+    read -rp "确认安装 / 更新？[y/N]: " ans
     if [[ ! "$ans" =~ ^[Yy]$ ]]; then
         rm -f "$tmp"
         echo "已取消更新。"
@@ -6393,7 +6528,7 @@ check_script_update() {
         return
     fi
 
-    # 覆盖前保存最近一个版本。安装失败时立即恢复。
+    # 覆盖前保存最近一个系统安装版本。安装失败时立即恢复。
     if [[ -f "$SCRIPT_INSTALL_PATH" ]]; then
         cp -a "$SCRIPT_INSTALL_PATH" "$SCRIPT_BACKUP_PATH" || {
             rm -f "$tmp"
@@ -6420,8 +6555,8 @@ check_script_update() {
     fi
 
     ln -sf "$SCRIPT_INSTALL_PATH" "$SCRIPT_PROXY_LINK" || true
-    echo -e "${GREEN}✔ 脚本更新完成：$(extract_script_version "$SCRIPT_INSTALL_PATH")${PLAIN}"
-    echo "正在重新进入新版管理面板..."
+    echo -e "${GREEN}✔ 脚本安装 / 更新完成：$(extract_script_version "$SCRIPT_INSTALL_PATH")${PLAIN}"
+    echo "正在重新进入安装后的管理面板..."
     sleep 1
     exec "$SCRIPT_INSTALL_PATH"
 }
