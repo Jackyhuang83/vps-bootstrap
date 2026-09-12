@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.0-dev27
+# 当前版本: v1.8.0-dev28
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,10 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.8.0-dev28:
+#   - “释放指定端口”进入后先显示全部监听端口，便于选择目标端口
+#   - 端口输入阶段增加 0=返回，可随时取消释放操作
 #
 # v1.8.0-dev27:
 #   - “查看端口占用”新增“释放指定端口”
@@ -219,12 +223,13 @@
 #   v1.8.0-dev25 系统信息主机名置顶
 #   v1.8.0-dev26 系统信息月流量统计 / 内存单位优化
 #   v1.8.0-dev27 端口占用释放工具
+#   v1.8.0-dev28 端口释放交互优化
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.0-dev27"
+SCRIPT_VERSION="v1.8.0-dev28"
 
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
@@ -7542,7 +7547,15 @@ server_tool_port_release() {
     local port c
     local docker_lines pids pid unit has_unit=0
 
-    read -rp "请输入要释放的端口号: " port
+    clear
+    echo -e "${CYAN}════════════════ 当前全部监听端口 ════════════════${PLAIN}"
+    server_tool_port_usage_show_all
+    echo ""
+    echo -e "${YELLOW}请输入需要释放的端口号；输入 0 返回。${PLAIN}"
+    read -rp "端口号 [0=返回]: " port
+
+    [[ "$port" == "0" ]] && return
+
     if ! validate_port_number "$port"; then
         echo -e "${RED}端口无效。${PLAIN}"
         pause
