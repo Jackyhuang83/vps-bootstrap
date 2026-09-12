@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.0-dev16
+# 当前版本: v1.8.0-dev17
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -86,6 +86,12 @@
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
 #
+# v1.8.0-dev17:
+#   - WARP 出口模式菜单固定提供：仅 IPv4 / 仅 IPv6 / IPv4+IPv6 双栈
+#   - IPv4-only VPS 默认推荐“仅 WARP IPv6”，但仍允许用户主动选择“仅 WARP IPv4”
+#   - IPv6-only VPS 默认推荐“仅 WARP IPv4”，但仍允许用户主动选择“仅 WARP IPv6”
+#   - 双栈 VPS 默认推荐 WARP 双栈；三种模式底层规则、状态页与测试逻辑保持一致
+#
 # v1.8.0-dev16:
 #   - 修正 dev15 仅“推荐”补全地址族但仍同时暴露 WARP IPv4/IPv6 的问题
 #   - WARP 安装/配置时明确选择：仅 IPv6 / 仅 IPv4 / 双栈
@@ -133,12 +139,13 @@
 #   v1.8.0-dev14 SS2022 原始密码透传 / Xray 原生直连
 #   v1.8.0-dev15 WARP IPv4/IPv6 双栈补全
 #   v1.8.0-dev16 WARP 单地址族出口强制（IPv6-only / IPv4-only / 双栈）
+#   v1.8.0-dev17 WARP 三种出口模式固定可选 / 按 VPS 网络自动推荐
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.0-dev16"
+SCRIPT_VERSION="v1.8.0-dev17"
 
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
@@ -3213,36 +3220,54 @@ warp_effective_rule_family() {
 
 warp_choose_egress_family() {
     warp_detect_direct_profile
-    local c
-    echo -e "${CYAN}请选择 WARP 实际出口模式：${PLAIN}"
+    local c default_choice recommendation
+
     case "$WARP_PROFILE" in
         supplement_ipv6)
-            echo "  1. 仅启用 WARP IPv6（推荐；VPS IPv4 继续 DIRECT）"
-            echo "  2. WARP IPv4 + IPv6 双栈"
-            echo "  0. 取消"
-            read -rp "请选择 [0-2，默认 1]: " c; c=${c:-1}
-            case "$c" in 1) WARP_SELECTED_EGRESS="ipv6_only" ;; 2) WARP_SELECTED_EGRESS="dual" ;; 0) return 1 ;; *) return 1 ;; esac
+            default_choice=2
+            recommendation="推荐：仅 WARP IPv6；VPS 原生 IPv4 继续 DIRECT"
             ;;
         supplement_ipv4)
-            echo "  1. 仅启用 WARP IPv4（推荐；VPS IPv6 继续 DIRECT）"
-            echo "  2. WARP IPv4 + IPv6 双栈"
-            echo "  0. 取消"
-            read -rp "请选择 [0-2，默认 1]: " c; c=${c:-1}
-            case "$c" in 1) WARP_SELECTED_EGRESS="ipv4_only" ;; 2) WARP_SELECTED_EGRESS="dual" ;; 0) return 1 ;; *) return 1 ;; esac
+            default_choice=1
+            recommendation="推荐：仅 WARP IPv4；VPS 原生 IPv6 继续 DIRECT"
             ;;
         dual_stack)
-            echo "  1. 仅启用 WARP IPv4"
-            echo "  2. 仅启用 WARP IPv6"
-            echo "  3. WARP IPv4 + IPv6 双栈（推荐）"
-            echo "  0. 取消"
-            read -rp "请选择 [0-3，默认 3]: " c; c=${c:-3}
-            case "$c" in 1) WARP_SELECTED_EGRESS="ipv4_only" ;; 2) WARP_SELECTED_EGRESS="ipv6_only" ;; 3) WARP_SELECTED_EGRESS="dual" ;; 0) return 1 ;; *) return 1 ;; esac
+            default_choice=3
+            recommendation="推荐：WARP IPv4 + IPv6 双栈"
             ;;
         *)
             echo -e "${RED}[错误] 无法识别 VPS 原生 IPv4/IPv6，不能安全选择 WARP 出口模式。${PLAIN}"
             return 1
             ;;
     esac
+
+    echo -e "${CYAN}请选择 WARP 实际出口模式：${PLAIN}"
+    echo ""
+    case "$WARP_PROFILE" in
+        supplement_ipv4) echo "  1. 仅启用 WARP IPv4（推荐；VPS IPv6 继续 DIRECT）" ;;
+        *)               echo "  1. 仅启用 WARP IPv4" ;;
+    esac
+    case "$WARP_PROFILE" in
+        supplement_ipv6) echo "  2. 仅启用 WARP IPv6（推荐；VPS IPv4 继续 DIRECT）" ;;
+        *)               echo "  2. 仅启用 WARP IPv6" ;;
+    esac
+    case "$WARP_PROFILE" in
+        dual_stack) echo "  3. WARP IPv4 + IPv6 双栈（推荐）" ;;
+        *)          echo "  3. WARP IPv4 + IPv6 双栈" ;;
+    esac
+    echo "  0. 取消"
+    echo ""
+    echo -e "${YELLOW}${recommendation}${PLAIN}"
+    read -rp "请选择 [0-3，默认 ${default_choice}]: " c
+    c=${c:-$default_choice}
+    case "$c" in
+        1) WARP_SELECTED_EGRESS="ipv4_only" ;;
+        2) WARP_SELECTED_EGRESS="ipv6_only" ;;
+        3) WARP_SELECTED_EGRESS="dual" ;;
+        0) return 1 ;;
+        *) echo -e "${RED}[错误] 无效选择。${PLAIN}"; return 1 ;;
+    esac
+
     echo ""
     echo -e "已选择：${GREEN}$(warp_egress_label "$WARP_SELECTED_EGRESS")${PLAIN}"
 }
