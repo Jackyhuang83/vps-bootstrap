@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.0-dev24
+# 当前版本: v1.8.0-dev25
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,9 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.8.0-dev25:
+#   - 系统信息页面将“主机名”移动到第一行显示
 #
 # v1.8.0-dev24:
 #   - 系统信息运行时间统一改为“X 天”，不再显示 weeks
@@ -200,12 +203,13 @@
 #   v1.8.0-dev22 TG-BOT 流量预警 / 端口占用增强 / IP 信息增强
 #   v1.8.0-dev23 工具菜单实测收口 / AI 测试替换
 #   v1.8.0-dev24 系统信息展示优化
+#   v1.8.0-dev25 系统信息主机名置顶
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.0-dev24"
+SCRIPT_VERSION="v1.8.0-dev25"
 
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
@@ -6644,6 +6648,7 @@ server_tool_system_info() {
     server_tool_get_ip_profile "$ipv4" "$ipv6"
 
     echo -e "${CYAN}════════════════════ 系统信息 ════════════════════${PLAIN}"
+    echo "  主机名     : ${hostname_text}"
     echo "  系统       : ${os_info}"
     echo "  CPU        : ${cpu}"
     echo "  CPU 核心   : ${cores}$([[ -n "$cpu_ghz" ]] && printf " 核 @ %s GHz" "$cpu_ghz" || printf " 核")"
@@ -6651,8 +6656,8 @@ server_tool_system_info() {
     echo "  虚拟内存   : ${swap_used:-?} / ${swap_total:-?}"
     echo "  硬盘占用   : ${disk_used:-?} / ${disk_total:-?}"
     echo "  运行时间   : ${uptime_days} 天"
-    echo "  流量入站   : $(server_tool_format_bytes "${traffic_rx:-0}")"
-    echo "  流量出站   : $(server_tool_format_bytes "${traffic_tx:-0}")"
+    echo "  入站流量   : $(server_tool_format_bytes "${traffic_rx:-0}")"
+    echo "  出站流量   : $(server_tool_format_bytes "${traffic_tx:-0}")"
     echo "  时区       : ${timezone:-未知}"
     echo "  IPv4 地址  : ${ipv4:-无 IPv4}"
     echo "  IPv6 地址  : ${ipv6:-无 IPv6}"
@@ -6662,7 +6667,6 @@ server_tool_system_info() {
     echo "  IP 危险性  : ${SERVER_INFO_IP_RISK}"
     echo "  DNS        : ${dns:-未检测到}"
     echo "  网络算法   : ${congestion} ${qdisc}"
-    echo "  主机名     : ${hostname_text}"
     echo -e "${CYAN}═══════════════════════════════════════════════════${PLAIN}"
 }
 
