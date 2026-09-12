@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.0-dev14
+# 当前版本: v1.8.0-dev15
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -11,7 +11,7 @@
 # │   │                            ├─ Xray: VLESS Reality             │
 # │   │                            └─ snell-server: Snell v5          │
 # │   ├─ 分流管理 ────────────────┬─ DIRECT                           │
-# │   │                            ├─ WARP Local Proxy                 │
+# │   │                            ├─ WARP Local Proxy / 双栈补全      │
 # │   │                            └─ Shadowsocks / SOCKS5 落地   │
 # │   ├─ 端口转发 ────────────────── Realm                              │
 # │   ├─ 协议运维                                                       │
@@ -86,6 +86,15 @@
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
 #
+# v1.8.0-dev15:
+#   - WARP Local Proxy 增加原生 IPv4 / IPv6 自动检测与双栈补全提示
+#   - IPv4-only VPS 推荐 DIRECT 保留原生 IPv4、WARP 补 IPv6
+#   - IPv6-only VPS 推荐 DIRECT 保留原生 IPv6、WARP 补 IPv4
+#   - 双栈 VPS 将 WARP 作为可选额外出口，不接管系统默认路由
+#   - WARP 状态页分别显示 DIRECT/WARP 的 IPv4、IPv6 可用性与出口 IP
+#   - 分流规则选择 WARP 时，IP 地址族默认推荐当前缺失的协议族
+#   - 若将 WARP 设为全局默认出口，在“补全模式”下增加明确警告确认
+#
 # v1.8.0-dev14:
 # - Shadowsocks 落地导入不再由 Bash 强制校验 SS2022 Key/Base64 长度；保留解析后的原始 password。
 # - SS2022 落地在 VLESS/Xray 链路中优先使用 Xray 原生 Shadowsocks outbound。
@@ -113,12 +122,14 @@
 #   v1.8.0-dev11 ss:// 导入自动识别标准 SS / SS2022
 #   v1.8.0-dev12 落地节点 Shadowsocks 入口合并
 #   v1.8.0-dev13 SS2022 EIH 多 PSK 导入兼容
+#   v1.8.0-dev14 SS2022 原始密码透传 / Xray 原生直连
+#   v1.8.0-dev15 WARP IPv4/IPv6 双栈补全
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.0-dev14"
+SCRIPT_VERSION="v1.8.0-dev15"
 
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
@@ -2853,7 +2864,10 @@ routing_init_state() {
   "default_outbound": "direct",
   "warp": {
     "proxy_host": "127.0.0.1",
-    "proxy_port": ${WARP_DEFAULT_PORT}
+    "proxy_port": ${WARP_DEFAULT_PORT},
+    "profile": "auto",
+    "direct_ipv4": null,
+    "direct_ipv6": null
   },
   "chain_nodes": [],
   "rules": []
@@ -2871,6 +2885,9 @@ EOF
       .warp = (.warp // {}) |
       .warp.proxy_host = (.warp.proxy_host // "127.0.0.1") |
       .warp.proxy_port = (.warp.proxy_port // $port) |
+      .warp.profile = (.warp.profile // "auto") |
+      .warp.direct_ipv4 = (.warp.direct_ipv4 // null) |
+      .warp.direct_ipv6 = (.warp.direct_ipv6 // null) |
       .chain_nodes = (.chain_nodes // []) |
       .rules = (.rules // [])
     ' "$ROUTING_FILE" > "$tmp"; then
@@ -3030,6 +3047,108 @@ routing_tag_xray() {
 warp_proxy_port() {
     routing_init_state || { echo "$WARP_DEFAULT_PORT"; return; }
     jq -r --argjson p "$WARP_DEFAULT_PORT" '.warp.proxy_port // $p' "$ROUTING_FILE" 2>/dev/null
+}
+
+warp_direct_ipv4_ready() {
+    curl -4fsS --connect-timeout 4 --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q '^ip='
+}
+
+warp_direct_ipv6_ready() {
+    curl -6fsS --connect-timeout 4 --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q '^ip='
+}
+
+warp_detect_direct_profile() {
+    # 只测试系统原生网络。WARP 使用 Local Proxy，不会影响这里的 DIRECT 探测。
+    WARP_DIRECT_IPV4=false
+    WARP_DIRECT_IPV6=false
+    WARP_PROFILE="unknown"
+    WARP_RECOMMENDED_FAMILY="default"
+
+    warp_direct_ipv4_ready && WARP_DIRECT_IPV4=true
+    warp_direct_ipv6_ready && WARP_DIRECT_IPV6=true
+
+    # 首次进入 WARP 菜单时 DNS 可能尚未初始化；此时用本机地址+默认路由作为保守兜底。
+    if [[ "$WARP_DIRECT_IPV4" == false ]] && ip -4 route show default 2>/dev/null | grep -q '^default ' \
+       && ip -4 addr show scope global 2>/dev/null | grep -q 'inet '; then
+        WARP_DIRECT_IPV4=true
+    fi
+    if [[ "$WARP_DIRECT_IPV6" == false ]] && ip -6 route show default 2>/dev/null | grep -q '^default ' \
+       && ip -6 addr show scope global 2>/dev/null | grep -q 'inet6 '; then
+        WARP_DIRECT_IPV6=true
+    fi
+
+    if [[ "$WARP_DIRECT_IPV4" == true && "$WARP_DIRECT_IPV6" == false ]]; then
+        WARP_PROFILE="supplement_ipv6"
+        WARP_RECOMMENDED_FAMILY="ipv6"
+    elif [[ "$WARP_DIRECT_IPV4" == false && "$WARP_DIRECT_IPV6" == true ]]; then
+        WARP_PROFILE="supplement_ipv4"
+        WARP_RECOMMENDED_FAMILY="ipv4"
+    elif [[ "$WARP_DIRECT_IPV4" == true && "$WARP_DIRECT_IPV6" == true ]]; then
+        WARP_PROFILE="dual_stack"
+        WARP_RECOMMENDED_FAMILY="default"
+    fi
+}
+
+warp_profile_label() {
+    local profile="${1:-unknown}"
+    case "$profile" in
+        supplement_ipv6) echo "IPv4-only：WARP 补充 IPv6" ;;
+        supplement_ipv4) echo "IPv6-only：WARP 补充 IPv4" ;;
+        dual_stack) echo "原生双栈：WARP 作为可选额外出口" ;;
+        *) echo "未识别 / 尚未检测" ;;
+    esac
+}
+
+warp_save_detected_profile() {
+    routing_init_state || return 1
+    local tmp
+    warp_detect_direct_profile
+    tmp=$(mktemp "${STATE_DIR}/routing.json.tmp.XXXXXX") || return 1
+    jq --arg profile "$WARP_PROFILE" \
+       --argjson v4 "$WARP_DIRECT_IPV4" \
+       --argjson v6 "$WARP_DIRECT_IPV6" \
+       '.warp.profile=$profile | .warp.direct_ipv4=$v4 | .warp.direct_ipv6=$v6' \
+       "$ROUTING_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$ROUTING_FILE"
+    chmod 600 "$ROUTING_FILE"
+}
+
+warp_show_direct_profile() {
+    warp_detect_direct_profile
+    echo "VPS 原生网络："
+    if [[ "$WARP_DIRECT_IPV4" == true ]]; then echo -e "  IPv4 : ${GREEN}可用${PLAIN}"; else echo -e "  IPv4 : ${YELLOW}不可用${PLAIN}"; fi
+    if [[ "$WARP_DIRECT_IPV6" == true ]]; then echo -e "  IPv6 : ${GREEN}可用${PLAIN}"; else echo -e "  IPv6 : ${YELLOW}不可用${PLAIN}"; fi
+    echo "推荐模式：$(warp_profile_label "$WARP_PROFILE")"
+    case "$WARP_PROFILE" in
+        supplement_ipv6)
+            echo "  DIRECT → VPS 原生 IPv4"
+            echo "  WARP   → 推荐仅 IPv6（按分流规则调用）"
+            ;;
+        supplement_ipv4)
+            echo "  DIRECT → VPS 原生 IPv6"
+            echo "  WARP   → 推荐仅 IPv4（按分流规则调用）"
+            ;;
+        dual_stack)
+            echo "  DIRECT → VPS 原生 IPv4 / IPv6"
+            echo "  WARP   → 可选 IPv4 / IPv6 额外出口"
+            ;;
+        *)
+            echo "  无法确认原生公网协议族，请先检查 VPS 网络。"
+            ;;
+    esac
+}
+
+warp_test_family() {
+    local family="$1" port url out
+    port=$(warp_proxy_port)
+    [[ "$family" == "ipv6" ]] && url="https://api6.ipify.org" || url="https://api4.ipify.org"
+    out=$(curl -fsS --connect-timeout 8 --max-time 15 --socks5-hostname "127.0.0.1:${port}" "$url" 2>/dev/null) || return 1
+    printf '%s' "$out"
+}
+
+warp_recommended_family() {
+    warp_detect_direct_profile
+    printf '%s' "$WARP_RECOMMENDED_FAMILY"
 }
 
 warp_proxy_ready() {
@@ -3257,13 +3376,29 @@ routing_choose_outbound() {
 }
 
 routing_choose_ip_family() {
-    local c
+    local c default_choice=1 recommended="default"
+
+    # WARP 在单栈 VPS 上默认推荐“补缺的地址族”，但仍允许用户手动选择其他模式。
+    if [[ "${SELECTED_OUTBOUND:-}" == "warp" ]]; then
+        recommended=$(warp_recommended_family)
+        [[ "$recommended" == "ipv4" ]] && default_choice=2
+        [[ "$recommended" == "ipv6" ]] && default_choice=3
+    fi
+
     echo "请选择 IP 地址族："
     echo "  1. 默认（不强制）"
-    echo "  2. 仅 IPv4"
-    echo "  3. 仅 IPv6"
-    read -rp "请选择 [1-3，默认 1]: " c
-    c=${c:-1}
+    if [[ "$recommended" == "ipv4" ]]; then
+        echo "  2. 仅 IPv4（WARP 补全推荐）"
+    else
+        echo "  2. 仅 IPv4"
+    fi
+    if [[ "$recommended" == "ipv6" ]]; then
+        echo "  3. 仅 IPv6（WARP 补全推荐）"
+    else
+        echo "  3. 仅 IPv6"
+    fi
+    read -rp "请选择 [1-3，默认 ${default_choice}]: " c
+    c=${c:-$default_choice}
     case "$c" in
         1) SELECTED_IP_FAMILY="default" ;;
         2) SELECTED_IP_FAMILY="ipv4" ;;
@@ -3558,9 +3693,26 @@ warp_install_client() {
     local managed=0 codename port
     routing_init_state || return 1
     port=$(warp_proxy_port)
+
+    echo -e "${CYAN}══════════════ WARP 双栈补全检测 ══════════════${PLAIN}"
+    warp_show_direct_profile
+    echo ""
+    if [[ "$WARP_PROFILE" == "unknown" ]]; then
+        echo -e "${RED}[错误] IPv4 / IPv6 原生公网连接均未检测成功，暂不安装 WARP。${PLAIN}"
+        return 1
+    fi
+    echo -e "${YELLOW}[说明] 使用 Cloudflare Local Proxy，不修改系统默认路由；DIRECT 仍保持 VPS 原生出口。${PLAIN}"
+    echo ""
+
+    # 让 IPv6-only VPS 也能通过 APT 正常安装 Cloudflare 官方客户端。
+    if [[ "$WARP_DIRECT_IPV4" == false && "$WARP_DIRECT_IPV6" == true ]]; then
+        prepare_ipv6_env no || return 1
+    else
+        prepare_ipv4_env no || return 1
+    fi
+
     if ! command -v warp-cli >/dev/null 2>&1; then
         echo -e "${YELLOW}>> 安装 Cloudflare 官方 WARP Linux 客户端...${PLAIN}"
-        apt-get update -y || return 1
         apt-get install -y curl ca-certificates gnupg lsb-release || return 1
         curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg || return 1
         codename=$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-}")
@@ -3586,7 +3738,9 @@ warp_install_client() {
     local n=0
     while [[ $n -lt 15 ]]; do
         if warp_proxy_ready; then
+            warp_save_detected_profile || true
             echo -e "${GREEN}✔ WARP Local Proxy 已连接：127.0.0.1:${port}${PLAIN}"
+            warp_test_exit
             return 0
         fi
         sleep 1; n=$((n+1))
@@ -3597,26 +3751,54 @@ warp_install_client() {
 }
 
 warp_show_status() {
-    local port
+    local port profile
     port=$(warp_proxy_port)
     echo -e "${CYAN}════════════════ WARP 状态 ════════════════${PLAIN}"
-    if ! command -v warp-cli >/dev/null 2>&1; then echo "未安装 Cloudflare WARP。"; return; fi
+    warp_show_direct_profile
+    echo ""
+    if ! command -v warp-cli >/dev/null 2>&1; then
+        echo "Cloudflare WARP：未安装"
+        return
+    fi
     warp-cli --accept-tos status 2>/dev/null || true
     echo ""
     warp-cli --accept-tos settings 2>/dev/null | grep -Ei 'mode|proxy|protocol' || true
     echo ""
     echo "Local Proxy: 127.0.0.1:${port}"
-    if warp_proxy_ready; then echo -e "状态: ${GREEN}可用${PLAIN}"; else echo -e "状态: ${YELLOW}未就绪${PLAIN}"; fi
+    if warp_proxy_ready; then
+        echo -e "状态: ${GREEN}可用${PLAIN}"
+        local v4="" v6=""
+        v4=$(warp_test_family ipv4 2>/dev/null || true)
+        v6=$(warp_test_family ipv6 2>/dev/null || true)
+        [[ -n "$v4" ]] && echo -e "WARP IPv4: ${GREEN}${v4}${PLAIN}" || echo -e "WARP IPv4: ${YELLOW}不可用${PLAIN}"
+        [[ -n "$v6" ]] && echo -e "WARP IPv6: ${GREEN}${v6}${PLAIN}" || echo -e "WARP IPv6: ${YELLOW}不可用${PLAIN}"
+    else
+        echo -e "状态: ${YELLOW}未就绪${PLAIN}"
+    fi
 }
 
 warp_test_exit() {
-    local port trace
-    port=$(warp_proxy_port)
+    local v4="" v6=""
     warp_proxy_ready || { echo -e "${RED}[错误] WARP Local Proxy 当前不可用。${PLAIN}"; return 1; }
-    echo -e "${YELLOW}>> 测试 WARP 出口...${PLAIN}"
-    trace=$(curl -fsS --connect-timeout 8 --max-time 15 --socks5-hostname "127.0.0.1:${port}" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null) || { echo -e "${RED}[错误] WARP 出口请求失败。${PLAIN}"; return 1; }
-    printf '%s\n' "$trace" | grep -E '^(ip|loc|warp|colo)=' || true
-    if grep -qE '^warp=(on|plus)$' <<<"$trace"; then echo -e "${GREEN}✔ WARP 出口正常。${PLAIN}"; else echo -e "${YELLOW}[警告] 请求成功，但 trace 未显示 warp=on/plus。${PLAIN}"; fi
+    echo -e "${YELLOW}>> 分别测试 WARP IPv4 / IPv6 出口...${PLAIN}"
+    v4=$(warp_test_family ipv4 2>/dev/null || true)
+    v6=$(warp_test_family ipv6 2>/dev/null || true)
+    if [[ -n "$v4" ]]; then echo -e "${GREEN}✔ WARP IPv4: ${v4}${PLAIN}"; else echo -e "${YELLOW}○ WARP IPv4: 不可用${PLAIN}"; fi
+    if [[ -n "$v6" ]]; then echo -e "${GREEN}✔ WARP IPv6: ${v6}${PLAIN}"; else echo -e "${YELLOW}○ WARP IPv6: 不可用${PLAIN}"; fi
+    [[ -n "$v4" || -n "$v6" ]] || return 1
+    echo ""
+    warp_detect_direct_profile
+    case "$WARP_PROFILE" in
+        supplement_ipv6)
+            [[ -n "$v6" ]] && echo -e "${GREEN}✔ IPv4-only VPS 的 WARP IPv6 补全可用。${PLAIN}" || echo -e "${RED}[错误] 当前 VPS 需要 IPv6 补全，但 WARP IPv6 测试失败。${PLAIN}"
+            ;;
+        supplement_ipv4)
+            [[ -n "$v4" ]] && echo -e "${GREEN}✔ IPv6-only VPS 的 WARP IPv4 补全可用。${PLAIN}" || echo -e "${RED}[错误] 当前 VPS 需要 IPv4 补全，但 WARP IPv4 测试失败。${PLAIN}"
+            ;;
+        dual_stack)
+            echo -e "${GREEN}✔ 原生双栈保持 DIRECT；WARP 可作为额外可选出口。${PLAIN}"
+            ;;
+    esac
 }
 
 warp_reregister() {
@@ -3654,19 +3836,21 @@ warp_management() {
         clear
         warp_show_status
         echo ""
-        echo "  1. 安装 / 配置 Cloudflare WARP Local Proxy"
-        echo "  2. 测试 WARP 出口"
-        echo "  3. 重连 WARP"
-        echo "  4. 重新注册 WARP"
-        echo "  5. 卸载 WARP"
+        echo "  1. 安装 / 配置 WARP 双栈补全（Local Proxy）"
+        echo "  2. 测试 WARP IPv4 / IPv6 出口"
+        echo "  3. 重新检测 VPS 原生 IPv4 / IPv6"
+        echo "  4. 重连 WARP"
+        echo "  5. 重新注册 WARP"
+        echo "  6. 卸载 WARP"
         echo "  0. 返回"
-        read -rp "请选择 [0-5]: " c
+        read -rp "请选择 [0-6]: " c
         case "$c" in
             1) warp_install_client; pause ;;
             2) warp_test_exit; pause ;;
-            3) if command -v warp-cli >/dev/null; then warp-cli --accept-tos disconnect >/dev/null 2>&1 || true; warp-cli --accept-tos connect; sleep 2; warp_test_exit; else echo "WARP 未安装。"; fi; pause ;;
-            4) warp_reregister; pause ;;
-            5) warp_uninstall_client; pause ;;
+            3) warp_save_detected_profile; echo ""; warp_show_direct_profile; pause ;;
+            4) if command -v warp-cli >/dev/null; then warp-cli --accept-tos disconnect >/dev/null 2>&1 || true; warp-cli --accept-tos connect; sleep 2; warp_test_exit; else echo "WARP 未安装。"; fi; pause ;;
+            5) warp_reregister; pause ;;
+            6) warp_uninstall_client; pause ;;
             0) return ;;
             *) sleep 1 ;;
         esac
@@ -3988,8 +4172,21 @@ chain_delete_node() {
 
 routing_set_default_outbound() {
     routing_choose_outbound "请选择全局默认出口（未命中特殊规则的流量使用此出口）：" || return 1
-    local tmp label
+    local tmp label yes profile
     label=$(routing_outbound_label "$SELECTED_OUTBOUND")
+
+    if [[ "$SELECTED_OUTBOUND" == "warp" ]]; then
+        warp_detect_direct_profile
+        profile="$WARP_PROFILE"
+        if [[ "$profile" == "supplement_ipv4" || "$profile" == "supplement_ipv6" ]]; then
+            echo -e "${YELLOW}[警告] 当前 WARP 被识别为“$(warp_profile_label "$profile")”。${PLAIN}"
+            echo "将 WARP 设为全局默认出口会让所有未命中特殊规则的流量都经过 WARP。"
+            echo "如果你的目标只是补全缺失的地址族，建议保持默认出口为 DIRECT，只在分流规则中选择 WARP。"
+            read -rp "仍要把 WARP 设为全局默认出口？[y/N]: " yes
+            [[ "$yes" =~ ^[Yy]$ ]] || { echo "已取消。"; return 0; }
+        fi
+    fi
+
     tmp=$(mktemp "${STATE_DIR}/routing.json.tmp.XXXXXX") || return 1
     jq --arg out "$SELECTED_OUTBOUND" '.default_outbound=$out' "$ROUTING_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
     if ! routing_commit_state_candidate "$tmp"; then echo -e "${RED}[错误] 默认出口配置应用失败，已恢复原配置。${PLAIN}"; return 1; fi
@@ -4125,6 +4322,7 @@ routing_modify_rule() {
             routing_choose_outbound "请选择新出口：" || { rm -f "$tmp"; return 1; }
             jq --argjson idx "$idx" --arg out "$SELECTED_OUTBOUND" '.rules[$idx].outbound=$out' "$ROUTING_FILE" > "$tmp" ;;
         2)
+            SELECTED_OUTBOUND=$(jq -r ".rules[$idx].outbound" "$ROUTING_FILE")
             routing_choose_ip_family || { rm -f "$tmp"; return 1; }
             jq --argjson idx "$idx" --arg fam "$SELECTED_IP_FAMILY" '.rules[$idx].ip_family=$fam' "$ROUTING_FILE" > "$tmp" ;;
         3)
@@ -4263,7 +4461,10 @@ routing_test_effect() {
     echo -e "${CYAN}════════════════ 基础出口测试 ════════════════${PLAIN}"
     routing_test_exit_ref direct ipv4 || true
     if ip -6 route show default 2>/dev/null | grep -q default; then routing_test_exit_ref direct ipv6 || true; fi
-    command -v warp-cli >/dev/null 2>&1 && routing_test_exit_ref warp default || true
+    if warp_proxy_ready; then
+        routing_test_exit_ref warp ipv4 || true
+        routing_test_exit_ref warp ipv6 || true
+    fi
     local count i id rule_count r ref fam key tested='|'
     count=$(jq '.chain_nodes|length' "$ROUTING_FILE")
     i=0
@@ -4310,7 +4511,12 @@ routing_management() {
         echo "Snell v5：保持官方 snell-server，分流请使用 Surge Rules"
         echo ""
         echo "默认出口 : $(routing_outbound_label "$def")"
-        echo "WARP     : ${warp_state}"
+        if [[ "$warp_state" == "Running" ]]; then
+            warp_detect_direct_profile
+            echo "WARP     : ${warp_state} / $(warp_profile_label "$WARP_PROFILE")"
+        else
+            echo "WARP     : ${warp_state}"
+        fi
         echo "落地节点 : ${count} 个"
         echo "规则     : ${rules} 条"
         echo ""
