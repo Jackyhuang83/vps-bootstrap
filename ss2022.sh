@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.0-dev12
+# 当前版本: v1.8.0-dev13
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -86,6 +86,12 @@
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
 #
+# v1.8.0-dev13:
+#   - 修复 SS2022 EIH / 多用户落地密码被误判为 Key 长度非法
+#   - 支持 iPSK:uPSK 与多级 iPSK:...:uPSK 组合密码
+#   - 每段 PSK 独立校验算法要求的字节长度
+#   - 兼容 Base64URL / 缺失 padding，并规范化为标准 Base64 后写入配置
+#
 # 版本主线:
 #   v1.7.0       四协议稳定基线
 #   v1.8.0-dev1  服务端分流
@@ -100,12 +106,13 @@
 #   v1.8.0-dev10 标准 Shadowsocks 扩展算法 + Xray/sing-box 按需 Bridge
 #   v1.8.0-dev11 ss:// 导入自动识别标准 SS / SS2022
 #   v1.8.0-dev12 落地节点 Shadowsocks 入口合并
+#   v1.8.0-dev13 SS2022 EIH 多 PSK 导入兼容
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.0-dev12"
+SCRIPT_VERSION="v1.8.0-dev13"
 
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
@@ -3200,14 +3207,72 @@ chain_node_type_label() {
     esac
 }
 
-validate_ss2022_outbound() {
-    local method="$1" pass="$2" bytes
-    case "$method" in
-        2022-blake3-aes-128-gcm) bytes=16 ;;
-        2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) bytes=32 ;;
+ss2022_expected_key_bytes() {
+    case "$1" in
+        2022-blake3-aes-128-gcm) echo 16 ;;
+        2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) echo 32 ;;
         *) return 1 ;;
     esac
-    validate_ss2022_key "$pass" "$bytes"
+}
+
+normalize_ss2022_psk_component() {
+    # SS2022 PSK 规范使用标准 Base64。为了兼容部分分享链接，额外接受
+    # Base64URL 字符和省略的 padding，校验后统一输出标准 Base64。
+    local key="$1" expected_bytes="$2" normalized mod tmp decoded_bytes
+    [[ -n "$key" ]] || return 1
+
+    normalized=${key//-/+}
+    normalized=${normalized//_/\/}
+    [[ "$normalized" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || return 1
+
+    # '=' 只能出现在尾部；若分享链接省略 padding，则补齐。
+    normalized=${normalized%=}
+    normalized=${normalized%=}
+    mod=$(( ${#normalized} % 4 ))
+    [[ $mod -eq 1 ]] && return 1
+    [[ $mod -eq 2 ]] && normalized+="=="
+    [[ $mod -eq 3 ]] && normalized+="="
+
+    tmp=$(mktemp) || return 1
+    if ! printf '%s' "$normalized" | base64 --decode > "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+    decoded_bytes=$(wc -c < "$tmp" | tr -d ' ')
+    [[ "$decoded_bytes" -eq "$expected_bytes" ]] || { rm -f "$tmp"; return 1; }
+
+    # 重新编码，避免 URL-safe / padding 差异传入 sing-box / Xray。
+    SS2022_PSK_COMPONENT_NORMALIZED=$(base64 -w 0 < "$tmp" 2>/dev/null || base64 < "$tmp" | tr -d '\n')
+    rm -f "$tmp"
+    [[ -n "$SS2022_PSK_COMPONENT_NORMALIZED" ]]
+}
+
+normalize_ss2022_outbound_password() {
+    # EIH 客户端密码格式: iPSK:iPSK:...:uPSK。
+    # 单用户场景则只有一个 PSK。每段都必须满足当前 method 的 Key 长度。
+    local method="$1" pass="$2" bytes part normalized="" count=0
+    local -a parts
+    bytes=$(ss2022_expected_key_bytes "$method") || return 1
+    [[ -n "$pass" ]] || return 1
+
+    IFS=':' read -r -a parts <<< "$pass"
+    [[ ${#parts[@]} -ge 1 ]] || return 1
+    for part in "${parts[@]}"; do
+        normalize_ss2022_psk_component "$part" "$bytes" || return 1
+        if [[ -n "$normalized" ]]; then
+            normalized+=":"
+        fi
+        normalized+="$SS2022_PSK_COMPONENT_NORMALIZED"
+        count=$((count+1))
+    done
+
+    SS2022_PASSWORD_NORMALIZED="$normalized"
+    SS2022_PASSWORD_SEGMENTS="$count"
+    return 0
+}
+
+validate_ss2022_outbound() {
+    normalize_ss2022_outbound_password "$1" "$2" >/dev/null
 }
 
 
@@ -3758,9 +3823,19 @@ chain_add_shadowsocks() {
     echo "密码   : $([[ -n "$pass" ]] && echo '已解析' || echo '解析失败')"
 
     if [[ "$ss_kind" == "ss2022" ]]; then
-        if ! validate_ss2022_outbound "$method" "$pass"; then
-            echo -e "${RED}[错误] SS2022 算法或 Key 长度不合法: ${method}${PLAIN}"
+        if ! normalize_ss2022_outbound_password "$method" "$pass"; then
+            local expected_bytes
+            expected_bytes=$(ss2022_expected_key_bytes "$method" 2>/dev/null || echo "未知")
+            echo -e "${RED}[错误] SS2022 Key 格式不合法: ${method}${PLAIN}"
+            echo "要求：每个 PSK 都必须是有效 Base64，解码后为 ${expected_bytes} 字节。"
+            echo "兼容：单 PSK，以及 EIH 多用户格式 iPSK:uPSK / iPSK:...:uPSK。"
             return 1
+        fi
+        pass="$SS2022_PASSWORD_NORMALIZED"
+        if [[ "${SS2022_PASSWORD_SEGMENTS:-1}" -gt 1 ]]; then
+            echo -e "${GREEN}✔ 已识别 SS2022 EIH 多用户密码：${SS2022_PASSWORD_SEGMENTS} 段 PSK。${PLAIN}"
+        else
+            echo -e "${GREEN}✔ SS2022 PSK 长度校验通过。${PLAIN}"
         fi
         id="n$(date +%s)${RANDOM}"
         node=$(jq -nc --arg id "$id" --arg name "$name" --arg server "$server" --argjson port "$port" --arg method "$method" --arg pass "$pass" \
