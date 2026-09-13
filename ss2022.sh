@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.1-dev4
+# 当前版本: v1.8.1-dev5
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,10 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.8.1-dev5:
+#   - Shadowsocks 落地测试增加双检测站容错，避免单一 IP 查询站超时造成假失败
+#   - ipify 失败后自动尝试 ident.me；IPv4 / IPv6 分别使用对应专用入口
 #
 # v1.8.1-dev4:
 #   - 修复 dev3 IPv6-only 落地测试请求未进入 Xray SOCKS 入站的问题
@@ -266,12 +270,13 @@
 #   v1.8.1-dev2 IPv6-only 落地测试修复
 #   v1.8.1-dev3 WARP 接入 IPv6-only 落地修复
 #   v1.8.1-dev4 IPv6-only 落地测试 SOCKS 调用修复
+#   v1.8.1-dev5 落地测试多检测站容错
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.1-dev4"
+SCRIPT_VERSION="v1.8.1-dev5"
 
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
@@ -4588,9 +4593,23 @@ chain_node_needs_warp_underlay() {
 }
 
 curl_chain_test_via_local_socks() {
-    local port="$1" family="$2" url="$3"
-    curl -fsS --connect-timeout 8 --max-time 15 \
-        --socks5-hostname "127.0.0.1:${port}" "$url"
+    local port="$1" family="$2" primary="$3" fallback endpoint out
+    case "$family" in
+        ipv4) fallback="https://4.ident.me" ;;
+        ipv6) fallback="https://6.ident.me" ;;
+        *) fallback="https://ident.me" ;;
+    esac
+    : > /tmp/ss2022-chain-curl.err
+    for endpoint in "$primary" "$fallback"; do
+        printf '[%s]\n' "$endpoint" >> /tmp/ss2022-chain-curl.err
+        if out=$(curl -fsS --connect-timeout 8 --max-time 15 \
+            --socks5-hostname "127.0.0.1:${port}" "$endpoint" \
+            2>>/tmp/ss2022-chain-curl.err); then
+            printf '%s\n' "$out"
+            return 0
+        fi
+    done
+    return 1
 }
 
 test_shadowsocks_node_with_singbox() {
@@ -4613,7 +4632,7 @@ test_shadowsocks_node_with_singbox() {
     "$SINGBOX_BIN" check -c "$cfg" >/dev/null 2>&1 || { rm -f "$cfg"; return 1; }
     "$SINGBOX_BIN" run -c "$cfg" >/tmp/ss2022-chain-test.log 2>&1 & pid=$!
     sleep 1
-    out=$(curl_chain_test_via_local_socks "$port" "$family" "$url" 2>/tmp/ss2022-chain-curl.err) && rc=0
+    out=$(curl_chain_test_via_local_socks "$port" "$family" "$url") && rc=0
     kill "$pid" >/dev/null 2>&1 || true; wait "$pid" 2>/dev/null || true; rm -f "$cfg"
     if [[ $rc -eq 0 ]]; then echo -e "${GREEN}✔ 落地节点可用，出口 IP: ${out}${PLAIN}"; return 0; fi
     echo -e "${RED}[错误] Shadowsocks 落地节点测试失败。${PLAIN}"; [[ -s /tmp/ss2022-chain-curl.err ]] && { echo "curl:"; tail -n 3 /tmp/ss2022-chain-curl.err; }; tail -n 10 /tmp/ss2022-chain-test.log 2>/dev/null || true; return 1
@@ -4654,7 +4673,7 @@ test_shadowsocks_node_with_xray() {
     "$XRAY_BIN" run -test -format json -config "$cfg" >/dev/null 2>&1 || { rm -f "$cfg"; return 1; }
     "$XRAY_BIN" run -format json -config "$cfg" >/tmp/ss2022-xray-chain-test.log 2>&1 & pid=$!
     sleep 1
-    out=$(curl_chain_test_via_local_socks "$port" "$family" "$url" 2>/tmp/ss2022-chain-curl.err) && rc=0
+    out=$(curl_chain_test_via_local_socks "$port" "$family" "$url") && rc=0
     kill "$pid" >/dev/null 2>&1 || true; wait "$pid" 2>/dev/null || true; rm -f "$cfg"
     if [[ $rc -eq 0 ]]; then echo -e "${GREEN}✔ 落地节点可用，出口 IP: ${out}${PLAIN}"; return 0; fi
     echo -e "${RED}[错误] Shadowsocks 落地节点测试失败。${PLAIN}"; [[ -s /tmp/ss2022-chain-curl.err ]] && { echo "curl:"; tail -n 3 /tmp/ss2022-chain-curl.err; }; tail -n 10 /tmp/ss2022-xray-chain-test.log 2>/dev/null || true; return 1
