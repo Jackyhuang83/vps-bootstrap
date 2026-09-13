@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.1-dev2
+# 当前版本: v1.8.1-dev3
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,12 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.8.1-dev3:
+#   - 修复“原生 IPv4 + WARP 补 IPv6”环境无法连接 IPv6-only 落地节点
+#   - IPv6-only 落地在无原生 IPv6 时自动以 WARP 作为节点接入链路
+#   - Xray 使用 dialerProxy，sing-box 使用 detour；测试与正式分流配置保持一致
+#   - IPv4-only VPS 通过 WARP IPv6 连接落地后，最终业务出口仍为落地节点
 #
 # v1.8.1-dev2:
 #   - 修复 IPv6-only Shadowsocks 落地节点被“默认地址族”测试误判失败
@@ -254,12 +260,13 @@
 #   v1.8.0 正式发布
 #   v1.8.1-dev1 系统信息 WARP IPv6 显示修复
 #   v1.8.1-dev2 IPv6-only 落地测试修复
+#   v1.8.1-dev3 WARP 接入 IPv6-only 落地修复
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.1-dev2"
+SCRIPT_VERSION="v1.8.1-dev3"
 
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
@@ -1757,7 +1764,6 @@ YAML
     echo -e "${CYAN}═════════════════════════════════════════════════════════${PLAIN}"
 }
 
-
 select_network_mode_for_update() {
     local current_network="$1"
     local require_time_sync="${2:-yes}"
@@ -3138,7 +3144,6 @@ remove_singbox_mode() {
     return 1
 }
 
-
 # ==============================================================================
 # [09] 服务端分流：WARP / Chain / Rules
 # ==============================================================================
@@ -3188,7 +3193,6 @@ EOF
     mv -f "$tmp" "$ROUTING_FILE"
     chmod 600 "$ROUTING_FILE"
 }
-
 
 routing_commit_state_candidate() {
     # 原子更新 routing.json：只有 sing-box / Xray 两侧都校验并应用成功后才提交状态。
@@ -3294,7 +3298,6 @@ routing_preset_rule_exists() {
     [[ "$service" != "custom" ]] || return 1
     jq -e --arg service "$service" 'any(.rules[]?; .service==$service)' "$ROUTING_FILE" >/dev/null 2>&1
 }
-
 
 routing_outbound_label() {
     local ref="$1" id name
@@ -3745,7 +3748,6 @@ chain_node_type_label() {
 # 导入的 SS2022 落地节点不在 Bash 层重复校验/重编码 PSK。
 # ss:// 解析后保留 password 原值，由 Xray / sing-box 自身配置校验负责协议合法性。
 
-
 routing_choose_outbound() {
     local prompt="${1:-请选择出口}" nodes count idx choice i id name type
     routing_init_state || return 1
@@ -3840,7 +3842,11 @@ build_singbox_routing_candidate() {
         tag="route-chain-$(jq -r '.id' <<<"$node")"
         case "$type" in
             ss2022|shadowsocks)
-                outbounds=$(jq -c --arg tag "$tag" --arg server "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" '. + [{type:"shadowsocks",tag:$tag,server:$server,server_port:$port,method:$method,password:$pass}]' <<<"$outbounds")
+                if chain_node_needs_warp_underlay "$node"; then
+                    outbounds=$(jq -c --arg tag "$tag" --arg server "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" '. + [{type:"shadowsocks",tag:$tag,server:$server,server_port:$port,method:$method,password:$pass,detour:"route-warp"}]' <<<"$outbounds")
+                else
+                    outbounds=$(jq -c --arg tag "$tag" --arg server "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" '. + [{type:"shadowsocks",tag:$tag,server:$server,server_port:$port,method:$method,password:$pass}]' <<<"$outbounds")
+                fi
                 if [[ "$type" == "shadowsocks" && "$(jq -r '.bridge_required // false' <<<"$node")" == "true" ]]; then
                     local bridge_port bridge_tag
                     bridge_port=$(jq -r '.bridge_port // 0' <<<"$node")
@@ -3926,7 +3932,11 @@ xray_outbound_for_node() {
     [[ "$family" == "ipv6" ]] && strategy="ForceIPv6"
     case "$type" in
         ss2022)
-            jq -nc --arg tag "$tag" --arg address "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" --arg ts "$strategy" '{protocol:"shadowsocks",tag:$tag,targetStrategy:$ts,settings:{address:$address,port:$port,method:$method,password:$pass}}'
+            if chain_node_needs_warp_underlay "$node"; then
+                jq -nc --arg tag "$tag" --arg address "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" --arg ts "$strategy" '{protocol:"shadowsocks",tag:$tag,targetStrategy:$ts,settings:{address:$address,port:$port,method:$method,password:$pass},streamSettings:{sockopt:{dialerProxy:"route-warp"}}}'
+            else
+                jq -nc --arg tag "$tag" --arg address "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" --arg ts "$strategy" '{protocol:"shadowsocks",tag:$tag,targetStrategy:$ts,settings:{address:$address,port:$port,method:$method,password:$pass}}'
+            fi
             ;;
         shadowsocks)
             local method bridge_required bridge_port
@@ -3937,7 +3947,11 @@ xray_outbound_for_node() {
                 [[ "$bridge_port" =~ ^[0-9]+$ && "$bridge_port" -gt 0 ]] || return 1
                 jq -nc --arg tag "$tag" --argjson port "$bridge_port" --arg ts "$strategy" '{protocol:"socks",tag:$tag,targetStrategy:$ts,settings:{address:"127.0.0.1",port:$port}}'
             else
-                jq -nc --arg tag "$tag" --arg address "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$method" --arg pass "$(jq -r '.password' <<<"$node")" --arg ts "$strategy" '{protocol:"shadowsocks",tag:$tag,targetStrategy:$ts,settings:{address:$address,port:$port,method:$method,password:$pass}}'
+                if chain_node_needs_warp_underlay "$node"; then
+                    jq -nc --arg tag "$tag" --arg address "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$method" --arg pass "$(jq -r '.password' <<<"$node")" --arg ts "$strategy" '{protocol:"shadowsocks",tag:$tag,targetStrategy:$ts,settings:{address:$address,port:$port,method:$method,password:$pass},streamSettings:{sockopt:{dialerProxy:"route-warp"}}}'
+                else
+                    jq -nc --arg tag "$tag" --arg address "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$method" --arg pass "$(jq -r '.password' <<<"$node")" --arg ts "$strategy" '{protocol:"shadowsocks",tag:$tag,targetStrategy:$ts,settings:{address:$address,port:$port,method:$method,password:$pass}}'
+                fi
             fi
             ;;
         socks5)
@@ -4552,52 +4566,97 @@ chain_node_recommended_test_family() {
     echo "default"
 }
 
+chain_node_needs_warp_underlay() {
+    local node="$1" family
+    family=$(chain_node_recommended_test_family "$node")
+    case "$family" in
+        ipv6)
+            warp_direct_ipv6_ready && return 1
+            warp_proxy_ready && warp_family_allowed ipv6 && warp_test_family ipv6 >/dev/null 2>&1
+            ;;
+        ipv4)
+            warp_direct_ipv4_ready && return 1
+            warp_proxy_ready && warp_family_allowed ipv4 && warp_test_family ipv4 >/dev/null 2>&1
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+curl_chain_test_via_local_socks() {
+    local port="$1" family="$2" url="$3"
+    case "$family" in
+        ipv6) curl -6fsS --connect-timeout 8 --max-time 15 --socks5 "127.0.0.1:${port}" "$url" ;;
+        ipv4) curl -4fsS --connect-timeout 8 --max-time 15 --socks5 "127.0.0.1:${port}" "$url" ;;
+        *) curl -fsS --connect-timeout 8 --max-time 15 --socks5-hostname "127.0.0.1:${port}" "$url" ;;
+    esac
+}
+
 test_shadowsocks_node_with_singbox() {
-    local node="$1" family="${2:-default}" port cfg pid out rc=1 n=19080 url
+    local node="$1" family="${2:-default}" port cfg pid out rc=1 n=19080 url warp_port use_warp=false
     url=$(ip_echo_url_for_family "$family")
     [[ -x "$SINGBOX_BIN" ]] || { echo -e "${YELLOW}[提示] 未安装 sing-box，无法执行 Shadowsocks 落地实连测试。${PLAIN}"; return 1; }
+    chain_node_needs_warp_underlay "$node" && use_warp=true
     while ss -H -ltn 2>/dev/null | grep -q ":${n} "; do n=$((n+1)); [[ $n -lt 19150 ]] || return 1; done
     port=$n
     cfg=$(mktemp /tmp/ss2022-chain-test.XXXXXX.json) || return 1
-    jq -n --arg server "$(jq -r '.server' <<<"$node")" --argjson sport "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" --argjson lp "$port" '{log:{level:"warn"},inbounds:[{type:"socks",tag:"test-in",listen:"127.0.0.1",listen_port:$lp}],outbounds:[{type:"shadowsocks",tag:"test-out",server:$server,server_port:$sport,method:$method,password:$pass}],route:{final:"test-out"}}' > "$cfg"
+    if [[ "$use_warp" == true ]]; then
+        warp_port=$(warp_proxy_port)
+        jq -n --arg server "$(jq -r '.server' <<<"$node")" --argjson sport "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" --argjson lp "$port" --argjson wp "$warp_port" \
+          '{log:{level:"warn"},inbounds:[{type:"socks",tag:"test-in",listen:"127.0.0.1",listen_port:$lp}],outbounds:[{type:"socks",tag:"test-warp",server:"127.0.0.1",server_port:$wp},{type:"shadowsocks",tag:"test-out",server:$server,server_port:$sport,method:$method,password:$pass,detour:"test-warp"}],route:{final:"test-out"}}' > "$cfg"
+        echo -e "${YELLOW}节点接入链路: WARP（VPS 缺少该地址族的原生出口）${PLAIN}"
+    else
+        jq -n --arg server "$(jq -r '.server' <<<"$node")" --argjson sport "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" --argjson lp "$port" \
+          '{log:{level:"warn"},inbounds:[{type:"socks",tag:"test-in",listen:"127.0.0.1",listen_port:$lp}],outbounds:[{type:"shadowsocks",tag:"test-out",server:$server,server_port:$sport,method:$method,password:$pass}],route:{final:"test-out"}}' > "$cfg"
+    fi
     "$SINGBOX_BIN" check -c "$cfg" >/dev/null 2>&1 || { rm -f "$cfg"; return 1; }
     "$SINGBOX_BIN" run -c "$cfg" >/tmp/ss2022-chain-test.log 2>&1 & pid=$!
     sleep 1
-    out=$(curl -fsS --connect-timeout 8 --max-time 15 --socks5-hostname "127.0.0.1:${port}" "$url" 2>/dev/null) && rc=0
+    out=$(curl_chain_test_via_local_socks "$port" "$family" "$url" 2>/dev/null) && rc=0
     kill "$pid" >/dev/null 2>&1 || true; wait "$pid" 2>/dev/null || true; rm -f "$cfg"
     if [[ $rc -eq 0 ]]; then echo -e "${GREEN}✔ 落地节点可用，出口 IP: ${out}${PLAIN}"; return 0; fi
     echo -e "${RED}[错误] Shadowsocks 落地节点测试失败。${PLAIN}"; tail -n 10 /tmp/ss2022-chain-test.log 2>/dev/null || true; return 1
 }
 
 test_shadowsocks_node_with_xray() {
-    local node="$1" family="${2:-default}" port cfg pid out rc=1 n=19180 url method strategy="AsIs"
+    local node="$1" family="${2:-default}" port cfg pid out rc=1 n=19180 url method strategy="AsIs" warp_port use_warp=false
     url=$(ip_echo_url_for_family "$family")
     [[ -x "$XRAY_BIN" ]] || { echo -e "${YELLOW}[提示] 未安装 Xray，无法使用 Xray 执行 Shadowsocks 落地实连测试。${PLAIN}"; return 1; }
     method=$(jq -r '.method' <<<"$node")
-    xray_supports_ss_method "$method" || {
-        echo -e "${YELLOW}[提示] Xray 不原生支持 ${method}，应改由 sing-box 测试。${PLAIN}"
-        return 1
-    }
+    xray_supports_ss_method "$method" || { echo -e "${YELLOW}[提示] Xray 不原生支持 ${method}，应改由 sing-box 测试。${PLAIN}"; return 1; }
     [[ "$family" == "ipv4" ]] && strategy="ForceIPv4"
     [[ "$family" == "ipv6" ]] && strategy="ForceIPv6"
+    chain_node_needs_warp_underlay "$node" && use_warp=true
     while ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${n}$"; do n=$((n+1)); [[ $n -lt 19250 ]] || return 1; done
     port=$n
     cfg=$(mktemp /tmp/ss2022-xray-chain-test.XXXXXX.json) || return 1
-    jq -n --arg server "$(jq -r '.server' <<<"$node")" --argjson sport "$(jq -r '.port' <<<"$node")" --arg method "$method" --arg pass "$(jq -r '.password' <<<"$node")" --argjson lp "$port" --arg ts "$strategy" '{
-      log:{loglevel:"warning"},
-      inbounds:[{listen:"127.0.0.1",port:$lp,protocol:"socks",tag:"test-in",settings:{auth:"noauth",udp:true}}],
-      outbounds:[{protocol:"shadowsocks",tag:"test-out",targetStrategy:$ts,settings:{address:$server,port:$sport,method:$method,password:$pass}}],
-      routing:{rules:[{type:"field",inboundTag:["test-in"],outboundTag:"test-out"}]}
-    }' > "$cfg"
+    if [[ "$use_warp" == true ]]; then
+        warp_port=$(warp_proxy_port)
+        jq -n --arg server "$(jq -r '.server' <<<"$node")" --argjson sport "$(jq -r '.port' <<<"$node")" --arg method "$method" --arg pass "$(jq -r '.password' <<<"$node")" --argjson lp "$port" --argjson wp "$warp_port" --arg ts "$strategy" '{
+          log:{loglevel:"warning"},
+          inbounds:[{listen:"127.0.0.1",port:$lp,protocol:"socks",tag:"test-in",settings:{auth:"noauth",udp:true}}],
+          outbounds:[
+            {protocol:"socks",tag:"test-warp",settings:{address:"127.0.0.1",port:$wp}},
+            {protocol:"shadowsocks",tag:"test-out",targetStrategy:$ts,settings:{address:$server,port:$sport,method:$method,password:$pass},streamSettings:{sockopt:{dialerProxy:"test-warp"}}}
+          ],
+          routing:{rules:[{type:"field",inboundTag:["test-in"],outboundTag:"test-out"}]}
+        }' > "$cfg"
+        echo -e "${YELLOW}节点接入链路: WARP（VPS 缺少该地址族的原生出口）${PLAIN}"
+    else
+        jq -n --arg server "$(jq -r '.server' <<<"$node")" --argjson sport "$(jq -r '.port' <<<"$node")" --arg method "$method" --arg pass "$(jq -r '.password' <<<"$node")" --argjson lp "$port" --arg ts "$strategy" '{
+          log:{loglevel:"warning"},
+          inbounds:[{listen:"127.0.0.1",port:$lp,protocol:"socks",tag:"test-in",settings:{auth:"noauth",udp:true}}],
+          outbounds:[{protocol:"shadowsocks",tag:"test-out",targetStrategy:$ts,settings:{address:$server,port:$sport,method:$method,password:$pass}}],
+          routing:{rules:[{type:"field",inboundTag:["test-in"],outboundTag:"test-out"}]}
+        }' > "$cfg"
+    fi
     "$XRAY_BIN" run -test -format json -config "$cfg" >/dev/null 2>&1 || { rm -f "$cfg"; return 1; }
     "$XRAY_BIN" run -format json -config "$cfg" >/tmp/ss2022-xray-chain-test.log 2>&1 & pid=$!
     sleep 1
-    out=$(curl -fsS --connect-timeout 8 --max-time 15 --socks5-hostname "127.0.0.1:${port}" "$url" 2>/dev/null) && rc=0
+    out=$(curl_chain_test_via_local_socks "$port" "$family" "$url" 2>/dev/null) && rc=0
     kill "$pid" >/dev/null 2>&1 || true; wait "$pid" 2>/dev/null || true; rm -f "$cfg"
     if [[ $rc -eq 0 ]]; then echo -e "${GREEN}✔ 落地节点可用，出口 IP: ${out}${PLAIN}"; return 0; fi
     echo -e "${RED}[错误] Shadowsocks 落地节点测试失败。${PLAIN}"; tail -n 10 /tmp/ss2022-xray-chain-test.log 2>/dev/null || true; return 1
 }
-
 
 test_shadowsocks_node_auto() {
     local node="$1" family="${2:-default}" method
