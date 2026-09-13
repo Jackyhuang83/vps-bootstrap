@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.1-dev1
+# 当前版本: v1.8.1-dev2
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,12 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.8.1-dev2:
+#   - 修复 IPv6-only Shadowsocks 落地节点被“默认地址族”测试误判失败
+#   - 落地节点测试会根据节点服务器地址自动识别 IPv4-only / IPv6-only / 双栈
+#   - IPv6-only Shadowsocks 测试自动使用 api6.ipify.org + Xray ForceIPv6
+#   - 基础出口测试同样按落地节点地址族自动选择测试目标
 #
 # v1.8.1-dev1:
 #   - 修复系统信息无法显示 WARP 补充 IPv6 的问题
@@ -247,12 +253,13 @@
 #   v1.8.0-dev29 脚本自更新版本判断修复
 #   v1.8.0 正式发布
 #   v1.8.1-dev1 系统信息 WARP IPv6 显示修复
+#   v1.8.1-dev2 IPv6-only 落地测试修复
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.1-dev1"
+SCRIPT_VERSION="v1.8.1-dev2"
 
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
@@ -4504,6 +4511,47 @@ ip_echo_url_for_family() {
     esac
 }
 
+chain_node_recommended_test_family() {
+    local node="$1" server=""
+    local has4=0 has6=0
+
+    server=$(jq -r '.server // empty' <<<"$node")
+    [[ -n "$server" ]] || {
+        echo "default"
+        return
+    }
+
+    # IPv6 字面量（ss:// 中解析后通常已去掉 []）
+    if [[ "$server" == *:* ]]; then
+        echo "ipv6"
+        return
+    fi
+
+    # IPv4 字面量
+    if [[ "$server" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        echo "ipv4"
+        return
+    fi
+
+    # 域名：只有 AAAA 时视为 IPv6-only；只有 A 时视为 IPv4-only；
+    # A / AAAA 同时存在时保持 default，不强制地址族。
+    if command -v getent >/dev/null 2>&1; then
+        getent ahostsv4 "$server" >/dev/null 2>&1 && has4=1
+        getent ahostsv6 "$server" >/dev/null 2>&1 && has6=1
+
+        if [[ $has6 -eq 1 && $has4 -eq 0 ]]; then
+            echo "ipv6"
+            return
+        fi
+        if [[ $has4 -eq 1 && $has6 -eq 0 ]]; then
+            echo "ipv4"
+            return
+        fi
+    fi
+
+    echo "default"
+}
+
 test_shadowsocks_node_with_singbox() {
     local node="$1" family="${2:-default}" port cfg pid out rc=1 n=19080 url
     url=$(ip_echo_url_for_family "$family")
@@ -4571,20 +4619,43 @@ test_shadowsocks_node_auto() {
 
 chain_test_node() {
     chain_select_id || return 1
-    local node type server port user pass out
+    local node type server port user pass out family url
     node=$(jq -c --arg id "$SELECTED_NODE_ID" '.chain_nodes[]|select(.id==$id)' "$ROUTING_FILE")
     type=$(jq -r '.type' <<<"$node")
+    family=$(chain_node_recommended_test_family "$node")
+    url=$(ip_echo_url_for_family "$family")
+
     echo -e "${YELLOW}>> 测试 $(jq -r '.name' <<<"$node")...${PLAIN}"
+    case "$family" in
+        ipv4) echo -e "检测地址族: ${CYAN}IPv4-only / IPv4 地址${PLAIN}，使用 IPv4 出口测试。" ;;
+        ipv6) echo -e "检测地址族: ${CYAN}IPv6-only / IPv6 地址${PLAIN}，使用 IPv6 出口测试。" ;;
+        *) echo -e "检测地址族: ${CYAN}双栈 / 未强制${PLAIN}，使用默认出口测试。" ;;
+    esac
+
     case "$type" in
         ss2022|shadowsocks)
-            test_shadowsocks_node_auto "$node" default
+            test_shadowsocks_node_auto "$node" "$family"
             ;;
         socks5)
-            server=$(jq -r '.server' <<<"$node"); port=$(jq -r '.port' <<<"$node"); user=$(jq -r '.username // ""' <<<"$node"); pass=$(jq -r '.password // ""' <<<"$node")
+            server=$(jq -r '.server' <<<"$node")
+            port=$(jq -r '.port' <<<"$node")
+            user=$(jq -r '.username // ""' <<<"$node")
+            pass=$(jq -r '.password // ""' <<<"$node")
             if [[ -n "$user" ]]; then
-                out=$(curl -fsS --connect-timeout 8 --max-time 15 --proxy-user "${user}:${pass}" --socks5-hostname "${server}:${port}" https://api.ipify.org 2>/dev/null) || { echo -e "${RED}[错误] SOCKS5 测试失败。${PLAIN}"; return 1; }
+                out=$(curl -fsS --connect-timeout 8 --max-time 15 \
+                    --proxy-user "${user}:${pass}" \
+                    --socks5-hostname "${server}:${port}" \
+                    "$url" 2>/dev/null) || {
+                        echo -e "${RED}[错误] SOCKS5 测试失败。${PLAIN}"
+                        return 1
+                    }
             else
-                out=$(curl -fsS --connect-timeout 8 --max-time 15 --socks5-hostname "${server}:${port}" https://api.ipify.org 2>/dev/null) || { echo -e "${RED}[错误] SOCKS5 测试失败。${PLAIN}"; return 1; }
+                out=$(curl -fsS --connect-timeout 8 --max-time 15 \
+                    --socks5-hostname "${server}:${port}" \
+                    "$url" 2>/dev/null) || {
+                        echo -e "${RED}[错误] SOCKS5 测试失败。${PLAIN}"
+                        return 1
+                    }
             fi
             echo -e "${GREEN}✔ 落地节点可用，出口 IP: ${out}${PLAIN}"
             ;;
@@ -4901,10 +4972,16 @@ routing_test_effect() {
         routing_test_exit_ref warp ipv4 || true
         routing_test_exit_ref warp ipv6 || true
     fi
-    local count i id rule_count r ref fam key tested='|'
+    local count i id rule_count r ref fam key tested='|' node
     count=$(jq '.chain_nodes|length' "$ROUTING_FILE")
     i=0
-    while [[ $i -lt $count ]]; do id=$(jq -r ".chain_nodes[$i].id" "$ROUTING_FILE"); routing_test_exit_ref "chain:${id}" default || true; i=$((i+1)); done
+    while [[ $i -lt $count ]]; do
+        id=$(jq -r ".chain_nodes[$i].id" "$ROUTING_FILE")
+        node=$(jq -c ".chain_nodes[$i]" "$ROUTING_FILE")
+        fam=$(chain_node_recommended_test_family "$node")
+        routing_test_exit_ref "chain:${id}" "$fam" || true
+        i=$((i+1))
+    done
 
     echo ""
     echo -e "${CYAN}════════════════ 规则出口验证 ════════════════${PLAIN}"
