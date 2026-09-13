@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.1-dev5
+# 当前版本: v1.8.1-dev6
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,11 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.8.1-dev6:
+#   - 拆分落地节点地址族识别结果，不再把“双栈”和“无法确定”混为 default
+#   - A + AAAA 同时存在时明确显示“IPv4 + IPv6 双栈”
+#   - DNS 无法明确判断地址族时显示“地址族无法确定”
 #
 # v1.8.1-dev5:
 #   - Shadowsocks 落地测试增加双检测站容错，避免单一 IP 查询站超时造成假失败
@@ -271,12 +276,13 @@
 #   v1.8.1-dev3 WARP 接入 IPv6-only 落地修复
 #   v1.8.1-dev4 IPv6-only 落地测试 SOCKS 调用修复
 #   v1.8.1-dev5 落地测试多检测站容错
+#   v1.8.1-dev6 落地地址族识别文案拆分
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.1-dev5"
+SCRIPT_VERSION="v1.8.1-dev6"
 
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
@@ -4541,7 +4547,7 @@ chain_node_recommended_test_family() {
 
     server=$(jq -r '.server // empty' <<<"$node")
     [[ -n "$server" ]] || {
-        echo "default"
+        echo "unknown"
         return
     }
 
@@ -4557,23 +4563,26 @@ chain_node_recommended_test_family() {
         return
     fi
 
-    # 域名：只有 AAAA 时视为 IPv6-only；只有 A 时视为 IPv4-only；
-    # A / AAAA 同时存在时保持 default，不强制地址族。
+    # 域名：分别检查 A / AAAA。
     if command -v getent >/dev/null 2>&1; then
         getent ahostsv4 "$server" >/dev/null 2>&1 && has4=1
         getent ahostsv6 "$server" >/dev/null 2>&1 && has6=1
 
-        if [[ $has6 -eq 1 && $has4 -eq 0 ]]; then
-            echo "ipv6"
+        if [[ $has4 -eq 1 && $has6 -eq 1 ]]; then
+            echo "dual"
             return
         fi
-        if [[ $has4 -eq 1 && $has6 -eq 0 ]]; then
+        if [[ $has4 -eq 1 ]]; then
             echo "ipv4"
+            return
+        fi
+        if [[ $has6 -eq 1 ]]; then
+            echo "ipv6"
             return
         fi
     fi
 
-    echo "default"
+    echo "unknown"
 }
 
 chain_node_needs_warp_underlay() {
@@ -4588,7 +4597,7 @@ chain_node_needs_warp_underlay() {
             warp_direct_ipv4_ready && return 1
             warp_proxy_ready && warp_family_allowed ipv4 && warp_test_family ipv4 >/dev/null 2>&1
             ;;
-        *) return 1 ;;
+        dual|unknown|*) return 1 ;;
     esac
 }
 
@@ -4597,7 +4606,7 @@ curl_chain_test_via_local_socks() {
     case "$family" in
         ipv4) fallback="https://4.ident.me" ;;
         ipv6) fallback="https://6.ident.me" ;;
-        *) fallback="https://ident.me" ;;
+        dual|unknown|*) fallback="https://ident.me" ;;
     esac
     : > /tmp/ss2022-chain-curl.err
     for endpoint in "$primary" "$fallback"; do
@@ -4703,13 +4712,19 @@ chain_test_node() {
     node=$(jq -c --arg id "$SELECTED_NODE_ID" '.chain_nodes[]|select(.id==$id)' "$ROUTING_FILE")
     type=$(jq -r '.type' <<<"$node")
     family=$(chain_node_recommended_test_family "$node")
-    url=$(ip_echo_url_for_family "$family")
+    case "$family" in
+        ipv4) url=$(ip_echo_url_for_family ipv4) ;;
+        ipv6) url=$(ip_echo_url_for_family ipv6) ;;
+        dual|unknown) url=$(ip_echo_url_for_family default) ;;
+        *) family="unknown"; url=$(ip_echo_url_for_family default) ;;
+    esac
 
     echo -e "${YELLOW}>> 测试 $(jq -r '.name' <<<"$node")...${PLAIN}"
     case "$family" in
         ipv4) echo -e "检测地址族: ${CYAN}IPv4-only / IPv4 地址${PLAIN}，使用 IPv4 出口测试。" ;;
         ipv6) echo -e "检测地址族: ${CYAN}IPv6-only / IPv6 地址${PLAIN}，使用 IPv6 出口测试。" ;;
-        *) echo -e "检测地址族: ${CYAN}双栈 / 未强制${PLAIN}，使用默认出口测试。" ;;
+        dual) echo -e "检测地址族: ${CYAN}IPv4 + IPv6 双栈${PLAIN}，使用默认出口测试。" ;;
+        unknown) echo -e "检测地址族: ${YELLOW}地址族无法确定${PLAIN}，使用默认出口测试。" ;;
     esac
 
     case "$type" in
