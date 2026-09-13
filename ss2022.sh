@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.1-dev6
+# 当前版本: v1.8.1-dev7
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,13 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.8.1-dev7:
+#   - 修复双栈落地服务器域名可能优先拨号 IPv6 导致超时
+#   - 双栈落地优先使用 VPS 原生 IPv4，其次原生 IPv6，再考虑 WARP
+#   - Xray 使用 sockopt.domainStrategy 控制代理服务器域名地址族
+#   - sing-box 使用 domain_strategy 控制代理服务器域名地址族
+#   - 测试与正式分流统一使用相同的落地服务器接入地址族
 #
 # v1.8.1-dev6:
 #   - 拆分落地节点地址族识别结果，不再把“双栈”和“无法确定”混为 default
@@ -277,25 +284,22 @@
 #   v1.8.1-dev4 IPv6-only 落地测试 SOCKS 调用修复
 #   v1.8.1-dev5 落地测试多检测站容错
 #   v1.8.1-dev6 落地地址族识别文案拆分
+#   v1.8.1-dev7 双栈落地服务器拨号地址族修复
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
-
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.1-dev6"
-
+SCRIPT_VERSION="v1.8.1-dev7"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
 SCRIPT_PROXY_LINK="/usr/local/bin/proxy"
 SCRIPT_BACKUP_PATH="/usr/local/bin/ss2022.bak"
-
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 PLAIN='\033[0m'
-
 # ----------------------------- sing-box ---------------------------------------
 SINGBOX_BIN="/usr/local/bin/sing-box"
 SINGBOX_CONF="/etc/sing-box/config.json"
@@ -304,7 +308,6 @@ SINGBOX_USER="sing-box"
 SINGBOX_GROUP="sing-box"
 SINGBOX_USER_MARKER="/etc/ss2022-singbox-user-managed"
 SINGBOX_VERSION="1.13.20"
-
 # ----------------------------- Xray (VLESS Reality) ---------------------------
 XRAY_VERSION="26.3.27"
 XRAY_BIN="/usr/local/lib/ss2022/xray"
@@ -316,7 +319,6 @@ XRAY_GROUP="ss2022-xray"
 XRAY_USER_MARKER="/etc/ss2022-xray-user-managed"
 XRAY_SHA256_AMD64="23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae"
 XRAY_SHA256_ARM64="4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c"
-
 # ----------------------------- Snell v5 ---------------------------------------
 SNELL_VERSION="5.0.1"
 SNELL_BIN="/usr/local/bin/snell-server-v5"
@@ -325,11 +327,9 @@ SNELL_SERVICE="/etc/systemd/system/snell-v5.service"
 SNELL_USER="snell"
 SNELL_GROUP="snell"
 SNELL_USER_MARKER="/etc/ss2022-snell-user-managed"
-
 # Snell 官方 v5.0.1 固定资产 SHA256（参考成熟模板并固定到官方 dl.nssurge.com 资产）
 SNELL_SHA256_AMD64="9bea1c2b9e35b73b31634856c04d18c393072b9e5dcde6a32781d8b8f908c539"
 SNELL_SHA256_ARM64="2f178bf5ac468ce1a130454efa40a0603fbbe4e47ecc4880a989f4abc7f824cf"
-
 # ----------------------------- Realm L4 端口转发 -------------------------------
 # 固定官方稳定版本；下载后使用 GitHub Release API 返回的 asset digest 进行 SHA256 校验。
 REALM_VERSION="2.9.6"
@@ -342,7 +342,6 @@ REALM_GROUP="ss2022-realm"
 REALM_USER_MARKER="/etc/ss2022-realm-user-managed"
 FORWARDING_FILE="/etc/ss2022/forwarding.json"
 REALM_MAX_RANGE_PORTS=1000
-
 # ----------------------------- 网络环境 ----------------------------------------
 BACKUP_DNS="/root/resolv.conf.orig"
 DNS_MARKER="/etc/ss2022-ipv6-dns-managed"
@@ -352,7 +351,6 @@ STATE_FILE="${STATE_DIR}/state.json"
 ROUTING_FILE="${STATE_DIR}/routing.json"
 WARP_DEFAULT_PORT=40000
 WARP_MANAGED_MARKER="${STATE_DIR}/warp-package-managed"
-
 # ----------------------------- TG-BOT 流量监控 ---------------------------------
 TG_MONITOR_CONF="${STATE_DIR}/tg-monitor.conf"
 TG_MONITOR_STATE="${STATE_DIR}/tg-monitor.state"
@@ -360,14 +358,12 @@ SYSTEM_INFO_TRAFFIC_STATE="${STATE_DIR}/system-info-traffic.state"
 TG_MONITOR_WORKER="/usr/local/lib/ss2022/tg-traffic-monitor.sh"
 TG_MONITOR_SERVICE="/etc/systemd/system/ss2022-tg-monitor.service"
 TG_MONITOR_TIMER="/etc/systemd/system/ss2022-tg-monitor.timer"
-
 # ----------------------------- sing-box tag -----------------------------------
 TAG_SS="ss-in"
 TAG_STLS="ss-shadowtls-in"
 TAG_STLS_BACKEND="ss-shadowtls-backend"
 TAG_STLS_UDP="ss-shadowtls-udp"
 TAG_VLESS="vless-reality-in"
-
 # ----------------------------- 全局临时参数 -------------------------------------
 PORT=""
 METHOD=""
@@ -377,22 +373,18 @@ SERVER_HOST=""
 NETWORK_MODE=""
 LISTEN_ADDR=""
 NODE_NAME=""
-
 # ==============================================================================
 # [02] 通用工具与状态面板
 # ==============================================================================
-
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         echo -e "${RED}[错误] 必须使用 root 权限运行此脚本！${PLAIN}"
         exit 1
     fi
 }
-
 pause() {
     read -rp "按回车继续..."
 }
-
 get_sys_info() {
     local os="" ver="" kernel=""
     if [[ -f /etc/os-release ]]; then
@@ -405,7 +397,6 @@ get_sys_info() {
     kernel=$(uname -r)
     echo "${os} | ${kernel}"
 }
-
 get_singbox_version() {
     if [[ -x "$SINGBOX_BIN" ]]; then
         local sb_v
@@ -415,7 +406,6 @@ get_singbox_version() {
         echo "Sing-box 未安装"
     fi
 }
-
 get_xray_version() {
     if [[ -x "$XRAY_BIN" ]]; then
         local xv
@@ -425,17 +415,14 @@ get_xray_version() {
         echo "Xray 未安装"
     fi
 }
-
 xray_vless_exists() {
     [[ -f "$XRAY_CONF" ]] || return 1
     jq -e '.inbounds[]? | select(.protocol=="vless" and (.tag // "") == "vless-reality-in")' "$XRAY_CONF" >/dev/null 2>&1
 }
-
 get_xray_vless_port() {
     [[ -f "$XRAY_CONF" ]] || return 1
     jq -r '.inbounds[]? | select(.protocol=="vless" and (.tag // "") == "vless-reality-in") | .port // empty' "$XRAY_CONF" 2>/dev/null | head -n1
 }
-
 get_snell_version() {
     if [[ -x "$SNELL_BIN" ]]; then
         echo "Snell v${SNELL_VERSION}"
@@ -443,14 +430,12 @@ get_snell_version() {
         echo "Snell 未安装"
     fi
 }
-
 time_sync_is_healthy() {
     local ntp_sync=""
     if command -v timedatectl &>/dev/null; then
         ntp_sync=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)
         [[ "$ntp_sync" == "yes" ]] && return 0
     fi
-
     if command -v chronyc &>/dev/null; then
         if chronyc tracking 2>/dev/null | grep -Eq '^Leap status[[:space:]]*:[[:space:]]*Normal$'; then
             return 0
@@ -458,7 +443,6 @@ time_sync_is_healthy() {
     fi
     return 1
 }
-
 get_time_sync_status() {
     if time_sync_is_healthy; then
         echo -e "${GREEN}● 已同步${PLAIN}"
@@ -468,20 +452,17 @@ get_time_sync_status() {
         echo -e "${YELLOW}○ 未检测${PLAIN}"
     fi
 }
-
 json_has_inbound_tag() {
     local tag="$1"
     [[ -f "$SINGBOX_CONF" ]] || return 1
     command -v jq >/dev/null 2>&1 || return 1
     jq -e --arg t "$tag" '.inbounds[]? | select(.tag == $t)' "$SINGBOX_CONF" >/dev/null 2>&1
 }
-
 get_inbound_port() {
     local tag="$1"
     [[ -f "$SINGBOX_CONF" ]] || return 1
     jq -r --arg t "$tag" '.inbounds[]? | select(.tag == $t) | .listen_port // empty' "$SINGBOX_CONF" 2>/dev/null | head -n 1
 }
-
 show_dashboard() {
     clear
     local sys_info singbox_info xray_info snell_info time_sync_status realm_info realm_status forwarding_count=0
@@ -493,13 +474,11 @@ show_dashboard() {
     realm_status="${YELLOW}○ 未安装${PLAIN}"
     local proto_list="" installed_count=0
     local p=""
-
     sys_info=$(get_sys_info)
     singbox_info=$(get_singbox_version)
     xray_info=$(get_xray_version)
     snell_info=$(get_snell_version)
     time_sync_status=$(get_time_sync_status)
-
     if [[ -x "$REALM_BIN" ]]; then
         realm_info=$("$REALM_BIN" --version 2>/dev/null | head -n1)
         realm_info=${realm_info:-"Realm 已安装"}
@@ -512,35 +491,29 @@ show_dashboard() {
     if [[ -f "$FORWARDING_FILE" ]]; then
         forwarding_count=$(jq '.rules|length' "$FORWARDING_FILE" 2>/dev/null || echo 0)
     fi
-
     if systemctl is-active --quiet sing-box 2>/dev/null; then
         sb_status="${GREEN}● 运行中${PLAIN}"
     elif [[ -f "$SINGBOX_CONF" || -x "$SINGBOX_BIN" ]]; then
         sb_status="${RED}○ 已停止${PLAIN}"
     fi
-
     if systemctl is-active --quiet "$XRAY_SERVICE_NAME" 2>/dev/null; then
         xray_status="${GREEN}● 运行中${PLAIN}"
     elif [[ -f "$XRAY_CONF" || -x "$XRAY_BIN" ]]; then
         xray_status="${RED}○ 已停止${PLAIN}"
     fi
-
     if systemctl is-active --quiet snell-v5 2>/dev/null; then
         snell_status="${GREEN}● 运行中${PLAIN}"
     elif [[ -f "$SNELL_CONF" || -x "$SNELL_BIN" ]]; then
         snell_status="${RED}○ 已停止${PLAIN}"
     fi
-
     if systemctl is-active --quiet ipv6-keepalive.timer 2>/dev/null; then
         keepalive_status="${GREEN}● 已激活 (5min轮询)${PLAIN}"
     fi
-
     if json_has_inbound_tag "$TAG_SS"; then
         p=$(get_inbound_port "$TAG_SS")
         ((installed_count++))
         proto_list+="\n    • SS2022 - 端口: ${CYAN}${p:-内部}${PLAIN}"
     fi
-
     if json_has_inbound_tag "$TAG_STLS"; then
         p=$(get_inbound_port "$TAG_STLS")
         ((installed_count++))
@@ -550,7 +523,6 @@ show_dashboard() {
             proto_list+=" / UDP: ${CYAN}${p}${PLAIN}"
         fi
     fi
-
     if xray_vless_exists; then
         p=$(get_xray_vless_port)
         ((installed_count++))
@@ -560,13 +532,11 @@ show_dashboard() {
         ((installed_count++))
         proto_list+="\n    • VLESS Reality (旧 sing-box，待迁移) - 端口: ${YELLOW}${p}${PLAIN}"
     fi
-
     if [[ -f "$SNELL_CONF" ]]; then
         p=$(awk -F'[: ]+' '/^[[:space:]]*listen[[:space:]]*=/{gsub(/\[/,"",$0); gsub(/\]/,"",$0); print $NF; exit}' "$SNELL_CONF" 2>/dev/null)
         ((installed_count++))
         proto_list+="\n    • Snell v5 - 端口: ${CYAN}${p:-未知}${PLAIN}"
     fi
-
     echo -e "${CYAN}═════════════════════════════════════════════════════════════════${PLAIN}"
     echo -e "      SS2022 多协议管理脚本 ${SCRIPT_VERSION}"
     echo -e "      快捷命令: ${GREEN}ss2022${PLAIN} 或 ${GREEN}proxy${PLAIN}"
@@ -585,14 +555,11 @@ show_dashboard() {
     fi
     echo -e "${CYAN}═════════════════════════════════════════════════════════════════${PLAIN}"
 }
-
 # ==============================================================================
 # [03] 系统网络环境：DNS / 时间同步 / IPv4 / IPv6
 # ==============================================================================
-
 restore_ipv4_apt_and_dns_if_needed() {
     rm -f "$FORCE_IPV6_CONF"
-
     local should_restore=0
     if [[ -f "$DNS_MARKER" ]]; then
         should_restore=1
@@ -601,7 +568,6 @@ restore_ipv4_apt_and_dns_if_needed() {
          && grep -q '2606:4700:4700::1111' /etc/resolv.conf; then
         should_restore=1
     fi
-
     if [[ $should_restore -eq 1 && -f "$BACKUP_DNS" && ! -L /etc/resolv.conf ]]; then
         if cp -f "$BACKUP_DNS" /etc/resolv.conf; then
             rm -f "$DNS_MARKER"
@@ -611,16 +577,13 @@ restore_ipv4_apt_and_dns_if_needed() {
         fi
     fi
 }
-
 ensure_time_sync() {
     local attempt=0
-
     echo -e "${YELLOW}>> 检查系统时间同步状态...${PLAIN}"
     if time_sync_is_healthy; then
         echo -e "${GREEN}✔ 系统时间已同步。当前 UTC: $(date -u '+%Y-%m-%d %H:%M:%S UTC')${PLAIN}"
         return 0
     fi
-
     echo -e "${YELLOW}[提示] 系统时钟尚未同步，准备使用 chrony 自动校时。${PLAIN}"
     if ! command -v chronyc &>/dev/null; then
         if ! apt-get install -y chrony; then
@@ -628,17 +591,14 @@ ensure_time_sync() {
             return 1
         fi
     fi
-
     if ! systemctl enable --now chrony >/dev/null 2>&1; then
         echo -e "${RED}[错误] chrony 服务启动失败。${PLAIN}"
         return 1
     fi
-
     systemctl restart chrony >/dev/null 2>&1 || true
     chronyc -a burst 4/4 >/dev/null 2>&1 || true
     sleep 2
     chronyc -a makestep >/dev/null 2>&1 || true
-
     for attempt in {1..15}; do
         if time_sync_is_healthy; then
             echo -e "${GREEN}✔ 系统时间同步完成。当前 UTC: $(date -u '+%Y-%m-%d %H:%M:%S UTC')${PLAIN}"
@@ -646,19 +606,16 @@ ensure_time_sync() {
         fi
         sleep 2
     done
-
     echo -e "${RED}[错误] 30 秒内未确认系统时间同步。停止部署。${PLAIN}"
     chronyc tracking 2>/dev/null || true
     return 1
 }
-
 install_dependencies() {
     echo -e "${YELLOW}>> 更新 APT 索引...${PLAIN}"
     if ! apt-get update -y; then
         echo -e "${RED}[错误] apt-get update 失败，请检查网络或软件源。${PLAIN}"
         return 1
     fi
-
     echo -e "${YELLOW}>> 安装运行依赖...${PLAIN}"
     if ! apt-get install -y curl jq openssl coreutils qrencode ca-certificates iproute2 tar unzip; then
         echo -e "${RED}[错误] 依赖安装失败。${PLAIN}"
@@ -666,7 +623,6 @@ install_dependencies() {
     fi
     return 0
 }
-
 prepare_ipv4_env() {
     local require_time_sync="${1:-yes}"
     echo -e "${YELLOW}>> 初始化 IPv4 / 双栈部署环境...${PLAIN}"
@@ -677,7 +633,6 @@ prepare_ipv4_env() {
     fi
     return 0
 }
-
 dns_ipv6_resolution_works() {
     local host=""
     for host in deb.debian.org github.com cloudflare.com; do
@@ -687,25 +642,20 @@ dns_ipv6_resolution_works() {
     done
     return 1
 }
-
 prepare_ipv6_env() {
     local require_time_sync="${1:-yes}"
     echo -e "${YELLOW}>> 初始化 IPv6-only 部署环境...${PLAIN}"
-
     if ! ip -6 addr show scope global 2>/dev/null | grep -q 'inet6 '; then
         echo -e "${RED}[错误] 未检测到全局 IPv6 地址，无法使用 IPv6-only 模式。${PLAIN}"
         return 1
     fi
-
     sed -i '/github/d' /etc/hosts 2>/dev/null || true
     sed -i '/ghproxy/d' /etc/hosts 2>/dev/null || true
     sed -i '/danwin/d' /etc/hosts 2>/dev/null || true
-
     if dns_ipv6_resolution_works; then
         echo -e "${GREEN}✔ 当前 DNS 可正常解析 IPv6 地址，不修改 /etc/resolv.conf。${PLAIN}"
     else
         echo -e "${YELLOW}[提示] 当前 DNS 无法完成 IPv6 解析，准备使用公共 IPv6 DNS 兜底。${PLAIN}"
-
         if [[ -f /etc/resolv.conf && ! -L /etc/resolv.conf ]]; then
             if [[ ! -f "$BACKUP_DNS" ]]; then
                 cp -a /etc/resolv.conf "$BACKUP_DNS" || {
@@ -713,14 +663,12 @@ prepare_ipv6_env() {
                     return 1
                 }
             fi
-
             cat > /etc/resolv.conf <<'DNS'
 nameserver 2001:4860:4860::8888
 nameserver 2606:4700:4700::1111
 options timeout:2 attempts:2
 DNS
             touch "$DNS_MARKER"
-
             if ! dns_ipv6_resolution_works; then
                 echo -e "${RED}[错误] 切换公共 IPv6 DNS 后仍无法解析，正在恢复原 DNS。${PLAIN}"
                 [[ -f "$BACKUP_DNS" ]] && cp -f "$BACKUP_DNS" /etc/resolv.conf 2>/dev/null || true
@@ -733,72 +681,59 @@ DNS
             return 1
         fi
     fi
-
     mkdir -p /etc/apt/apt.conf.d/
     printf '%s\n' 'Acquire::ForceIPv6 "true";' > "$FORCE_IPV6_CONF" || return 1
-
     if [[ -f /etc/apt/mirrors/debian.list ]]; then
         printf '%s\n' 'https://deb.debian.org/debian' > /etc/apt/mirrors/debian.list || return 1
     fi
     if [[ -f /etc/apt/mirrors/debian-security.list ]]; then
         printf '%s\n' 'https://deb.debian.org/debian-security' > /etc/apt/mirrors/debian-security.list || return 1
     fi
-
     install_dependencies || return 1
     if [[ "$require_time_sync" == "yes" ]]; then
         ensure_time_sync || return 1
     fi
     return 0
 }
-
 setup_keepalive() {
     echo -e "${YELLOW}>> 部署 IPv6 HTTPS 链路保活定时器...${PLAIN}"
-
     cat > /etc/systemd/system/ipv6-keepalive.service <<'KSERVICE'
 [Unit]
 Description=IPv6 HTTPS Keepalive Probe
 After=network-online.target
 Wants=network-online.target
-
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/curl -6fsSI --max-time 5 https://www.cloudflare.com
 StandardOutput=null
 StandardError=null
 KSERVICE
-
     cat > /etc/systemd/system/ipv6-keepalive.timer <<'KTIMER'
 [Unit]
 Description=Run IPv6 Keepalive Every 5 Minutes
-
 [Timer]
 OnBootSec=1min
 OnUnitActiveSec=5min
 Unit=ipv6-keepalive.service
-
 [Install]
 WantedBy=timers.target
 KTIMER
-
     systemctl daemon-reload || return 1
     systemctl enable --now ipv6-keepalive.timer >/dev/null 2>&1 || return 1
     echo -e "${GREEN}✔ IPv6 Keepalive 定时器已激活。${PLAIN}"
     return 0
 }
-
 disable_keepalive_for_ipv4() {
     # 双栈 VPS 上若已有 IPv6 节点在使用 Keepalive，不因新增 IPv4 节点而关闭。
     if ip -6 addr show scope global 2>/dev/null | grep -q 'inet6 '; then
         return 0
     fi
-
     if systemctl is-enabled --quiet ipv6-keepalive.timer 2>/dev/null || \
        systemctl is-active --quiet ipv6-keepalive.timer 2>/dev/null; then
         systemctl disable --now ipv6-keepalive.timer >/dev/null 2>&1 || \
             echo -e "${YELLOW}[警告] IPv6 Keepalive 定时器未能自动停用。${PLAIN}"
     fi
 }
-
 select_network_mode() {
     local require_time_sync="${1:-yes}"
     while true; do
@@ -808,7 +743,6 @@ select_network_mode() {
         echo "  2) IPv6-only（监听 ::，启用 IPv6 Keepalive）"
         echo "  0) 取消"
         read -rp "请选择 [0-2]: " n
-
         case "$n" in
             1)
                 NETWORK_MODE="ipv4"
@@ -833,11 +767,9 @@ select_network_mode() {
         esac
     done
 }
-
 # ==============================================================================
 # [04] 状态文件与 sing-box 基础设施
 # ==============================================================================
-
 ensure_state_file() {
     mkdir -p "$STATE_DIR" || return 1
     chmod 700 "$STATE_DIR"
@@ -848,7 +780,6 @@ ensure_state_file() {
     jq -e 'type == "object"' "$STATE_FILE" >/dev/null 2>&1 || printf '%s\n' '{}' > "$STATE_FILE"
     return 0
 }
-
 save_mode_state() {
     local mode="$1" object_json="$2" tmp=""
     ensure_state_file || return 1
@@ -861,7 +792,6 @@ save_mode_state() {
     mv -f "$tmp" "$STATE_FILE"
     chmod 600 "$STATE_FILE"
 }
-
 remove_mode_state() {
     local mode="$1" tmp=""
     [[ -f "$STATE_FILE" ]] || return 0
@@ -874,13 +804,11 @@ remove_mode_state() {
     mv -f "$tmp" "$STATE_FILE"
     chmod 600 "$STATE_FILE"
 }
-
 get_mode_state_field() {
     local mode="$1" field="$2"
     [[ -f "$STATE_FILE" ]] || return 1
     jq -r --arg mode "$mode" --arg field "$field" '.[$mode][$field] // empty' "$STATE_FILE" 2>/dev/null
 }
-
 default_node_name() {
     case "$1" in
         ss)        printf '%s' "Proxy-SS2022" ;;
@@ -890,11 +818,9 @@ default_node_name() {
         *)         printf '%s' "Proxy-Node" ;;
     esac
 }
-
 get_node_name() {
     local mode="$1"
     local name=""
-
     name=$(get_mode_state_field "$mode" "name" 2>/dev/null || true)
     if [[ -n "$name" ]]; then
         printf '%s' "$name"
@@ -902,42 +828,32 @@ get_node_name() {
         default_node_name "$mode"
     fi
 }
-
 validate_node_name() {
     local name="$1"
-
     [[ -n "$name" ]] || return 1
     [[ ${#name} -le 64 ]] || return 1
-
     case "$name" in
         *$'\n'*|*$'\r'*|*'='*|*','*|*'"'*|*'\'*)
             return 1
             ;;
     esac
-
     return 0
 }
-
 ask_node_name() {
     local mode="$1"
     local current="${2:-}"
     local default input=""
-
     default=${current:-$(default_node_name "$mode")}
-
     while true; do
         read -rp "节点名称 [默认: ${default}]: " input
         input=${input:-$default}
-
         if validate_node_name "$input"; then
             NODE_NAME="$input"
             return 0
         fi
-
         echo -e "${RED}节点名称无效：不能为空、最多 64 个字符，且不能包含 = , \" 或反斜杠。${PLAIN}"
     done
 }
-
 protocol_mode_exists() {
     case "$1" in
         ss) json_has_inbound_tag "$TAG_SS" ;;
@@ -947,64 +863,52 @@ protocol_mode_exists() {
         *) return 1 ;;
     esac
 }
-
 rename_node_name() {
     local mode="$1"
     local label="$2"
     local current=""
-
     if ! protocol_mode_exists "$mode"; then
         echo -e "${YELLOW}${label} 尚未部署。${PLAIN}"
         return 1
     fi
-
     current=$(get_node_name "$mode")
     echo -e "当前节点名称: ${GREEN}${current}${PLAIN}"
     ask_node_name "$mode" "$current" || return 1
-
     if save_mode_state "$mode" "$(jq -n --arg name "$NODE_NAME" '{name:$name}')"; then
         echo -e "${GREEN}✔ ${label} 节点名称已修改为: ${NODE_NAME}${PLAIN}"
         echo -e "${YELLOW}提示: 仅修改客户端导出名称，不需要重启代理服务。${PLAIN}"
         return 0
     fi
-
     echo -e "${RED}[错误] 节点名称保存失败。${PLAIN}"
     return 1
 }
-
 node_name_management() {
     while true; do
         clear
         echo -e "${CYAN}════════════════════ 修改节点名称 ════════════════════${PLAIN}"
-
         if protocol_mode_exists ss; then
             echo -e "  1. SS2022                  [${GREEN}$(get_node_name ss)${PLAIN}]"
         else
             echo "  1. SS2022                  [未部署]"
         fi
-
         if protocol_mode_exists shadowtls; then
             echo -e "  2. SS2022 + ShadowTLS v3   [${GREEN}$(get_node_name shadowtls)${PLAIN}]"
         else
             echo "  2. SS2022 + ShadowTLS v3   [未部署]"
         fi
-
         if protocol_mode_exists vless; then
             echo -e "  3. VLESS Reality           [${GREEN}$(get_node_name vless)${PLAIN}]"
         else
             echo "  3. VLESS Reality           [未部署]"
         fi
-
         if protocol_mode_exists snell; then
             echo -e "  4. Snell v5                [${GREEN}$(get_node_name snell)${PLAIN}]"
         else
             echo "  4. Snell v5                [未部署]"
         fi
-
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
         read -rp "请选择 [0-4]: " c
-
         case "$c" in
             1) rename_node_name "ss" "SS2022"; pause ;;
             2) rename_node_name "shadowtls" "SS2022 + ShadowTLS v3"; pause ;;
@@ -1015,10 +919,8 @@ node_name_management() {
         esac
     done
 }
-
 ensure_singbox_user() {
     local nologin_shell=""
-
     if id -u "$SINGBOX_USER" >/dev/null 2>&1; then
         if ! getent group "$SINGBOX_GROUP" >/dev/null 2>&1; then
             groupadd --system "$SINGBOX_GROUP" || return 1
@@ -1028,7 +930,6 @@ ensure_singbox_user() {
         fi
         return 0
     fi
-
     nologin_shell=$(command -v nologin 2>/dev/null || true)
     nologin_shell=${nologin_shell:-/usr/sbin/nologin}
     useradd --system --user-group --no-create-home --home-dir /nonexistent --shell "$nologin_shell" "$SINGBOX_USER" || return 1
@@ -1036,17 +937,14 @@ ensure_singbox_user() {
     chmod 600 "$SINGBOX_USER_MARKER"
     return 0
 }
-
 write_singbox_service() {
     ensure_singbox_user || return 1
-
     cat > "$SINGBOX_SERVICE" <<'SERVICE'
 [Unit]
 Description=sing-box service
 Documentation=https://sing-box.sagernet.org
 After=network.target nss-lookup.target network-online.target
 Wants=network-online.target
-
 [Service]
 Type=simple
 User=sing-box
@@ -1070,20 +968,16 @@ ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
-
 [Install]
 WantedBy=multi-user.target
 SERVICE
-
     systemctl daemon-reload || return 1
     systemctl enable sing-box >/dev/null 2>&1 || return 1
     return 0
 }
-
 install_singbox_core() {
     local arch s_arch="" expected_sha256="" tar_file="" target_url="" curl_family=""
     local success=0 download_url="" actual_sha256=""
-
     arch=$(uname -m)
     case "$arch" in
         x86_64|amd64)
@@ -1099,9 +993,7 @@ install_singbox_core() {
             return 1
             ;;
     esac
-
     [[ "$NETWORK_MODE" == "ipv6" ]] && curl_family="-6" || curl_family="-4"
-
     if [[ -x "$SINGBOX_BIN" ]]; then
         local current=""
         current=$("$SINGBOX_BIN" version 2>/dev/null | head -n 1 | awk '{print $3}')
@@ -1109,10 +1001,8 @@ install_singbox_core() {
     else
         echo -e "${YELLOW}>> 下载 sing-box ${SINGBOX_VERSION} 并进行 SHA256 校验...${PLAIN}"
     fi
-
     tar_file="sing-box-${SINGBOX_VERSION}-linux-${s_arch}.tar.gz"
     target_url="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/${tar_file}"
-
     local download_sources=(
         "$target_url"
         "https://ghproxy.net/${target_url}"
@@ -1120,20 +1010,16 @@ install_singbox_core() {
         "https://ghps.cc/${target_url}"
         "https://github.boki.moe/${target_url}"
     )
-
     cd /tmp || return 1
     rm -rf /tmp/sb-temp "/tmp/${tar_file}"
-
     for download_url in "${download_sources[@]}"; do
         echo -e "   尝试下载: ${CYAN}${download_url}${PLAIN}"
         rm -f "/tmp/${tar_file}"
-
         if ! curl -fL "$curl_family" --retry 2 --retry-delay 1 --connect-timeout 8 --max-time 90 \
             "$download_url" -o "/tmp/${tar_file}"; then
             echo -e "${YELLOW}   下载失败，尝试下一个源。${PLAIN}"
             continue
         fi
-
         actual_sha256=$(sha256sum "/tmp/${tar_file}" | awk '{print $1}')
         if [[ "$actual_sha256" != "$expected_sha256" ]]; then
             echo -e "${RED}   SHA256 校验失败，拒绝安装该文件！${PLAIN}"
@@ -1142,39 +1028,31 @@ install_singbox_core() {
             rm -f "/tmp/${tar_file}"
             continue
         fi
-
         if ! tar -tzf "/tmp/${tar_file}" >/dev/null 2>&1; then
             echo -e "${RED}   压缩包结构校验失败。${PLAIN}"
             rm -f "/tmp/${tar_file}"
             continue
         fi
-
         success=1
         break
     done
-
     if [[ $success -ne 1 ]]; then
         echo -e "${RED}[错误] 所有下载源均失败或未通过 SHA256 校验。${PLAIN}"
         return 1
     fi
-
     mkdir -p /tmp/sb-temp
     tar -xzf "/tmp/${tar_file}" -C /tmp/sb-temp --strip-components=1 || return 1
-
     if [[ ! -f /tmp/sb-temp/sing-box ]]; then
         echo -e "${RED}[错误] 压缩包中未找到 sing-box 二进制。${PLAIN}"
         rm -rf /tmp/sb-temp "/tmp/${tar_file}"
         return 1
     fi
-
     install -m 755 /tmp/sb-temp/sing-box "$SINGBOX_BIN" || return 1
     rm -rf /tmp/sb-temp "/tmp/${tar_file}"
-
     "$SINGBOX_BIN" version >/dev/null 2>&1 || {
         echo -e "${RED}[错误] sing-box 安装后无法执行。${PLAIN}"
         return 1
     }
-
     write_singbox_service || return 1
     echo -e "${GREEN}✔ sing-box ${SINGBOX_VERSION} 核心与 systemd 服务已就绪。${PLAIN}"
     return 0
@@ -3859,9 +3737,9 @@ build_singbox_routing_candidate() {
         case "$type" in
             ss2022|shadowsocks)
                 if chain_node_needs_warp_underlay "$node"; then
-                    outbounds=$(jq -c --arg tag "$tag" --arg server "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" '. + [{type:"shadowsocks",tag:$tag,server:$server,server_port:$port,method:$method,password:$pass,detour:"route-warp"}]' <<<"$outbounds")
+                    outbounds=$(jq -c --arg tag "$tag" --arg server "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" --arg ds "$(chain_node_singbox_domain_strategy "$node")" '. + [({type:"shadowsocks",tag:$tag,server:$server,server_port:$port,method:$method,password:$pass,detour:"route-warp"} + (if $ds!="" then {domain_strategy:$ds} else {} end))]' <<<"$outbounds")
                 else
-                    outbounds=$(jq -c --arg tag "$tag" --arg server "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" '. + [{type:"shadowsocks",tag:$tag,server:$server,server_port:$port,method:$method,password:$pass}]' <<<"$outbounds")
+                    outbounds=$(jq -c --arg tag "$tag" --arg server "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" --arg ds "$(chain_node_singbox_domain_strategy "$node")" '. + [({type:"shadowsocks",tag:$tag,server:$server,server_port:$port,method:$method,password:$pass} + (if $ds!="" then {domain_strategy:$ds} else {} end))]' <<<"$outbounds")
                 fi
                 if [[ "$type" == "shadowsocks" && "$(jq -r '.bridge_required // false' <<<"$node")" == "true" ]]; then
                     local bridge_port bridge_tag
@@ -3942,16 +3820,17 @@ build_singbox_routing_candidate() {
 }
 
 xray_outbound_for_node() {
-    local node="$1" tag="$2" family="${3:-default}" type strategy="AsIs"
+    local node="$1" tag="$2" family="${3:-default}" type strategy="AsIs" server_strategy
     type=$(jq -r '.type' <<<"$node")
+    server_strategy=$(chain_node_xray_server_strategy "$node")
     [[ "$family" == "ipv4" ]] && strategy="ForceIPv4"
     [[ "$family" == "ipv6" ]] && strategy="ForceIPv6"
     case "$type" in
         ss2022)
             if chain_node_needs_warp_underlay "$node"; then
-                jq -nc --arg tag "$tag" --arg address "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" --arg ts "$strategy" '{protocol:"shadowsocks",tag:$tag,targetStrategy:$ts,settings:{address:$address,port:$port,method:$method,password:$pass},streamSettings:{sockopt:{dialerProxy:"route-warp"}}}'
+                jq -nc --arg tag "$tag" --arg address "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" --arg ts "$strategy" --arg ss "$server_strategy" '{protocol:"shadowsocks",tag:$tag,targetStrategy:$ts,settings:{address:$address,port:$port,method:$method,password:$pass},streamSettings:{sockopt:{dialerProxy:"route-warp",domainStrategy:$ss}}}'
             else
-                jq -nc --arg tag "$tag" --arg address "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" --arg ts "$strategy" '{protocol:"shadowsocks",tag:$tag,targetStrategy:$ts,settings:{address:$address,port:$port,method:$method,password:$pass}}'
+                jq -nc --arg tag "$tag" --arg address "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" --arg ts "$strategy" --arg ss "$server_strategy" '{protocol:"shadowsocks",tag:$tag,targetStrategy:$ts,settings:{address:$address,port:$port,method:$method,password:$pass},streamSettings:{sockopt:{domainStrategy:$ss}}}'
             fi
             ;;
         shadowsocks)
@@ -3964,9 +3843,9 @@ xray_outbound_for_node() {
                 jq -nc --arg tag "$tag" --argjson port "$bridge_port" --arg ts "$strategy" '{protocol:"socks",tag:$tag,targetStrategy:$ts,settings:{address:"127.0.0.1",port:$port}}'
             else
                 if chain_node_needs_warp_underlay "$node"; then
-                    jq -nc --arg tag "$tag" --arg address "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$method" --arg pass "$(jq -r '.password' <<<"$node")" --arg ts "$strategy" '{protocol:"shadowsocks",tag:$tag,targetStrategy:$ts,settings:{address:$address,port:$port,method:$method,password:$pass},streamSettings:{sockopt:{dialerProxy:"route-warp"}}}'
+                    jq -nc --arg tag "$tag" --arg address "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$method" --arg pass "$(jq -r '.password' <<<"$node")" --arg ts "$strategy" --arg ss "$server_strategy" '{protocol:"shadowsocks",tag:$tag,targetStrategy:$ts,settings:{address:$address,port:$port,method:$method,password:$pass},streamSettings:{sockopt:{dialerProxy:"route-warp",domainStrategy:$ss}}}'
                 else
-                    jq -nc --arg tag "$tag" --arg address "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$method" --arg pass "$(jq -r '.password' <<<"$node")" --arg ts "$strategy" '{protocol:"shadowsocks",tag:$tag,targetStrategy:$ts,settings:{address:$address,port:$port,method:$method,password:$pass}}'
+                    jq -nc --arg tag "$tag" --arg address "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$method" --arg pass "$(jq -r '.password' <<<"$node")" --arg ts "$strategy" --arg ss "$server_strategy" '{protocol:"shadowsocks",tag:$tag,targetStrategy:$ts,settings:{address:$address,port:$port,method:$method,password:$pass},streamSettings:{sockopt:{domainStrategy:$ss}}}'
                 fi
             fi
             ;;
@@ -4585,9 +4464,58 @@ chain_node_recommended_test_family() {
     echo "unknown"
 }
 
+chain_node_effective_connect_family() {
+    local node="$1" detected
+    detected=$(chain_node_recommended_test_family "$node")
+
+    case "$detected" in
+        ipv4|ipv6)
+            echo "$detected"
+            ;;
+        dual)
+            # 双栈落地优先使用 VPS 原生地址族。
+            # 原生 IPv4 优先于 WARP 补充 IPv6，避免 Go/AsIs 优先 AAAA 后超时。
+            if warp_direct_ipv4_ready; then
+                echo "ipv4"
+            elif warp_direct_ipv6_ready; then
+                echo "ipv6"
+            elif warp_proxy_ready && warp_family_allowed ipv4 && warp_test_family ipv4 >/dev/null 2>&1; then
+                echo "ipv4"
+            elif warp_proxy_ready && warp_family_allowed ipv6 && warp_test_family ipv6 >/dev/null 2>&1; then
+                echo "ipv6"
+            else
+                echo "default"
+            fi
+            ;;
+        *)
+            echo "default"
+            ;;
+    esac
+}
+
+chain_node_xray_server_strategy() {
+    local family
+    family=$(chain_node_effective_connect_family "$1")
+    case "$family" in
+        ipv4) echo "ForceIPv4" ;;
+        ipv6) echo "ForceIPv6" ;;
+        *) echo "AsIs" ;;
+    esac
+}
+
+chain_node_singbox_domain_strategy() {
+    local family
+    family=$(chain_node_effective_connect_family "$1")
+    case "$family" in
+        ipv4) echo "ipv4_only" ;;
+        ipv6) echo "ipv6_only" ;;
+        *) echo "" ;;
+    esac
+}
+
 chain_node_needs_warp_underlay() {
     local node="$1" family
-    family=$(chain_node_recommended_test_family "$node")
+    family=$(chain_node_effective_connect_family "$node")
     case "$family" in
         ipv6)
             warp_direct_ipv6_ready && return 1
@@ -4597,7 +4525,7 @@ chain_node_needs_warp_underlay() {
             warp_direct_ipv4_ready && return 1
             warp_proxy_ready && warp_family_allowed ipv4 && warp_test_family ipv4 >/dev/null 2>&1
             ;;
-        dual|unknown|*) return 1 ;;
+        *) return 1 ;;
     esac
 }
 
@@ -4622,8 +4550,9 @@ curl_chain_test_via_local_socks() {
 }
 
 test_shadowsocks_node_with_singbox() {
-    local node="$1" family="${2:-default}" port cfg pid out rc=1 n=19080 url warp_port use_warp=false
+    local node="$1" family="${2:-default}" port cfg pid out rc=1 n=19080 url warp_port use_warp=false sb_ds
     url=$(ip_echo_url_for_family "$family")
+    sb_ds=$(chain_node_singbox_domain_strategy "$node")
     [[ -x "$SINGBOX_BIN" ]] || { echo -e "${YELLOW}[提示] 未安装 sing-box，无法执行 Shadowsocks 落地实连测试。${PLAIN}"; return 1; }
     chain_node_needs_warp_underlay "$node" && use_warp=true
     while ss -H -ltn 2>/dev/null | grep -q ":${n} "; do n=$((n+1)); [[ $n -lt 19150 ]] || return 1; done
@@ -4631,25 +4560,34 @@ test_shadowsocks_node_with_singbox() {
     cfg=$(mktemp /tmp/ss2022-chain-test.XXXXXX.json) || return 1
     if [[ "$use_warp" == true ]]; then
         warp_port=$(warp_proxy_port)
-        jq -n --arg server "$(jq -r '.server' <<<"$node")" --argjson sport "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" --argjson lp "$port" --argjson wp "$warp_port" \
-          '{log:{level:"warn"},inbounds:[{type:"socks",tag:"test-in",listen:"127.0.0.1",listen_port:$lp}],outbounds:[{type:"socks",tag:"test-warp",server:"127.0.0.1",server_port:$wp},{type:"shadowsocks",tag:"test-out",server:$server,server_port:$sport,method:$method,password:$pass,detour:"test-warp"}],route:{final:"test-out"}}' > "$cfg"
+        jq -n --arg server "$(jq -r '.server' <<<"$node")" --argjson sport "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" --argjson lp "$port" --argjson wp "$warp_port" --arg ds "$sb_ds" \
+          '{log:{level:"warn"},inbounds:[{type:"socks",tag:"test-in",listen:"127.0.0.1",listen_port:$lp}],outbounds:[{type:"socks",tag:"test-warp",server:"127.0.0.1",server_port:$wp},({type:"shadowsocks",tag:"test-out",server:$server,server_port:$sport,method:$method,password:$pass,detour:"test-warp"} + (if $ds!="" then {domain_strategy:$ds} else {} end))],route:{final:"test-out"}}' > "$cfg"
         echo -e "${YELLOW}节点接入链路: WARP（VPS 缺少该地址族的原生出口）${PLAIN}"
     else
-        jq -n --arg server "$(jq -r '.server' <<<"$node")" --argjson sport "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" --argjson lp "$port" \
-          '{log:{level:"warn"},inbounds:[{type:"socks",tag:"test-in",listen:"127.0.0.1",listen_port:$lp}],outbounds:[{type:"shadowsocks",tag:"test-out",server:$server,server_port:$sport,method:$method,password:$pass}],route:{final:"test-out"}}' > "$cfg"
+        jq -n --arg server "$(jq -r '.server' <<<"$node")" --argjson sport "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" --argjson lp "$port" --arg ds "$sb_ds" \
+          '{log:{level:"warn"},inbounds:[{type:"socks",tag:"test-in",listen:"127.0.0.1",listen_port:$lp}],outbounds:[({type:"shadowsocks",tag:"test-out",server:$server,server_port:$sport,method:$method,password:$pass} + (if $ds!="" then {domain_strategy:$ds} else {} end))],route:{final:"test-out"}}' > "$cfg"
     fi
     "$SINGBOX_BIN" check -c "$cfg" >/dev/null 2>&1 || { rm -f "$cfg"; return 1; }
     "$SINGBOX_BIN" run -c "$cfg" >/tmp/ss2022-chain-test.log 2>&1 & pid=$!
     sleep 1
     out=$(curl_chain_test_via_local_socks "$port" "$family" "$url") && rc=0
-    kill "$pid" >/dev/null 2>&1 || true; wait "$pid" 2>/dev/null || true; rm -f "$cfg"
-    if [[ $rc -eq 0 ]]; then echo -e "${GREEN}✔ 落地节点可用，出口 IP: ${out}${PLAIN}"; return 0; fi
-    echo -e "${RED}[错误] Shadowsocks 落地节点测试失败。${PLAIN}"; [[ -s /tmp/ss2022-chain-curl.err ]] && { echo "curl:"; tail -n 3 /tmp/ss2022-chain-curl.err; }; tail -n 10 /tmp/ss2022-chain-test.log 2>/dev/null || true; return 1
+    kill "$pid" >/dev/null 2>&1 || true
+    wait "$pid" 2>/dev/null || true
+    rm -f "$cfg"
+    if [[ $rc -eq 0 ]]; then
+        echo -e "${GREEN}✔ 落地节点可用，出口 IP: ${out}${PLAIN}"
+        return 0
+    fi
+    echo -e "${RED}[错误] Shadowsocks 落地节点测试失败。${PLAIN}"
+    [[ -s /tmp/ss2022-chain-curl.err ]] && { echo "curl:"; tail -n 3 /tmp/ss2022-chain-curl.err; }
+    tail -n 10 /tmp/ss2022-chain-test.log 2>/dev/null || true
+    return 1
 }
 
 test_shadowsocks_node_with_xray() {
-    local node="$1" family="${2:-default}" port cfg pid out rc=1 n=19180 url method strategy="AsIs" warp_port use_warp=false
+    local node="$1" family="${2:-default}" port cfg pid out rc=1 n=19180 url method strategy="AsIs" server_strategy warp_port use_warp=false
     url=$(ip_echo_url_for_family "$family")
+    server_strategy=$(chain_node_xray_server_strategy "$node")
     [[ -x "$XRAY_BIN" ]] || { echo -e "${YELLOW}[提示] 未安装 Xray，无法使用 Xray 执行 Shadowsocks 落地实连测试。${PLAIN}"; return 1; }
     method=$(jq -r '.method' <<<"$node")
     xray_supports_ss_method "$method" || { echo -e "${YELLOW}[提示] Xray 不原生支持 ${method}，应改由 sing-box 测试。${PLAIN}"; return 1; }
@@ -4661,21 +4599,21 @@ test_shadowsocks_node_with_xray() {
     cfg=$(mktemp /tmp/ss2022-xray-chain-test.XXXXXX.json) || return 1
     if [[ "$use_warp" == true ]]; then
         warp_port=$(warp_proxy_port)
-        jq -n --arg server "$(jq -r '.server' <<<"$node")" --argjson sport "$(jq -r '.port' <<<"$node")" --arg method "$method" --arg pass "$(jq -r '.password' <<<"$node")" --argjson lp "$port" --argjson wp "$warp_port" --arg ts "$strategy" '{
+        jq -n --arg server "$(jq -r '.server' <<<"$node")" --argjson sport "$(jq -r '.port' <<<"$node")" --arg method "$method" --arg pass "$(jq -r '.password' <<<"$node")" --argjson lp "$port" --argjson wp "$warp_port" --arg ts "$strategy" --arg ss "$server_strategy" '{
           log:{loglevel:"warning"},
           inbounds:[{listen:"127.0.0.1",port:$lp,protocol:"socks",tag:"test-in",settings:{auth:"noauth",udp:true}}],
           outbounds:[
             {protocol:"socks",tag:"test-warp",settings:{address:"127.0.0.1",port:$wp}},
-            {protocol:"shadowsocks",tag:"test-out",targetStrategy:$ts,settings:{address:$server,port:$sport,method:$method,password:$pass},streamSettings:{sockopt:{dialerProxy:"test-warp"}}}
+            {protocol:"shadowsocks",tag:"test-out",targetStrategy:$ts,settings:{address:$server,port:$sport,method:$method,password:$pass},streamSettings:{sockopt:{dialerProxy:"test-warp",domainStrategy:$ss}}}
           ],
           routing:{rules:[{type:"field",inboundTag:["test-in"],outboundTag:"test-out"}]}
         }' > "$cfg"
         echo -e "${YELLOW}节点接入链路: WARP（VPS 缺少该地址族的原生出口）${PLAIN}"
     else
-        jq -n --arg server "$(jq -r '.server' <<<"$node")" --argjson sport "$(jq -r '.port' <<<"$node")" --arg method "$method" --arg pass "$(jq -r '.password' <<<"$node")" --argjson lp "$port" --arg ts "$strategy" '{
+        jq -n --arg server "$(jq -r '.server' <<<"$node")" --argjson sport "$(jq -r '.port' <<<"$node")" --arg method "$method" --arg pass "$(jq -r '.password' <<<"$node")" --argjson lp "$port" --arg ts "$strategy" --arg ss "$server_strategy" '{
           log:{loglevel:"warning"},
           inbounds:[{listen:"127.0.0.1",port:$lp,protocol:"socks",tag:"test-in",settings:{auth:"noauth",udp:true}}],
-          outbounds:[{protocol:"shadowsocks",tag:"test-out",targetStrategy:$ts,settings:{address:$server,port:$sport,method:$method,password:$pass}}],
+          outbounds:[{protocol:"shadowsocks",tag:"test-out",targetStrategy:$ts,settings:{address:$server,port:$sport,method:$method,password:$pass},streamSettings:{sockopt:{domainStrategy:$ss}}}],
           routing:{rules:[{type:"field",inboundTag:["test-in"],outboundTag:"test-out"}]}
         }' > "$cfg"
     fi
@@ -4683,9 +4621,17 @@ test_shadowsocks_node_with_xray() {
     "$XRAY_BIN" run -format json -config "$cfg" >/tmp/ss2022-xray-chain-test.log 2>&1 & pid=$!
     sleep 1
     out=$(curl_chain_test_via_local_socks "$port" "$family" "$url") && rc=0
-    kill "$pid" >/dev/null 2>&1 || true; wait "$pid" 2>/dev/null || true; rm -f "$cfg"
-    if [[ $rc -eq 0 ]]; then echo -e "${GREEN}✔ 落地节点可用，出口 IP: ${out}${PLAIN}"; return 0; fi
-    echo -e "${RED}[错误] Shadowsocks 落地节点测试失败。${PLAIN}"; [[ -s /tmp/ss2022-chain-curl.err ]] && { echo "curl:"; tail -n 3 /tmp/ss2022-chain-curl.err; }; tail -n 10 /tmp/ss2022-xray-chain-test.log 2>/dev/null || true; return 1
+    kill "$pid" >/dev/null 2>&1 || true
+    wait "$pid" 2>/dev/null || true
+    rm -f "$cfg"
+    if [[ $rc -eq 0 ]]; then
+        echo -e "${GREEN}✔ 落地节点可用，出口 IP: ${out}${PLAIN}"
+        return 0
+    fi
+    echo -e "${RED}[错误] Shadowsocks 落地节点测试失败。${PLAIN}"
+    [[ -s /tmp/ss2022-chain-curl.err ]] && { echo "curl:"; tail -n 3 /tmp/ss2022-chain-curl.err; }
+    tail -n 10 /tmp/ss2022-xray-chain-test.log 2>/dev/null || true
+    return 1
 }
 
 test_shadowsocks_node_auto() {
@@ -4708,10 +4654,11 @@ test_shadowsocks_node_auto() {
 
 chain_test_node() {
     chain_select_id || return 1
-    local node type server port user pass out family url
+    local node type server port user pass out family detected_family url
     node=$(jq -c --arg id "$SELECTED_NODE_ID" '.chain_nodes[]|select(.id==$id)' "$ROUTING_FILE")
     type=$(jq -r '.type' <<<"$node")
-    family=$(chain_node_recommended_test_family "$node")
+    detected_family=$(chain_node_recommended_test_family "$node")
+    family=$(chain_node_effective_connect_family "$node")
     case "$family" in
         ipv4) url=$(ip_echo_url_for_family ipv4) ;;
         ipv6) url=$(ip_echo_url_for_family ipv6) ;;
@@ -4720,11 +4667,19 @@ chain_test_node() {
     esac
 
     echo -e "${YELLOW}>> 测试 $(jq -r '.name' <<<"$node")...${PLAIN}"
-    case "$family" in
-        ipv4) echo -e "检测地址族: ${CYAN}IPv4-only / IPv4 地址${PLAIN}，使用 IPv4 出口测试。" ;;
-        ipv6) echo -e "检测地址族: ${CYAN}IPv6-only / IPv6 地址${PLAIN}，使用 IPv6 出口测试。" ;;
-        dual) echo -e "检测地址族: ${CYAN}IPv4 + IPv6 双栈${PLAIN}，使用默认出口测试。" ;;
-        unknown) echo -e "检测地址族: ${YELLOW}地址族无法确定${PLAIN}，使用默认出口测试。" ;;
+    case "$detected_family" in
+        ipv4) echo -e "检测地址族: ${CYAN}IPv4-only / IPv4 地址${PLAIN}，使用 IPv4 接入测试。" ;;
+        ipv6) echo -e "检测地址族: ${CYAN}IPv6-only / IPv6 地址${PLAIN}，使用 IPv6 接入测试。" ;;
+        dual)
+            if [[ "$family" == "ipv4" ]]; then
+                echo -e "检测地址族: ${CYAN}IPv4 + IPv6 双栈${PLAIN}，优先使用 IPv4 接入测试。"
+            elif [[ "$family" == "ipv6" ]]; then
+                echo -e "检测地址族: ${CYAN}IPv4 + IPv6 双栈${PLAIN}，优先使用 IPv6 接入测试。"
+            else
+                echo -e "检测地址族: ${CYAN}IPv4 + IPv6 双栈${PLAIN}，使用默认接入测试。"
+            fi
+            ;;
+        unknown) echo -e "检测地址族: ${YELLOW}地址族无法确定${PLAIN}，使用默认接入测试。" ;;
     esac
 
     case "$type" in
@@ -5073,7 +5028,7 @@ routing_test_effect() {
     while [[ $i -lt $count ]]; do
         id=$(jq -r ".chain_nodes[$i].id" "$ROUTING_FILE")
         node=$(jq -c ".chain_nodes[$i]" "$ROUTING_FILE")
-        fam=$(chain_node_recommended_test_family "$node")
+        fam=$(chain_node_effective_connect_family "$node")
         routing_test_exit_ref "chain:${id}" "$fam" || true
         i=$((i+1))
     done
