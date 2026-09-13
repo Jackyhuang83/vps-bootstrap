@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.0
+# 当前版本: v1.8.1-dev1
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,11 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.8.1-dev1:
+#   - 修复系统信息无法显示 WARP 补充 IPv6 的问题
+#   - IPv6 显示优先使用 VPS 原生 IPv6；无原生 IPv6 时检测 WARP IPv6 出口
+#   - WARP IPv6 显示增加“（WARP）”标识，避免与 VPS 原生 IPv6 混淆
 #
 # v1.8.0 Release:
 #   - 正式发布 v1.8.0
@@ -241,12 +246,13 @@
 #   v1.8.0-dev28 端口释放交互优化
 #   v1.8.0-dev29 脚本自更新版本判断修复
 #   v1.8.0 正式发布
+#   v1.8.1-dev1 系统信息 WARP IPv6 显示修复
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.0"
+SCRIPT_VERSION="v1.8.1-dev1"
 
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
@@ -6847,6 +6853,7 @@ server_tool_system_info() {
     local cpu cores mem_total mem_used swap_total swap_used disk_used disk_total
     local uptime_days timezone dns congestion qdisc os_info ipv4 ipv6 hostname_text
     local cpu_mhz cpu_ghz traffic_rx traffic_tx traffic_pair
+    local warp_ipv6="" ipv6_display=""
 
     clear
     os_info=$(get_sys_info)
@@ -6899,6 +6906,23 @@ server_tool_system_info() {
 
     ipv4=$(curl -4fsS --connect-timeout 2 --max-time 4 https://api4.ipify.org 2>/dev/null || true)
     ipv6=$(curl -6fsS --connect-timeout 2 --max-time 4 https://api6.ipify.org 2>/dev/null || true)
+
+    # WARP 使用 Local Proxy，不会把 Cloudflare IPv6 写入 VPS 本机网络栈。
+    # 因此原生 IPv6 不存在时，需要通过 WARP SOCKS 出口单独查询。
+    if [[ -n "$ipv6" ]]; then
+        ipv6_display="$ipv6"
+    elif warp_proxy_ready 2>/dev/null && warp_family_allowed ipv6 2>/dev/null; then
+        warp_ipv6=$(warp_test_family ipv6 2>/dev/null || true)
+        if [[ -n "$warp_ipv6" ]]; then
+            ipv6_display="${warp_ipv6}（WARP）"
+        else
+            ipv6_display="无 IPv6"
+        fi
+    else
+        ipv6_display="无 IPv6"
+    fi
+
+    # IP 属性继续以 VPS 原生公网地址为准，不使用 WARP 出口覆盖机房/IP 属性。
     server_tool_get_ip_profile "$ipv4" "$ipv6"
 
     echo -e "${CYAN}════════════════════ 系统信息 ════════════════════${PLAIN}"
@@ -6914,7 +6938,7 @@ server_tool_system_info() {
     echo "  出站流量   : $(server_tool_format_bytes "${traffic_tx:-0}")（本月）"
     echo "  时区       : ${timezone:-未知}"
     echo "  IPv4 地址  : ${ipv4:-无 IPv4}"
-    echo "  IPv6 地址  : ${ipv6:-无 IPv6}"
+    echo "  IPv6 地址  : ${ipv6_display}"
     echo "  地理位置   : ${SERVER_INFO_LOCATION}"
     echo "  ISP / ASN  : ${SERVER_INFO_ISP} / ${SERVER_INFO_ASN}"
     echo "  IP 性质    : ${SERVER_INFO_IP_TYPE}"
