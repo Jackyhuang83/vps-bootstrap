@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "ss2022.sh"
+      - ".github/workflows/ci.yml"
+
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "ss2022.sh"
+      - ".github/workflows/ci.yml"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate ss2022.sh
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Bash syntax check
+        run: |
+          bash -n ss2022.sh
+
+      - name: ShellCheck
+        run: |
+          shellcheck --version
+          shellcheck --severity=error -x ss2022.sh
+
+      - name: Check script version
+        run: |
+          if ! grep -Eq '^SCRIPT_VERSION="v[0-9]+\.[0-9]+\.[0-9]+(-dev[0-9]+)?"$' ss2022.sh; then
+            echo "ERROR: SCRIPT_VERSION format is invalid."
+            exit 1
+          fi
+
+          version=$(grep -E '^SCRIPT_VERSION=' ss2022.sh | head -n1)
+          echo "Detected ${version}"
+
+      - name: Check critical functions
+        shell: bash
+        run: |
+          required_functions=(
+            protocol_management
+            routing_management
+            forwarding_management
+            server_management_tools
+            server_test_management
+            check_script_update
+          )
+
+          missing=0
+
+          for fn in "${required_functions[@]}"; do
+            if grep -Eq "^${fn}\(\)[[:space:]]*\{" ss2022.sh; then
+              echo "OK: ${fn}"
+            else
+              echo "ERROR: missing function: ${fn}"
+              missing=1
+            fi
+          done
+
+          exit "${missing}"
+
+      - name: Summary
+        run: |
+          echo "CI passed."
+          echo "Lines: $(wc -l < ss2022.sh)"
+          echo "Version: $(grep -E '^SCRIPT_VERSION=' ss2022.sh | head -n1)"
