@@ -1,0 +1,150 @@
+name: Promote ss2022 Candidate
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "ss2022.next.sh"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: promote-ss2022-main
+  cancel-in-progress: false
+
+jobs:
+  validate-and-promote:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      CANDIDATE: ss2022.next.sh
+      TARGET: ss2022.sh
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate identity and versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -f "$CANDIDATE" ]] || { echo "::error::Missing $CANDIDATE"; exit 1; }
+          [[ -f "$TARGET" ]] || { echo "::error::Missing $TARGET"; exit 1; }
+
+          head -n1 "$CANDIDATE" | grep -qx '#!/bin/bash'
+          grep -qx '# 项目名称: vps-bootstrap / ss2022.sh' "$CANDIDATE"
+
+          OLD_VERSION="$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' "$TARGET" | head -n1)"
+          NEW_VERSION="$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' "$CANDIDATE" | head -n1)"
+          HEADER_VERSION="$(sed -n 's/^# 当前版本: \(.*\)$/\1/p' "$CANDIDATE" | head -n1)"
+
+          version_re='^v[0-9]+\.[0-9]+\.[0-9]+(-dev[0-9]+)?$'
+          [[ "$OLD_VERSION" =~ $version_re ]] || { echo "::error::Invalid current version"; exit 1; }
+          [[ "$NEW_VERSION" =~ $version_re ]] || { echo "::error::Invalid candidate version"; exit 1; }
+          [[ "$HEADER_VERSION" == "$NEW_VERSION" ]] || { echo "::error::Header/SCRIPT_VERSION mismatch"; exit 1; }
+
+          echo "OLD_VERSION=$OLD_VERSION" >> "$GITHUB_ENV"
+          echo "NEW_VERSION=$NEW_VERSION" >> "$GITHUB_ENV"
+
+      - name: Require newer version
+        shell: python
+        run: |
+          import os, re, sys
+          p = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:-dev(\d+))?$")
+          def parse(v):
+              m = p.fullmatch(v)
+              a,b,c = map(int, m.group(1,2,3))
+              d = m.group(4)
+              return (a,b,c,1,0) if d is None else (a,b,c,0,int(d))
+          old_v = os.environ["OLD_VERSION"]
+          new_v = os.environ["NEW_VERSION"]
+          if parse(new_v) <= parse(old_v):
+              print(f"::error::Candidate must be newer: {old_v} -> {new_v}")
+              sys.exit(1)
+
+      - name: Bash syntax check
+        run: bash -n "$CANDIDATE"
+
+      - name: ShellCheck
+        run: shellcheck --severity=error -x "$CANDIDATE"
+
+      - name: Check critical functions
+        shell: bash
+        run: |
+          set -euo pipefail
+          for fn in apply_singbox_candidate protocol_management routing_management forwarding_management server_management_tools server_test_management check_script_update full_uninstall main; do
+            grep -Eq "^${fn}\(\)[[:space:]]*\{" "$CANDIDATE" || { echo "::error::Missing function: $fn"; exit 1; }
+          done
+
+      - name: Size and hash checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          OLD_BYTES="$(wc -c < "$TARGET")"
+          NEW_BYTES="$(wc -c < "$CANDIDATE")"
+          (( NEW_BYTES >= OLD_BYTES / 2 )) || { echo "::error::Candidate too small"; exit 1; }
+          (( NEW_BYTES <= OLD_BYTES * 2 )) || { echo "::error::Candidate too large"; exit 1; }
+
+          OLD_SHA="$(sha256sum "$TARGET" | awk '{print $1}')"
+          NEW_SHA="$(sha256sum "$CANDIDATE" | awk '{print $1}')"
+          [[ "$OLD_SHA" != "$NEW_SHA" ]] || { echo "::error::Candidate identical to current"; exit 1; }
+
+          echo "NEW_SHA=$NEW_SHA" >> "$GITHUB_ENV"
+          echo "OLD_BYTES=$OLD_BYTES" >> "$GITHUB_ENV"
+          echo "NEW_BYTES=$NEW_BYTES" >> "$GITHUB_ENV"
+
+      - name: Generate diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          git diff --no-index -- "$TARGET" "$CANDIDATE" > promotion-diff.patch
+          rc=$?
+          set -e
+          [[ "$rc" -le 1 ]] || exit "$rc"
+
+          {
+            echo "## ss2022 promotion preflight"
+            echo ""
+            echo "- Current: \`$OLD_VERSION\`"
+            echo "- Candidate: \`$NEW_VERSION\`"
+            echo "- Current bytes: $OLD_BYTES"
+            echo "- Candidate bytes: $NEW_BYTES"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          git diff --no-index --stat -- "$TARGET" "$CANDIDATE" || true
+
+      - name: Upload diff artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ss2022-promotion-diff
+          path: promotion-diff.patch
+          retention-days: 30
+
+      - name: Promote candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "$CANDIDATE" "$TARGET"
+          chmod 0755 "$TARGET"
+          bash -n "$TARGET"
+          [[ "$(sha256sum "$TARGET" | awk '{print $1}')" == "$NEW_SHA" ]]
+          rm -f "$CANDIDATE"
+          git add -- "$TARGET" "$CANDIDATE"
+          git diff --cached --check
+
+      - name: Commit and push
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: promote ss2022 ${OLD_VERSION} -> ${NEW_VERSION}"
+          git push origin HEAD:main
