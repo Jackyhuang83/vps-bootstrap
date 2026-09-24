@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.1-dev7
+# 当前版本: v1.8.1-dev8
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,12 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.8.1-dev8:
+#   - 修复 sing-box 1.13.20 local DNS 在部分精简系统中依赖 systemd-resolved / resolve1 导致解析异常
+#   - 新生成的 local-dns 默认写入 prefer_go:true，优先使用 Go resolver
+#   - 老用户启动新版脚本时自动检测已有 local-dns；缺少 prefer_go:true 时先生成候选配置并执行 sing-box check
+#   - 候选配置校验通过后才替换；替换/重启失败自动回滚，且保持升级前服务运行状态
 #
 # v1.8.1-dev7:
 #   - 修复双栈落地服务器域名可能优先拨号 IPv6 导致超时
@@ -285,11 +291,12 @@
 #   v1.8.1-dev5 落地测试多检测站容错
 #   v1.8.1-dev6 落地地址族识别文案拆分
 #   v1.8.1-dev7 双栈落地服务器拨号地址族修复
+#   v1.8.1-dev8 sing-box local DNS prefer_go 安全迁移
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.1-dev7"
+SCRIPT_VERSION="v1.8.1-dev8"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -1088,6 +1095,109 @@ CONFIG
     chown root:"$SINGBOX_GROUP" "$SINGBOX_CONF"
     chmod 640 "$SINGBOX_CONF"
     "$SINGBOX_BIN" check -c "$SINGBOX_CONF" >/dev/null 2>&1 || return 1
+    return 0
+}
+
+migrate_singbox_local_dns_prefer_go() {
+    local candidate="" backup="" was_active=0
+
+    [[ -f "$SINGBOX_CONF" && -x "$SINGBOX_BIN" ]] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+
+    # 仅处理本项目使用的 type=local + tag=local-dns。
+    jq -e '
+      any(.dns.servers[]?;
+        (type == "object") and
+        ((.type // "") == "local") and
+        ((.tag // "") == "local-dns"))
+    ' "$SINGBOX_CONF" >/dev/null 2>&1 || return 0
+
+    # 已经是 prefer_go:true 时不重复修改。
+    jq -e '
+      any(.dns.servers[]?;
+        (type == "object") and
+        ((.type // "") == "local") and
+        ((.tag // "") == "local-dns") and
+        ((.prefer_go // false) != true))
+    ' "$SINGBOX_CONF" >/dev/null 2>&1 || return 0
+
+    candidate=$(mktemp "/etc/sing-box/config.dns-migrate.XXXXXX.json") || {
+        echo -e "${RED}[错误] 无法创建 sing-box DNS 迁移候选配置；原配置保持不变。${PLAIN}"
+        return 1
+    }
+
+    if ! jq '
+      (.dns.servers[]?
+        | select(
+            (type == "object") and
+            ((.type // "") == "local") and
+            ((.tag // "") == "local-dns")
+          )
+        | .prefer_go) = true
+    ' "$SINGBOX_CONF" > "$candidate"; then
+        rm -f "$candidate"
+        echo -e "${RED}[错误] sing-box DNS 迁移候选配置生成失败；原配置保持不变。${PLAIN}"
+        return 1
+    fi
+
+    chown root:"$SINGBOX_GROUP" "$candidate" 2>/dev/null || true
+    chmod 640 "$candidate" || {
+        rm -f "$candidate"
+        echo -e "${RED}[错误] 无法设置候选配置权限；原配置保持不变。${PLAIN}"
+        return 1
+    }
+
+    echo -e "${YELLOW}>> 检测到旧版 local-dns 缺少 prefer_go:true，正在校验候选配置...${PLAIN}"
+    if ! "$SINGBOX_BIN" check -c "$candidate"; then
+        rm -f "$candidate"
+        echo -e "${RED}[错误] 候选配置未通过 sing-box check；原配置保持不变。${PLAIN}"
+        return 1
+    fi
+
+    backup=$(mktemp "/etc/sing-box/config.dns-rollback.XXXXXX.json") || {
+        rm -f "$candidate"
+        echo -e "${RED}[错误] 无法创建 DNS 迁移回滚备份；原配置保持不变。${PLAIN}"
+        return 1
+    }
+    if ! cp -a "$SINGBOX_CONF" "$backup"; then
+        rm -f "$candidate" "$backup"
+        echo -e "${RED}[错误] 无法备份原 sing-box 配置；原配置保持不变。${PLAIN}"
+        return 1
+    fi
+
+    if systemctl is-active --quiet sing-box 2>/dev/null; then
+        was_active=1
+    fi
+
+    if ! mv -f "$candidate" "$SINGBOX_CONF"; then
+        rm -f "$candidate" "$backup"
+        echo -e "${RED}[错误] DNS 迁移配置替换失败；原配置保持不变。${PLAIN}"
+        return 1
+    fi
+    chown root:"$SINGBOX_GROUP" "$SINGBOX_CONF" 2>/dev/null || true
+    chmod 640 "$SINGBOX_CONF"
+
+    # 原服务正在运行时才重启；若用户原本停止服务，升级不会擅自启动。
+    if [[ $was_active -eq 1 ]]; then
+        if ! systemctl restart sing-box; then
+            echo -e "${RED}[错误] sing-box 使用新 DNS 配置启动失败，正在自动回滚...${PLAIN}"
+            if mv -f "$backup" "$SINGBOX_CONF"; then
+                chown root:"$SINGBOX_GROUP" "$SINGBOX_CONF" 2>/dev/null || true
+                chmod 640 "$SINGBOX_CONF" 2>/dev/null || true
+                if systemctl restart sing-box; then
+                    echo -e "${YELLOW}✔ 已恢复原配置并重新启动 sing-box。${PLAIN}"
+                else
+                    echo -e "${RED}[严重] 原配置已恢复，但 sing-box 仍无法重新启动，请检查日志。${PLAIN}"
+                fi
+            else
+                echo -e "${RED}[严重] 新配置启动失败且旧配置回滚失败，请立即检查 ${SINGBOX_CONF}。${PLAIN}"
+            fi
+            return 1
+        fi
+    fi
+
+    rm -f "$backup"
+    echo -e "${GREEN}✔ local-dns 已安全迁移为 prefer_go:true。${PLAIN}"
     return 0
 }
 
@@ -3808,8 +3918,15 @@ build_singbox_routing_candidate() {
     jq --argjson outs "$outbounds" --argjson rules "$rules" --argjson bridges "$bridge_inbounds" --arg final "$default_tag" '
       .dns = (.dns // {}) |
       .dns.servers = ((.dns.servers // []) as $servers |
-        if any($servers[]?; .tag == "local-dns") then $servers
-        else $servers + [{type:"local",tag:"local-dns"}] end) |
+        if any($servers[]?; ((.tag // "") == "local-dns"))
+        then ($servers | map(
+          if (type == "object") and ((.type // "") == "local") and ((.tag // "") == "local-dns")
+          then . + {prefer_go:true}
+          else .
+          end
+        ))
+        else $servers + [{type:"local",tag:"local-dns",prefer_go:true}]
+        end) |
       .inbounds = (((.inbounds // []) | map(select(((.tag // "") | startswith("route-bridge-in-")) | not))) + $bridges) |
       .outbounds = $outs |
       .route = (.route // {}) |
@@ -8940,6 +9057,10 @@ protocol_operations_management() {
 
 main() {
     check_root
+
+    # 兼容旧安装：已有 local-dns 缺少 prefer_go:true 时执行一次安全迁移。
+    # 失败不会覆盖旧配置，也不会阻断管理面板。
+    migrate_singbox_local_dns_prefer_go || true
 
     while true; do
         show_dashboard
