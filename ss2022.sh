@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.1-dev8
+# 当前版本: v1.8.1-dev9
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,14 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.8.1-dev9:
+#   - 服务器管理新增统一 IPv4 / IPv6 管理：地址优先级、业务出口地址族、应用地址族分流、协议族关闭/恢复
+#   - 新增全局业务出口：双栈 / 仅 IPv4 / 仅 IPv6；仅影响 vps-bootstrap 承载的分流业务流量
+#   - 应用地址族复用现有 OpenAI / Netflix / YouTube / Google / Telegram / MyTVSuper / Apple TV+ / TikTok 规则库
+#   - 应用可独立指定 默认 / 仅 IPv4 / 仅 IPv6；未单独指定时跟随全局业务出口地址族
+#   - 新增可逆 IPv4 / IPv6 公网关闭：保留地址配置，以独立 nftables 表阻断指定协议族并通过 systemd 持久化
+#   - 关闭当前 SSH 所使用的地址族会被拒绝；恢复双栈只删除本脚本自己的 nftables 规则
 #
 # v1.8.1-dev8:
 #   - 修复 sing-box 1.13.20 local DNS 在部分精简系统中依赖 systemd-resolved / resolve1 导致解析异常
@@ -292,11 +300,12 @@
 #   v1.8.1-dev6 落地地址族识别文案拆分
 #   v1.8.1-dev7 双栈落地服务器拨号地址族修复
 #   v1.8.1-dev8 sing-box local DNS prefer_go 安全迁移
+#   v1.8.1-dev9 IPv4 / IPv6 全局与应用级地址族管理
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.1-dev8"
+SCRIPT_VERSION="v1.8.1-dev9"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -358,6 +367,10 @@ STATE_FILE="${STATE_DIR}/state.json"
 ROUTING_FILE="${STATE_DIR}/routing.json"
 WARP_DEFAULT_PORT=40000
 WARP_MANAGED_MARKER="${STATE_DIR}/warp-package-managed"
+IP_FAMILY_MODE_FILE="${STATE_DIR}/ip-family-mode"
+IP_FAMILY_APPLY_HELPER="/usr/local/lib/ss2022/ip-family-apply.sh"
+IP_FAMILY_SERVICE_NAME="ss2022-ip-family"
+IP_FAMILY_SERVICE="/etc/systemd/system/${IP_FAMILY_SERVICE_NAME}.service"
 # ----------------------------- TG-BOT 流量监控 ---------------------------------
 TG_MONITOR_CONF="${STATE_DIR}/tg-monitor.conf"
 TG_MONITOR_STATE="${STATE_DIR}/tg-monitor.state"
@@ -3160,6 +3173,7 @@ routing_init_state() {
 {
   "version": 1,
   "default_outbound": "direct",
+  "global_ip_family": "default",
   "warp": {
     "proxy_host": "127.0.0.1",
     "proxy_port": ${WARP_DEFAULT_PORT},
@@ -3181,6 +3195,7 @@ EOF
     if ! jq --argjson port "$WARP_DEFAULT_PORT" '
       .version = (.version // 1) |
       .default_outbound = (.default_outbound // "direct") |
+      .global_ip_family = (.global_ip_family // "default") |
       .warp = (.warp // {}) |
       .warp.proxy_host = (.warp.proxy_host // "127.0.0.1") |
       .warp.proxy_port = (.warp.proxy_port // $port) |
@@ -3303,9 +3318,21 @@ routing_preset_rule_exists() {
     jq -e --arg service "$service" 'any(.rules[]?; .service==$service)' "$ROUTING_FILE" >/dev/null 2>&1
 }
 
+routing_resolve_outbound_ref() {
+    local ref="$1" resolved
+    if [[ "$ref" == "default" ]]; then
+        resolved=$(jq -r '.default_outbound // "direct"' "$ROUTING_FILE" 2>/dev/null)
+        [[ -n "$resolved" && "$resolved" != "default" ]] || resolved="direct"
+        echo "$resolved"
+    else
+        echo "$ref"
+    fi
+}
+
 routing_outbound_label() {
     local ref="$1" id name
     case "$ref" in
+        default) echo "DEFAULT（跟随全局默认出口）" ;;
         direct) echo "DIRECT（本 VPS）" ;;
         warp) echo "WARP（$(warp_egress_label)）" ;;
         chain:*)
@@ -3318,7 +3345,8 @@ routing_outbound_label() {
 }
 
 routing_tag_singbox() {
-    local ref="$1"
+    local ref
+    ref=$(routing_resolve_outbound_ref "$1")
     case "$ref" in
         direct) echo "direct" ;;
         warp) echo "route-warp" ;;
@@ -3328,7 +3356,8 @@ routing_tag_singbox() {
 }
 
 routing_tag_xray() {
-    local ref="$1" family="${2:-default}" base
+    local ref family="${2:-default}" base
+    ref=$(routing_resolve_outbound_ref "$1")
     case "$ref" in
         direct) base="route-direct" ;;
         warp) base="route-warp" ;;
@@ -3496,6 +3525,31 @@ warp_effective_rule_family() {
         ipv6_only) echo "ipv6" ;;
         *) echo "$requested" ;;
     esac
+}
+
+routing_global_ip_family() {
+    routing_init_state >/dev/null 2>&1 || { echo "default"; return; }
+    jq -r '.global_ip_family // "default"' "$ROUTING_FILE" 2>/dev/null
+}
+
+routing_ip_family_label() {
+    case "${1:-default}" in
+        ipv4) echo "仅 IPv4" ;;
+        ipv6) echo "仅 IPv6" ;;
+        *) echo "双栈 / 默认" ;;
+    esac
+}
+
+routing_effective_family() {
+    local requested="${1:-default}" ref="${2:-direct}" family global actual_ref
+    global=$(routing_global_ip_family)
+    family="$requested"
+    [[ "$family" == "default" ]] && family="$global"
+    actual_ref=$(routing_resolve_outbound_ref "$ref")
+    if [[ "$actual_ref" == "warp" ]]; then
+        family=$(warp_effective_rule_family "$family")
+    fi
+    echo "$family"
 }
 
 warp_choose_egress_family() {
@@ -3829,9 +3883,10 @@ routing_choose_ip_family() {
 
 build_singbox_routing_candidate() {
     local output="$1" outbounds='[]' rules='[{"action":"sniff","timeout":"300ms"}]' bridge_inbounds='[]' nodes count i node type tag ref default_ref default_tag port
-    local rule_count r rmatch family outbound domains suffix keywords ips part action
+    local rule_count r rmatch family outbound domains suffix keywords ips part action global_family global_strategy
     [[ -f "$SINGBOX_CONF" && -x "$SINGBOX_BIN" ]] || return 2
     routing_init_state || return 1
+    global_family=$(routing_global_ip_family)
 
     outbounds=$(jq -nc '[{"type":"direct","tag":"direct"}]')
     port=$(warp_proxy_port)
@@ -3879,9 +3934,8 @@ build_singbox_routing_candidate() {
     while [[ $i -lt $rule_count ]]; do
         r=$(jq -c ".rules[$i]" "$ROUTING_FILE")
         rmatch=$(routing_rule_match_json "$r")
-        family=$(jq -r '.ip_family // "default"' <<<"$r")
         outbound=$(jq -r '.outbound' <<<"$r")
-        [[ "$outbound" == "warp" ]] && family=$(warp_effective_rule_family "$family")
+        family=$(routing_effective_family "$(jq -r '.ip_family // "default"' <<<"$r")" "$outbound")
         action=$(routing_tag_singbox "$outbound")
         domains=$(jq -c '.domain' <<<"$rmatch")
         suffix=$(jq -c '.domain_suffix' <<<"$rmatch")
@@ -3912,6 +3966,11 @@ build_singbox_routing_candidate() {
         fi
         i=$((i+1))
     done
+
+    if [[ "$global_family" == "ipv4" || "$global_family" == "ipv6" ]]; then
+        [[ "$global_family" == "ipv4" ]] && global_strategy="ipv4_only" || global_strategy="ipv6_only"
+        rules=$(jq -c --arg strategy "$global_strategy" '. + [{action:"resolve",strategy:$strategy}]' <<<"$rules")
+    fi
 
     default_ref=$(jq -r '.default_outbound' "$ROUTING_FILE")
     default_tag=$(routing_tag_singbox "$default_ref")
@@ -4000,9 +4059,10 @@ ensure_existing_bridges_for_vless() {
 
 build_xray_routing_candidate() {
     local output="$1" outbounds='[]' rules='[]' nodes count i node ref family base match
-    local rule_count r rmatch domains suffix keywords ips xdomains tag part arr default_ref default_tag
+    local rule_count r rmatch domains suffix keywords ips xdomains tag part arr default_ref default_tag global_family default_family
     [[ -f "$XRAY_CONF" && -x "$XRAY_BIN" ]] || return 2
     routing_init_state || return 1
+    global_family=$(routing_global_ip_family)
 
     outbounds=$(jq -nc --argjson a "$(xray_direct_outbound route-direct default)" --argjson b "$(xray_direct_outbound route-direct-v4 ipv4)" --argjson c "$(xray_direct_outbound route-direct-v6 ipv6)" --argjson d "$(xray_warp_outbound route-warp default)" --argjson e "$(xray_warp_outbound route-warp-v4 ipv4)" --argjson f "$(xray_warp_outbound route-warp-v6 ipv6)" '[$a,$b,$c,$d,$e,$f]')
 
@@ -4025,9 +4085,8 @@ build_xray_routing_candidate() {
     while [[ $i -lt $rule_count ]]; do
         r=$(jq -c ".rules[$i]" "$ROUTING_FILE")
         rmatch=$(routing_rule_match_json "$r")
-        family=$(jq -r '.ip_family // "default"' <<<"$r")
         ref=$(jq -r '.outbound' <<<"$r")
-        [[ "$ref" == "warp" ]] && family=$(warp_effective_rule_family "$family")
+        family=$(routing_effective_family "$(jq -r '.ip_family // "default"' <<<"$r")" "$ref")
         tag=$(routing_tag_xray "$ref" "$family")
         xdomains='[]'
         domains=$(jq -c '.domain' <<<"$rmatch")
@@ -4047,7 +4106,8 @@ build_xray_routing_candidate() {
     done
 
     default_ref=$(jq -r '.default_outbound' "$ROUTING_FILE")
-    default_tag=$(routing_tag_xray "$default_ref" default)
+    default_family=$(routing_effective_family "$global_family" "$default_ref")
+    default_tag=$(routing_tag_xray "$default_ref" "$default_family")
     rules=$(jq -c --arg tag "$default_tag" '. + [{type:"field",network:"tcp,udp",outboundTag:$tag}]' <<<"$rules")
 
     jq --argjson outs "$outbounds" --argjson rules "$rules" '
@@ -4994,7 +5054,7 @@ routing_modify_rule() {
     case "$c" in
         1)
             routing_choose_outbound "请选择新出口：" || { rm -f "$tmp"; return 1; }
-            jq --argjson idx "$idx" --arg out "$SELECTED_OUTBOUND" '.rules[$idx].outbound=$out' "$ROUTING_FILE" > "$tmp" ;;
+            jq --argjson idx "$idx" --arg out "$SELECTED_OUTBOUND" '.rules[$idx].outbound=$out | .rules[$idx].family_only=false' "$ROUTING_FILE" > "$tmp" ;;
         2)
             SELECTED_OUTBOUND=$(jq -r ".rules[$idx].outbound" "$ROUTING_FILE")
             routing_choose_ip_family || { rm -f "$tmp"; return 1; }
@@ -5046,6 +5106,147 @@ routing_move_rule() {
     routing_commit_state_candidate "$tmp"
 }
 
+routing_global_ip_family_management() {
+    local c family tmp
+    while true; do
+        routing_init_state || return 1
+        clear
+        echo -e "${CYAN}════════════ 全局业务出口地址族 ════════════${PLAIN}"
+        echo "当前模式: $(routing_ip_family_label "$(routing_global_ip_family)")"
+        echo "说明: 仅控制 vps-bootstrap 承载的 SS2022 / ShadowTLS / VLESS 分流业务出口，不关闭系统网卡地址。"
+        echo "应用单独指定 IPv4 / IPv6 时，应用规则优先于这里的全局模式。"
+        echo ""
+        echo "  1. 双栈 / 默认"
+        echo "  2. 仅 IPv4"
+        echo "  3. 仅 IPv6"
+        echo "  0. 返回"
+        read -rp "请选择 [0-3]: " c
+        case "$c" in
+            1) family="default" ;;
+            2) family="ipv4" ;;
+            3) family="ipv6" ;;
+            0) return 0 ;;
+            *) sleep 1; continue ;;
+        esac
+
+        if ! server_tool_ip_family_mode_allows "$family"; then
+            echo -e "${RED}[冲突] 当前系统协议族关闭策略不允许使用 $(routing_ip_family_label "$family")。${PLAIN}"
+            pause
+            continue
+        fi
+
+        tmp=$(mktemp "${STATE_DIR}/routing.json.tmp.XXXXXX") || return 1
+        jq --arg fam "$family" '.global_ip_family=$fam' "$ROUTING_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+        if routing_commit_state_candidate "$tmp"; then
+            echo -e "${GREEN}✔ 全局业务出口地址族已设置为：$(routing_ip_family_label "$family")。${PLAIN}"
+        else
+            echo -e "${RED}[错误] 地址族配置应用失败，已恢复上一版配置。${PLAIN}"
+        fi
+        pause
+    done
+}
+
+routing_app_family_rule_index() {
+    local service="$1"
+    jq -r --arg service "$service" '.rules | to_entries[]? | select(.value.service==$service) | .key' "$ROUTING_FILE" 2>/dev/null | head -n1
+}
+
+routing_app_family_list() {
+    local service idx rule fam out i=1
+    printf '%-4s %-22s %-28s %-12s\n' "序号" "应用 / 服务" "出口" "地址族"
+    printf '%s\n' "----------------------------------------------------------------------------"
+    for service in openai netflix youtube google telegram mytvsuper appletv tiktok; do
+        idx=$(routing_app_family_rule_index "$service")
+        if [[ -n "$idx" ]]; then
+            rule=$(jq -c --argjson idx "$idx" '.rules[$idx]' "$ROUTING_FILE")
+            fam=$(jq -r '.ip_family // "default"' <<<"$rule")
+            out=$(jq -r '.outbound // "default"' <<<"$rule")
+        else
+            fam="default"
+            out="default"
+        fi
+        printf '%-4s %-22s %-28s %-12s\n' "$i" "$(routing_service_name "$service")" "$(routing_outbound_label "$out")" "$(routing_ip_family_label "$fam")"
+        i=$((i+1))
+    done
+}
+
+routing_set_app_family() {
+    local service="$1" family="$2" idx tmp id name rule family_only
+    routing_init_state || return 1
+
+    if ! server_tool_ip_family_mode_allows "$family"; then
+        echo -e "${RED}[冲突] 当前系统协议族关闭策略不允许使用 $(routing_ip_family_label "$family")。${PLAIN}"
+        return 1
+    fi
+
+    idx=$(routing_app_family_rule_index "$service")
+    tmp=$(mktemp "${STATE_DIR}/routing.json.tmp.XXXXXX") || return 1
+
+    if [[ -z "$idx" ]]; then
+        if [[ "$family" == "default" ]]; then
+            rm -f "$tmp"
+            echo -e "${GREEN}✔ $(routing_service_name "$service") 已经跟随全局地址族。${PLAIN}"
+            return 0
+        fi
+        id="r$(date +%s)${RANDOM}"
+        name=$(routing_service_name "$service")
+        rule=$(jq -nc --arg id "$id" --arg name "$name" --arg service "$service" --arg fam "$family" '{id:$id,name:$name,service:$service,custom_type:"",values:[],outbound:"default",ip_family:$fam,family_only:true}')
+        jq --argjson r "$rule" '.rules += [$r]' "$ROUTING_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+    else
+        family_only=$(jq -r --argjson idx "$idx" '.rules[$idx].family_only // false' "$ROUTING_FILE")
+        if [[ "$family" == "default" && "$family_only" == "true" ]]; then
+            jq --argjson idx "$idx" 'del(.rules[$idx])' "$ROUTING_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+        else
+            jq --argjson idx "$idx" --arg fam "$family" '.rules[$idx].ip_family=$fam' "$ROUTING_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+        fi
+    fi
+
+    routing_commit_state_candidate "$tmp"
+}
+
+routing_app_family_management() {
+    local c service family fc
+    while true; do
+        routing_init_state || return 1
+        clear
+        echo -e "${CYAN}════════════ 应用 IPv4 / IPv6 分流 ════════════${PLAIN}"
+        echo "未单独指定的应用跟随全局业务出口地址族。"
+        echo "已有分流规则会保留原出口，只修改其 IP 地址族；新建的地址族规则默认跟随全局默认出口。"
+        echo ""
+        routing_app_family_list
+        echo ""
+        echo "  9. 自定义域名 / IP（进入现有分流规则管理）"
+        echo "  0. 返回"
+        read -rp "请选择应用 [0-9]: " c
+        case "$c" in
+            1) service=openai ;; 2) service=netflix ;; 3) service=youtube ;; 4) service=google ;;
+            5) service=telegram ;; 6) service=mytvsuper ;; 7) service=appletv ;; 8) service=tiktok ;;
+            9) routing_rule_management; continue ;;
+            0) return 0 ;;
+            *) sleep 1; continue ;;
+        esac
+
+        echo ""
+        echo "$(routing_service_name "$service") 地址族："
+        echo "  1. 默认（跟随全局）"
+        echo "  2. 仅 IPv4"
+        echo "  3. 仅 IPv6"
+        echo "  0. 取消"
+        read -rp "请选择 [0-3]: " fc
+        case "$fc" in
+            1) family=default ;;
+            2) family=ipv4 ;;
+            3) family=ipv6 ;;
+            0) continue ;;
+            *) continue ;;
+        esac
+        if routing_set_app_family "$service" "$family"; then
+            echo -e "${GREEN}✔ $(routing_service_name "$service") 地址族已设置为：$(routing_ip_family_label "$family")。${PLAIN}"
+        fi
+        pause
+    done
+}
+
 routing_rule_management() {
     while true; do
         clear
@@ -5084,6 +5285,7 @@ routing_show_config() {
     echo "【默认出口】"
     def=$(jq -r '.default_outbound' "$ROUTING_FILE")
     echo "  $(routing_outbound_label "$def")"
+    echo "  地址族: $(routing_ip_family_label "$(routing_global_ip_family)")"
     echo ""
     echo "【WARP】"
     if warp_proxy_ready; then echo "  Running / 127.0.0.1:$(warp_proxy_port)"; else echo "  未连接"; fi
@@ -5096,8 +5298,14 @@ routing_show_config() {
 }
 
 routing_test_exit_ref() {
-    local ref="$1" family="${2:-default}" label out="" rc=1 url
-    label=$(routing_outbound_label "$ref")
+    local ref="$1" family="${2:-default}" label out="" rc=1 url requested_ref
+    requested_ref="$ref"
+    ref=$(routing_resolve_outbound_ref "$ref")
+    if [[ "$requested_ref" == "default" ]]; then
+        label="DEFAULT → $(routing_outbound_label "$ref")"
+    else
+        label=$(routing_outbound_label "$ref")
+    fi
     url=$(ip_echo_url_for_family "$family")
     if [[ "$ref" == "direct" ]]; then
         if [[ "$family" == "ipv4" ]]; then out=$(curl -4fsS --connect-timeout 6 --max-time 10 "$url" 2>/dev/null) && rc=0
@@ -5160,9 +5368,9 @@ routing_test_effect() {
         while [[ $i -lt $rule_count ]]; do
             r=$(jq -c ".rules[$i]" "$ROUTING_FILE")
             ref=$(jq -r '.outbound' <<<"$r")
-            fam=$(jq -r '.ip_family // "default"' <<<"$r")
+            fam=$(routing_effective_family "$(jq -r '.ip_family // "default"' <<<"$r")" "$ref")
             key="${ref}@${fam}"
-            echo "$(jq -r '.name' <<<"$r") → $(routing_outbound_label "$ref") / ${fam}"
+            echo "$(jq -r '.name' <<<"$r") → $(routing_outbound_label "$ref") / $(routing_ip_family_label "$fam")"
             if [[ "$tested" != *"|${key}|"* ]]; then
                 routing_test_exit_ref "$ref" "$fam" || true
                 tested+="${key}|"
@@ -5191,6 +5399,7 @@ routing_management() {
         echo "Snell v5：保持官方 snell-server，分流请使用 Surge Rules"
         echo ""
         echo "默认出口 : $(routing_outbound_label "$def")"
+        echo "地址族   : $(routing_ip_family_label "$(routing_global_ip_family)")"
         if [[ "$warp_state" == "Running" ]]; then
             warp_detect_direct_profile
             echo "WARP     : ${warp_state} / $(warp_profile_label "$WARP_PROFILE")"
@@ -6215,7 +6424,9 @@ full_uninstall() {
     [[ "$yes" == "DELETE" ]] || { echo "已取消。"; sleep 1; return; }
 
     systemctl disable --now sing-box "$XRAY_SERVICE_NAME" snell-v5 "$REALM_SERVICE_NAME" ipv6-keepalive.timer >/dev/null 2>&1 || true
+    systemctl disable --now "$IP_FAMILY_SERVICE_NAME" >/dev/null 2>&1 || true
     systemctl stop ipv6-keepalive.service >/dev/null 2>&1 || true
+    command -v nft >/dev/null 2>&1 && nft delete table inet ss2022_ip_family >/dev/null 2>&1 || true
 
     if [[ -f "$WARP_MANAGED_MARKER" ]] && command -v warp-cli >/dev/null 2>&1; then
         warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
@@ -6235,6 +6446,7 @@ full_uninstall() {
         "$XRAY_SERVICE" \
         "$SNELL_SERVICE" \
         "$REALM_SERVICE" \
+        "$IP_FAMILY_SERVICE" \
         /etc/systemd/system/ipv6-keepalive.service \
         /etc/systemd/system/ipv6-keepalive.timer \
         "$FORCE_IPV6_CONF"
@@ -7557,9 +7769,9 @@ server_tool_dns_management() {
 
 server_tool_ip_priority_status() {
     if grep -q '^precedence ::ffff:0:0/96[[:space:]]\+100[[:space:]]*# ss2022-prefer-ipv4$' /etc/gai.conf 2>/dev/null; then
-        echo "当前模式: IPv4 优先"
+        echo "IPv4 优先"
     else
-        echo "当前模式: 系统默认（通常 IPv6 优先）"
+        echo "系统默认（通常 IPv6 优先）"
     fi
 }
 
@@ -7568,7 +7780,7 @@ server_tool_ip_priority_management() {
     while true; do
         clear
         echo -e "${CYAN}════════════ IPv4 / IPv6 优先级 ════════════${PLAIN}"
-        server_tool_ip_priority_status
+        echo "当前模式: $(server_tool_ip_priority_status)"
         echo ""
         echo "  1. 设置 IPv4 优先"
         echo "  2. 恢复系统默认优先级"
@@ -7587,6 +7799,259 @@ server_tool_ip_priority_management() {
                 echo -e "${GREEN}✔ 已恢复系统默认地址优先级。${PLAIN}"
                 pause
                 ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+server_tool_ip_family_mode() {
+    local mode="dual"
+    if [[ -f "$IP_FAMILY_MODE_FILE" ]]; then
+        mode=$(tr -d '[:space:]' < "$IP_FAMILY_MODE_FILE" 2>/dev/null)
+    fi
+    case "$mode" in
+        dual|ipv4-only|ipv6-only) echo "$mode" ;;
+        *) echo "dual" ;;
+    esac
+}
+
+server_tool_ip_family_mode_label() {
+    case "${1:-dual}" in
+        ipv4-only) echo "仅 IPv4（IPv6 已关闭）" ;;
+        ipv6-only) echo "仅 IPv6（IPv4 已关闭）" ;;
+        *) echo "IPv4 + IPv6 双栈" ;;
+    esac
+}
+
+server_tool_ip_family_mode_allows() {
+    local family="${1:-default}" mode
+    [[ "$family" == "default" ]] && return 0
+    mode=$(server_tool_ip_family_mode)
+    case "$mode:$family" in
+        dual:ipv4|dual:ipv6|ipv4-only:ipv4|ipv6-only:ipv6) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+server_tool_current_ssh_family() {
+    local peer=""
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then
+        peer=${SSH_CONNECTION%% *}
+    elif [[ -n "${SSH_CLIENT:-}" ]]; then
+        peer=${SSH_CLIENT%% *}
+    fi
+    [[ -n "$peer" ]] || { echo "unknown"; return; }
+    if [[ "$peer" == *:* ]]; then echo "ipv6"; else echo "ipv4"; fi
+}
+
+server_tool_native_family_ready() {
+    local family="$1"
+    case "$family" in
+        ipv4)
+            ip -4 addr show scope global 2>/dev/null | grep -q 'inet ' || return 1
+            ip -4 route show default 2>/dev/null | grep -q '^default ' || return 1
+            curl -4fsS --connect-timeout 4 --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q '^ip='
+            ;;
+        ipv6)
+            ip -6 addr show scope global 2>/dev/null | grep -q 'inet6 ' || return 1
+            ip -6 route show default 2>/dev/null | grep -q '^default ' || return 1
+            curl -6fsS --connect-timeout 4 --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q '^ip='
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+server_tool_ip_family_policy_conflict() {
+    local mode="$1" blocked="" global default_ref effective count i r ref fam name found=0
+    [[ "$mode" == "ipv4-only" ]] && blocked="ipv6"
+    [[ "$mode" == "ipv6-only" ]] && blocked="ipv4"
+    [[ -n "$blocked" ]] || return 1
+
+    routing_init_state || return 1
+    global=$(routing_global_ip_family)
+    default_ref=$(jq -r '.default_outbound // "direct"' "$ROUTING_FILE")
+    effective=$(routing_effective_family "$global" "$default_ref")
+    if [[ "$effective" == "$blocked" ]]; then
+        echo -e "${RED}[冲突] 全局默认出口当前固定为 $(routing_ip_family_label "$blocked")。${PLAIN}"
+        found=1
+    fi
+
+    count=$(jq '.rules|length' "$ROUTING_FILE")
+    i=0
+    while [[ $i -lt $count ]]; do
+        r=$(jq -c ".rules[$i]" "$ROUTING_FILE")
+        ref=$(jq -r '.outbound // "default"' <<<"$r")
+        fam=$(routing_effective_family "$(jq -r '.ip_family // "default"' <<<"$r")" "$ref")
+        if [[ "$fam" == "$blocked" ]]; then
+            name=$(jq -r '.name // "未命名规则"' <<<"$r")
+            echo -e "${RED}[冲突] 规则 ${name} 当前固定为 $(routing_ip_family_label "$blocked")。${PLAIN}"
+            found=1
+        fi
+        i=$((i+1))
+    done
+
+    [[ $found -eq 1 ]]
+}
+
+server_tool_install_ip_family_guard() {
+    ensure_test_dependency nft nftables || {
+        echo -e "${RED}[错误] nftables 不可用，无法安全管理 IPv4 / IPv6 关闭状态。${PLAIN}"
+        return 1
+    }
+
+    mkdir -p "$STATE_DIR" /usr/local/lib/ss2022 || return 1
+    chmod 700 "$STATE_DIR"
+
+    cat > "$IP_FAMILY_APPLY_HELPER" <<'EOF'
+#!/bin/bash
+set -u
+STATE_FILE="/etc/ss2022/ip-family-mode"
+TABLE="ss2022_ip_family"
+mode="dual"
+[[ -f "$STATE_FILE" ]] && mode=$(tr -d '[:space:]' < "$STATE_FILE" 2>/dev/null)
+
+command -v nft >/dev/null 2>&1 || exit 1
+nft delete table inet "$TABLE" >/dev/null 2>&1 || true
+
+case "$mode" in
+  dual) exit 0 ;;
+  ipv4-only|ipv6-only) ;;
+  *) exit 1 ;;
+esac
+
+nft add table inet "$TABLE"
+nft 'add chain inet ss2022_ip_family input { type filter hook input priority -20; policy accept; }'
+nft 'add chain inet ss2022_ip_family output { type filter hook output priority -20; policy accept; }'
+
+if [[ "$mode" == "ipv4-only" ]]; then
+    nft 'add rule inet ss2022_ip_family input meta nfproto ipv6 iifname != "lo" drop'
+    nft 'add rule inet ss2022_ip_family output meta nfproto ipv6 oifname != "lo" drop'
+else
+    nft 'add rule inet ss2022_ip_family input meta nfproto ipv4 iifname != "lo" drop'
+    nft 'add rule inet ss2022_ip_family output meta nfproto ipv4 oifname != "lo" drop'
+fi
+EOF
+    chmod 700 "$IP_FAMILY_APPLY_HELPER"
+
+    cat > "$IP_FAMILY_SERVICE" <<EOF
+[Unit]
+Description=vps-bootstrap IPv4/IPv6 family guard
+After=network-online.target
+Wants=network-online.target
+Before=sing-box.service ${XRAY_SERVICE_NAME}.service
+
+[Service]
+Type=oneshot
+ExecStart=${IP_FAMILY_APPLY_HELPER}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 644 "$IP_FAMILY_SERVICE"
+    systemctl daemon-reload || return 1
+    systemctl enable "$IP_FAMILY_SERVICE_NAME" >/dev/null 2>&1 || return 1
+}
+
+server_tool_set_ip_family_mode() {
+    local new_mode="$1" old_mode ssh_family keep_family label
+    old_mode=$(server_tool_ip_family_mode)
+    [[ "$new_mode" != "$old_mode" ]] || {
+        echo -e "${GREEN}当前已经是：$(server_tool_ip_family_mode_label "$new_mode")。${PLAIN}"
+        return 0
+    }
+
+    if [[ "$old_mode" != "dual" && "$new_mode" != "dual" ]]; then
+        echo -e "${YELLOW}[提示] 请先恢复 IPv4 + IPv6 双栈，再切换到另一单地址族模式。${PLAIN}"
+        return 1
+    fi
+
+    case "$new_mode" in
+        ipv4-only) keep_family="ipv4" ;;
+        ipv6-only) keep_family="ipv6" ;;
+        dual) keep_family="" ;;
+        *) return 1 ;;
+    esac
+
+    if [[ -n "$keep_family" ]]; then
+        ssh_family=$(server_tool_current_ssh_family)
+        if [[ "$ssh_family" != "unknown" && "$ssh_family" != "$keep_family" ]]; then
+            echo -e "${RED}[拒绝] 当前 SSH 会话正在使用 ${ssh_family^^}，不能关闭该地址族。${PLAIN}"
+            echo "请先用 ${keep_family^^} 地址重新建立 SSH 会话后再操作。"
+            return 1
+        fi
+
+        if ! server_tool_native_family_ready "$keep_family"; then
+            echo -e "${RED}[拒绝] 未确认 ${keep_family^^} 原生公网连接可用，不能关闭另一地址族。${PLAIN}"
+            return 1
+        fi
+
+        if server_tool_ip_family_policy_conflict "$new_mode"; then
+            echo -e "${RED}[拒绝] 请先调整上面的全局/应用地址族规则，再关闭协议族。${PLAIN}"
+            return 1
+        fi
+    fi
+
+    server_tool_install_ip_family_guard || return 1
+    printf '%s
+' "$new_mode" > "$IP_FAMILY_MODE_FILE" || return 1
+    chmod 600 "$IP_FAMILY_MODE_FILE"
+
+    if ! systemctl restart "$IP_FAMILY_SERVICE_NAME"; then
+        echo -e "${RED}[错误] 新协议族策略应用失败，正在恢复。${PLAIN}"
+        printf '%s
+' "$old_mode" > "$IP_FAMILY_MODE_FILE"
+        systemctl restart "$IP_FAMILY_SERVICE_NAME" >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    label=$(server_tool_ip_family_mode_label "$new_mode")
+    echo -e "${GREEN}✔ 已切换为：${label}。${PLAIN}"
+    if [[ "$new_mode" != "dual" ]]; then
+        echo -e "${YELLOW}说明: IP 地址本身不会被删除；本脚本通过独立 nftables 表阻断已关闭地址族的公网收发，因此可以安全恢复。${PLAIN}"
+    fi
+}
+
+server_tool_ip_family_status() {
+    local v4="无" v6="无" mode global
+    v4=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | head -n1)
+    v6=$(ip -6 -o addr show scope global 2>/dev/null | awk '{print $4}' | head -n1)
+    v4=${v4:-无}
+    v6=${v6:-无}
+    mode=$(server_tool_ip_family_mode)
+    global=$(routing_global_ip_family)
+    echo "  IPv4 地址     : $v4"
+    echo "  IPv6 地址     : $v6"
+    echo "  系统协议族状态 : $(server_tool_ip_family_mode_label "$mode")"
+    echo "  业务出口地址族 : $(routing_ip_family_label "$global")"
+    echo "  地址优先级     : $(server_tool_ip_priority_status)"
+}
+
+server_tool_ip_family_management() {
+    local c
+    while true; do
+        clear
+        routing_init_state >/dev/null 2>&1 || true
+        echo -e "${CYAN}════════════ IPv4 / IPv6 管理 ════════════${PLAIN}"
+        server_tool_ip_family_status
+        echo ""
+        echo "  1. IPv4 / IPv6 地址优先级"
+        echo "  2. 全局业务出口地址族（双栈 / 仅 IPv4 / 仅 IPv6）"
+        echo "  3. 应用地址族分流（YouTube / ChatGPT / MyTVSuper 等）"
+        echo "  ------------------------------------------"
+        echo "  4. 关闭 IPv4（仅保留 IPv6 公网通信）"
+        echo "  5. 关闭 IPv6（仅保留 IPv4 公网通信）"
+        echo "  6. 恢复 IPv4 + IPv6 双栈公网通信"
+        echo "  0. 返回"
+        read -rp "请选择 [0-6]: " c
+        case "$c" in
+            1) server_tool_ip_priority_management ;;
+            2) routing_global_ip_family_management ;;
+            3) routing_app_family_management ;;
+            4) server_tool_set_ip_family_mode ipv6-only; pause ;;
+            5) server_tool_set_ip_family_mode ipv4-only; pause ;;
+            6) server_tool_set_ip_family_mode dual; pause ;;
             0) return ;;
             *) sleep 1 ;;
         esac
@@ -8774,7 +9239,7 @@ server_management_tools() {
         echo "  5. Swap 虚拟内存"
         echo "  6. BBR 加速"
         echo "  7. DNS 管理"
-        echo "  8. IPv4 / IPv6 优先级"
+        echo "  8. IPv4 / IPv6 管理"
         echo "  9. 系统时区"
         echo " 10. SSH 端口管理"
         echo " 11. 重启服务器"
@@ -8789,7 +9254,7 @@ server_management_tools() {
             5) server_tool_swap_management ;;
             6) server_tool_bbr_management ;;
             7) server_tool_dns_management ;;
-            8) server_tool_ip_priority_management ;;
+            8) server_tool_ip_family_management ;;
             9) server_tool_timezone_management ;;
             10) server_tool_ssh_management ;;
             11) server_tool_reboot ;;
