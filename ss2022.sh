@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.1-dev9
+# 当前版本: v1.8.1-dev10
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,13 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.8.1-dev10:
+#   - 应用 IPv4 / IPv6 分流新增“一键地址族出口测试”，无需手工安装 tcpdump
+#   - 测试会读取应用当前规则、全局地址族与实际出口，计算最终生效的 IPv4 / IPv6 策略
+#   - DIRECT / WARP / Shadowsocks / SOCKS5 落地均复用现有出口测试链路，直接回显最终出口 IP
+#   - 应用固定 IPv4 / IPv6 时验证对应地址族；双栈/默认模式会分别探测 IPv4 与 IPv6 可用性
+#   - 落地节点场景验证的是落地后的最终业务出口地址族，不把“主 VPS -> 落地”的接入地址族混为业务出口
 #
 # v1.8.1-dev9:
 #   - 服务器管理新增统一 IPv4 / IPv6 管理：地址优先级、业务出口地址族、应用地址族分流、协议族关闭/恢复
@@ -305,7 +312,7 @@
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.1-dev9"
+SCRIPT_VERSION="v1.8.1-dev10"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -5204,6 +5211,80 @@ routing_set_app_family() {
     routing_commit_state_candidate "$tmp"
 }
 
+routing_app_family_test_one() {
+    local service="$1" idx rule configured_family ref effective_family resolved_ref name rc4=1 rc6=1
+    routing_init_state || return 1
+
+    name=$(routing_service_name "$service")
+    idx=$(routing_app_family_rule_index "$service")
+    if [[ -n "$idx" ]]; then
+        rule=$(jq -c --argjson idx "$idx" '.rules[$idx]' "$ROUTING_FILE")
+        configured_family=$(jq -r '.ip_family // "default"' <<<"$rule")
+        ref=$(jq -r '.outbound // "default"' <<<"$rule")
+    else
+        configured_family="default"
+        ref="default"
+    fi
+
+    effective_family=$(routing_effective_family "$configured_family" "$ref")
+    resolved_ref=$(routing_resolve_outbound_ref "$ref")
+
+    echo ""
+    echo -e "${CYAN}════════════ ${name} 地址族出口测试 ════════════${PLAIN}"
+    echo "规则设置     : $(routing_ip_family_label "$configured_family")"
+    echo "全局地址族   : $(routing_ip_family_label "$(routing_global_ip_family)")"
+    echo "实际生效     : $(routing_ip_family_label "$effective_family")"
+    echo "规则出口     : $(routing_outbound_label "$ref")"
+    if [[ "$ref" == "default" ]]; then
+        echo "实际出口     : $(routing_outbound_label "$resolved_ref")"
+    fi
+    echo ""
+
+    if ! server_tool_ip_family_mode_allows "$effective_family"; then
+        echo -e "${RED}[冲突] 当前系统协议族状态不允许使用 $(routing_ip_family_label "$effective_family")。${PLAIN}"
+        return 1
+    fi
+
+    case "$effective_family" in
+        ipv4)
+            echo -e "${YELLOW}>> 正在通过该应用实际出口验证 IPv4...${PLAIN}"
+            if routing_test_exit_ref "$ref" ipv4; then
+                echo -e "${GREEN}✔ ${name}: IPv4 出口验证通过。${PLAIN}"
+                return 0
+            fi
+            echo -e "${RED}✘ ${name}: 规则要求 IPv4，但 IPv4 出口验证失败。${PLAIN}"
+            return 1
+            ;;
+        ipv6)
+            echo -e "${YELLOW}>> 正在通过该应用实际出口验证 IPv6...${PLAIN}"
+            if routing_test_exit_ref "$ref" ipv6; then
+                echo -e "${GREEN}✔ ${name}: IPv6 出口验证通过。${PLAIN}"
+                return 0
+            fi
+            echo -e "${RED}✘ ${name}: 规则要求 IPv6，但 IPv6 出口验证失败。${PLAIN}"
+            return 1
+            ;;
+        *)
+            echo -e "${YELLOW}当前未强制单一地址族，分别探测该出口的 IPv4 / IPv6。${PLAIN}"
+            routing_test_exit_ref "$ref" ipv4 && rc4=0
+            routing_test_exit_ref "$ref" ipv6 && rc6=0
+            echo ""
+            if [[ $rc4 -eq 0 && $rc6 -eq 0 ]]; then
+                echo -e "${GREEN}✔ ${name}: 当前出口 IPv4 / IPv6 均可用。${PLAIN}"
+                return 0
+            elif [[ $rc4 -eq 0 ]]; then
+                echo -e "${YELLOW}○ ${name}: 当前出口仅检测到 IPv4 可用；规则本身未强制地址族。${PLAIN}"
+                return 0
+            elif [[ $rc6 -eq 0 ]]; then
+                echo -e "${YELLOW}○ ${name}: 当前出口仅检测到 IPv6 可用；规则本身未强制地址族。${PLAIN}"
+                return 0
+            fi
+            echo -e "${RED}✘ ${name}: IPv4 / IPv6 出口均验证失败。${PLAIN}"
+            return 1
+            ;;
+    esac
+}
+
 routing_app_family_management() {
     local c service family fc
     while true; do
@@ -5231,12 +5312,18 @@ routing_app_family_management() {
         echo "  1. 默认（跟随全局）"
         echo "  2. 仅 IPv4"
         echo "  3. 仅 IPv6"
+        echo "  4. 测试当前地址族出口"
         echo "  0. 取消"
-        read -rp "请选择 [0-3]: " fc
+        read -rp "请选择 [0-4]: " fc
         case "$fc" in
             1) family=default ;;
             2) family=ipv4 ;;
             3) family=ipv6 ;;
+            4)
+                routing_app_family_test_one "$service" || true
+                pause
+                continue
+                ;;
             0) continue ;;
             *) continue ;;
         esac
