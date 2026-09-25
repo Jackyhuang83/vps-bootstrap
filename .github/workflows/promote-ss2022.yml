@@ -5,7 +5,7 @@ on:
     branches:
       - main
     paths:
-      - "ss2022.next.sh"
+      - "ss2022.next.v*.sh"
   workflow_dispatch:
 
 permissions:
@@ -22,7 +22,6 @@ jobs:
     timeout-minutes: 10
 
     env:
-      CANDIDATE: ss2022.next.sh
       TARGET: ss2022.sh
 
     steps:
@@ -31,7 +30,72 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Validate identity and versions
+      - name: Select latest candidate
+        shell: python
+        run: |
+          import glob, os, re, sys
+
+          filename_re = re.compile(r'^ss2022\.next\.(v\d+\.\d+\.\d+(?:-dev\d+)?)\.sh$')
+          version_re = re.compile(r'^v(\d+)\.(\d+)\.(\d+)(?:-dev(\d+))?$')
+
+          def parse(v):
+              m = version_re.fullmatch(v)
+              if not m:
+                  raise ValueError(v)
+              a, b, c = map(int, m.group(1, 2, 3))
+              d = m.group(4)
+              return (a, b, c, 1, 0) if d is None else (a, b, c, 0, int(d))
+
+          files = sorted(glob.glob('ss2022.next.v*.sh'))
+          if not files:
+              print('::error::No versioned candidate found (expected ss2022.next.vX.Y.Z[-devN].sh)')
+              sys.exit(1)
+
+          valid = []
+          invalid = []
+          for path in files:
+              name = os.path.basename(path)
+              m = filename_re.fullmatch(name)
+              if not m:
+                  invalid.append(name)
+                  continue
+              valid.append((parse(m.group(1)), m.group(1), name))
+
+          if invalid:
+              print('::error::Invalid candidate filename(s): ' + ', '.join(invalid))
+              sys.exit(1)
+          if not valid:
+              print('::error::No valid versioned candidate found')
+              sys.exit(1)
+
+          _, file_version, candidate = max(valid, key=lambda x: x[0])
+
+          with open(candidate, 'r', encoding='utf-8') as fh:
+              text = fh.read()
+
+          m_script = re.search(r'^SCRIPT_VERSION="([^"]+)"$', text, re.M)
+          m_header = re.search(r'^# 当前版本: (.+)$', text, re.M)
+          if not m_script or not m_header:
+              print('::error::Candidate version markers missing')
+              sys.exit(1)
+
+          script_version = m_script.group(1).strip()
+          header_version = m_header.group(1).strip()
+          if script_version != file_version:
+              print(f'::error::Filename/script version mismatch: {file_version} != {script_version}')
+              sys.exit(1)
+          if header_version != script_version:
+              print(f'::error::Header/SCRIPT_VERSION mismatch: {header_version} != {script_version}')
+              sys.exit(1)
+
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
+              env.write(f'CANDIDATE={candidate}\n')
+              env.write(f'NEW_VERSION={script_version}\n')
+
+          print(f'Selected candidate: {candidate}')
+          print(f'Candidate version: {script_version}')
+
+      - name: Validate identity and current version
         shell: bash
         run: |
           set -euo pipefail
@@ -42,16 +106,11 @@ jobs:
           grep -qx '# 项目名称: vps-bootstrap / ss2022.sh' "$CANDIDATE"
 
           OLD_VERSION="$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' "$TARGET" | head -n1)"
-          NEW_VERSION="$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' "$CANDIDATE" | head -n1)"
-          HEADER_VERSION="$(sed -n 's/^# 当前版本: \(.*\)$/\1/p' "$CANDIDATE" | head -n1)"
-
           version_re='^v[0-9]+\.[0-9]+\.[0-9]+(-dev[0-9]+)?$'
           [[ "$OLD_VERSION" =~ $version_re ]] || { echo "::error::Invalid current version"; exit 1; }
           [[ "$NEW_VERSION" =~ $version_re ]] || { echo "::error::Invalid candidate version"; exit 1; }
-          [[ "$HEADER_VERSION" == "$NEW_VERSION" ]] || { echo "::error::Header/SCRIPT_VERSION mismatch"; exit 1; }
 
           echo "OLD_VERSION=$OLD_VERSION" >> "$GITHUB_ENV"
-          echo "NEW_VERSION=$NEW_VERSION" >> "$GITHUB_ENV"
 
       - name: Require newer version
         shell: python
@@ -60,9 +119,9 @@ jobs:
           p = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:-dev(\d+))?$")
           def parse(v):
               m = p.fullmatch(v)
-              a,b,c = map(int, m.group(1,2,3))
+              a, b, c = map(int, m.group(1, 2, 3))
               d = m.group(4)
-              return (a,b,c,1,0) if d is None else (a,b,c,0,int(d))
+              return (a, b, c, 1, 0) if d is None else (a, b, c, 0, int(d))
           old_v = os.environ["OLD_VERSION"]
           new_v = os.environ["NEW_VERSION"]
           if parse(new_v) <= parse(old_v):
@@ -115,6 +174,7 @@ jobs:
             echo ""
             echo "- Current: \`$OLD_VERSION\`"
             echo "- Candidate: \`$NEW_VERSION\`"
+            echo "- Candidate file: \`$CANDIDATE\`"
             echo "- Current bytes: $OLD_BYTES"
             echo "- Candidate bytes: $NEW_BYTES"
           } >> "$GITHUB_STEP_SUMMARY"
