@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev6
+# 当前版本: v1.9.0-dev7
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,14 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev7:
+#   - 修正“IPv4 / 双栈”旧菜单语义：0.0.0.0 只作为 IPv4 入站，不再误标为双栈
+#   - SS2022 / ShadowTLS 新增真正的 IPv4 + IPv6 双栈入站模式，监听 :: 并要求 bindv6only=0
+#   - 双栈模式部署前同时验证公网 IPv4、公网 IPv6 与内核 IPv4-mapped IPv6 监听能力
+#   - 双栈节点自动保存 IPv4 / IPv6 两个服务器地址
+#   - SS2022 / ShadowTLS 部署成功和“查看节点配置”时同时输出 IPv4 节点与 IPv6 节点
+#   - IPv6 URI 自动使用方括号格式；IPv4/IPv6 两个节点共用同一端口、密钥与服务端实例
 #
 # v1.9.0-dev6:
 #   - 修复 Alpine 3.21 apk-tools v2 无法读取上游 apk mkpkg 生成的 APK v3，导致 IO ERROR
@@ -368,11 +376,12 @@
 #   v1.9.0-dev4 Alpine sing-box musl 构建修复
 #   v1.9.0-dev5 Alpine sing-box 原生 APK 安装
 #   v1.9.0-dev6 Alpine 3.21 gcompat + 完整 release 归档兼容
+#   v1.9.0-dev7 SS2022/ShadowTLS IPv4+IPv6 双栈入站 / 双节点输出
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev6"
+SCRIPT_VERSION="v1.9.0-dev7"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -469,6 +478,8 @@ METHOD=""
 KEY_BYTES=""
 SS_KEY=""
 SERVER_HOST=""
+SERVER_HOST_V4=""
+SERVER_HOST_V6=""
 NETWORK_MODE=""
 LISTEN_ADDR=""
 NODE_NAME=""
@@ -1286,19 +1297,64 @@ disable_keepalive_for_ipv4() {
         service_disable_now ss2022-ipv6-keepalive
     fi
 }
+prepare_dualstack_env() {
+    local require_time_sync="${1:-yes}" ip4="" ip6="" bindv6only=""
+
+    echo -e "${YELLOW}>> 初始化 IPv4 + IPv6 双栈入站环境...${PLAIN}"
+    restore_ipv4_apt_and_dns_if_needed
+    install_dependencies || return 1
+
+    ip4=$(get_public_ipv4 2>/dev/null || true)
+    ip6=$(get_public_ipv6 2>/dev/null || true)
+    if [[ -z "$ip4" ]]; then
+        echo -e "${RED}[错误] 双栈模式未检测到可用公网 IPv4。${PLAIN}"
+        return 1
+    fi
+    if [[ -z "$ip6" ]]; then
+        echo -e "${RED}[错误] 双栈模式未检测到可用公网 IPv6。${PLAIN}"
+        return 1
+    fi
+
+    bindv6only=$(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null || echo "unknown")
+    if [[ "$bindv6only" != "0" ]]; then
+        echo -e "${RED}[错误] 当前 net.ipv6.bindv6only=${bindv6only}，无法用单个 :: 监听同时承载 IPv4 和 IPv6。${PLAIN}"
+        echo -e "${YELLOW}为避免修改系统级 IPv6 socket 行为，脚本不会自动改这个内核参数。${PLAIN}"
+        return 1
+    fi
+
+    if [[ "$require_time_sync" == "yes" ]]; then
+        ensure_time_sync || return 1
+    fi
+
+    SERVER_HOST_V4="$ip4"
+    SERVER_HOST_V6="$ip6"
+    echo -e "${GREEN}✔ 双栈入站环境可用：IPv4=${ip4} / IPv6=${ip6}${PLAIN}"
+    return 0
+}
+
 select_network_mode() {
     local require_time_sync="${1:-yes}"
+    local allow_dual="${2:-no}"
+    local max_choice="2"
+
+    [[ "$allow_dual" == "yes" ]] && max_choice="3"
+
     while true; do
         echo ""
         echo "请选择 VPS 入站网络模式："
-        echo "  1) IPv4 / 双栈（监听 0.0.0.0）"
+        echo "  1) IPv4（监听 0.0.0.0）"
         echo "  2) IPv6-only（监听 ::，启用 IPv6 Keepalive）"
+        if [[ "$allow_dual" == "yes" ]]; then
+            echo "  3) IPv4 + IPv6 双栈（监听 ::，同时输出 IPv4 / IPv6 节点）"
+        fi
         echo "  0) 取消"
-        read -rp "请选择 [0-2]: " n
+        read -rp "请选择 [0-${max_choice}]: " n
         case "$n" in
             1)
                 NETWORK_MODE="ipv4"
                 LISTEN_ADDR="0.0.0.0"
+                SERVER_HOST_V4=""
+                SERVER_HOST_V6=""
                 prepare_ipv4_env "$require_time_sync" || return 1
                 disable_keepalive_for_ipv4
                 return 0
@@ -1306,22 +1362,27 @@ select_network_mode() {
             2)
                 NETWORK_MODE="ipv6"
                 LISTEN_ADDR="::"
+                SERVER_HOST_V4=""
+                SERVER_HOST_V6=""
                 prepare_ipv6_env "$require_time_sync" || return 1
                 setup_keepalive || return 1
                 return 0
                 ;;
-            0)
-                return 1
+            3)
+                if [[ "$allow_dual" != "yes" ]]; then
+                    echo -e "${RED}当前协议暂未开放双栈入站。${PLAIN}"
+                    continue
+                fi
+                NETWORK_MODE="dual"
+                LISTEN_ADDR="::"
+                prepare_dualstack_env "$require_time_sync" || return 1
+                return 0
                 ;;
-            *)
-                echo -e "${RED}输入无效。${PLAIN}"
-                ;;
+            0) return 1 ;;
+            *) echo -e "${RED}输入无效。${PLAIN}" ;;
         esac
     done
 }
-# ==============================================================================
-# [04] 状态文件与 sing-box 基础设施
-# ==============================================================================
 ensure_state_file() {
     mkdir -p "$STATE_DIR" || return 1
     chmod 700 "$STATE_DIR"
@@ -2110,6 +2171,18 @@ get_public_ipv4() {
     return 1
 }
 
+get_public_ipv6() {
+    local ip=""
+    ip=$(curl -6fsS --connect-timeout 5 --max-time 10 https://api6.ipify.org 2>/dev/null) || true
+    [[ -z "$ip" ]] && ip=$(curl -6fsS --connect-timeout 5 --max-time 10 https://6.ident.me 2>/dev/null) || true
+
+    if [[ "$ip" == *:* ]]; then
+        printf '%s' "$ip"
+        return 0
+    fi
+    return 1
+}
+
 get_global_ipv6() {
     local ip6=""
     ip6=$(ip -6 addr show scope global 2>/dev/null | grep -v 'temporary' | grep 'inet6 ' | awk '{print $2}' | cut -d/ -f1 | head -n 1)
@@ -2120,11 +2193,27 @@ get_global_ipv6() {
 ask_server_host() {
     local detected="" input=""
 
-    if [[ "$NETWORK_MODE" == "ipv6" ]]; then
-        detected=$(get_global_ipv6 2>/dev/null || true)
-    else
-        detected=$(get_public_ipv4 2>/dev/null || true)
-    fi
+    SERVER_HOST_V4=""
+    SERVER_HOST_V6=""
+
+    case "$NETWORK_MODE" in
+        ipv6)
+            detected=$(get_public_ipv6 2>/dev/null || get_global_ipv6 2>/dev/null || true)
+            SERVER_HOST_V6="$detected"
+            ;;
+        dual)
+            SERVER_HOST_V4=$(get_public_ipv4 2>/dev/null || true)
+            SERVER_HOST_V6=$(get_public_ipv6 2>/dev/null || get_global_ipv6 2>/dev/null || true)
+            detected="$SERVER_HOST_V4"
+            echo -e "${GREEN}检测到双栈公网地址：${PLAIN}"
+            echo -e "  IPv4: ${CYAN}${SERVER_HOST_V4:-未检测到}${PLAIN}"
+            echo -e "  IPv6: ${CYAN}${SERVER_HOST_V6:-未检测到}${PLAIN}"
+            ;;
+        *)
+            detected=$(get_public_ipv4 2>/dev/null || true)
+            SERVER_HOST_V4="$detected"
+            ;;
+    esac
 
     if [[ -n "$detected" ]]; then
         read -rp "服务器地址/域名 [回车默认使用: ${detected}]: " input
@@ -2136,7 +2225,6 @@ ask_server_host() {
         SERVER_HOST="$input"
     fi
 }
-
 urlencode() {
     local value="$1"
     jq -nr --arg v "$value" '$v|@uri'
@@ -2163,7 +2251,7 @@ show_qr() {
 # [05] 节点参数与客户端配置输出
 # ==============================================================================
 
-show_ss_details() {
+show_ss_details_single() {
     local host="$1" port="$2" method="$3" pass="$4"
     local tag="${5:-$(default_node_name ss)}"
     local url_host method_enc pass_enc tag_enc ss_url
@@ -2211,7 +2299,22 @@ YAML
     echo -e "${CYAN}═════════════════════════════════════════════════════════${PLAIN}"
 }
 
-show_shadowtls_details() {
+show_ss_details() {
+    local host="$1" port="$2" method="$3" pass="$4"
+    local tag="${5:-$(default_node_name ss)}"
+    local host_v4="${6:-}" host_v6="${7:-}"
+
+    if [[ -n "$host_v4" && -n "$host_v6" && "$host_v4" != "$host_v6" ]]; then
+        echo ""
+        echo -e "${CYAN}检测到双栈入站：以下两个节点连接同一 SS2022 服务，共用端口和密钥。${PLAIN}"
+        show_ss_details_single "$host_v4" "$port" "$method" "$pass" "${tag}-IPv4"
+        show_ss_details_single "$host_v6" "$port" "$method" "$pass" "${tag}-IPv6"
+    else
+        show_ss_details_single "$host" "$port" "$method" "$pass" "$tag"
+    fi
+}
+
+show_shadowtls_details_single() {
     local host="$1" port="$2" method="$3" ss_pass="$4" stls_pass="$5" sni="$6" udp_enabled="$7" udp_port="$8"
     local tag="${9:-$(default_node_name shadowtls)}"
     local surge_udp="udp-relay=false" loon_udp="udp=false" mihomo_udp="false"
@@ -2299,6 +2402,21 @@ YAML
     show_qr "$qr_payload"
     echo -e "${YELLOW}[二维码说明] SS2022+ShadowTLS 尚无统一跨客户端 URI；二维码保存完整参数，客户端仍应使用上面的对应格式。${PLAIN}"
     echo -e "${CYAN}════════════════════════════════════════════════════════════${PLAIN}"
+}
+
+show_shadowtls_details() {
+    local host="$1" port="$2" method="$3" ss_pass="$4" stls_pass="$5" sni="$6" udp_enabled="$7" udp_port="$8"
+    local tag="${9:-$(default_node_name shadowtls)}"
+    local host_v4="${10:-}" host_v6="${11:-}"
+
+    if [[ -n "$host_v4" && -n "$host_v6" && "$host_v4" != "$host_v6" ]]; then
+        echo ""
+        echo -e "${CYAN}检测到双栈入站：以下两个节点连接同一 ShadowTLS 服务，共用 TCP/UDP 端口与密钥。${PLAIN}"
+        show_shadowtls_details_single "$host_v4" "$port" "$method" "$ss_pass" "$stls_pass" "$sni" "$udp_enabled" "$udp_port" "${tag}-IPv4"
+        show_shadowtls_details_single "$host_v6" "$port" "$method" "$ss_pass" "$stls_pass" "$sni" "$udp_enabled" "$udp_port" "${tag}-IPv6"
+    else
+        show_shadowtls_details_single "$host" "$port" "$method" "$ss_pass" "$stls_pass" "$sni" "$udp_enabled" "$udp_port" "$tag"
+    fi
 }
 
 show_vless_details() {
@@ -2422,23 +2540,33 @@ YAML
 select_network_mode_for_update() {
     local current_network="$1"
     local require_time_sync="${2:-yes}"
-    local default_choice="1" n=""
+    local allow_dual="${3:-no}"
+    local default_choice="1" n="" max_choice="2"
 
     [[ "$current_network" == "ipv6" ]] && default_choice="2"
+    if [[ "$allow_dual" == "yes" ]]; then
+        max_choice="3"
+        [[ "$current_network" == "dual" ]] && default_choice="3"
+    fi
 
     while true; do
         echo ""
         echo "请选择 VPS 入站网络模式："
-        echo "  1) IPv4 / 双栈（监听 0.0.0.0）"
+        echo "  1) IPv4（监听 0.0.0.0）"
         echo "  2) IPv6-only（监听 ::，启用 IPv6 Keepalive）"
+        if [[ "$allow_dual" == "yes" ]]; then
+            echo "  3) IPv4 + IPv6 双栈（监听 ::，同时输出 IPv4 / IPv6 节点）"
+        fi
         echo "  0) 取消"
-        read -rp "请选择 [0-2，默认: ${default_choice}]: " n
+        read -rp "请选择 [0-${max_choice}，默认: ${default_choice}]: " n
         n=${n:-$default_choice}
 
         case "$n" in
             1)
                 NETWORK_MODE="ipv4"
                 LISTEN_ADDR="0.0.0.0"
+                SERVER_HOST_V4=""
+                SERVER_HOST_V6=""
                 prepare_ipv4_env "$require_time_sync" || return 1
                 disable_keepalive_for_ipv4
                 return 0
@@ -2446,8 +2574,17 @@ select_network_mode_for_update() {
             2)
                 NETWORK_MODE="ipv6"
                 LISTEN_ADDR="::"
+                SERVER_HOST_V4=""
+                SERVER_HOST_V6=""
                 prepare_ipv6_env "$require_time_sync" || return 1
                 setup_keepalive || return 1
+                return 0
+                ;;
+            3)
+                [[ "$allow_dual" == "yes" ]] || { echo -e "${RED}当前协议暂未开放双栈入站。${PLAIN}"; continue; }
+                NETWORK_MODE="dual"
+                LISTEN_ADDR="::"
+                prepare_dualstack_env "$require_time_sync" || return 1
                 return 0
                 ;;
             0) return 1 ;;
@@ -2455,7 +2592,6 @@ select_network_mode_for_update() {
         esac
     done
 }
-
 ask_server_host_with_default() {
     local current_host="$1" input=""
     if [[ -n "$current_host" ]]; then
@@ -2519,7 +2655,7 @@ update_ss2022() {
 
         case "$choice" in
             1)
-                select_network_mode_for_update "$current_network" || continue
+                select_network_mode_for_update "$current_network" "yes" "yes" || continue
                 new_listen="$LISTEN_ADDR"; new_network="$NETWORK_MODE"
                 ;;
             2)
@@ -2554,7 +2690,14 @@ update_ss2022() {
             '{type:"shadowsocks",tag:"ss-in",listen:$listen,listen_port:$port,method:$method,password:$password}')
         add_json=$(jq -n --argjson a "$inbound" '[$a]')
         if update_singbox_inbounds "$excluded_tags" "$add_json"; then
-            save_mode_state "ss" "$(jq -n --arg host "$current_host" --arg network "$new_network" '{host:$host,network:$network}')" || true
+            if [[ "$new_network" == "dual" ]]; then
+                SERVER_HOST_V4=$(get_public_ipv4 2>/dev/null || true)
+                SERVER_HOST_V6=$(get_public_ipv6 2>/dev/null || get_global_ipv6 2>/dev/null || true)
+            else
+                SERVER_HOST_V4=""
+                SERVER_HOST_V6=""
+            fi
+            save_mode_state "ss" "$(jq -n --arg host "$current_host" --arg host_v4 "$SERVER_HOST_V4" --arg host_v6 "$SERVER_HOST_V6" --arg network "$new_network" '{host:$host,host_v4:$host_v4,host_v6:$host_v6,network:$network}')" || true
             apply_routing_config >/dev/null 2>&1 || echo -e "${YELLOW}[提示] 节点已更新，但现有分流配置未能自动应用。${PLAIN}"
             echo -e "${GREEN}✔ SS2022 更新成功。${PLAIN}"
         else
@@ -2618,7 +2761,7 @@ update_shadowtls() {
 
         case "$choice" in
             1)
-                select_network_mode_for_update "$current_network" || continue
+                select_network_mode_for_update "$current_network" "yes" "yes" || continue
                 new_listen="$LISTEN_ADDR"; new_network="$NETWORK_MODE"
                 ;;
             2)
@@ -2694,7 +2837,14 @@ update_shadowtls() {
         fi
 
         if update_singbox_inbounds "$excluded_tags" "$add_json"; then
-            save_mode_state "shadowtls" "$(jq -n --arg host "$current_host" --arg network "$new_network" '{host:$host,network:$network}')" || true
+            if [[ "$new_network" == "dual" ]]; then
+                SERVER_HOST_V4=$(get_public_ipv4 2>/dev/null || true)
+                SERVER_HOST_V6=$(get_public_ipv6 2>/dev/null || get_global_ipv6 2>/dev/null || true)
+            else
+                SERVER_HOST_V4=""
+                SERVER_HOST_V6=""
+            fi
+            save_mode_state "shadowtls" "$(jq -n --arg host "$current_host" --arg host_v4 "$SERVER_HOST_V4" --arg host_v6 "$SERVER_HOST_V6" --arg network "$new_network" '{host:$host,host_v4:$host_v4,host_v6:$host_v6,network:$network}')" || true
             apply_routing_config >/dev/null 2>&1 || echo -e "${YELLOW}[提示] 节点已更新，但现有分流配置未能自动应用。${PLAIN}"
             echo -e "${GREEN}✔ SS2022 + ShadowTLS v3 更新成功。${PLAIN}"
         else
@@ -2968,7 +3118,7 @@ deploy_ss2022() {
     fi
 
     echo -e "${CYAN}>> [1/3] 初始化系统与网络环境...${PLAIN}"
-    if ! select_network_mode; then
+    if ! select_network_mode "yes" "yes"; then
         echo ""
         echo -e "${RED}[部署中止] SS2022 尚未进入端口配置阶段：系统/网络环境初始化失败或被取消。${PLAIN}"
         echo -e "${YELLOW}上方最后一条错误就是本次中止原因；当前不会写入 SS2022 节点配置。${PLAIN}"
@@ -3013,8 +3163,8 @@ deploy_ss2022() {
     if update_singbox_inbounds "$excluded_tags" "$add_json"; then
         apply_routing_config >/dev/null 2>&1 || echo -e "${YELLOW}[提示] 节点已部署，但现有分流配置未能自动应用，请进入“分流管理”重新应用。${PLAIN}"
         echo -e "${GREEN}✔ SS2022 部署成功。${PLAIN}"
-        save_mode_state "ss" "$(jq -n --arg host "$SERVER_HOST" --arg network "$NETWORK_MODE" --arg name "$NODE_NAME" '{host:$host,network:$network,name:$name}')" || true
-        show_ss_details "$SERVER_HOST" "$PORT" "$METHOD" "$SS_KEY" "$NODE_NAME"
+        save_mode_state "ss" "$(jq -n --arg host "$SERVER_HOST" --arg host_v4 "$SERVER_HOST_V4" --arg host_v6 "$SERVER_HOST_V6" --arg network "$NETWORK_MODE" --arg name "$NODE_NAME" '{host:$host,host_v4:$host_v4,host_v6:$host_v6,network:$network,name:$name}')" || true
+        show_ss_details "$SERVER_HOST" "$PORT" "$METHOD" "$SS_KEY" "$NODE_NAME" "$SERVER_HOST_V4" "$SERVER_HOST_V6"
     else
         service_log_tail sing-box 30 || true
     fi
@@ -3034,7 +3184,7 @@ deploy_shadowtls() {
     local default_udp=""
 
     echo -e "${CYAN}>> [1/3] 初始化系统与网络环境...${PLAIN}"
-    if ! select_network_mode; then
+    if ! select_network_mode "yes" "yes"; then
         echo ""
         echo -e "${RED}[部署中止] ShadowTLS 尚未进入端口配置阶段：系统/网络环境初始化失败或被取消。${PLAIN}"
         pause
@@ -3154,8 +3304,8 @@ deploy_shadowtls() {
     if update_singbox_inbounds "$excluded_tags" "$add_json"; then
         apply_routing_config >/dev/null 2>&1 || echo -e "${YELLOW}[提示] 节点已部署，但现有分流配置未能自动应用，请进入“分流管理”重新应用。${PLAIN}"
         echo -e "${GREEN}✔ SS2022 + ShadowTLS v3 部署成功。${PLAIN}"
-        save_mode_state "shadowtls" "$(jq -n --arg host "$SERVER_HOST" --arg network "$NETWORK_MODE" --arg name "$NODE_NAME" '{host:$host,network:$network,name:$name}')" || true
-        show_shadowtls_details "$SERVER_HOST" "$tcp_port" "$METHOD" "$SS_KEY" "$stls_pass" "$sni" "$udp_enabled" "$udp_port" "$NODE_NAME"
+        save_mode_state "shadowtls" "$(jq -n --arg host "$SERVER_HOST" --arg host_v4 "$SERVER_HOST_V4" --arg host_v6 "$SERVER_HOST_V6" --arg network "$NETWORK_MODE" --arg name "$NODE_NAME" '{host:$host,host_v4:$host_v4,host_v6:$host_v6,network:$network,name:$name}')" || true
+        show_shadowtls_details "$SERVER_HOST" "$tcp_port" "$METHOD" "$SS_KEY" "$stls_pass" "$sni" "$udp_enabled" "$udp_port" "$NODE_NAME" "$SERVER_HOST_V4" "$SERVER_HOST_V6"
     else
         service_log_tail sing-box 30 || true
     fi
@@ -3684,7 +3834,7 @@ CONFIG
 # ==============================================================================
 
 view_ss2022_config() {
-    local host port method pass listen ip_type name
+    local host host_v4="" host_v6="" network="" port method pass listen ip_type name
     json_has_inbound_tag "$TAG_SS" || {
         echo -e "${YELLOW}未部署 SS2022。${PLAIN}"
         return
@@ -3703,12 +3853,17 @@ view_ss2022_config() {
             host=$(get_public_ipv4 2>/dev/null || echo "请填写服务器地址")
         fi
     fi
+    network=$(get_mode_state_field "ss" "network" 2>/dev/null || true)
+    if [[ "$network" == "dual" ]]; then
+        host_v4=$(get_mode_state_field "ss" "host_v4" 2>/dev/null || get_public_ipv4 2>/dev/null || true)
+        host_v6=$(get_mode_state_field "ss" "host_v6" 2>/dev/null || get_public_ipv6 2>/dev/null || get_global_ipv6 2>/dev/null || true)
+    fi
     name=$(get_node_name "ss")
-    show_ss_details "$host" "$port" "$method" "$pass" "$name"
+    show_ss_details "$host" "$port" "$method" "$pass" "$name" "$host_v4" "$host_v6"
 }
 
 view_shadowtls_config() {
-    local host port method ss_pass stls_pass sni listen udp_enabled="false" udp_port="" name
+    local host host_v4="" host_v6="" network="" port method ss_pass stls_pass sni listen udp_enabled="false" udp_port="" name
 
     json_has_inbound_tag "$TAG_STLS" || {
         echo -e "${YELLOW}未部署 SS2022 + ShadowTLS。${PLAIN}"
@@ -3735,8 +3890,13 @@ view_shadowtls_config() {
             host=$(get_public_ipv4 2>/dev/null || echo "请填写服务器地址")
         fi
     fi
+    network=$(get_mode_state_field "shadowtls" "network" 2>/dev/null || true)
+    if [[ "$network" == "dual" ]]; then
+        host_v4=$(get_mode_state_field "shadowtls" "host_v4" 2>/dev/null || get_public_ipv4 2>/dev/null || true)
+        host_v6=$(get_mode_state_field "shadowtls" "host_v6" 2>/dev/null || get_public_ipv6 2>/dev/null || get_global_ipv6 2>/dev/null || true)
+    fi
     name=$(get_node_name "shadowtls")
-    show_shadowtls_details "$host" "$port" "$method" "$ss_pass" "$stls_pass" "$sni" "$udp_enabled" "$udp_port" "$name"
+    show_shadowtls_details "$host" "$port" "$method" "$ss_pass" "$stls_pass" "$sni" "$udp_enabled" "$udp_port" "$name" "$host_v4" "$host_v6"
 }
 
 view_vless_config() {
