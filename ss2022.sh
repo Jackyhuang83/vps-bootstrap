@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.1
+# 当前版本: v1.9.0-dev1
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,15 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev1:
+#   - 启动 Alpine / OpenRC 适配主线；Debian / Ubuntu + systemd 行为保持兼容
+#   - 新增操作系统、init 与包管理器抽象：Debian/Ubuntu + systemd + apt，Alpine + OpenRC + apk
+#   - 新增统一服务控制接口，首批覆盖 sing-box 的启动、停止、重启、状态、PID 与日志
+#   - SS2022 / SS2022 + ShadowTLS v3 首批接入 OpenRC；Alpine 使用独立 init.d 服务并保持非 root 运行
+#   - Alpine 基础依赖、chrony 时间同步、IPv6-only 环境与 IPv6 Keepalive 首批适配
+#   - Alpine dev1 暂不开放 VLESS Reality、Snell v5、Realm、WARP 与完整服务器管理，避免未验证功能误操作
+#   - 本版本为开发预览，需 Alpine VPS 实机验证后再继续扩大支持范围
 #
 # v1.8.1 Release:
 #   - 正式发布 v1.8.1，基于已实机验证的 v1.8.1-dev10 收口，不引入新的业务逻辑
@@ -318,11 +327,12 @@
 #   v1.8.1-dev9 IPv4 / IPv6 全局与应用级地址族管理
 #   v1.8.1-dev10 应用地址族一键出口测试 / YouTube IPv6 实例验证
 #   v1.8.1 正式发布
+#   v1.9.0-dev1 Alpine / OpenRC 基础兼容层 / SS2022 + ShadowTLS 首批适配
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.1"
+SCRIPT_VERSION="v1.9.0-dev1"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -333,6 +343,15 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 PLAIN='\033[0m'
+PLATFORM_OS=""
+PLATFORM_INIT=""
+PLATFORM_PKG=""
+PLATFORM_NAME=""
+SINGBOX_OPENRC_SERVICE="/etc/init.d/sing-box"
+SINGBOX_OPENRC_PID="/run/sing-box.pid"
+SINGBOX_OPENRC_LOG="/var/log/ss2022/sing-box.log"
+IPV6_KEEPALIVE_OPENRC_SERVICE="/etc/init.d/ss2022-ipv6-keepalive"
+IPV6_KEEPALIVE_HELPER="/usr/local/lib/ss2022/ipv6-keepalive.sh"
 # ----------------------------- sing-box ---------------------------------------
 SINGBOX_BIN="/usr/local/bin/sing-box"
 SINGBOX_CONF="/etc/sing-box/config.json"
@@ -417,6 +436,291 @@ check_root() {
     if [[ $EUID -ne 0 ]]; then
         echo -e "${RED}[错误] 必须使用 root 权限运行此脚本！${PLAIN}"
         exit 1
+    fi
+}
+
+detect_platform() {
+    local os_id="" os_like="" pretty=""
+    if [[ -r /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        os_id="$ID"
+        os_like="$ID_LIKE"
+        pretty="$PRETTY_NAME"
+    fi
+
+    case "$os_id" in
+        debian|ubuntu)
+            PLATFORM_OS="$os_id"
+            PLATFORM_PKG="apt"
+            PLATFORM_NAME="$pretty"
+            command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]] || {
+                echo "[错误] Debian / Ubuntu 当前仅支持 systemd。"
+                return 1
+            }
+            PLATFORM_INIT="systemd"
+            ;;
+        alpine)
+            PLATFORM_OS="alpine"
+            PLATFORM_PKG="apk"
+            PLATFORM_NAME="$pretty"
+            command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1 || {
+                echo "[错误] 检测到 Alpine，但未检测到完整 OpenRC 环境。"
+                return 1
+            }
+            PLATFORM_INIT="openrc"
+            ;;
+        *)
+            if [[ " $os_like " == *" debian "* ]]; then
+                PLATFORM_OS="debian"
+                PLATFORM_PKG="apt"
+                PLATFORM_NAME="$pretty"
+                command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]] || {
+                    echo "[错误] Debian 系发行版当前仅支持 systemd。"
+                    return 1
+                }
+                PLATFORM_INIT="systemd"
+            else
+                echo "[错误] 暂不支持当前发行版: $os_id"
+                echo "当前支持: Debian / Ubuntu + systemd；Alpine + OpenRC（v1.9 开发预览）。"
+                return 1
+            fi
+            ;;
+    esac
+
+    [[ -n "$PLATFORM_NAME" ]] || PLATFORM_NAME="$os_id"
+    return 0
+}
+
+platform_is_alpine() {
+    [[ "$PLATFORM_OS" == "alpine" ]]
+}
+
+platform_label() {
+    case "$PLATFORM_INIT" in
+        systemd) printf '%s / systemd' "$PLATFORM_NAME" ;;
+        openrc) printf '%s / OpenRC' "$PLATFORM_NAME" ;;
+        *) printf '%s' "$PLATFORM_NAME" ;;
+    esac
+}
+
+pkg_update() {
+    case "$PLATFORM_PKG" in
+        apt) DEBIAN_FRONTEND=noninteractive apt-get update -y ;;
+        apk) apk update ;;
+        *) return 1 ;;
+    esac
+}
+
+pkg_install() {
+    case "$PLATFORM_PKG" in
+        apt) DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
+        apk) apk add --no-cache "$@" ;;
+        *) return 1 ;;
+    esac
+}
+
+pkg_remove() {
+    case "$PLATFORM_PKG" in
+        apt) DEBIAN_FRONTEND=noninteractive apt-get remove -y "$@" ;;
+        apk) apk del "$@" ;;
+        *) return 1 ;;
+    esac
+}
+
+service_daemon_reload() {
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        systemctl daemon-reload
+    else
+        return 0
+    fi
+}
+
+service_is_active() {
+    local svc="$1"
+    case "$PLATFORM_INIT" in
+        systemd) service_is_active "$svc" 2>/dev/null ;;
+        openrc) rc-service "$svc" status >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+service_enable() {
+    local svc="$1"
+    case "$PLATFORM_INIT" in
+        systemd) systemctl enable "$svc" >/dev/null 2>&1 ;;
+        openrc) rc-update add "$svc" default >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+service_disable() {
+    local svc="$1"
+    case "$PLATFORM_INIT" in
+        systemd) systemctl disable "$svc" >/dev/null 2>&1 ;;
+        openrc) rc-update del "$svc" default >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+service_start() {
+    local svc="$1"
+    case "$PLATFORM_INIT" in
+        systemd) systemctl start "$svc" ;;
+        openrc) rc-service "$svc" start ;;
+        *) return 1 ;;
+    esac
+}
+
+service_stop() {
+    local svc="$1"
+    case "$PLATFORM_INIT" in
+        systemd) systemctl stop "$svc" ;;
+        openrc) rc-service "$svc" stop ;;
+        *) return 1 ;;
+    esac
+}
+
+service_restart() {
+    local svc="$1"
+    case "$PLATFORM_INIT" in
+        systemd) systemctl restart "$svc" ;;
+        openrc) rc-service "$svc" restart ;;
+        *) return 1 ;;
+    esac
+}
+
+service_enable_now() {
+    local svc="$1"
+    service_enable "$svc" || return 1
+    service_is_active "$svc" && return 0
+    service_start "$svc"
+}
+
+service_disable_now() {
+    local svc="$1"
+    service_stop "$svc" >/dev/null 2>&1 || true
+    service_disable "$svc" >/dev/null 2>&1 || true
+}
+
+service_main_pid() {
+    local svc="$1" pid=""
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        systemctl show -p MainPID --value "$svc" 2>/dev/null || true
+        return
+    fi
+    if [[ "$svc" == "sing-box" && -r "$SINGBOX_OPENRC_PID" ]]; then
+        cat "$SINGBOX_OPENRC_PID" 2>/dev/null || true
+        return
+    fi
+    pid=$(pgrep -o -x "$svc" 2>/dev/null || true)
+    [[ -n "$pid" ]] && printf '%s\n' "$pid"
+}
+
+service_status_output() {
+    local svc="$1"
+    case "$PLATFORM_INIT" in
+        systemd) systemctl --no-pager --full status "$svc" 2>/dev/null ;;
+        openrc) rc-service "$svc" status 2>/dev/null ;;
+        *) return 1 ;;
+    esac
+}
+
+service_log_tail() {
+    local svc="$1" lines="$2" log="/var/log/ss2022/$1.log"
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        journalctl -u "$svc" -n "$lines" --no-pager 2>/dev/null
+        return
+    fi
+    if [[ -f "$log" ]]; then
+        tail -n "$lines" "$log"
+    else
+        rc-service "$svc" status 2>/dev/null || true
+        echo "[提示] OpenRC 未发现该服务的独立日志文件。"
+    fi
+}
+
+service_log_follow() {
+    local svc="$1" log="/var/log/ss2022/$1.log"
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        journalctl -u "$svc" -f -n 30
+        return
+    fi
+    if [[ -f "$log" ]]; then
+        tail -n 30 -f "$log"
+    else
+        rc-service "$svc" status 2>/dev/null || true
+        echo "[提示] OpenRC 未发现该服务的独立日志文件。"
+        return 1
+    fi
+}
+
+platform_feature_unavailable() {
+    local feature="$1"
+    echo ""
+    echo "[开发预览] Alpine / OpenRC 的 $feature 尚未在 v1.9.0-dev1 开放。"
+    echo "当前首批开放: SS2022、SS2022 + ShadowTLS v3、sing-box 基础运维与服务端分流（不含 WARP）。"
+    return 1
+}
+
+system_group_exists() {
+    grep -q "^$1:" /etc/group 2>/dev/null
+}
+
+ensure_system_group() {
+    local group="$1"
+    system_group_exists "$group" && return 0
+    if platform_is_alpine; then
+        addgroup -S "$group"
+    else
+        groupadd --system "$group"
+    fi
+}
+
+add_system_user_to_group() {
+    local user="$1" group="$2"
+    id -nG "$user" 2>/dev/null | tr ' ' '\n' | grep -qx "$group" && return 0
+    if platform_is_alpine; then
+        addgroup "$user" "$group"
+    else
+        usermod -a -G "$group" "$user"
+    fi
+}
+
+create_system_user() {
+    local user="$1" group="$2" nologin_shell=""
+    ensure_system_group "$group" || return 1
+    if id -u "$user" >/dev/null 2>&1; then
+        add_system_user_to_group "$user" "$group"
+        return
+    fi
+
+    nologin_shell=$(command -v nologin 2>/dev/null || true)
+    if platform_is_alpine; then
+        [[ -n "$nologin_shell" ]] || nologin_shell="/sbin/nologin"
+        [[ -x "$nologin_shell" ]] || nologin_shell="/bin/false"
+        adduser -S -D -H -h /nonexistent -s "$nologin_shell" -G "$group" "$user"
+    else
+        [[ -n "$nologin_shell" ]] || nologin_shell="/usr/sbin/nologin"
+        useradd --system --gid "$group" --no-create-home --home-dir /nonexistent --shell "$nologin_shell" "$user"
+    fi
+}
+
+delete_system_user() {
+    local user="$1"
+    id -u "$user" >/dev/null 2>&1 || return 0
+    if platform_is_alpine; then
+        deluser "$user" >/dev/null 2>&1 || true
+    else
+        userdel "$user" >/dev/null 2>&1 || true
+    fi
+}
+
+keepalive_service_name() {
+    if [[ "$PLATFORM_INIT" == "openrc" ]]; then
+        echo "ss2022-ipv6-keepalive"
+    else
+        echo "ipv6-keepalive.timer"
     fi
 }
 pause() {
@@ -519,7 +823,7 @@ show_dashboard() {
     if [[ -x "$REALM_BIN" ]]; then
         realm_info=$("$REALM_BIN" --version 2>/dev/null | head -n1)
         realm_info=${realm_info:-"Realm 已安装"}
-        if systemctl is-active --quiet "$REALM_SERVICE_NAME" 2>/dev/null; then
+        if service_is_active "$REALM_SERVICE_NAME"; then
             realm_status="${GREEN}● 运行中${PLAIN}"
         else
             realm_status="${RED}○ 已停止${PLAIN}"
@@ -528,22 +832,22 @@ show_dashboard() {
     if [[ -f "$FORWARDING_FILE" ]]; then
         forwarding_count=$(jq '.rules|length' "$FORWARDING_FILE" 2>/dev/null || echo 0)
     fi
-    if systemctl is-active --quiet sing-box 2>/dev/null; then
+    if service_is_active sing-box; then
         sb_status="${GREEN}● 运行中${PLAIN}"
     elif [[ -f "$SINGBOX_CONF" || -x "$SINGBOX_BIN" ]]; then
         sb_status="${RED}○ 已停止${PLAIN}"
     fi
-    if systemctl is-active --quiet "$XRAY_SERVICE_NAME" 2>/dev/null; then
+    if service_is_active "$XRAY_SERVICE_NAME"; then
         xray_status="${GREEN}● 运行中${PLAIN}"
     elif [[ -f "$XRAY_CONF" || -x "$XRAY_BIN" ]]; then
         xray_status="${RED}○ 已停止${PLAIN}"
     fi
-    if systemctl is-active --quiet snell-v5 2>/dev/null; then
+    if service_is_active snell-v5; then
         snell_status="${GREEN}● 运行中${PLAIN}"
     elif [[ -f "$SNELL_CONF" || -x "$SNELL_BIN" ]]; then
         snell_status="${RED}○ 已停止${PLAIN}"
     fi
-    if systemctl is-active --quiet ipv6-keepalive.timer 2>/dev/null; then
+    if service_is_active "$(keepalive_service_name)"; then
         keepalive_status="${GREEN}● 已激活 (5min轮询)${PLAIN}"
     fi
     if json_has_inbound_tag "$TAG_SS"; then
@@ -579,6 +883,7 @@ show_dashboard() {
     echo -e "      快捷命令: ${GREEN}ss2022${PLAIN} 或 ${GREEN}proxy${PLAIN}"
     echo -e "${CYAN}═════════════════════════════════════════════════════════════════${PLAIN}"
     echo -e "  系统信息: ${sys_info}"
+    echo -e "  运行环境: $(platform_label)"
     echo -e "  sing-box: ${singbox_info} / ${sb_status}"
     echo -e "  Xray核心: ${xray_info} / ${xray_status}"
     echo -e "  Snell核心: ${snell_info} / ${snell_status}"
@@ -615,48 +920,59 @@ restore_ipv4_apt_and_dns_if_needed() {
     fi
 }
 ensure_time_sync() {
-    local attempt=0
-    echo -e "${YELLOW}>> 检查系统时间同步状态...${PLAIN}"
+    local attempt=0 chrony_svc=""
+    echo -e "$YELLOW>> 检查系统时间同步状态...$PLAIN"
     if time_sync_is_healthy; then
-        echo -e "${GREEN}✔ 系统时间已同步。当前 UTC: $(date -u '+%Y-%m-%d %H:%M:%S UTC')${PLAIN}"
+        echo -e "$GREEN✔ 系统时间已同步。当前 UTC: $(date -u '+%Y-%m-%d %H:%M:%S UTC')$PLAIN"
         return 0
     fi
-    echo -e "${YELLOW}[提示] 系统时钟尚未同步，准备使用 chrony 自动校时。${PLAIN}"
-    if ! command -v chronyc &>/dev/null; then
-        if ! apt-get install -y chrony; then
-            echo -e "${RED}[错误] chrony 安装失败。SS2022 / Reality 对时间偏差敏感，停止部署。${PLAIN}"
+    echo -e "${YELLOW}[提示] 系统时钟尚未同步，准备使用 chrony 自动校时。$PLAIN"
+    if ! command -v chronyc >/dev/null 2>&1; then
+        pkg_install chrony || {
+            echo -e "${RED}[错误] chrony 安装失败。SS2022 / Reality 对时间偏差敏感，停止部署。$PLAIN"
             return 1
-        fi
+        }
     fi
-    if ! systemctl enable --now chrony >/dev/null 2>&1; then
-        echo -e "${RED}[错误] chrony 服务启动失败。${PLAIN}"
+    if [[ "$PLATFORM_INIT" == "openrc" ]]; then chrony_svc="chronyd"; else chrony_svc="chrony"; fi
+    service_enable_now "$chrony_svc" >/dev/null 2>&1 || {
+        echo -e "${RED}[错误] chrony 服务启动失败。$PLAIN"
         return 1
-    fi
-    systemctl restart chrony >/dev/null 2>&1 || true
+    }
+    service_restart "$chrony_svc" >/dev/null 2>&1 || true
     chronyc -a burst 4/4 >/dev/null 2>&1 || true
     sleep 2
     chronyc -a makestep >/dev/null 2>&1 || true
     for attempt in {1..15}; do
         if time_sync_is_healthy; then
-            echo -e "${GREEN}✔ 系统时间同步完成。当前 UTC: $(date -u '+%Y-%m-%d %H:%M:%S UTC')${PLAIN}"
+            echo -e "$GREEN✔ 系统时间同步完成。当前 UTC: $(date -u '+%Y-%m-%d %H:%M:%S UTC')$PLAIN"
             return 0
         fi
         sleep 2
     done
-    echo -e "${RED}[错误] 30 秒内未确认系统时间同步。停止部署。${PLAIN}"
+    echo -e "${RED}[错误] 30 秒内未确认系统时间同步。停止部署。$PLAIN"
     chronyc tracking 2>/dev/null || true
     return 1
 }
 install_dependencies() {
-    echo -e "${YELLOW}>> 更新 APT 索引...${PLAIN}"
-    if ! apt-get update -y; then
-        echo -e "${RED}[错误] apt-get update 失败，请检查网络或软件源。${PLAIN}"
+    echo -e "$YELLOW>> 更新软件包索引...$PLAIN"
+    pkg_update || {
+        echo -e "${RED}[错误] 软件包索引更新失败，请检查网络或软件源。$PLAIN"
         return 1
-    fi
-    echo -e "${YELLOW}>> 安装运行依赖...${PLAIN}"
-    if ! apt-get install -y curl jq openssl coreutils qrencode ca-certificates iproute2 tar unzip; then
-        echo -e "${RED}[错误] 依赖安装失败。${PLAIN}"
-        return 1
+    }
+    echo -e "$YELLOW>> 安装运行依赖...$PLAIN"
+    if [[ "$PLATFORM_PKG" == "apk" ]]; then
+        pkg_install curl jq openssl coreutils ca-certificates iproute2 tar unzip libcap-setcap || {
+            echo -e "${RED}[错误] Alpine 基础依赖安装失败。$PLAIN"
+            return 1
+        }
+        if ! command -v qrencode >/dev/null 2>&1; then
+            pkg_install libqrencode-tools >/dev/null 2>&1 ||                 echo -e "${YELLOW}[提示] libqrencode-tools 未安装；二维码将暂不显示，不影响节点使用。$PLAIN"
+        fi
+    else
+        pkg_install curl jq openssl coreutils qrencode ca-certificates iproute2 tar unzip || {
+            echo -e "${RED}[错误] 依赖安装失败。$PLAIN"
+            return 1
+        }
     fi
     return 0
 }
@@ -672,33 +988,40 @@ prepare_ipv4_env() {
 }
 dns_ipv6_resolution_works() {
     local host=""
-    for host in deb.debian.org github.com cloudflare.com; do
-        if getent ahostsv6 "$host" 2>/dev/null | grep -q ':'; then
+    local -a hosts=(github.com cloudflare.com)
+    if platform_is_alpine; then
+        hosts+=(dl-cdn.alpinelinux.org)
+    else
+        hosts+=(deb.debian.org)
+    fi
+    for host in "${hosts[@]}"; do
+        if command -v getent >/dev/null 2>&1 && getent ahostsv6 "$host" 2>/dev/null | grep -q ':'; then
+            return 0
+        fi
+        if command -v ping >/dev/null 2>&1 && ping -6 -c 1 -W 2 "$host" >/dev/null 2>&1; then
             return 0
         fi
     done
     return 1
 }
 prepare_ipv6_env() {
-    local require_time_sync="${1:-yes}"
-    echo -e "${YELLOW}>> 初始化 IPv6-only 部署环境...${PLAIN}"
+    local require_time_sync="$1"
+    [[ -n "$require_time_sync" ]] || require_time_sync="yes"
+    echo -e "$YELLOW>> 初始化 IPv6-only 部署环境...$PLAIN"
     if ! ip -6 addr show scope global 2>/dev/null | grep -q 'inet6 '; then
-        echo -e "${RED}[错误] 未检测到全局 IPv6 地址，无法使用 IPv6-only 模式。${PLAIN}"
+        echo -e "${RED}[错误] 未检测到全局 IPv6 地址，无法使用 IPv6-only 模式。$PLAIN"
         return 1
     fi
     sed -i '/github/d' /etc/hosts 2>/dev/null || true
     sed -i '/ghproxy/d' /etc/hosts 2>/dev/null || true
     sed -i '/danwin/d' /etc/hosts 2>/dev/null || true
     if dns_ipv6_resolution_works; then
-        echo -e "${GREEN}✔ 当前 DNS 可正常解析 IPv6 地址，不修改 /etc/resolv.conf。${PLAIN}"
+        echo -e "$GREEN✔ 当前 DNS 可正常解析 IPv6 地址，不修改 /etc/resolv.conf。$PLAIN"
     else
-        echo -e "${YELLOW}[提示] 当前 DNS 无法完成 IPv6 解析，准备使用公共 IPv6 DNS 兜底。${PLAIN}"
+        echo -e "${YELLOW}[提示] 当前 DNS 无法完成 IPv6 解析，准备使用公共 IPv6 DNS 兜底。$PLAIN"
         if [[ -f /etc/resolv.conf && ! -L /etc/resolv.conf ]]; then
             if [[ ! -f "$BACKUP_DNS" ]]; then
-                cp -a /etc/resolv.conf "$BACKUP_DNS" || {
-                    echo -e "${RED}[错误] 无法备份 /etc/resolv.conf。${PLAIN}"
-                    return 1
-                }
+                cp -a /etc/resolv.conf "$BACKUP_DNS" || return 1
             fi
             cat > /etc/resolv.conf <<'DNS'
 nameserver 2001:4860:4860::8888
@@ -707,25 +1030,24 @@ options timeout:2 attempts:2
 DNS
             touch "$DNS_MARKER"
             if ! dns_ipv6_resolution_works; then
-                echo -e "${RED}[错误] 切换公共 IPv6 DNS 后仍无法解析，正在恢复原 DNS。${PLAIN}"
                 [[ -f "$BACKUP_DNS" ]] && cp -f "$BACKUP_DNS" /etc/resolv.conf 2>/dev/null || true
                 rm -f "$DNS_MARKER"
+                echo -e "${RED}[错误] 公共 IPv6 DNS 仍无法解析，已尝试恢复原 DNS。$PLAIN"
                 return 1
             fi
         else
-            echo -e "${RED}[错误] DNS 解析失败，且 /etc/resolv.conf 由系统服务管理。${PLAIN}"
-            echo -e "${YELLOW}为避免破坏 systemd-resolved/NetworkManager，本脚本不会强制覆盖符号链接。${PLAIN}"
+            echo -e "${RED}[错误] DNS 解析失败，且 /etc/resolv.conf 由系统服务管理。$PLAIN"
             return 1
         fi
     fi
-    mkdir -p /etc/apt/apt.conf.d/
-    printf '%s\n' 'Acquire::ForceIPv6 "true";' > "$FORCE_IPV6_CONF" || return 1
-    if [[ -f /etc/apt/mirrors/debian.list ]]; then
-        printf '%s\n' 'https://deb.debian.org/debian' > /etc/apt/mirrors/debian.list || return 1
+
+    if [[ "$PLATFORM_PKG" == "apt" ]]; then
+        mkdir -p /etc/apt/apt.conf.d/
+        printf '%s\n' 'Acquire::ForceIPv6 "true";' > "$FORCE_IPV6_CONF" || return 1
+        [[ -f /etc/apt/mirrors/debian.list ]] && printf '%s\n' 'https://deb.debian.org/debian' > /etc/apt/mirrors/debian.list
+        [[ -f /etc/apt/mirrors/debian-security.list ]] && printf '%s\n' 'https://deb.debian.org/debian-security' > /etc/apt/mirrors/debian-security.list
     fi
-    if [[ -f /etc/apt/mirrors/debian-security.list ]]; then
-        printf '%s\n' 'https://deb.debian.org/debian-security' > /etc/apt/mirrors/debian-security.list || return 1
-    fi
+
     install_dependencies || return 1
     if [[ "$require_time_sync" == "yes" ]]; then
         ensure_time_sync || return 1
@@ -733,8 +1055,9 @@ DNS
     return 0
 }
 setup_keepalive() {
-    echo -e "${YELLOW}>> 部署 IPv6 HTTPS 链路保活定时器...${PLAIN}"
-    cat > /etc/systemd/system/ipv6-keepalive.service <<'KSERVICE'
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        echo -e "$YELLOW>> 部署 IPv6 HTTPS 链路保活定时器...$PLAIN"
+        cat > /etc/systemd/system/ipv6-keepalive.service <<'KSERVICE'
 [Unit]
 Description=IPv6 HTTPS Keepalive Probe
 After=network-online.target
@@ -745,7 +1068,7 @@ ExecStart=/usr/bin/curl -6fsSI --max-time 5 https://www.cloudflare.com
 StandardOutput=null
 StandardError=null
 KSERVICE
-    cat > /etc/systemd/system/ipv6-keepalive.timer <<'KTIMER'
+        cat > /etc/systemd/system/ipv6-keepalive.timer <<'KTIMER'
 [Unit]
 Description=Run IPv6 Keepalive Every 5 Minutes
 [Timer]
@@ -755,20 +1078,48 @@ Unit=ipv6-keepalive.service
 [Install]
 WantedBy=timers.target
 KTIMER
-    systemctl daemon-reload || return 1
-    systemctl enable --now ipv6-keepalive.timer >/dev/null 2>&1 || return 1
-    echo -e "${GREEN}✔ IPv6 Keepalive 定时器已激活。${PLAIN}"
+        service_daemon_reload || return 1
+        systemctl enable --now ipv6-keepalive.timer >/dev/null 2>&1 || return 1
+        echo -e "$GREEN✔ IPv6 Keepalive 定时器已激活。$PLAIN"
+        return 0
+    fi
+
+    echo -e "$YELLOW>> 部署 OpenRC IPv6 HTTPS 链路保活服务...$PLAIN"
+    mkdir -p /usr/local/lib/ss2022 || return 1
+    cat > "$IPV6_KEEPALIVE_HELPER" <<'KHELPER'
+#!/bin/sh
+while :; do
+    /usr/bin/curl -6fsSI --max-time 5 https://www.cloudflare.com >/dev/null 2>&1 || true
+    sleep 300
+done
+KHELPER
+    chmod 755 "$IPV6_KEEPALIVE_HELPER"
+    cat > "$IPV6_KEEPALIVE_OPENRC_SERVICE" <<'KOPENRC'
+#!/sbin/openrc-run
+description="vps-bootstrap IPv6 HTTPS Keepalive"
+command="/usr/local/lib/ss2022/ipv6-keepalive.sh"
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
+depend() {
+    need net
+}
+KOPENRC
+    chmod 755 "$IPV6_KEEPALIVE_OPENRC_SERVICE"
+    service_enable_now ss2022-ipv6-keepalive || return 1
+    echo -e "$GREEN✔ OpenRC IPv6 Keepalive 已激活。$PLAIN"
     return 0
 }
 disable_keepalive_for_ipv4() {
-    # 双栈 VPS 上若已有 IPv6 节点在使用 Keepalive，不因新增 IPv4 节点而关闭。
     if ip -6 addr show scope global 2>/dev/null | grep -q 'inet6 '; then
         return 0
     fi
-    if systemctl is-enabled --quiet ipv6-keepalive.timer 2>/dev/null || \
-       systemctl is-active --quiet ipv6-keepalive.timer 2>/dev/null; then
-        systemctl disable --now ipv6-keepalive.timer >/dev/null 2>&1 || \
-            echo -e "${YELLOW}[警告] IPv6 Keepalive 定时器未能自动停用。${PLAIN}"
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        if systemctl is-enabled --quiet ipv6-keepalive.timer 2>/dev/null ||            systemctl is-active --quiet ipv6-keepalive.timer 2>/dev/null; then
+            systemctl disable --now ipv6-keepalive.timer >/dev/null 2>&1 || true
+        fi
+    else
+        service_disable_now ss2022-ipv6-keepalive
     fi
 }
 select_network_mode() {
@@ -957,26 +1308,15 @@ node_name_management() {
     done
 }
 ensure_singbox_user() {
-    local nologin_shell=""
-    if id -u "$SINGBOX_USER" >/dev/null 2>&1; then
-        if ! getent group "$SINGBOX_GROUP" >/dev/null 2>&1; then
-            groupadd --system "$SINGBOX_GROUP" || return 1
-        fi
-        if ! id -nG "$SINGBOX_USER" 2>/dev/null | tr ' ' '\n' | grep -qx "$SINGBOX_GROUP"; then
-            usermod -a -G "$SINGBOX_GROUP" "$SINGBOX_USER" || return 1
-        fi
-        return 0
-    fi
-    nologin_shell=$(command -v nologin 2>/dev/null || true)
-    nologin_shell=${nologin_shell:-/usr/sbin/nologin}
-    useradd --system --user-group --no-create-home --home-dir /nonexistent --shell "$nologin_shell" "$SINGBOX_USER" || return 1
+    create_system_user "$SINGBOX_USER" "$SINGBOX_GROUP" || return 1
     touch "$SINGBOX_USER_MARKER"
     chmod 600 "$SINGBOX_USER_MARKER"
     return 0
 }
 write_singbox_service() {
     ensure_singbox_user || return 1
-    cat > "$SINGBOX_SERVICE" <<'SERVICE'
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        cat > "$SINGBOX_SERVICE" <<'SERVICE'
 [Unit]
 Description=sing-box service
 Documentation=https://sing-box.sagernet.org
@@ -1008,8 +1348,35 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 [Install]
 WantedBy=multi-user.target
 SERVICE
-    systemctl daemon-reload || return 1
-    systemctl enable sing-box >/dev/null 2>&1 || return 1
+        service_daemon_reload || return 1
+        service_enable sing-box || return 1
+        return 0
+    fi
+
+    mkdir -p /var/log/ss2022 || return 1
+    touch "$SINGBOX_OPENRC_LOG" || return 1
+    chown "$SINGBOX_USER:$SINGBOX_GROUP" "$SINGBOX_OPENRC_LOG" || return 1
+    chmod 640 "$SINGBOX_OPENRC_LOG"
+    cat > "$SINGBOX_OPENRC_SERVICE" <<'SERVICE'
+#!/sbin/openrc-run
+description="sing-box service"
+command="/usr/local/bin/sing-box"
+command_args="run -c /etc/sing-box/config.json"
+command_user="sing-box:sing-box"
+supervisor="supervise-daemon"
+pidfile="/run/sing-box.pid"
+output_log="/var/log/ss2022/sing-box.log"
+error_log="/var/log/ss2022/sing-box.log"
+respawn_delay=10
+respawn_max=0
+umask=0077
+depend() {
+    need net
+    use dns
+}
+SERVICE
+    chmod 755 "$SINGBOX_OPENRC_SERVICE"
+    service_enable sing-box || return 1
     return 0
 }
 install_singbox_core() {
@@ -1085,13 +1452,20 @@ install_singbox_core() {
         return 1
     fi
     install -m 755 /tmp/sb-temp/sing-box "$SINGBOX_BIN" || return 1
+    if platform_is_alpine; then
+        command -v setcap >/dev/null 2>&1 || return 1
+        setcap cap_net_bind_service=+ep "$SINGBOX_BIN" || {
+            echo -e "${RED}[错误] 无法为 sing-box 设置低端口绑定能力。$PLAIN"
+            return 1
+        }
+    fi
     rm -rf /tmp/sb-temp "/tmp/${tar_file}"
     "$SINGBOX_BIN" version >/dev/null 2>&1 || {
         echo -e "${RED}[错误] sing-box 安装后无法执行。${PLAIN}"
         return 1
     }
     write_singbox_service || return 1
-    echo -e "${GREEN}✔ sing-box ${SINGBOX_VERSION} 核心与 systemd 服务已就绪。${PLAIN}"
+    echo -e "${GREEN}✔ sing-box ${SINGBOX_VERSION} 核心与服务管理已就绪。${PLAIN}"
     return 0
 }
 
@@ -1195,7 +1569,7 @@ migrate_singbox_local_dns_prefer_go() {
         return 1
     fi
 
-    if systemctl is-active --quiet sing-box 2>/dev/null; then
+    if service_is_active sing-box; then
         was_active=1
     fi
 
@@ -1209,12 +1583,12 @@ migrate_singbox_local_dns_prefer_go() {
 
     # 原服务正在运行时才重启；若用户原本停止服务，升级不会擅自启动。
     if [[ $was_active -eq 1 ]]; then
-        if ! systemctl restart sing-box; then
+        if ! service_restart sing-box; then
             echo -e "${RED}[错误] sing-box 使用新 DNS 配置启动失败，正在自动回滚...${PLAIN}"
             if mv -f "$backup" "$SINGBOX_CONF"; then
                 chown root:"$SINGBOX_GROUP" "$SINGBOX_CONF" 2>/dev/null || true
                 chmod 640 "$SINGBOX_CONF" 2>/dev/null || true
-                if systemctl restart sing-box; then
+                if service_restart sing-box; then
                     echo -e "${YELLOW}✔ 已恢复原配置并重新启动 sing-box。${PLAIN}"
                 else
                     echo -e "${RED}[严重] 原配置已恢复，但 sing-box 仍无法重新启动，请检查日志。${PLAIN}"
@@ -1272,26 +1646,26 @@ apply_singbox_candidate() {
     inbound_count=$(jq '.inbounds | length' "$SINGBOX_CONF" 2>/dev/null || echo 0)
 
     if [[ "$inbound_count" -eq 0 ]]; then
-        systemctl stop sing-box >/dev/null 2>&1 || true
+        service_stop sing-box >/dev/null 2>&1 || true
         rm -f "$backup"
         echo -e "${GREEN}✔ sing-box 配置已更新，当前无活动入口，服务已停止。${PLAIN}"
         return 0
     fi
 
-    if ! systemctl restart sing-box; then
+    if ! service_restart sing-box; then
         echo -e "${RED}[错误] sing-box 使用新配置启动失败，正在自动回滚...${PLAIN}"
         if [[ $had_old -eq 1 && -f "$backup" ]]; then
             mv -f "$backup" "$SINGBOX_CONF"
             chown root:"$SINGBOX_GROUP" "$SINGBOX_CONF"
             chmod 640 "$SINGBOX_CONF"
-            if systemctl restart sing-box; then
+            if service_restart sing-box; then
                 echo -e "${YELLOW}✔ 已恢复原配置并重新启动服务。${PLAIN}"
             else
                 echo -e "${RED}[严重] 原配置已恢复，但 sing-box 仍无法启动。${PLAIN}"
             fi
         else
             rm -f "$SINGBOX_CONF"
-            systemctl stop sing-box >/dev/null 2>&1 || true
+            service_stop sing-box >/dev/null 2>&1 || true
         fi
         return 1
     fi
@@ -1383,7 +1757,7 @@ port_is_available_for_singbox_mode() {
         return 1
     fi
 
-    sb_pid=$(systemctl show -p MainPID --value sing-box 2>/dev/null || true)
+    sb_pid=$(service_main_pid sing-box 2>/dev/null || true)
     if port_in_use_by_other_process "$port" "$sb_pid" >/tmp/ss2022-port-conflict.$$ 2>/dev/null; then
         echo -e "${RED}[错误] 端口 ${port} 已被其他进程占用：${PLAIN}"
         cat /tmp/ss2022-port-conflict.$$ 2>/dev/null || true
@@ -1937,7 +2311,7 @@ update_ss2022() {
             apply_routing_config >/dev/null 2>&1 || echo -e "${YELLOW}[提示] 节点已更新，但现有分流配置未能自动应用。${PLAIN}"
             echo -e "${GREEN}✔ SS2022 更新成功。${PLAIN}"
         else
-            journalctl -u sing-box -n 30 --no-pager 2>/dev/null || true
+            service_log_tail sing-box 30 || true
         fi
         pause
     done
@@ -2077,7 +2451,7 @@ update_shadowtls() {
             apply_routing_config >/dev/null 2>&1 || echo -e "${YELLOW}[提示] 节点已更新，但现有分流配置未能自动应用。${PLAIN}"
             echo -e "${GREEN}✔ SS2022 + ShadowTLS v3 更新成功。${PLAIN}"
         else
-            journalctl -u sing-box -n 30 --no-pager 2>/dev/null || true
+            service_log_tail sing-box 30 || true
         fi
         pause
     done
@@ -2375,7 +2749,7 @@ deploy_ss2022() {
         save_mode_state "ss" "$(jq -n --arg host "$SERVER_HOST" --arg network "$NETWORK_MODE" --arg name "$NODE_NAME" '{host:$host,network:$network,name:$name}')" || true
         show_ss_details "$SERVER_HOST" "$PORT" "$METHOD" "$SS_KEY" "$NODE_NAME"
     else
-        journalctl -u sing-box -n 30 --no-pager 2>/dev/null || true
+        service_log_tail sing-box 30 || true
     fi
     pause
 }
@@ -2428,7 +2802,7 @@ deploy_shadowtls() {
                 continue
             fi
             local sb_pid
-            sb_pid=$(systemctl show -p MainPID --value sing-box 2>/dev/null || true)
+            sb_pid=$(service_main_pid sing-box 2>/dev/null || true)
             if port_in_use_by_other_process "$udp_port" "$sb_pid" >/tmp/ss2022-udp-conflict.$$ 2>/dev/null; then
                 echo -e "${RED}[错误] 端口 ${udp_port} 已被其他进程占用。${PLAIN}"
                 cat /tmp/ss2022-udp-conflict.$$ 2>/dev/null || true
@@ -2498,7 +2872,7 @@ deploy_shadowtls() {
         save_mode_state "shadowtls" "$(jq -n --arg host "$SERVER_HOST" --arg network "$NETWORK_MODE" --arg name "$NODE_NAME" '{host:$host,network:$network,name:$name}')" || true
         show_shadowtls_details "$SERVER_HOST" "$tcp_port" "$METHOD" "$SS_KEY" "$stls_pass" "$sni" "$udp_enabled" "$udp_port" "$NODE_NAME"
     else
-        journalctl -u sing-box -n 30 --no-pager 2>/dev/null || true
+        service_log_tail sing-box 30 || true
     fi
     pause
 }
@@ -4193,12 +4567,12 @@ apply_routing_config() {
         chmod 640 "$XRAY_CONF"
     fi
 
-    if [[ $failed -eq 0 && $sb_active -eq 1 ]] && ! systemctl restart sing-box; then failed=1; fi
+    if [[ $failed -eq 0 && $sb_active -eq 1 ]] && ! service_restart sing-box; then failed=1; fi
     if [[ $failed -eq 0 && $xr_active -eq 1 ]] && ! systemctl restart "$XRAY_SERVICE_NAME"; then failed=1; fi
 
     if [[ $failed -ne 0 ]]; then
         echo -e "${RED}[错误] 分流配置应用失败，正在回滚 sing-box / Xray...${PLAIN}"
-        if [[ $sb_active -eq 1 && -f "$sb_backup" ]]; then mv -f "$sb_backup" "$SINGBOX_CONF"; chown root:"$SINGBOX_GROUP" "$SINGBOX_CONF" 2>/dev/null || true; chmod 640 "$SINGBOX_CONF"; systemctl restart sing-box >/dev/null 2>&1 || true; fi
+        if [[ $sb_active -eq 1 && -f "$sb_backup" ]]; then mv -f "$sb_backup" "$SINGBOX_CONF"; chown root:"$SINGBOX_GROUP" "$SINGBOX_CONF" 2>/dev/null || true; chmod 640 "$SINGBOX_CONF"; service_restart sing-box >/dev/null 2>&1 || true; fi
         if [[ $xr_active -eq 1 && -f "$xr_backup" ]]; then mv -f "$xr_backup" "$XRAY_CONF"; chown root:"$XRAY_GROUP" "$XRAY_CONF" 2>/dev/null || true; chmod 640 "$XRAY_CONF"; systemctl restart "$XRAY_SERVICE_NAME" >/dev/null 2>&1 || true; fi
         rm -f "$sb_tmp" "$xr_tmp" "$sb_backup" "$xr_backup"
         return 1
@@ -4380,6 +4754,11 @@ warp_uninstall_client() {
 }
 
 warp_management() {
+    if platform_is_alpine; then
+        platform_feature_unavailable "Cloudflare WARP 官方客户端"
+        pause
+        return
+    fi
     while true; do
         clear
         warp_show_status
@@ -6445,6 +6824,11 @@ realm_service_management() {
 }
 
 forwarding_management() {
+    if platform_is_alpine; then
+        platform_feature_unavailable "Realm 端口转发"
+        pause
+        return
+    fi
     forwarding_init_state || { pause; return; }
     while true; do
         clear
@@ -6489,26 +6873,21 @@ forwarding_management() {
 
 show_service_status() {
     echo ""
-    echo -e "${YELLOW}【sing-box】${PLAIN}"
-    systemctl --no-pager --full status sing-box 2>/dev/null | head -n 15 || echo "未安装/未加载"
-
+    echo -e "$YELLOW【sing-box】$PLAIN"
+    service_status_output sing-box | head -n 15 || echo "未安装/未加载"
     echo ""
-    echo -e "${YELLOW}【ss2022-xray / VLESS Reality】${PLAIN}"
-    systemctl --no-pager --full status "$XRAY_SERVICE_NAME" 2>/dev/null | head -n 15 || echo "未安装/未加载"
-
+    echo -e "$YELLOW【ss2022-xray / VLESS Reality】$PLAIN"
+    service_status_output "$XRAY_SERVICE_NAME" | head -n 15 || echo "未安装/未加载"
     echo ""
-    echo -e "${YELLOW}【Snell v5】${PLAIN}"
-    systemctl --no-pager --full status snell-v5 2>/dev/null | head -n 15 || echo "未安装/未加载"
-
+    echo -e "$YELLOW【Snell v5】$PLAIN"
+    service_status_output snell-v5 | head -n 15 || echo "未安装/未加载"
     echo ""
-    echo -e "${YELLOW}【Realm 端口转发】${PLAIN}"
-    systemctl --no-pager --full status "$REALM_SERVICE_NAME" 2>/dev/null | head -n 15 || echo "未安装/未加载"
-
+    echo -e "$YELLOW【Realm 端口转发】$PLAIN"
+    service_status_output "$REALM_SERVICE_NAME" | head -n 15 || echo "未安装/未加载"
     echo ""
-    echo -e "${YELLOW}【监听端口】${PLAIN}"
+    echo -e "$YELLOW【监听端口】$PLAIN"
     ss -lntup 2>/dev/null | grep -E 'sing-box|xray|snell-server|ss2022-realm|realm' || echo "未检测到相关监听"
 }
-
 full_uninstall() {
     local yes=""
     echo -e "${RED}========== 完全卸载 ss2022.sh ==========${PLAIN}"
@@ -6682,6 +7061,10 @@ component_validate_existing_config() {
 
 component_install_recommended() {
     local c="$1" label bin svc tmp old_active=0 had_bin=0 ok=0
+    if platform_is_alpine && [[ "$c" != "singbox" ]]; then
+        platform_feature_unavailable "$(component_label "$c")"
+        return 1
+    fi
     label=$(component_label "$c")
     bin=$(component_bin_path "$c")
     svc=$(component_service_name "$c")
@@ -6691,7 +7074,7 @@ component_install_recommended() {
         cp -a "$bin" "$tmp/old.bin" || { rm -rf "$tmp"; return 1; }
         had_bin=1
     fi
-    systemctl is-active --quiet "$svc" 2>/dev/null && old_active=1 || true
+    service_is_active "$svc" && old_active=1 || true
 
     echo -e "${YELLOW}>> ${label}: 安装/修复到脚本推荐版本 $(component_recommended_version "$c")...${PLAIN}"
     case "$c" in
@@ -6707,13 +7090,13 @@ component_install_recommended() {
     fi
 
     if [[ $ok -eq 1 ]] && component_config_exists "$c"; then
-        systemctl daemon-reload >/dev/null 2>&1 || true
-        if ! systemctl restart "$svc" >/dev/null 2>&1; then
+        service_daemon_reload >/dev/null 2>&1 || true
+        if ! service_restart "$svc" >/dev/null 2>&1; then
             echo -e "${RED}[错误] ${label} 新版本启动失败，开始回滚。${PLAIN}"
             ok=0
         else
             sleep 1
-            systemctl is-active --quiet "$svc" || ok=0
+            service_is_active "$svc" || ok=0
         fi
     fi
 
@@ -6723,8 +7106,8 @@ component_install_recommended() {
         elif [[ $had_bin -eq 0 ]]; then
             rm -f "$bin"
         fi
-        systemctl daemon-reload >/dev/null 2>&1 || true
-        [[ $old_active -eq 1 ]] && systemctl restart "$svc" >/dev/null 2>&1 || true
+        service_daemon_reload >/dev/null 2>&1 || true
+        [[ $old_active -eq 1 ]] && service_restart "$svc" >/dev/null 2>&1 || true
         rm -rf "$tmp"
         echo -e "${RED}[错误] ${label} 升级/修复失败，已尽力恢复原核心。${PLAIN}"
         return 1
@@ -7134,40 +7517,42 @@ check_script_update() {
 protocol_management() {
     while true; do
         clear
-        echo -e "${CYAN}════════════════════ 协议管理 ════════════════════${PLAIN}"
+        echo -e "$CYAN════════════════════ 协议管理 ════════════════════$PLAIN"
         echo "  1. SS2022"
         echo "  2. SS2022 + ShadowTLS v3（增强伪装）"
-        echo "  3. VLESS Reality"
-        echo "  4. Snell v5"
+        if platform_is_alpine; then
+            echo "  3. VLESS Reality           [Alpine dev1 暂未开放]"
+            echo "  4. Snell v5                [Alpine dev1 暂未开放]"
+        else
+            echo "  3. VLESS Reality"
+            echo "  4. Snell v5"
+        fi
         echo "  0. 返回"
-        echo -e "${CYAN}═══════════════════════════════════════════════════${PLAIN}"
+        echo -e "$CYAN═══════════════════════════════════════════════════$PLAIN"
         read -rp "请选择 [0-4]: " c
         case "$c" in
             1) protocol_action_menu "SS2022" deploy_ss2022 update_ss2022 delete_ss2022 ;;
             2) protocol_action_menu "SS2022 + ShadowTLS v3" deploy_shadowtls update_shadowtls delete_shadowtls ;;
-            3) protocol_action_menu "VLESS Reality" deploy_vless_reality update_vless_reality delete_vless_reality ;;
-            4) protocol_action_menu "Snell v5" deploy_snell_v5 update_snell_v5 delete_snell_v5 ;;
+            3) if platform_is_alpine; then platform_feature_unavailable "VLESS Reality"; pause; else protocol_action_menu "VLESS Reality" deploy_vless_reality update_vless_reality delete_vless_reality; fi ;;
+            4) if platform_is_alpine; then platform_feature_unavailable "Snell v5"; pause; else protocol_action_menu "Snell v5" deploy_snell_v5 update_snell_v5 delete_snell_v5; fi ;;
             0) return ;;
             *) sleep 1 ;;
         esac
     done
 }
-
 follow_service_log() {
     local service="$1"
-    journalctl -u "$service" -f -n 30
+    service_log_follow "$service"
 }
-
 restart_service_safe() {
     local service="$1" label="$2"
-    if systemctl restart "$service"; then
-        echo -e "${GREEN}✔ ${label} 已重启。${PLAIN}"
+    if service_restart "$service"; then
+        echo -e "$GREEN✔ $label 已重启。$PLAIN"
     else
-        journalctl -u "$service" -n 30 --no-pager 2>/dev/null || true
+        service_log_tail "$service" 30 || true
         return 1
     fi
 }
-
 server_tool_pkg_manager() {
     if command -v apt-get >/dev/null 2>&1; then
         echo "apt"
@@ -9280,7 +9665,7 @@ server_tool_tg_monitor_remove() {
     systemctl disable --now ss2022-tg-monitor.timer >/dev/null 2>&1 || true
     rm -f "$TG_MONITOR_TIMER" "$TG_MONITOR_SERVICE" "$TG_MONITOR_WORKER" \
           "$TG_MONITOR_CONF" "$TG_MONITOR_STATE"
-    systemctl daemon-reload >/dev/null 2>&1 || true
+    service_daemon_reload >/dev/null 2>&1 || true
     echo -e "${GREEN}✔ TG-BOT 流量监控已彻底删除。${PLAIN}"
 }
 
@@ -9326,6 +9711,22 @@ server_tool_reboot() {
 }
 
 server_management_tools() {
+    if platform_is_alpine; then
+        while true; do
+            clear
+            echo -e "$CYAN════════════ Alpine / OpenRC 服务器工具（dev1） ════════════$PLAIN"
+            echo "  1. 系统信息"
+            echo "  2. 查看端口占用"
+            echo "  0. 返回"
+            read -rp "请选择 [0-2]: " c
+            case "$c" in
+                1) server_tool_system_info; pause ;;
+                2) server_tool_port_usage ;;
+                0) return ;;
+                *) sleep 1 ;;
+            esac
+        done
+    fi
     while true; do
         clear
         echo -e "${CYAN}════════════════════ 服务器管理工具 ════════════════════${PLAIN}"
@@ -9619,6 +10020,10 @@ protocol_operations_management() {
 
 main() {
     check_root
+    detect_platform || exit 1
+    if platform_is_alpine; then
+        echo "[v1.9 开发预览] 已检测到 Alpine / OpenRC；dev1 首批开放 SS2022 / ShadowTLS。"
+    fi
 
     # 兼容旧安装：已有 local-dns 缺少 prefer_go:true 时执行一次安全迁移。
     # 失败不会覆盖旧配置，也不会阻断管理面板。
