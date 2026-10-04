@@ -197,7 +197,25 @@ jobs:
           bash -n "$TARGET"
           [[ "$(sha256sum "$TARGET" | awk '{print $1}')" == "$NEW_SHA" ]]
           rm -f "$CANDIDATE"
-          git add -- "$TARGET" "$CANDIDATE"
+
+          # Stable promotions also advance the README's formal-version markers.
+          if [[ "$NEW_VERSION" != *-dev* && -f README.md ]]; then
+            python - <<'PY'
+          import os, re
+          from pathlib import Path
+
+          version = os.environ["NEW_VERSION"]
+          p = Path("README.md")
+          text = p.read_text(encoding="utf-8")
+          text = re.sub(r'当前正式版本：\*\*v\d+\.\d+\.\d+\*\*',
+                        f'当前正式版本：**{version}**', text)
+          text = re.sub(r'\| \*\*当前正式版本\*\* \| v\d+\.\d+\.\d+ \|',
+                        f'| **当前正式版本** | {version} |', text)
+          p.write_text(text, encoding="utf-8")
+          PY
+          fi
+
+          git add -- "$TARGET" "$CANDIDATE" README.md
           git diff --cached --check
 
       - name: Commit and push
@@ -208,3 +226,60 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "chore: promote ss2022 ${OLD_VERSION} -> ${NEW_VERSION}"
           git push origin HEAD:main
+
+      - name: Create stable GitHub Release
+        if: ${{ !contains(env.NEW_VERSION, '-dev') }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$NEW_VERSION" >/dev/null 2>&1; then
+            echo "Release $NEW_VERSION already exists; skipping."
+            exit 0
+          fi
+
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          version = os.environ["NEW_VERSION"]
+          target = os.environ["TARGET"]
+          lines = Path(target).read_text(encoding="utf-8").splitlines()
+
+          marker = f"# {version} Release:"
+          notes = []
+          capture = False
+          for line in lines:
+              if line == marker:
+                  capture = True
+                  continue
+              if not capture:
+                  continue
+              if line.startswith("# v") and line.endswith(":"):
+                  break
+              if line.startswith("#   - "):
+                  notes.append("- " + line[len("#   - "):])
+              elif line == "#" and notes:
+                  break
+
+          if not notes:
+              notes = [f"- 正式发布 {version}。"]
+
+          body = [f"## {version}", "", *notes]
+          Path("release-notes.md").write_text("\n".join(body) + "\n", encoding="utf-8")
+          PY
+
+          {
+            echo ""
+            echo "### SHA256"
+            echo '~~~text'
+            sha256sum "$TARGET" | awk '{print $1}'
+            echo '~~~'
+          } >> release-notes.md
+
+          gh release create "$NEW_VERSION" \
+            --target "$(git rev-parse HEAD)" \
+            --title "$NEW_VERSION" \
+            --notes-file release-notes.md
