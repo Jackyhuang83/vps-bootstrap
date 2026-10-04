@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev4
+# 当前版本: v1.9.0-dev5
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,13 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev5:
+#   - Alpine sing-box 安装切换为官方原生 .apk 资产，不再直接复制 Linux tar 包二进制
+#   - x86_64 / aarch64 分别固定官方 Alpine APK SHA256，并由 apk 安装其运行依赖
+#   - APK 安装成功后先验证 /usr/bin/sing-box，再复制到项目固定路径并设置低端口能力
+#   - 新增 Alpine sing-box 包管理标记，后续彻底卸载时只清理由本脚本安装的 sing-box 包
+#   - Debian / Ubuntu 继续使用原有 tar.gz + SHA256 安装路径，不受影响
 #
 # v1.9.0-dev4:
 #   - 修复 Alpine 下载了 glibc/通用 Linux sing-box 后无法执行的问题
@@ -351,11 +358,12 @@
 #   v1.9.0-dev2 Alpine 部署前置阶段诊断增强
 #   v1.9.0-dev3 Alpine/OpenRC 时间同步策略修复
 #   v1.9.0-dev4 Alpine sing-box musl 构建修复
+#   v1.9.0-dev5 Alpine sing-box 原生 APK 安装
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev4"
+SCRIPT_VERSION="v1.9.0-dev5"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -382,6 +390,7 @@ SINGBOX_SERVICE="/etc/systemd/system/sing-box.service"
 SINGBOX_USER="sing-box"
 SINGBOX_GROUP="sing-box"
 SINGBOX_USER_MARKER="/etc/ss2022-singbox-user-managed"
+SINGBOX_ALPINE_PKG_MARKER="/etc/ss2022-singbox-apk-managed"
 SINGBOX_VERSION="1.13.20"
 # ----------------------------- Xray (VLESS Reality) ---------------------------
 XRAY_VERSION="26.3.27"
@@ -1528,45 +1537,150 @@ SERVICE
     return 0
 }
 install_singbox_core() {
-    local arch s_arch="" expected_sha256="" tar_file="" target_url="" curl_family="" libc_suffix=""
-    local success=0 download_url="" actual_sha256=""
-    arch=$(uname -m)
+    local arch s_arch="" expected_sha256="" tar_file="" target_url="" curl_family=""
+    local success=0 download_url="" actual_sha256="" apk_arch="" apk_file=""
 
-    if platform_is_alpine; then
-        libc_suffix="-musl"
+    arch=$(uname -m)
+    [[ "$NETWORK_MODE" == "ipv6" ]] && curl_family="-6" || curl_family="-4"
+
+    if [[ -x "$SINGBOX_BIN" ]]; then
+        local current=""
+        current=$("$SINGBOX_BIN" version 2>/dev/null | head -n 1 | awk '{print $3}')
+        echo -e "${YELLOW}>> 已检测到 sing-box ${current:-未知版本}；将重新安装固定版本 ${SINGBOX_VERSION} 并校验 SHA256。${PLAIN}"
     fi
 
+    # Alpine 使用 sing-box 官方原生 APK，让 apk 负责 ABI 与运行依赖。
+    if platform_is_alpine; then
+        case "$arch" in
+            x86_64|amd64)
+                apk_arch="x86_64"
+                expected_sha256="d13a8c16757f2aeee3a7147e4ab18d2b581f80bc2d9b6a727f71213c65c2d878"
+                ;;
+            aarch64|arm64)
+                apk_arch="aarch64"
+                expected_sha256="4951c96e08a1e0038b9f0528cdddb6a722fa51877399f988ff2643dc098602e5"
+                ;;
+            *)
+                echo -e "${RED}[错误] Alpine 暂不支持 CPU 架构: ${arch}${PLAIN}"
+                return 1
+                ;;
+        esac
+
+        apk_file="sing-box_${SINGBOX_VERSION}_linux_${apk_arch}.apk"
+        target_url="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/${apk_file}"
+        local alpine_sources=(
+            "$target_url"
+            "https://ghproxy.net/${target_url}"
+            "https://gh-proxy.com/${target_url}"
+            "https://ghps.cc/${target_url}"
+            "https://github.boki.moe/${target_url}"
+        )
+
+        cd /tmp || return 1
+        rm -f "/tmp/${apk_file}"
+
+        echo -e "${YELLOW}>> 下载 sing-box ${SINGBOX_VERSION} Alpine 原生 APK 并校验 SHA256...${PLAIN}"
+        for download_url in "${alpine_sources[@]}"; do
+            echo -e "   尝试下载: ${CYAN}${download_url}${PLAIN}"
+            rm -f "/tmp/${apk_file}"
+            if ! curl -fL "$curl_family" --retry 2 --retry-delay 1 --connect-timeout 8 --max-time 90                 "$download_url" -o "/tmp/${apk_file}"; then
+                echo -e "${YELLOW}   下载失败，尝试下一个源。${PLAIN}"
+                continue
+            fi
+
+            actual_sha256=$(sha256sum "/tmp/${apk_file}" | awk '{print $1}')
+            if [[ "$actual_sha256" != "$expected_sha256" ]]; then
+                echo -e "${RED}   SHA256 校验失败，拒绝安装该 APK！${PLAIN}"
+                echo -e "${YELLOW}   期望: ${expected_sha256}${PLAIN}"
+                echo -e "${YELLOW}   实际: ${actual_sha256}${PLAIN}"
+                rm -f "/tmp/${apk_file}"
+                continue
+            fi
+            success=1
+            break
+        done
+
+        if [[ $success -ne 1 ]]; then
+            echo -e "${RED}[错误] sing-box Alpine APK 所有下载源均失败或未通过 SHA256 校验。${PLAIN}"
+            return 1
+        fi
+
+        echo -e "${YELLOW}>> 使用 apk 安装官方 sing-box 包及其运行依赖...${PLAIN}"
+        if ! apk add --allow-untrusted --no-cache "/tmp/${apk_file}"; then
+            echo -e "${RED}[错误] Alpine APK 安装失败。${PLAIN}"
+            apk add --simulate --allow-untrusted "/tmp/${apk_file}" 2>&1 || true
+            rm -f "/tmp/${apk_file}"
+            return 1
+        fi
+        mkdir -p "$(dirname "$SINGBOX_ALPINE_PKG_MARKER")" || return 1
+        touch "$SINGBOX_ALPINE_PKG_MARKER"
+        chmod 600 "$SINGBOX_ALPINE_PKG_MARKER"
+
+        if [[ ! -x /usr/bin/sing-box ]]; then
+            echo -e "${RED}[错误] APK 安装完成，但未找到 /usr/bin/sing-box。${PLAIN}"
+            apk info -L sing-box 2>/dev/null | head -n 50 || true
+            rm -f "/tmp/${apk_file}"
+            return 1
+        fi
+        if ! /usr/bin/sing-box version >/dev/null 2>&1; then
+            echo -e "${RED}[错误] 官方 Alpine APK 已安装，但 /usr/bin/sing-box 仍无法执行。${PLAIN}"
+            echo -e "${YELLOW}这说明问题已不是 glibc/musl 资产选择，而是当前 Alpine 运行环境本身。${PLAIN}"
+            ldd /usr/bin/sing-box 2>&1 || true
+            scanelf -n /usr/bin/sing-box 2>&1 || true
+            rm -f "/tmp/${apk_file}"
+            return 1
+        fi
+
+        install -m 755 /usr/bin/sing-box "$SINGBOX_BIN" || {
+            rm -f "/tmp/${apk_file}"
+            return 1
+        }
+
+        if ! command -v setcap >/dev/null 2>&1; then
+            echo -e "${RED}[错误] Alpine 未找到 setcap；libcap-setcap 依赖未正确安装。${PLAIN}"
+            rm -f "/tmp/${apk_file}"
+            return 1
+        fi
+        setcap cap_net_bind_service=+ep "$SINGBOX_BIN" || {
+            echo -e "${RED}[错误] 无法为 sing-box 设置 cap_net_bind_service。${PLAIN}"
+            rm -f "/tmp/${apk_file}"
+            return 1
+        }
+
+        rm -f "/tmp/${apk_file}"
+        if ! "$SINGBOX_BIN" version >/dev/null 2>&1; then
+            echo -e "${RED}[错误] /usr/bin/sing-box 可执行，但复制到 ${SINGBOX_BIN} 后无法执行。${PLAIN}"
+            getcap "$SINGBOX_BIN" 2>/dev/null || true
+            ldd "$SINGBOX_BIN" 2>&1 || true
+            return 1
+        fi
+
+        write_singbox_service || return 1
+        echo -e "${GREEN}✔ sing-box ${SINGBOX_VERSION}（Alpine APK）核心与 OpenRC 服务已就绪。${PLAIN}"
+        return 0
+    fi
+
+    # Debian / Ubuntu 保持既有 tar.gz 安装路径。
     case "$arch" in
         x86_64|amd64)
             s_arch="amd64"
-            if platform_is_alpine; then
-                expected_sha256="ea5c79f74d88db43b58debbd510aac03e8c9432ed6de51b34f67271dddb5d05e"
-            else
-                expected_sha256="646bc01bf128c32a12eb50d8690e387bba7504da7b1d65c704bd53916e38595a"
-            fi
+            expected_sha256="646bc01bf128c32a12eb50d8690e387bba7504da7b1d65c704bd53916e38595a"
             ;;
         aarch64|arm64)
             s_arch="arm64"
-            if platform_is_alpine; then
-                expected_sha256="ab37923ee950695edf25733c10e7381b368ab9069617727be06ebd1b1b0e031a"
-            else
-                expected_sha256="7f8187b1d1d30258cd4fa70892eaa232649f8f28b294078eeac719579e14cf42"
-            fi
+            expected_sha256="7f8187b1d1d30258cd4fa70892eaa232649f8f28b294078eeac719579e14cf42"
             ;;
         *)
             echo -e "${RED}[错误] 暂不支持 CPU 架构: ${arch}${PLAIN}"
             return 1
             ;;
     esac
-    [[ "$NETWORK_MODE" == "ipv6" ]] && curl_family="-6" || curl_family="-4"
-    if [[ -x "$SINGBOX_BIN" ]]; then
-        local current=""
-        current=$("$SINGBOX_BIN" version 2>/dev/null | head -n 1 | awk '{print $3}')
-        echo -e "${YELLOW}>> 已检测到 sing-box ${current:-未知版本}；按 v1.6.1 安全策略重新下载固定版本 ${SINGBOX_VERSION} 并校验 SHA256 后覆盖。${PLAIN}"
-    else
+
+    if [[ ! -x "$SINGBOX_BIN" ]]; then
         echo -e "${YELLOW}>> 下载 sing-box ${SINGBOX_VERSION} 并进行 SHA256 校验...${PLAIN}"
     fi
-    tar_file="sing-box-${SINGBOX_VERSION}-linux-${s_arch}${libc_suffix}.tar.gz"
+
+    tar_file="sing-box-${SINGBOX_VERSION}-linux-${s_arch}.tar.gz"
     target_url="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/${tar_file}"
     local download_sources=(
         "$target_url"
@@ -1575,13 +1689,14 @@ install_singbox_core() {
         "https://ghps.cc/${target_url}"
         "https://github.boki.moe/${target_url}"
     )
+
     cd /tmp || return 1
     rm -rf /tmp/sb-temp "/tmp/${tar_file}"
+    success=0
     for download_url in "${download_sources[@]}"; do
         echo -e "   尝试下载: ${CYAN}${download_url}${PLAIN}"
         rm -f "/tmp/${tar_file}"
-        if ! curl -fL "$curl_family" --retry 2 --retry-delay 1 --connect-timeout 8 --max-time 90 \
-            "$download_url" -o "/tmp/${tar_file}"; then
+        if ! curl -fL "$curl_family" --retry 2 --retry-delay 1 --connect-timeout 8 --max-time 90             "$download_url" -o "/tmp/${tar_file}"; then
             echo -e "${YELLOW}   下载失败，尝试下一个源。${PLAIN}"
             continue
         fi
@@ -1601,10 +1716,12 @@ install_singbox_core() {
         success=1
         break
     done
+
     if [[ $success -ne 1 ]]; then
         echo -e "${RED}[错误] 所有下载源均失败或未通过 SHA256 校验。${PLAIN}"
         return 1
     fi
+
     mkdir -p /tmp/sb-temp
     tar -xzf "/tmp/${tar_file}" -C /tmp/sb-temp --strip-components=1 || return 1
     if [[ ! -f /tmp/sb-temp/sing-box ]]; then
@@ -1612,35 +1729,19 @@ install_singbox_core() {
         rm -rf /tmp/sb-temp "/tmp/${tar_file}"
         return 1
     fi
+
     install -m 755 /tmp/sb-temp/sing-box "$SINGBOX_BIN" || return 1
-    if platform_is_alpine; then
-        if ! command -v setcap >/dev/null 2>&1; then
-            echo -e "${RED}[错误] Alpine 未找到 setcap；libcap-setcap 依赖未正确安装。$PLAIN"
-            apk info -e libcap-setcap >/dev/null 2>&1 || echo "缺少 Alpine 包: libcap-setcap"
-            return 1
-        fi
-        setcap cap_net_bind_service=+ep "$SINGBOX_BIN" || {
-            echo -e "${RED}[错误] 无法为 sing-box 设置 cap_net_bind_service，不能安全监听低端口。$PLAIN"
-            getcap "$SINGBOX_BIN" 2>/dev/null || true
-            return 1
-        }
-    fi
     rm -rf /tmp/sb-temp "/tmp/${tar_file}"
-    if ! "$SINGBOX_BIN" version >/dev/null 2>&1; then
+
+    "$SINGBOX_BIN" version >/dev/null 2>&1 || {
         echo -e "${RED}[错误] sing-box 安装后无法执行。${PLAIN}"
-        if platform_is_alpine; then
-            echo -e "${YELLOW}Alpine 必须使用 musl 构建；当前目标资产: ${tar_file}${PLAIN}"
-            if command -v file >/dev/null 2>&1; then
-                file "$SINGBOX_BIN" 2>/dev/null || true
-            fi
-        fi
         return 1
-    fi
+    }
+
     write_singbox_service || return 1
     echo -e "${GREEN}✔ sing-box ${SINGBOX_VERSION} 核心与服务管理已就绪。${PLAIN}"
     return 0
 }
-
 ensure_base_singbox_config() {
     ensure_singbox_user || return 1
     mkdir -p /etc/sing-box || return 1
@@ -7113,6 +7214,11 @@ full_uninstall() {
     systemctl disable --now "$IP_FAMILY_SERVICE_NAME" >/dev/null 2>&1 || true
     systemctl stop ipv6-keepalive.service >/dev/null 2>&1 || true
     command -v nft >/dev/null 2>&1 && nft delete table inet ss2022_ip_family >/dev/null 2>&1 || true
+
+    if platform_is_alpine && [[ -f "$SINGBOX_ALPINE_PKG_MARKER" ]]; then
+        apk del sing-box >/dev/null 2>&1 || true
+        rm -f "$SINGBOX_ALPINE_PKG_MARKER"
+    fi
 
     if [[ -f "$WARP_MANAGED_MARKER" ]] && command -v warp-cli >/dev/null 2>&1; then
         warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
