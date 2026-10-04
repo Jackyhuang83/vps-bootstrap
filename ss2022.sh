@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev3
+# 当前版本: v1.9.0-dev4
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,12 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev4:
+#   - 修复 Alpine 下载了 glibc/通用 Linux sing-box 后无法执行的问题
+#   - Alpine x86_64 / arm64 改用 sing-box 官方 musl 构建，并固定对应官方 SHA256
+#   - Debian / Ubuntu 继续使用原有 Linux 构建，不改变 v1.8.1 稳定路径
+#   - sing-box 安装后执行失败时增加 Alpine ABI 提示，便于区分架构/动态链接器问题
 #
 # v1.9.0-dev3:
 #   - 修复 Alpine/OpenRC 时间同步策略：不再强制以 chronyd 启动成功作为部署前提
@@ -344,11 +350,12 @@
 #   v1.9.0-dev1 Alpine / OpenRC 基础兼容层 / SS2022 + ShadowTLS 首批适配
 #   v1.9.0-dev2 Alpine 部署前置阶段诊断增强
 #   v1.9.0-dev3 Alpine/OpenRC 时间同步策略修复
+#   v1.9.0-dev4 Alpine sing-box musl 构建修复
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev3"
+SCRIPT_VERSION="v1.9.0-dev4"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -1521,17 +1528,30 @@ SERVICE
     return 0
 }
 install_singbox_core() {
-    local arch s_arch="" expected_sha256="" tar_file="" target_url="" curl_family=""
+    local arch s_arch="" expected_sha256="" tar_file="" target_url="" curl_family="" libc_suffix=""
     local success=0 download_url="" actual_sha256=""
     arch=$(uname -m)
+
+    if platform_is_alpine; then
+        libc_suffix="-musl"
+    fi
+
     case "$arch" in
         x86_64|amd64)
             s_arch="amd64"
-            expected_sha256="646bc01bf128c32a12eb50d8690e387bba7504da7b1d65c704bd53916e38595a"
+            if platform_is_alpine; then
+                expected_sha256="ea5c79f74d88db43b58debbd510aac03e8c9432ed6de51b34f67271dddb5d05e"
+            else
+                expected_sha256="646bc01bf128c32a12eb50d8690e387bba7504da7b1d65c704bd53916e38595a"
+            fi
             ;;
         aarch64|arm64)
             s_arch="arm64"
-            expected_sha256="7f8187b1d1d30258cd4fa70892eaa232649f8f28b294078eeac719579e14cf42"
+            if platform_is_alpine; then
+                expected_sha256="ab37923ee950695edf25733c10e7381b368ab9069617727be06ebd1b1b0e031a"
+            else
+                expected_sha256="7f8187b1d1d30258cd4fa70892eaa232649f8f28b294078eeac719579e14cf42"
+            fi
             ;;
         *)
             echo -e "${RED}[错误] 暂不支持 CPU 架构: ${arch}${PLAIN}"
@@ -1546,7 +1566,7 @@ install_singbox_core() {
     else
         echo -e "${YELLOW}>> 下载 sing-box ${SINGBOX_VERSION} 并进行 SHA256 校验...${PLAIN}"
     fi
-    tar_file="sing-box-${SINGBOX_VERSION}-linux-${s_arch}.tar.gz"
+    tar_file="sing-box-${SINGBOX_VERSION}-linux-${s_arch}${libc_suffix}.tar.gz"
     target_url="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/${tar_file}"
     local download_sources=(
         "$target_url"
@@ -1606,10 +1626,16 @@ install_singbox_core() {
         }
     fi
     rm -rf /tmp/sb-temp "/tmp/${tar_file}"
-    "$SINGBOX_BIN" version >/dev/null 2>&1 || {
+    if ! "$SINGBOX_BIN" version >/dev/null 2>&1; then
         echo -e "${RED}[错误] sing-box 安装后无法执行。${PLAIN}"
+        if platform_is_alpine; then
+            echo -e "${YELLOW}Alpine 必须使用 musl 构建；当前目标资产: ${tar_file}${PLAIN}"
+            if command -v file >/dev/null 2>&1; then
+                file "$SINGBOX_BIN" 2>/dev/null || true
+            fi
+        fi
         return 1
-    }
+    fi
     write_singbox_service || return 1
     echo -e "${GREEN}✔ sing-box ${SINGBOX_VERSION} 核心与服务管理已就绪。${PLAIN}"
     return 0
