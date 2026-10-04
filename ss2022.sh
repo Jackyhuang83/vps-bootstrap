@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev7
+# 当前版本: v1.9.0-dev8
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,14 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev8:
+#   - Alpine / OpenRC 开放 VLESS Reality（独立 Xray-core）与 Realm 端口转发
+#   - Xray 新增 OpenRC 服务、非 root 用户、独立日志、低端口 capability 与安全重启/回滚
+#   - Realm 继续使用官方 musl 资产，并新增 OpenRC 服务、非 root 用户、独立日志与低端口 capability
+#   - Realm 配置权限统一修正为 root:服务组 0640，避免非 root 服务无法读取 config.json
+#   - VLESS / Realm 的状态、日志、启动、停止、重启与卸载统一走 systemd/OpenRC 服务抽象
+#   - Alpine 组件版本管理开放 Xray-core 与 Realm；Snell v5 继续暂缓
 #
 # v1.9.0-dev7:
 #   - 修正“IPv4 / 双栈”旧菜单语义：0.0.0.0 只作为 IPv4 入站，不再误标为双栈
@@ -377,11 +385,12 @@
 #   v1.9.0-dev5 Alpine sing-box 原生 APK 安装
 #   v1.9.0-dev6 Alpine 3.21 gcompat + 完整 release 归档兼容
 #   v1.9.0-dev7 SS2022/ShadowTLS IPv4+IPv6 双栈入站 / 双节点输出
+#   v1.9.0-dev8 Alpine VLESS Reality / Realm OpenRC
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev7"
+SCRIPT_VERSION="v1.9.0-dev8"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -421,6 +430,9 @@ XRAY_SERVICE="/etc/systemd/system/${XRAY_SERVICE_NAME}.service"
 XRAY_USER="ss2022-xray"
 XRAY_GROUP="ss2022-xray"
 XRAY_USER_MARKER="/etc/ss2022-xray-user-managed"
+XRAY_OPENRC_SERVICE="/etc/init.d/${XRAY_SERVICE_NAME}"
+XRAY_OPENRC_PID="/run/${XRAY_SERVICE_NAME}.pid"
+XRAY_OPENRC_LOG="/var/log/ss2022/${XRAY_SERVICE_NAME}.log"
 XRAY_SHA256_AMD64="23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae"
 XRAY_SHA256_ARM64="4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c"
 # ----------------------------- Snell v5 ---------------------------------------
@@ -444,6 +456,9 @@ REALM_SERVICE="/etc/systemd/system/${REALM_SERVICE_NAME}.service"
 REALM_USER="ss2022-realm"
 REALM_GROUP="ss2022-realm"
 REALM_USER_MARKER="/etc/ss2022-realm-user-managed"
+REALM_OPENRC_SERVICE="/etc/init.d/${REALM_SERVICE_NAME}"
+REALM_OPENRC_PID="/run/${REALM_SERVICE_NAME}.pid"
+REALM_OPENRC_LOG="/var/log/ss2022/${REALM_SERVICE_NAME}.log"
 FORWARDING_FILE="/etc/ss2022/forwarding.json"
 REALM_MAX_RANGE_PORTS=1000
 # ----------------------------- 网络环境 ----------------------------------------
@@ -658,19 +673,27 @@ service_disable_now() {
 }
 
 service_main_pid() {
-    local svc="$1" pid=""
+    local svc="$1" pidfile="" pid=""
     if [[ "$PLATFORM_INIT" == "systemd" ]]; then
         systemctl show -p MainPID --value "$svc" 2>/dev/null || true
         return
     fi
-    if [[ "$svc" == "sing-box" && -r "$SINGBOX_OPENRC_PID" ]]; then
-        cat "$SINGBOX_OPENRC_PID" 2>/dev/null || true
+    case "$svc" in
+        sing-box) pidfile="$SINGBOX_OPENRC_PID" ;;
+        "$XRAY_SERVICE_NAME") pidfile="$XRAY_OPENRC_PID" ;;
+        "$REALM_SERVICE_NAME") pidfile="$REALM_OPENRC_PID" ;;
+    esac
+    if [[ -n "$pidfile" && -r "$pidfile" ]]; then
+        cat "$pidfile" 2>/dev/null || true
         return
     fi
-    pid=$(pgrep -o -x "$svc" 2>/dev/null || true)
+    case "$svc" in
+        "$XRAY_SERVICE_NAME") pid=$(pgrep -o -f "$XRAY_BIN" 2>/dev/null || true) ;;
+        "$REALM_SERVICE_NAME") pid=$(pgrep -o -f "$REALM_BIN" 2>/dev/null || true) ;;
+        *) pid=$(pgrep -o -x "$svc" 2>/dev/null || true) ;;
+    esac
     [[ -n "$pid" ]] && printf '%s\n' "$pid"
 }
-
 service_status_output() {
     local svc="$1"
     case "$PLATFORM_INIT" in
@@ -713,7 +736,7 @@ platform_feature_unavailable() {
     local feature="$1"
     echo ""
     echo "[开发预览] Alpine / OpenRC 的 $feature 尚未在 v1.9.0-dev1 开放。"
-    echo "当前首批开放: SS2022、SS2022 + ShadowTLS v3、sing-box 基础运维与服务端分流（不含 WARP）。"
+    echo "当前 Alpine 已开放: SS2022、ShadowTLS v3、VLESS Reality、Realm；Snell v5 与 WARP 暂未开放。"
     return 1
 }
 
@@ -767,6 +790,16 @@ delete_system_user() {
         deluser "$user" >/dev/null 2>&1 || true
     else
         userdel "$user" >/dev/null 2>&1 || true
+    fi
+}
+
+delete_system_group() {
+    local group="$1"
+    system_group_exists "$group" || return 0
+    if platform_is_alpine; then
+        delgroup "$group" >/dev/null 2>&1 || true
+    else
+        groupdel "$group" >/dev/null 2>&1 || true
     fi
 }
 
@@ -2929,7 +2962,7 @@ update_vless_reality() {
             save_mode_state "vless" "$(jq -n --arg host "$current_host" --arg network "$new_network" --arg public_key "$new_public" '{host:$host,network:$network,public_key:$public_key,core:"xray"}')" || true
             apply_routing_config >/dev/null 2>&1 || echo -e "${YELLOW}[提示] VLESS 已更新，但现有分流配置未能自动应用。${PLAIN}"
             echo -e "${GREEN}✔ VLESS Reality (Xray) 更新成功。${PLAIN}"
-        else journalctl -u "$XRAY_SERVICE_NAME" -n 30 --no-pager 2>/dev/null || true; fi
+        else service_log_tail "$XRAY_SERVICE_NAME" 30 || true; fi
         pause
     done
 }
@@ -3061,7 +3094,7 @@ delete_vless_reality() {
     if [[ $has_xray -eq 0 && $has_legacy -eq 0 ]]; then echo -e "${YELLOW}未部署 VLESS Reality。${PLAIN}"; pause; return; fi
     read -rp "确认删除 VLESS Reality（含旧 sing-box / 新 Xray 配置）？[y/N]: " yes
     if [[ "$yes" =~ ^[Yy]$ ]]; then
-        if [[ $has_xray -eq 1 ]]; then systemctl disable --now "$XRAY_SERVICE_NAME" >/dev/null 2>&1 || true; rm -f "$XRAY_CONF"; fi
+        if [[ $has_xray -eq 1 ]]; then service_disable_now "$XRAY_SERVICE_NAME"; rm -f "$XRAY_CONF"; fi
         if [[ $has_legacy -eq 1 ]]; then remove_singbox_mode vless || true; fi
         remove_mode_state "vless" || true
         echo -e "${GREEN}✔ VLESS Reality 已删除；Xray 二进制保留供后续部署。${PLAIN}"
@@ -3324,7 +3357,7 @@ deploy_vless_reality() {
         pause; return
     fi
     select_network_mode || return
-    if [[ -x /usr/local/bin/xray ]] || systemctl cat xray.service >/dev/null 2>&1 || [[ -f /usr/local/etc/xray/config.json ]]; then
+    if [[ -x /usr/local/bin/xray ]] || { [[ "$PLATFORM_INIT" == "systemd" ]] && systemctl cat xray.service >/dev/null 2>&1; } || [[ -x /etc/init.d/xray ]] || [[ -f /usr/local/etc/xray/config.json ]]; then
         echo -e "${YELLOW}[提示] 检测到服务器已有 Xray。本脚本使用独立 ss2022-xray 服务、二进制和配置，不会覆盖或重启现有 xray.service。${PLAIN}"
     fi
     # 如果之前已经添加了 Xray 不原生支持的标准 SS 落地节点，VLESS 部署前补齐 sing-box Bridge 依赖。
@@ -3360,33 +3393,21 @@ deploy_vless_reality() {
         echo -e "${GREEN}✔ VLESS Reality (Xray) 部署成功。${PLAIN}"
         show_vless_details "$SERVER_HOST" "$vless_port" "$uuid" "$sni" "$REALITY_PUBLIC_KEY" "$short_id" "$NODE_NAME"
     else
-        journalctl -u "$XRAY_SERVICE_NAME" -n 30 --no-pager 2>/dev/null || true
+        service_log_tail "$XRAY_SERVICE_NAME" 30 || true
     fi
     pause
 }
 
 ensure_xray_user() {
-    local nologin_shell=""
-    if id -u "$XRAY_USER" >/dev/null 2>&1; then
-        if ! getent group "$XRAY_GROUP" >/dev/null 2>&1; then
-            groupadd --system "$XRAY_GROUP" || return 1
-        fi
-        if ! id -nG "$XRAY_USER" 2>/dev/null | tr ' ' '\n' | grep -qx "$XRAY_GROUP"; then
-            usermod -a -G "$XRAY_GROUP" "$XRAY_USER" || return 1
-        fi
-        return 0
-    fi
-    nologin_shell=$(command -v nologin 2>/dev/null || true)
-    nologin_shell=${nologin_shell:-/usr/sbin/nologin}
-    useradd --system --user-group --no-create-home --home-dir /nonexistent --shell "$nologin_shell" "$XRAY_USER" || return 1
+    create_system_user "$XRAY_USER" "$XRAY_GROUP" || return 1
     touch "$XRAY_USER_MARKER"
     chmod 600 "$XRAY_USER_MARKER"
     return 0
 }
-
 write_xray_service() {
     ensure_xray_user || return 1
-    cat > "$XRAY_SERVICE" <<'SERVICE'
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        cat > "$XRAY_SERVICE" <<'SERVICE'
 [Unit]
 Description=ss2022.sh managed Xray VLESS Reality service
 Documentation=https://github.com/XTLS/Xray-core
@@ -3417,12 +3438,44 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 [Install]
 WantedBy=multi-user.target
 SERVICE
-    systemctl daemon-reload || return 1
-    systemctl enable "$XRAY_SERVICE_NAME" >/dev/null 2>&1 || return 1
-}
+        service_daemon_reload || return 1
+        service_enable "$XRAY_SERVICE_NAME" || return 1
+        return 0
+    fi
 
+    mkdir -p /var/log/ss2022 || return 1
+    touch "$XRAY_OPENRC_LOG" || return 1
+    chown "$XRAY_USER:$XRAY_GROUP" "$XRAY_OPENRC_LOG" || return 1
+    chmod 640 "$XRAY_OPENRC_LOG"
+    cat > "$XRAY_OPENRC_SERVICE" <<SERVICE
+#!/sbin/openrc-run
+description="vps-bootstrap Xray VLESS Reality"
+command="$XRAY_BIN"
+command_args="run -format json -config $XRAY_CONF"
+command_user="$XRAY_USER:$XRAY_GROUP"
+supervisor="supervise-daemon"
+pidfile="$XRAY_OPENRC_PID"
+output_log="$XRAY_OPENRC_LOG"
+error_log="$XRAY_OPENRC_LOG"
+respawn_delay=10
+respawn_max=0
+umask=0077
+
+depend() {
+    need net
+    use dns
+}
+SERVICE
+    chmod 755 "$XRAY_OPENRC_SERVICE"
+    service_enable "$XRAY_SERVICE_NAME" || {
+        echo -e "${RED}[错误] OpenRC 无法注册 $XRAY_SERVICE_NAME。${PLAIN}"
+        return 1
+    }
+    return 0
+}
 install_xray_core() {
     local arch asset sha curl_family tmp zip url actual
+    install_dependencies || return 1
     arch=$(uname -m)
     case "$arch" in
         x86_64|amd64) asset="Xray-linux-64.zip"; sha="$XRAY_SHA256_AMD64" ;;
@@ -3445,11 +3498,19 @@ install_xray_core() {
     install -d -m 755 "$(dirname "$XRAY_BIN")" || { rm -rf "$tmp"; return 1; }
     install -m 755 "$tmp/unpack/xray" "$XRAY_BIN" || { rm -rf "$tmp"; return 1; }
     rm -rf "$tmp"
-    "$XRAY_BIN" version >/dev/null 2>&1 || return 1
+    if ! "$XRAY_BIN" version >/dev/null 2>&1; then
+        echo -e "${RED}[错误] Xray 安装后无法执行。${PLAIN}"
+        platform_is_alpine && ldd "$XRAY_BIN" 2>&1 || true
+        return 1
+    fi
+    if platform_is_alpine; then
+        command -v setcap >/dev/null 2>&1 || { echo -e "${RED}[错误] Alpine 缺少 setcap。${PLAIN}"; return 1; }
+        setcap cap_net_bind_service=+ep "$XRAY_BIN" || { echo -e "${RED}[错误] 无法为 Xray 设置低端口 capability。${PLAIN}"; return 1; }
+        "$XRAY_BIN" version >/dev/null 2>&1 || { echo -e "${RED}[错误] Xray 设置 capability 后无法执行。${PLAIN}"; return 1; }
+    fi
     write_xray_service || return 1
     echo -e "${GREEN}✔ Xray-core ${XRAY_VERSION} 已安装并通过固定 SHA256 校验。${PLAIN}"
 }
-
 generate_xray_reality_keypair() {
     local out private public
     out=$("$XRAY_BIN" x25519 2>/dev/null) || return 1
@@ -3484,7 +3545,7 @@ ask_xray_port() {
         if xray_port_conflict_configured "$input" no; then
             echo -e "${RED}[错误] 端口 ${input} 已被现有协议配置占用。${PLAIN}"; continue
         fi
-        pid=$(systemctl show -p MainPID --value "$XRAY_SERVICE_NAME" 2>/dev/null || true)
+        pid=$(service_main_pid "$XRAY_SERVICE_NAME" 2>/dev/null || true)
         if port_in_use_by_other_process "$input" "$pid" >/tmp/ss2022-port-conflict.$$ 2>/dev/null; then
             echo -e "${RED}[错误] 端口 ${input} 已被其他进程占用：${PLAIN}"; cat /tmp/ss2022-port-conflict.$$; rm -f /tmp/ss2022-port-conflict.$$; continue
         fi
@@ -3521,9 +3582,10 @@ write_xray_vless_config() {
     fi
     mv -f "$candidate" "$XRAY_CONF" || { rm -f "$candidate" "$backup"; return 1; }
     chown root:"$XRAY_GROUP" "$XRAY_CONF"; chmod 640 "$XRAY_CONF"
-    if ! systemctl restart "$XRAY_SERVICE_NAME"; then
+    if ! service_restart "$XRAY_SERVICE_NAME"; then
         echo -e "${RED}[错误] Xray 新配置启动失败，正在回滚...${PLAIN}"
-        if [[ $had_old -eq 1 && -f "$backup" ]]; then mv -f "$backup" "$XRAY_CONF"; chown root:"$XRAY_GROUP" "$XRAY_CONF"; chmod 640 "$XRAY_CONF"; systemctl restart "$XRAY_SERVICE_NAME" || true; else rm -f "$XRAY_CONF"; fi
+        if [[ $had_old -eq 1 && -f "$backup" ]]; then mv -f "$backup" "$XRAY_CONF"; chown root:"$XRAY_GROUP" "$XRAY_CONF"; chmod 640 "$XRAY_CONF"; service_restart "$XRAY_SERVICE_NAME" || true; else rm -f "$XRAY_CONF"; fi
+        service_log_tail "$XRAY_SERVICE_NAME" 30 || true
         return 1
     fi
     rm -f "$backup"
@@ -5013,12 +5075,12 @@ apply_routing_config() {
     fi
 
     if [[ $failed -eq 0 && $sb_active -eq 1 ]] && ! service_restart sing-box; then failed=1; fi
-    if [[ $failed -eq 0 && $xr_active -eq 1 ]] && ! systemctl restart "$XRAY_SERVICE_NAME"; then failed=1; fi
+    if [[ $failed -eq 0 && $xr_active -eq 1 ]] && ! service_restart "$XRAY_SERVICE_NAME"; then failed=1; fi
 
     if [[ $failed -ne 0 ]]; then
         echo -e "${RED}[错误] 分流配置应用失败，正在回滚 sing-box / Xray...${PLAIN}"
         if [[ $sb_active -eq 1 && -f "$sb_backup" ]]; then mv -f "$sb_backup" "$SINGBOX_CONF"; chown root:"$SINGBOX_GROUP" "$SINGBOX_CONF" 2>/dev/null || true; chmod 640 "$SINGBOX_CONF"; service_restart sing-box >/dev/null 2>&1 || true; fi
-        if [[ $xr_active -eq 1 && -f "$xr_backup" ]]; then mv -f "$xr_backup" "$XRAY_CONF"; chown root:"$XRAY_GROUP" "$XRAY_CONF" 2>/dev/null || true; chmod 640 "$XRAY_CONF"; systemctl restart "$XRAY_SERVICE_NAME" >/dev/null 2>&1 || true; fi
+        if [[ $xr_active -eq 1 && -f "$xr_backup" ]]; then mv -f "$xr_backup" "$XRAY_CONF"; chown root:"$XRAY_GROUP" "$XRAY_CONF" 2>/dev/null || true; chmod 640 "$XRAY_CONF"; service_restart "$XRAY_SERVICE_NAME" >/dev/null 2>&1 || true; fi
         rm -f "$sb_tmp" "$xr_tmp" "$sb_backup" "$xr_backup"
         return 1
     fi
@@ -6355,33 +6417,16 @@ routing_management() {
 # ==============================================================================
 
 ensure_realm_user() {
-    local nologin_shell=""
-    if getent group "$REALM_GROUP" >/dev/null 2>&1; then
-        :
-    else
-        groupadd --system "$REALM_GROUP" || return 1
-    fi
-
-    if id -u "$REALM_USER" >/dev/null 2>&1; then
-        if ! id -nG "$REALM_USER" 2>/dev/null | tr ' ' '\n' | grep -qx "$REALM_GROUP"; then
-            usermod -a -G "$REALM_GROUP" "$REALM_USER" || return 1
-        fi
-        return 0
-    fi
-
-    nologin_shell=$(command -v nologin 2>/dev/null || true)
-    nologin_shell=${nologin_shell:-/usr/sbin/nologin}
-    useradd --system --gid "$REALM_GROUP" --no-create-home --home-dir /nonexistent --shell "$nologin_shell" "$REALM_USER" || return 1
+    create_system_user "$REALM_USER" "$REALM_GROUP" || return 1
     touch "$REALM_USER_MARKER"
     chmod 600 "$REALM_USER_MARKER"
     return 0
 }
-
 write_realm_service() {
     ensure_realm_user || return 1
     mkdir -p "$(dirname "$REALM_CONF")" "$(dirname "$REALM_BIN")" || return 1
-
-    cat > "$REALM_SERVICE" <<SERVICE
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        cat > "$REALM_SERVICE" <<SERVICE
 [Unit]
 Description=ss2022.sh managed Realm L4 forwarding service
 Documentation=https://github.com/zhboner/realm
@@ -6414,11 +6459,35 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 [Install]
 WantedBy=multi-user.target
 SERVICE
+        service_daemon_reload || return 1
+        return 0
+    fi
+    mkdir -p /var/log/ss2022 || return 1
+    touch "$REALM_OPENRC_LOG" || return 1
+    chown "$REALM_USER:$REALM_GROUP" "$REALM_OPENRC_LOG" || return 1
+    chmod 640 "$REALM_OPENRC_LOG"
+    cat > "$REALM_OPENRC_SERVICE" <<SERVICE
+#!/sbin/openrc-run
+description="vps-bootstrap Realm L4 forwarding"
+command="$REALM_BIN"
+command_args="-c $REALM_CONF"
+command_user="$REALM_USER:$REALM_GROUP"
+supervisor="supervise-daemon"
+pidfile="$REALM_OPENRC_PID"
+output_log="$REALM_OPENRC_LOG"
+error_log="$REALM_OPENRC_LOG"
+respawn_delay=3
+respawn_max=0
+umask=0077
 
-    systemctl daemon-reload || return 1
+depend() {
+    need net
+    use dns
+}
+SERVICE
+    chmod 755 "$REALM_OPENRC_SERVICE"
     return 0
 }
-
 forwarding_init_state() {
     mkdir -p "$STATE_DIR" || return 1
     chmod 700 "$STATE_DIR"
@@ -6554,6 +6623,11 @@ install_realm_core() {
         return 1
     fi
 
+    if platform_is_alpine; then
+        command -v setcap >/dev/null 2>&1 || { echo -e "${RED}[错误] Alpine 缺少 setcap。${PLAIN}"; return 1; }
+        setcap cap_net_bind_service=+ep "$REALM_BIN" || { echo -e "${RED}[错误] 无法为 Realm 设置低端口 capability。${PLAIN}"; return 1; }
+        "$REALM_BIN" --version >/dev/null 2>&1 || { echo -e "${RED}[错误] Realm 设置 capability 后无法执行。${PLAIN}"; return 1; }
+    fi
     write_realm_service || return 1
     echo -e "${GREEN}✔ Realm v${REALM_VERSION} 已安装并通过 SHA256/版本校验。${PLAIN}"
 }
@@ -6678,7 +6752,7 @@ forwarding_state_port_conflict() {
 
 forwarding_os_port_conflict_range() {
     local start="$1" end="$2" allowed_pid=""
-    allowed_pid=$(systemctl show -p MainPID --value "$REALM_SERVICE_NAME" 2>/dev/null || true)
+    allowed_pid=$(service_main_pid "$REALM_SERVICE_NAME" 2>/dev/null || true)
     local p lines conflicts
     lines=$(ss -H -lntup 2>/dev/null || true)
     p="$start"
@@ -6736,18 +6810,19 @@ forwarding_apply_state_candidate() {
     mv -f "$candidate" "$FORWARDING_FILE"
     chmod 600 "$FORWARDING_FILE"
     mv -f "$cfg_tmp" "$REALM_CONF"
-    chmod 600 "$REALM_CONF"
+    chown root:"$REALM_GROUP" "$REALM_CONF"
+    chmod 640 "$REALM_CONF"
 
     if [[ "$new_count" -eq 0 ]]; then
-        systemctl disable --now "$REALM_SERVICE_NAME" >/dev/null 2>&1 || true
+        service_disable_now "$REALM_SERVICE_NAME"
         rm -f "$state_backup" "$cfg_backup"
         echo -e "${GREEN}✔ Realm 转发规则已清空，服务已停止。${PLAIN}"
         return 0
     fi
 
-    systemctl daemon-reload || true
-    systemctl enable "$REALM_SERVICE_NAME" >/dev/null 2>&1 || true
-    if systemctl restart "$REALM_SERVICE_NAME" && sleep 1 && systemctl is-active --quiet "$REALM_SERVICE_NAME"; then
+    service_daemon_reload || true
+    service_enable "$REALM_SERVICE_NAME" >/dev/null 2>&1 || true
+    if service_restart "$REALM_SERVICE_NAME" && sleep 1 && service_is_active "$REALM_SERVICE_NAME"; then
         rm -f "$state_backup" "$cfg_backup"
         echo -e "${GREEN}✔ Realm 转发配置已应用。${PLAIN}"
         return 0
@@ -6757,15 +6832,17 @@ forwarding_apply_state_candidate() {
     mv -f "$state_backup" "$FORWARDING_FILE"
     if [[ -n "$cfg_backup" && -f "$cfg_backup" ]]; then
         mv -f "$cfg_backup" "$REALM_CONF"
+        chown root:"$REALM_GROUP" "$REALM_CONF" 2>/dev/null || true
+        chmod 640 "$REALM_CONF"
     else
         rm -f "$REALM_CONF"
     fi
     if [[ "$old_count" -gt 0 ]]; then
-        systemctl restart "$REALM_SERVICE_NAME" >/dev/null 2>&1 || true
+        service_restart "$REALM_SERVICE_NAME" >/dev/null 2>&1 || true
     else
-        systemctl disable --now "$REALM_SERVICE_NAME" >/dev/null 2>&1 || true
+        service_disable_now "$REALM_SERVICE_NAME"
     fi
-    journalctl -u "$REALM_SERVICE_NAME" -n 30 --no-pager 2>/dev/null || true
+    service_log_tail "$REALM_SERVICE_NAME" 30 || true
     return 1
 }
 
@@ -7216,20 +7293,18 @@ uninstall_realm_forwarding() {
     echo -e "${YELLOW}此操作只删除 ss2022.sh 管理的 Realm 转发组件和 forwarding.json；不会删除服务器已有 realm.service 或 /usr/local/bin/realm。${PLAIN}"
     read -rp "确认卸载 Realm 转发组件？[y/N]: " yes
     [[ "$yes" =~ ^[Yy]$ ]] || return
-
-    systemctl disable --now "$REALM_SERVICE_NAME" >/dev/null 2>&1 || true
-    rm -f "$REALM_SERVICE" "$REALM_BIN" "$FORWARDING_FILE"
+    service_disable_now "$REALM_SERVICE_NAME"
+    rm -f "$REALM_SERVICE" "$REALM_OPENRC_SERVICE" "$REALM_BIN" "$FORWARDING_FILE"
     rm -rf /etc/ss2022-realm
     if [[ -f "$REALM_USER_MARKER" ]]; then
-        userdel "$REALM_USER" >/dev/null 2>&1 || true
+        delete_system_user "$REALM_USER"
         rm -f "$REALM_USER_MARKER"
     fi
-    getent group "$REALM_GROUP" >/dev/null 2>&1 && groupdel "$REALM_GROUP" >/dev/null 2>&1 || true
-    systemctl daemon-reload || true
+    delete_system_group "$REALM_GROUP"
+    service_daemon_reload || true
     echo -e "${GREEN}✔ ss2022.sh Realm 转发组件已卸载。${PLAIN}"
     pause
 }
-
 realm_service_management() {
     while true; do
         clear
@@ -7256,24 +7331,18 @@ realm_service_management() {
                 fi
                 pause
                 ;;
-            2) systemctl --no-pager --full status "$REALM_SERVICE_NAME" 2>/dev/null || echo "未运行"; pause ;;
-            3) journalctl -u "$REALM_SERVICE_NAME" -f -n 30 ;;
-            4) systemctl restart "$REALM_SERVICE_NAME" && echo "已重启" || journalctl -u "$REALM_SERVICE_NAME" -n 30 --no-pager; pause ;;
-            5) systemctl stop "$REALM_SERVICE_NAME" && echo "已停止"; pause ;;
-            6) systemctl start "$REALM_SERVICE_NAME" && echo "已启动" || journalctl -u "$REALM_SERVICE_NAME" -n 30 --no-pager; pause ;;
+            2) service_status_output "$REALM_SERVICE_NAME" || echo "未运行"; pause ;;
+            3) service_log_follow "$REALM_SERVICE_NAME" ;;
+            4) service_restart "$REALM_SERVICE_NAME" && echo "已重启" || service_log_tail "$REALM_SERVICE_NAME" 30; pause ;;
+            5) service_stop "$REALM_SERVICE_NAME" && echo "已停止"; pause ;;
+            6) service_start "$REALM_SERVICE_NAME" && echo "已启动" || service_log_tail "$REALM_SERVICE_NAME" 30; pause ;;
             7) uninstall_realm_forwarding ;;
             0) return ;;
             *) sleep 1 ;;
         esac
     done
 }
-
 forwarding_management() {
-    if platform_is_alpine; then
-        platform_feature_unavailable "Realm 端口转发"
-        pause
-        return
-    fi
     forwarding_init_state || { pause; return; }
     while true; do
         clear
@@ -7281,7 +7350,7 @@ forwarding_management() {
         local count="" state="未安装"
         count=$(jq '.rules|length' "$FORWARDING_FILE")
         if [[ -x "$REALM_BIN" ]]; then
-            if systemctl is-active --quiet "$REALM_SERVICE_NAME"; then state="Running"; else state="Stopped"; fi
+            if service_is_active "$REALM_SERVICE_NAME"; then state="Running"; else state="Stopped"; fi
         fi
         echo -e "${CYAN}════════════════════ Realm 端口转发 ════════════════════${PLAIN}"
         echo "Realm     : ${state}"
@@ -7348,6 +7417,8 @@ full_uninstall() {
         systemctl stop ipv6-keepalive.service >/dev/null 2>&1 || true
     else
         service_disable_now sing-box
+        service_disable_now "$XRAY_SERVICE_NAME"
+        service_disable_now "$REALM_SERVICE_NAME"
         service_disable_now ss2022-ipv6-keepalive
     fi
 
@@ -7380,10 +7451,11 @@ full_uninstall() {
         rm -f "$SINGBOX_USER_MARKER"
     fi
 
-    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
-        if [[ -f "$XRAY_USER_MARKER" ]]; then userdel "$XRAY_USER" >/dev/null 2>&1 || true; rm -f "$XRAY_USER_MARKER"; fi
-        if [[ -f "$SNELL_USER_MARKER" ]]; then userdel "$SNELL_USER" >/dev/null 2>&1 || true; rm -f "$SNELL_USER_MARKER"; fi
-        if [[ -f "$REALM_USER_MARKER" ]]; then userdel "$REALM_USER" >/dev/null 2>&1 || true; rm -f "$REALM_USER_MARKER"; fi
+    if [[ -f "$XRAY_USER_MARKER" ]]; then delete_system_user "$XRAY_USER"; rm -f "$XRAY_USER_MARKER"; fi
+    if [[ -f "$REALM_USER_MARKER" ]]; then delete_system_user "$REALM_USER"; rm -f "$REALM_USER_MARKER"; fi
+    if [[ "$PLATFORM_INIT" == "systemd" && -f "$SNELL_USER_MARKER" ]]; then
+        userdel "$SNELL_USER" >/dev/null 2>&1 || true
+        rm -f "$SNELL_USER_MARKER"
     fi
 
     service_daemon_reload || true
@@ -7490,7 +7562,7 @@ component_validate_existing_config() {
 
 component_install_recommended() {
     local c="$1" label bin svc tmp old_active=0 had_bin=0 ok=0
-    if platform_is_alpine && [[ "$c" != "singbox" ]]; then
+    if platform_is_alpine && [[ "$c" == "snell" ]]; then
         platform_feature_unavailable "$(component_label "$c")"
         return 1
     fi
@@ -7949,11 +8021,10 @@ protocol_management() {
         echo -e "$CYAN════════════════════ 协议管理 ════════════════════$PLAIN"
         echo "  1. SS2022"
         echo "  2. SS2022 + ShadowTLS v3（增强伪装）"
+        echo "  3. VLESS Reality"
         if platform_is_alpine; then
-            echo "  3. VLESS Reality           [Alpine dev1 暂未开放]"
-            echo "  4. Snell v5                [Alpine dev1 暂未开放]"
+            echo "  4. Snell v5                [Alpine 暂未开放]"
         else
-            echo "  3. VLESS Reality"
             echo "  4. Snell v5"
         fi
         echo "  0. 返回"
@@ -7962,7 +8033,7 @@ protocol_management() {
         case "$c" in
             1) protocol_action_menu "SS2022" deploy_ss2022 update_ss2022 delete_ss2022 ;;
             2) protocol_action_menu "SS2022 + ShadowTLS v3" deploy_shadowtls update_shadowtls delete_shadowtls ;;
-            3) if platform_is_alpine; then platform_feature_unavailable "VLESS Reality"; pause; else protocol_action_menu "VLESS Reality" deploy_vless_reality update_vless_reality delete_vless_reality; fi ;;
+            3) protocol_action_menu "VLESS Reality" deploy_vless_reality update_vless_reality delete_vless_reality ;;
             4) if platform_is_alpine; then platform_feature_unavailable "Snell v5"; pause; else protocol_action_menu "Snell v5" deploy_snell_v5 update_snell_v5 delete_snell_v5; fi ;;
             0) return ;;
             *) sleep 1 ;;
@@ -10440,7 +10511,15 @@ protocol_operations_management() {
             7) restart_service_safe "$XRAY_SERVICE_NAME" "ss2022-xray"; pause ;;
             8) restart_service_safe snell-v5 "Snell v5"; pause ;;
             9) restart_service_safe "$REALM_SERVICE_NAME" "Realm 转发"; pause ;;
-            10) systemctl list-timers --all | grep -E 'keepalive|NEXT' || echo "未检测到 Keepalive 定时器。"; pause ;;
+            10)
+                if service_is_active "$(keepalive_service_name)"; then
+                    echo "IPv6 Keepalive: Running"
+                    service_status_output "$(keepalive_service_name)" 2>/dev/null || true
+                else
+                    echo "IPv6 Keepalive: 未运行"
+                fi
+                pause
+                ;;
             0) return ;;
             *) sleep 1 ;;
         esac
