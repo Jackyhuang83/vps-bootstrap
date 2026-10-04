@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.8.1-dev10
+# 当前版本: v1.8.1
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,14 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.8.1 Release:
+#   - 正式发布 v1.8.1，基于已实机验证的 v1.8.1-dev10 收口，不引入新的业务逻辑
+#   - 修复 sing-box 1.13.20 local DNS / prefer_go 兼容问题，并保留安全迁移与失败回滚
+#   - 完善 IPv6-only、双栈与 WARP 补充地址族场景下的落地节点接入和出口测试
+#   - 新增 IPv4 / IPv6 全局业务出口、应用级地址族分流以及可逆协议族关闭 / 恢复
+#   - 新增应用地址族一键出口测试，已完成 YouTube 指定 IPv6 的实例验证
+#   - 候选脚本采用版本化文件名并由 GitHub Actions 自动校验、晋级与清理
 #
 # v1.8.1-dev10:
 #   - 应用 IPv4 / IPv6 分流新增“一键地址族出口测试”，无需手工安装 tcpdump
@@ -308,11 +316,13 @@
 #   v1.8.1-dev7 双栈落地服务器拨号地址族修复
 #   v1.8.1-dev8 sing-box local DNS prefer_go 安全迁移
 #   v1.8.1-dev9 IPv4 / IPv6 全局与应用级地址族管理
+#   v1.8.1-dev10 应用地址族一键出口测试 / YouTube IPv6 实例验证
+#   v1.8.1 正式发布
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.8.1-dev10"
+SCRIPT_VERSION="v1.8.1"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
