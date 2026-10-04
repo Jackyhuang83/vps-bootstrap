@@ -926,16 +926,16 @@ ensure_time_sync() {
         echo -e "$GREEN✔ 系统时间已同步。当前 UTC: $(date -u '+%Y-%m-%d %H:%M:%S UTC')$PLAIN"
         return 0
     fi
-    echo -e "$YELLOW[提示] 系统时钟尚未同步，准备使用 chrony 自动校时。$PLAIN"
+    echo -e "${YELLOW}[提示] 系统时钟尚未同步，准备使用 chrony 自动校时。$PLAIN"
     if ! command -v chronyc >/dev/null 2>&1; then
         pkg_install chrony || {
-            echo -e "$RED[错误] chrony 安装失败。SS2022 / Reality 对时间偏差敏感，停止部署。$PLAIN"
+            echo -e "${RED}[错误] chrony 安装失败。SS2022 / Reality 对时间偏差敏感，停止部署。$PLAIN"
             return 1
         }
     fi
     if [[ "$PLATFORM_INIT" == "openrc" ]]; then chrony_svc="chronyd"; else chrony_svc="chrony"; fi
     service_enable_now "$chrony_svc" >/dev/null 2>&1 || {
-        echo -e "$RED[错误] chrony 服务启动失败。$PLAIN"
+        echo -e "${RED}[错误] chrony 服务启动失败。$PLAIN"
         return 1
     }
     service_restart "$chrony_svc" >/dev/null 2>&1 || true
@@ -949,28 +949,28 @@ ensure_time_sync() {
         fi
         sleep 2
     done
-    echo -e "$RED[错误] 30 秒内未确认系统时间同步。停止部署。$PLAIN"
+    echo -e "${RED}[错误] 30 秒内未确认系统时间同步。停止部署。$PLAIN"
     chronyc tracking 2>/dev/null || true
     return 1
 }
 install_dependencies() {
     echo -e "$YELLOW>> 更新软件包索引...$PLAIN"
     pkg_update || {
-        echo -e "$RED[错误] 软件包索引更新失败，请检查网络或软件源。$PLAIN"
+        echo -e "${RED}[错误] 软件包索引更新失败，请检查网络或软件源。$PLAIN"
         return 1
     }
     echo -e "$YELLOW>> 安装运行依赖...$PLAIN"
     if [[ "$PLATFORM_PKG" == "apk" ]]; then
         pkg_install curl jq openssl coreutils ca-certificates iproute2 tar unzip libcap-setcap || {
-            echo -e "$RED[错误] Alpine 基础依赖安装失败。$PLAIN"
+            echo -e "${RED}[错误] Alpine 基础依赖安装失败。$PLAIN"
             return 1
         }
         if ! command -v qrencode >/dev/null 2>&1; then
-            pkg_install libqrencode-tools >/dev/null 2>&1 ||                 echo -e "$YELLOW[提示] libqrencode-tools 未安装；二维码将暂不显示，不影响节点使用。$PLAIN"
+            pkg_install libqrencode-tools >/dev/null 2>&1 ||                 echo -e "${YELLOW}[提示] libqrencode-tools 未安装；二维码将暂不显示，不影响节点使用。$PLAIN"
         fi
     else
         pkg_install curl jq openssl coreutils qrencode ca-certificates iproute2 tar unzip || {
-            echo -e "$RED[错误] 依赖安装失败。$PLAIN"
+            echo -e "${RED}[错误] 依赖安装失败。$PLAIN"
             return 1
         }
     fi
@@ -1009,7 +1009,7 @@ prepare_ipv6_env() {
     [[ -n "$require_time_sync" ]] || require_time_sync="yes"
     echo -e "$YELLOW>> 初始化 IPv6-only 部署环境...$PLAIN"
     if ! ip -6 addr show scope global 2>/dev/null | grep -q 'inet6 '; then
-        echo -e "$RED[错误] 未检测到全局 IPv6 地址，无法使用 IPv6-only 模式。$PLAIN"
+        echo -e "${RED}[错误] 未检测到全局 IPv6 地址，无法使用 IPv6-only 模式。$PLAIN"
         return 1
     fi
     sed -i '/github/d' /etc/hosts 2>/dev/null || true
@@ -1018,7 +1018,7 @@ prepare_ipv6_env() {
     if dns_ipv6_resolution_works; then
         echo -e "$GREEN✔ 当前 DNS 可正常解析 IPv6 地址，不修改 /etc/resolv.conf。$PLAIN"
     else
-        echo -e "$YELLOW[提示] 当前 DNS 无法完成 IPv6 解析，准备使用公共 IPv6 DNS 兜底。$PLAIN"
+        echo -e "${YELLOW}[提示] 当前 DNS 无法完成 IPv6 解析，准备使用公共 IPv6 DNS 兜底。$PLAIN"
         if [[ -f /etc/resolv.conf && ! -L /etc/resolv.conf ]]; then
             if [[ ! -f "$BACKUP_DNS" ]]; then
                 cp -a /etc/resolv.conf "$BACKUP_DNS" || return 1
@@ -1032,11 +1032,11 @@ DNS
             if ! dns_ipv6_resolution_works; then
                 [[ -f "$BACKUP_DNS" ]] && cp -f "$BACKUP_DNS" /etc/resolv.conf 2>/dev/null || true
                 rm -f "$DNS_MARKER"
-                echo -e "$RED[错误] 公共 IPv6 DNS 仍无法解析，已尝试恢复原 DNS。$PLAIN"
+                echo -e "${RED}[错误] 公共 IPv6 DNS 仍无法解析，已尝试恢复原 DNS。$PLAIN"
                 return 1
             fi
         else
-            echo -e "$RED[错误] DNS 解析失败，且 /etc/resolv.conf 由系统服务管理。$PLAIN"
+            echo -e "${RED}[错误] DNS 解析失败，且 /etc/resolv.conf 由系统服务管理。$PLAIN"
             return 1
         fi
     fi
@@ -1455,7 +1455,7 @@ install_singbox_core() {
     if platform_is_alpine; then
         command -v setcap >/dev/null 2>&1 || return 1
         setcap cap_net_bind_service=+ep "$SINGBOX_BIN" || {
-            echo -e "$RED[错误] 无法为 sing-box 设置低端口绑定能力。$PLAIN"
+            echo -e "${RED}[错误] 无法为 sing-box 设置低端口绑定能力。$PLAIN"
             return 1
         }
     fi
