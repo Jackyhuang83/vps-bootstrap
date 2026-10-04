@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev2
+# 当前版本: v1.9.0-dev3
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,13 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev3:
+#   - 修复 Alpine/OpenRC 时间同步策略：不再强制以 chronyd 启动成功作为部署前提
+#   - 新增 HTTPS Date 时钟偏差校验；当前系统时间已在安全范围内时直接继续部署
+#   - Alpine 优先复用现有 chronyd / BusyBox ntpd / openntpd，避免重复安装时间守护进程
+#   - 无可用时间服务时优先启用 Alpine 自带 BusyBox ntpd；失败再回退 chrony
+#   - 时间同步失败时保留完整 OpenRC / ntpd / chronyd 诊断，不再误判“服务未运行=时钟一定不安全”
 #
 # v1.9.0-dev2:
 #   - 修复 Alpine 部署前置阶段失败后界面立即清屏，导致错误原因不可见的问题
@@ -336,11 +343,12 @@
 #   v1.8.1 正式发布
 #   v1.9.0-dev1 Alpine / OpenRC 基础兼容层 / SS2022 + ShadowTLS 首批适配
 #   v1.9.0-dev2 Alpine 部署前置阶段诊断增强
+#   v1.9.0-dev3 Alpine/OpenRC 时间同步策略修复
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev2"
+SCRIPT_VERSION="v1.9.0-dev3"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -779,24 +787,69 @@ get_snell_version() {
         echo "Snell 未安装"
     fi
 }
+http_time_skew_seconds() {
+    local header="" remote_date="" remote_epoch="" local_epoch="" skew=""
+
+    command -v curl >/dev/null 2>&1 || return 1
+    command -v date >/dev/null 2>&1 || return 1
+
+    header=$(curl -kfsSI --connect-timeout 4 --max-time 8 https://www.cloudflare.com 2>/dev/null | tr -d '\r' || true)
+    remote_date=$(printf '%s\n' "$header" | awk 'BEGIN{IGNORECASE=1} /^date:[[:space:]]*/{sub(/^[Dd][Aa][Tt][Ee]:[[:space:]]*/, ""); print; exit}')
+    [[ -n "$remote_date" ]] || return 1
+
+    remote_epoch=$(date -u -d "$remote_date" +%s 2>/dev/null || true)
+    local_epoch=$(date -u +%s 2>/dev/null || true)
+    [[ "$remote_epoch" =~ ^[0-9]+$ && "$local_epoch" =~ ^[0-9]+$ ]] || return 1
+
+    if (( local_epoch >= remote_epoch )); then
+        skew=$((local_epoch - remote_epoch))
+    else
+        skew=$((remote_epoch - local_epoch))
+    fi
+    printf '%s\n' "$skew"
+}
+
+http_time_is_healthy() {
+    local skew=""
+    skew=$(http_time_skew_seconds 2>/dev/null || true)
+    [[ "$skew" =~ ^[0-9]+$ ]] || return 1
+    (( skew <= 120 ))
+}
+
 time_sync_is_healthy() {
     local ntp_sync=""
-    if command -v timedatectl &>/dev/null; then
+
+    if command -v timedatectl >/dev/null 2>&1; then
         ntp_sync=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)
         [[ "$ntp_sync" == "yes" ]] && return 0
     fi
-    if command -v chronyc &>/dev/null; then
+
+    if command -v chronyc >/dev/null 2>&1; then
         if chronyc tracking 2>/dev/null | grep -Eq '^Leap status[[:space:]]*:[[:space:]]*Normal$'; then
             return 0
         fi
     fi
+
+    # VPS 场景下只要当前时钟与可信公网 Date 相差不超过 120 秒，
+    # 就满足 SS2022 / Reality 部署前的时间安全要求，不强制绑定某个 NTP 实现。
+    if http_time_is_healthy; then
+        return 0
+    fi
+
+    # Alpine / OpenRC 允许系统已有的 NTP 守护进程继续负责长期校时。
+    if [[ "$PLATFORM_INIT" == "openrc" ]]; then
+        rc-service chronyd status >/dev/null 2>&1 && return 0
+        rc-service ntpd status >/dev/null 2>&1 && return 0
+        rc-service openntpd status >/dev/null 2>&1 && return 0
+    fi
+
     return 1
 }
 get_time_sync_status() {
     if time_sync_is_healthy; then
-        echo -e "${GREEN}● 已同步${PLAIN}"
-    elif command -v chronyc &>/dev/null || command -v timedatectl &>/dev/null; then
-        echo -e "${YELLOW}○ 未同步${PLAIN}"
+        echo -e "${GREEN}● 已同步/时钟正常${PLAIN}"
+    elif command -v chronyc >/dev/null 2>&1 || command -v timedatectl >/dev/null 2>&1 || [[ "$PLATFORM_INIT" == "openrc" ]]; then
+        echo -e "${YELLOW}○ 未确认同步${PLAIN}"
     else
         echo -e "${YELLOW}○ 未检测${PLAIN}"
     fi
@@ -928,46 +981,113 @@ restore_ipv4_apt_and_dns_if_needed() {
     fi
 }
 ensure_time_sync() {
-    local attempt=0 chrony_svc=""
-    echo -e "$YELLOW>> 检查系统时间同步状态...$PLAIN"
+    local attempt=0 chrony_svc="" skew=""
+
+    echo -e "${YELLOW}>> 检查系统时间同步状态...${PLAIN}"
     if time_sync_is_healthy; then
-        echo -e "$GREEN✔ 系统时间已同步。当前 UTC: $(date -u '+%Y-%m-%d %H:%M:%S UTC')$PLAIN"
+        skew=$(http_time_skew_seconds 2>/dev/null || true)
+        if [[ "$skew" =~ ^[0-9]+$ ]]; then
+            echo -e "${GREEN}✔ 系统时钟正常，与公网时间偏差约 ${skew} 秒。当前 UTC: $(date -u '+%Y-%m-%d %H:%M:%S UTC')${PLAIN}"
+        else
+            echo -e "${GREEN}✔ 系统时间同步状态正常。当前 UTC: $(date -u '+%Y-%m-%d %H:%M:%S UTC')${PLAIN}"
+        fi
         return 0
     fi
-    echo -e "${YELLOW}[提示] 系统时钟尚未同步，准备使用 chrony 自动校时。$PLAIN"
+
+    if [[ "$PLATFORM_INIT" == "openrc" ]]; then
+        echo -e "${YELLOW}[提示] 当前时钟尚未通过安全校验，优先复用 Alpine / OpenRC 现有时间服务。${PLAIN}"
+
+        for chrony_svc in chronyd ntpd openntpd; do
+            if [[ -x "/etc/init.d/$chrony_svc" ]] && rc-service "$chrony_svc" status >/dev/null 2>&1; then
+                echo -e "${YELLOW}>> 已检测到运行中的 $chrony_svc，等待时钟稳定...${PLAIN}"
+                for attempt in {1..10}; do
+                    http_time_is_healthy && {
+                        echo -e "${GREEN}✔ $chrony_svc 已使系统时钟进入安全范围。${PLAIN}"
+                        return 0
+                    }
+                    sleep 1
+                done
+            fi
+        done
+
+        # Alpine 基础系统自带 BusyBox ntpd/OpenRC 脚本，优先使用它，避免额外引入 chrony。
+        if [[ -x /etc/init.d/ntpd ]] && command -v ntpd >/dev/null 2>&1; then
+            echo -e "${YELLOW}>> 尝试启用 Alpine BusyBox ntpd...${PLAIN}"
+            rc-update add ntpd default >/dev/null 2>&1 || true
+            if rc-service ntpd start >/dev/null 2>&1 || rc-service ntpd status >/dev/null 2>&1; then
+                for attempt in {1..15}; do
+                    http_time_is_healthy && {
+                        echo -e "${GREEN}✔ BusyBox ntpd 已启动，系统时钟正常。${PLAIN}"
+                        return 0
+                    }
+                    sleep 1
+                done
+            fi
+        fi
+
+        echo -e "${YELLOW}[提示] BusyBox ntpd 未能确认时钟，回退到 chrony。${PLAIN}"
+        if ! command -v chronyc >/dev/null 2>&1; then
+            pkg_install chrony || {
+                echo -e "${RED}[错误] chrony 安装失败。${PLAIN}"
+                return 1
+            }
+        fi
+
+        chrony_svc="chronyd"
+        rc-update add "$chrony_svc" default >/dev/null 2>&1 || true
+        if ! rc-service "$chrony_svc" start >/dev/null 2>&1 && ! rc-service "$chrony_svc" status >/dev/null 2>&1; then
+            echo -e "${RED}[错误] chronyd 无法启动，且当前系统时钟仍未通过安全校验。${PLAIN}"
+            echo -e "${YELLOW}OpenRC 状态：${PLAIN}"
+            rc-service -d "$chrony_svc" start 2>&1 || true
+            echo -e "${YELLOW}当前时间偏差：${PLAIN}"
+            skew=$(http_time_skew_seconds 2>/dev/null || true)
+            [[ "$skew" =~ ^[0-9]+$ ]] && echo "${skew} 秒" || echo "无法取得公网 Date"
+            return 1
+        fi
+
+        chronyc -a burst 4/4 >/dev/null 2>&1 || true
+        chronyc -a makestep >/dev/null 2>&1 || true
+        for attempt in {1..15}; do
+            time_sync_is_healthy && {
+                echo -e "${GREEN}✔ chronyd 已启动，系统时间同步完成。${PLAIN}"
+                return 0
+            }
+            sleep 1
+        done
+
+        echo -e "${RED}[错误] 时间服务已启动，但 15 秒内仍未确认系统时钟进入安全范围。${PLAIN}"
+        chronyc tracking 2>&1 || true
+        return 1
+    fi
+
+    echo -e "${YELLOW}[提示] 系统时钟尚未同步，准备使用 chrony 自动校时。${PLAIN}"
     if ! command -v chronyc >/dev/null 2>&1; then
         pkg_install chrony || {
-            echo -e "${RED}[错误] chrony 安装失败。SS2022 / Reality 对时间偏差敏感，停止部署。$PLAIN"
+            echo -e "${RED}[错误] chrony 安装失败。SS2022 / Reality 对时间偏差敏感，停止部署。${PLAIN}"
             return 1
         }
     fi
-    if [[ "$PLATFORM_INIT" == "openrc" ]]; then chrony_svc="chronyd"; else chrony_svc="chrony"; fi
+
+    chrony_svc="chrony"
     service_enable_now "$chrony_svc" >/dev/null 2>&1 || {
-        echo -e "${RED}[错误] chrony 服务启动失败。$PLAIN"
-        if [[ "$PLATFORM_INIT" == "openrc" ]]; then
-            echo -e "${YELLOW}OpenRC chronyd 状态：${PLAIN}"
-            rc-service "$chrony_svc" status 2>&1 || true
-        fi
+        echo -e "${RED}[错误] chrony 服务启动失败。${PLAIN}"
         return 1
     }
     service_restart "$chrony_svc" >/dev/null 2>&1 || true
     chronyc -a burst 4/4 >/dev/null 2>&1 || true
     sleep 2
     chronyc -a makestep >/dev/null 2>&1 || true
+
     for attempt in {1..15}; do
         if time_sync_is_healthy; then
-            echo -e "$GREEN✔ 系统时间同步完成。当前 UTC: $(date -u '+%Y-%m-%d %H:%M:%S UTC')$PLAIN"
+            echo -e "${GREEN}✔ 系统时间同步完成。当前 UTC: $(date -u '+%Y-%m-%d %H:%M:%S UTC')${PLAIN}"
             return 0
         fi
         sleep 2
     done
-    echo -e "${RED}[错误] 30 秒内未确认系统时间同步。停止部署。$PLAIN"
-    if [[ "$PLATFORM_INIT" == "openrc" ]]; then
-        echo -e "${YELLOW}OpenRC chronyd 状态：${PLAIN}"
-        rc-service "$chrony_svc" status 2>&1 || true
-    fi
-    echo -e "${YELLOW}chronyc tracking：${PLAIN}"
-    chronyc tracking 2>&1 || true
+
+    echo -e "${RED}[错误] 30 秒内未确认系统时间同步。停止部署。${PLAIN}"
+    chronyc tracking 2>/dev/null || true
     return 1
 }
 install_dependencies() {
