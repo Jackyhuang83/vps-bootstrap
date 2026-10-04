@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev1
+# 当前版本: v1.9.0-dev2
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,13 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev2:
+#   - 修复 Alpine 部署前置阶段失败后界面立即清屏，导致错误原因不可见的问题
+#   - SS2022 / ShadowTLS 增加“环境初始化 / sing-box 核心 / 端口参数”三阶段提示
+#   - 环境初始化或核心安装失败时停留在错误页面并显示失败阶段，不再直接返回协议菜单
+#   - Alpine chrony 启动/同步失败时追加 OpenRC 服务状态与 chronyc tracking
+#   - Alpine setcap / OpenRC 服务注册失败时输出明确错误
 #
 # v1.9.0-dev1:
 #   - 启动 Alpine / OpenRC 适配主线；Debian / Ubuntu + systemd 行为保持兼容
@@ -328,11 +335,12 @@
 #   v1.8.1-dev10 应用地址族一键出口测试 / YouTube IPv6 实例验证
 #   v1.8.1 正式发布
 #   v1.9.0-dev1 Alpine / OpenRC 基础兼容层 / SS2022 + ShadowTLS 首批适配
+#   v1.9.0-dev2 Alpine 部署前置阶段诊断增强
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev1"
+SCRIPT_VERSION="v1.9.0-dev2"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -936,6 +944,10 @@ ensure_time_sync() {
     if [[ "$PLATFORM_INIT" == "openrc" ]]; then chrony_svc="chronyd"; else chrony_svc="chrony"; fi
     service_enable_now "$chrony_svc" >/dev/null 2>&1 || {
         echo -e "${RED}[错误] chrony 服务启动失败。$PLAIN"
+        if [[ "$PLATFORM_INIT" == "openrc" ]]; then
+            echo -e "${YELLOW}OpenRC chronyd 状态：${PLAIN}"
+            rc-service "$chrony_svc" status 2>&1 || true
+        fi
         return 1
     }
     service_restart "$chrony_svc" >/dev/null 2>&1 || true
@@ -950,7 +962,12 @@ ensure_time_sync() {
         sleep 2
     done
     echo -e "${RED}[错误] 30 秒内未确认系统时间同步。停止部署。$PLAIN"
-    chronyc tracking 2>/dev/null || true
+    if [[ "$PLATFORM_INIT" == "openrc" ]]; then
+        echo -e "${YELLOW}OpenRC chronyd 状态：${PLAIN}"
+        rc-service "$chrony_svc" status 2>&1 || true
+    fi
+    echo -e "${YELLOW}chronyc tracking：${PLAIN}"
+    chronyc tracking 2>&1 || true
     return 1
 }
 install_dependencies() {
@@ -1376,7 +1393,11 @@ depend() {
 }
 SERVICE
     chmod 755 "$SINGBOX_OPENRC_SERVICE"
-    service_enable sing-box || return 1
+    if ! service_enable sing-box; then
+        echo -e "${RED}[错误] OpenRC 无法把 sing-box 加入 default runlevel。${PLAIN}"
+        rc-update show 2>&1 | grep -E 'sing-box|default' || true
+        return 1
+    fi
     return 0
 }
 install_singbox_core() {
@@ -1453,9 +1474,14 @@ install_singbox_core() {
     fi
     install -m 755 /tmp/sb-temp/sing-box "$SINGBOX_BIN" || return 1
     if platform_is_alpine; then
-        command -v setcap >/dev/null 2>&1 || return 1
+        if ! command -v setcap >/dev/null 2>&1; then
+            echo -e "${RED}[错误] Alpine 未找到 setcap；libcap-setcap 依赖未正确安装。$PLAIN"
+            apk info -e libcap-setcap >/dev/null 2>&1 || echo "缺少 Alpine 包: libcap-setcap"
+            return 1
+        fi
         setcap cap_net_bind_service=+ep "$SINGBOX_BIN" || {
-            echo -e "${RED}[错误] 无法为 sing-box 设置低端口绑定能力。$PLAIN"
+            echo -e "${RED}[错误] 无法为 sing-box 设置 cap_net_bind_service，不能安全监听低端口。$PLAIN"
+            getcap "$SINGBOX_BIN" 2>/dev/null || true
             return 1
         }
     fi
@@ -2720,9 +2746,29 @@ deploy_ss2022() {
         return
     fi
 
-    select_network_mode || return
-    install_singbox_core || { pause; return; }
+    echo -e "${CYAN}>> [1/3] 初始化系统与网络环境...${PLAIN}"
+    if ! select_network_mode; then
+        echo ""
+        echo -e "${RED}[部署中止] SS2022 尚未进入端口配置阶段：系统/网络环境初始化失败或被取消。${PLAIN}"
+        echo -e "${YELLOW}上方最后一条错误就是本次中止原因；当前不会写入 SS2022 节点配置。${PLAIN}"
+        pause
+        return
+    fi
 
+    echo -e "${CYAN}>> [2/3] 安装 / 校验 sing-box 核心与服务...${PLAIN}"
+    if ! install_singbox_core; then
+        echo ""
+        echo -e "${RED}[部署中止] sing-box 核心或服务初始化失败，因此没有进入端口配置阶段。${PLAIN}"
+        if platform_is_alpine; then
+            echo -e "${YELLOW}Alpine / OpenRC 快速状态：${PLAIN}"
+            [[ -x "$SINGBOX_BIN" ]] && "$SINGBOX_BIN" version 2>&1 | head -n 2 || true
+            [[ -f "$SINGBOX_OPENRC_SERVICE" ]] && rc-service sing-box status 2>&1 || true
+        fi
+        pause
+        return
+    fi
+
+    echo -e "${CYAN}>> [3/3] 配置 SS2022 监听端口与节点参数...${PLAIN}"
     ask_singbox_port "请输入 SS2022 监听端口" "58588" "$excluded_tags" || return
     get_ss_cipher_and_key || { pause; return; }
     ask_server_host
@@ -2766,9 +2812,27 @@ deploy_shadowtls() {
     local outer backend udp_inbound add_json=""
     local default_udp=""
 
-    select_network_mode || return
-    install_singbox_core || { pause; return; }
+    echo -e "${CYAN}>> [1/3] 初始化系统与网络环境...${PLAIN}"
+    if ! select_network_mode; then
+        echo ""
+        echo -e "${RED}[部署中止] ShadowTLS 尚未进入端口配置阶段：系统/网络环境初始化失败或被取消。${PLAIN}"
+        pause
+        return
+    fi
 
+    echo -e "${CYAN}>> [2/3] 安装 / 校验 sing-box 核心与服务...${PLAIN}"
+    if ! install_singbox_core; then
+        echo ""
+        echo -e "${RED}[部署中止] sing-box 核心或 OpenRC 服务初始化失败，因此没有进入端口配置阶段。${PLAIN}"
+        if platform_is_alpine; then
+            [[ -x "$SINGBOX_BIN" ]] && "$SINGBOX_BIN" version 2>&1 | head -n 2 || true
+            [[ -f "$SINGBOX_OPENRC_SERVICE" ]] && rc-service sing-box status 2>&1 || true
+        fi
+        pause
+        return
+    fi
+
+    echo -e "${CYAN}>> [3/3] 配置 ShadowTLS 端口与节点参数...${PLAIN}"
     ask_singbox_port "请输入 ShadowTLS 对外 TCP 端口（推荐 443）" "443" "$excluded_tags" || return
     tcp_port="$PORT"
 
