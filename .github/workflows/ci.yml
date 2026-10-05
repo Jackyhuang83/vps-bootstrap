@@ -236,6 +236,48 @@ jobs:
           grep -Fq '"$REALM_GROUP_MARKER"' <<<"$full_body"
           grep -Fq '"$SNELL_GROUP_MARKER"' <<<"$full_body"
 
+      - name: Guard shared config directory ownership
+        shell: bash
+        run: |
+          export SS2022_LIB_ONLY=1
+          # shellcheck disable=SC1091
+          source ./ss2022.sh
+
+          [[ "$SINGBOX_CONF_DIR" == "/etc/sing-box" ]]
+          [[ "$SNELL_CONF_DIR" == "/etc/snell" ]]
+          [[ "$SINGBOX_DIR_MARKER" == "/etc/ss2022-singbox-dir-managed" ]]
+          [[ "$SNELL_DIR_MARKER" == "/etc/ss2022-snell-dir-managed" ]]
+
+          dir_body=$(declare -f ensure_project_config_dir)
+          sb_body=$(declare -f ensure_base_singbox_config)
+          snell_body=$(declare -f apply_snell_config)
+          migrate_body=$(declare -f migrate_singbox_local_dns_prefer_go)
+          full_body=$(declare -f full_uninstall)
+
+          grep -Fq '[[ ! -d "$dir" ]]' <<<"$dir_body"
+          grep -Fq 'touch "$marker"' <<<"$dir_body"
+          grep -Fq 'elif [[ -f "$marker" ]]' <<<"$dir_body"
+          grep -Fq 'ensure_singbox_config_dir' <<<"$sb_body"
+          grep -Fq 'ensure_snell_config_dir' <<<"$snell_body"
+          grep -Fq 'singbox_is_project_managed || return 0' <<<"$migrate_body"
+
+          if grep -Fq 'rm -rf /etc/sing-box' <<<"$full_body" ||
+             grep -Fq 'rm -rf /etc/snell' <<<"$full_body"; then
+            echo "ERROR: full uninstall must not recursively delete shared config directories."
+            exit 1
+          fi
+          grep -Fq 'rm -f "$SINGBOX_CONF" "${SINGBOX_CONF_DIR}"/.ss2022-*' <<<"$full_body"
+          grep -Fq 'rm -f "$SNELL_CONF" "${SNELL_CONF_DIR}"/.ss2022-*' <<<"$full_body"
+          grep -Fq 'rmdir "$SINGBOX_CONF_DIR"' <<<"$full_body"
+          grep -Fq 'rmdir "$SNELL_CONF_DIR"' <<<"$full_body"
+
+          if grep -Fq '/etc/snell-v5.conf.tmp.' ss2022.sh ||
+             grep -Fq '/etc/sing-box/config.routing.' ss2022.sh ||
+             grep -Fq '/etc/sing-box/config.json.tmp.' ss2022.sh; then
+            echo "ERROR: config transaction files must use the .ss2022-* namespace."
+            exit 1
+          fi
+
       - name: Guard external sing-box ownership
         shell: bash
         run: |
