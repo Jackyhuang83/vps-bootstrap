@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev34
+# 当前版本: v1.9.0-dev35
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -91,9 +91,9 @@
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
 #
-# v1.9.0-dev34:
+# v1.9.0-dev35:
 #   - Alpine 3.21 CI 实测确认 Surge 官方 Snell v5.0.1 在 gcompat 下无法启动（Not a valid dynamic program）
-#   - Alpine 协议/组件菜单正式关闭 Snell v5，避免反复下载已知不可运行的官方二进制
+#   - Alpine 协议/组件菜单正式关闭 Snell v5，全部组件升级自动跳过 Snell
 #   - 坚持仅使用 Surge 官方 snell-server：不注入第三方 glibc、不改用非官方实现
 #   - Debian / Ubuntu 的 Snell v5 路径保持不变；完全卸载仍兼容清理早期 dev 版本可能留下的 Alpine Snell 文件
 #
@@ -575,7 +575,7 @@
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev34"
+SCRIPT_VERSION="v1.9.0-dev35"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -8124,7 +8124,11 @@ component_version_management() {
         echo ""
         echo "  1. sing-box"
         echo "  2. Xray-core"
-        echo "  3. Snell Server"
+        if platform_is_alpine; then
+            echo "  3. Snell Server            [Alpine 暂不支持]"
+        else
+            echo "  3. Snell Server"
+        fi
         echo "  4. Realm"
         echo "  5. 检查官方上游版本（仅提示）"
         echo "  6. 全部升级到脚本推荐版本"
