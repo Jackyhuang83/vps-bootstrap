@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev27
+# 当前版本: v1.9.0-dev28
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,11 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev28:
+#   - IPv6-only 不再改写 /etc/apt/mirrors/debian.list 与 debian-security.list
+#   - APT 仅通过独立 99force-ipv6 配置强制 IPv6，切回 IPv4/双栈时可直接删除
+#   - 保留管理员原有 Debian/Ubuntu 镜像选择，消除不可逆镜像修改
 #
 # v1.9.0-dev27:
 #   - 移除 IPv6-only 初始化对 /etc/hosts 中 github / ghproxy / danwin 记录的无条件删除
@@ -522,11 +527,12 @@
 #   v1.9.0-dev25 v1.9 支持状态文案收口
 #   v1.9.0-dev26 修复 TG-BOT systemd 完全卸载残留
 #   v1.9.0-dev27 禁止 IPv6-only 误删用户 hosts
+#   v1.9.0-dev28 IPv6-only 不再改写 APT 镜像
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev27"
+SCRIPT_VERSION="v1.9.0-dev28"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -1413,8 +1419,8 @@ DNS
     if [[ "$PLATFORM_PKG" == "apt" ]]; then
         mkdir -p /etc/apt/apt.conf.d/
         printf '%s\n' 'Acquire::ForceIPv6 "true";' > "$FORCE_IPV6_CONF" || return 1
-        [[ -f /etc/apt/mirrors/debian.list ]] && printf '%s\n' 'https://deb.debian.org/debian' > /etc/apt/mirrors/debian.list
-        [[ -f /etc/apt/mirrors/debian-security.list ]] && printf '%s\n' 'https://deb.debian.org/debian-security' > /etc/apt/mirrors/debian-security.list
+        # Keep the administrator's configured Debian/Ubuntu mirrors unchanged.
+        # Force APT to use IPv6, but never rewrite /etc/apt/mirrors/*.
     fi
 
     install_dependencies || return 1
