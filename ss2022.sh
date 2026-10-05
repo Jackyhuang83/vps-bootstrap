@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev37
+# 当前版本: v1.9.0-dev38
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,10 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.9.0-dev38:
+#   - Snell 安装候选文件改用 vps-bootstrap 专属隐藏前缀，完全卸载可安全清理中断残留
+#   - SSH 新增端口事务在确认新端口监听成功后删除临时回滚备份，失败场景仍保留用于恢复
 #
 # v1.9.0-dev37:
 #   - WARP managed marker 提前到 keyring / apt 源写入之前，覆盖中途安装失败清理路径
@@ -583,11 +587,12 @@
 #   v1.9.0-dev35 Alpine Snell 官方二进制兼容性结论收口
 #   v1.9.0-dev36 Snell 安装 ownership 保护
 #   v1.9.0-dev37 完全卸载临时/备份残留与 WARP 失败路径收口
+#   v1.9.0-dev38 Snell 候选文件与 SSH 事务备份残留收口
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev37"
+SCRIPT_VERSION="v1.9.0-dev38"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -645,6 +650,7 @@ SNELL_GROUP="snell"
 SNELL_USER_MARKER="/etc/ss2022-snell-user-managed"
 SNELL_GROUP_MARKER="/etc/ss2022-snell-group-managed"
 SNELL_MANAGED_MARKER="/etc/ss2022-snell-install-managed"
+SNELL_CANDIDATE_PREFIX="/usr/local/bin/.ss2022-snell-server-v5.new"
 SNELL_OPENRC_SERVICE="/etc/init.d/snell-v5"
 SNELL_OPENRC_PID="/run/snell-v5.pid"
 SNELL_OPENRC_LOG="/var/log/ss2022/snell-v5.log"
@@ -4038,7 +4044,7 @@ install_snell_v5_core() {
 
     tmp=$(mktemp -d /tmp/ss2022-snell-install.XXXXXX) || return 1
     zip="$tmp/snell.zip"
-    candidate="${SNELL_BIN}.new.$$"
+    candidate="${SNELL_CANDIDATE_PREFIX}.$"
     url="https://dl.nssurge.com/snell/snell-server-v${SNELL_VERSION}-linux-${sarch}.zip"
 
     echo -e "${YELLOW}>> 从 Surge 官方下载 Snell v${SNELL_VERSION}...${PLAIN}"
@@ -7884,6 +7890,7 @@ full_uninstall() {
         /usr/local/bin/ss2022 \
         /usr/local/bin/proxy \
         "$SCRIPT_BACKUP_PATH" \
+        "${SNELL_CANDIDATE_PREFIX}".* \
         "$XRAY_BIN" \
         "$XRAY_SERVICE" \
         "$REALM_SERVICE" \
@@ -10172,6 +10179,7 @@ server_tool_ssh_add_port() {
     fi
     sleep 1
     if ss -H -lnt 2>/dev/null | awk -v p="$new_port" '{addr=$4; n=split(addr,a,":"); if (a[n]==p) found=1} END {exit !found}'; then
+        rm -f "$backup"
         echo -e "${GREEN}✔ SSH 已新增端口 ${new_port}，旧端口继续保留。${PLAIN}"
         echo -e "${YELLOW}请先新开一个 SSH 会话验证 ${new_port} 可登录，再考虑手工移除旧端口。${PLAIN}"
         return 0
