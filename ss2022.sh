@@ -2,8 +2,8 @@
 # ==============================================================================
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
-# 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev42
+# 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
+# 当前版本: v1.9.0-dev43
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,10 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.9.0-dev43:
+#   - 首页仅在 /usr/local/bin/proxy 确认属于本项目时显示 proxy 快捷命令
+#   - 安装文档不再使用 ln -sf 强制覆盖已有 proxy 路径
 #
 # v1.9.0-dev42:
 #   - sing-box / Snell 配置目录增加独立 dir ownership marker；预先存在目录不再被 chown/chmod 接管
@@ -613,11 +617,12 @@
 #   v1.9.0-dev40 proxy 快捷命令 ownership 收口
 #   v1.9.0-dev41 APT ForceIPv6 / WARP 仓库 ownership 收口
 #   v1.9.0-dev42 sing-box / Snell 配置目录 ownership 收口
+#   v1.9.0-dev43 proxy 展示与安装文档 ownership 一致性收口
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev42"
+SCRIPT_VERSION="v1.9.0-dev43"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -1327,7 +1332,11 @@ show_dashboard() {
     fi
     echo -e "${CYAN}═════════════════════════════════════════════════════════════════${PLAIN}"
     echo -e "      SS2022 多协议管理脚本 ${SCRIPT_VERSION}"
-    echo -e "      快捷命令: ${GREEN}ss2022${PLAIN} 或 ${GREEN}proxy${PLAIN}"
+    if proxy_shortcut_is_project_managed; then
+        echo -e "      快捷命令: ${GREEN}ss2022${PLAIN} 或 ${GREEN}proxy${PLAIN}"
+    else
+        echo -e "      快捷命令: ${GREEN}ss2022${PLAIN}"
+    fi
     echo -e "${CYAN}═════════════════════════════════════════════════════════════════${PLAIN}"
     echo -e "  系统信息: ${sys_info}"
     echo -e "  运行环境: $(platform_label)"
