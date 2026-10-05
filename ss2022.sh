@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev12
+# 当前版本: v1.9.0-dev13
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,11 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev13:
+#   - 通信软件测试增加 IPv4 / IPv6 各自出口 IP 与出口国家/地区显示
+#   - 出口地区使用 Cloudflare trace 的 loc 国家代码，不需要 API Token
+#   - Telegram / WhatsApp / Signal / Discord 继续只表示网络可达性，不伪装成流媒体“区服解锁”
 #
 # v1.9.0-dev12:
 #   - 流媒体与 AI 检测彻底拆分；不再使用会混入 AI 平台的“跨国平台”作为流媒体默认入口
@@ -422,11 +427,12 @@
 #   v1.9.0-dev10 跨发行版服务器测试组件重构
 #   v1.9.0-dev11 流媒体地区选择 / IPv4+IPv6 独立检测
 #   v1.9.0-dev12 流媒体/AI拆分 / 通用平台 / 通信软件检测
+#   v1.9.0-dev13 通信软件出口地区识别
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev12"
+SCRIPT_VERSION="v1.9.0-dev13"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -10595,10 +10601,30 @@ server_test_communication_probe() {
     printf " %-25s %s\n" "$name" "$status"
 }
 
+server_test_communication_exit_info() {
+    local family="$1" family_flag ip trace country
+    [[ "$family" == "ipv6" ]] && family_flag="-6" || family_flag="-4"
+
+    if [[ "$family" == "ipv6" ]]; then
+        ip=$(get_public_ipv6 2>/dev/null || true)
+    else
+        ip=$(get_public_ipv4 2>/dev/null || true)
+    fi
+
+    trace=$(curl "$family_flag" -fsS --connect-timeout 5 --max-time 8 \
+        "https://www.cloudflare.com/cdn-cgi/trace" 2>/dev/null || true)
+    country=$(awk -F= '$1=="loc" {print $2; exit}' <<<"$trace")
+    [[ "$country" =~ ^[A-Z]{2}$ ]] || country="未知"
+
+    printf " %-25s %s\n" "出口 IP" "${ip:-未知}"
+    printf " %-25s %s\n" "出口地区" "$country"
+}
+
 server_test_run_communication_family() {
     local family="$1" title
     [[ "$family" == "ipv6" ]] && title="IPV6" || title="IPV4"
     echo "===========[ ${title} 通信软件 ]============"
+    server_test_communication_exit_info "$family"
     server_test_communication_probe "$family" "Telegram" "https://web.telegram.org/"
     server_test_communication_probe "$family" "WhatsApp" "https://web.whatsapp.com/"
     server_test_communication_probe "$family" "Signal" "https://signal.org/"
