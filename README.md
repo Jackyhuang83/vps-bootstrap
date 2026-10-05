@@ -3,7 +3,7 @@
 一体化 VPS 网络协议、服务端分流、端口转发与日常运维脚本。
 
 当前正式版本：**v1.8.1**  
-当前开发版本：**v1.9.0-dev31**
+当前开发版本：**v1.9.0-dev33**
 
 项目以单一交互式 Bash 脚本 `ss2022.sh` 为入口，整合 **SS2022、SS2022 + ShadowTLS v3、VLESS Reality、Snell v5**，并提供 WARP 出口、链式落地、规则分流、Realm L4 端口转发、组件管理、服务器工具、服务器测试与脚本自更新。
 
@@ -619,7 +619,9 @@ ss -lntup
 - 配置失败时尽量回滚
 - sing-box / Xray / Snell 使用独立运行用户
 - Xray / Realm 使用 `ss2022` 独立命名空间
-- 不覆盖服务器已有同名服务
+- Xray / Realm 使用项目独立命名空间，不覆盖服务器已有同名服务
+- sing-box 使用通用路径，但安装前会执行 ownership 检查；检测到外部 sing-box 时拒绝覆盖
+- 服务用户/组仅在确认由本脚本创建时才会在卸载阶段删除
 - 下载核心进行来源 / SHA256 校验
 - SSH 端口修改保留旧端口并验证配置
 - 端口释放保护当前 SSH 会话
@@ -661,7 +663,7 @@ v1.8.1 为当前稳定正式版。
 
 ## v1.9.x
 
-当前开发版为 **v1.9.0-dev31**，重点是 Alpine / OpenRC 收口：
+当前开发版为 **v1.9.0-dev33**，重点是 Alpine / OpenRC 收口：
 
 - SS2022、ShadowTLS v3、VLESS Reality、Realm 已接入 OpenRC
 - Snell v5 已接入 OpenRC；由于 Surge 官方二进制依赖 glibc，Alpine 部署必须通过本机运行时自检
