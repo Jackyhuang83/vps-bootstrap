@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev8
+# 当前版本: v1.9.0-dev9
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,15 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev9:
+#   - Alpine / OpenRC 服务器管理工具由精简预览升级为完整菜单
+#   - Swap / BBR / DNS / 时区 / SSH / 端口释放 / TG-BOT 流量监控完成 Alpine 适配
+#   - IPv4 / IPv6 协议族硬关闭新增 OpenRC+nftables 持久化，保留 SSH 地址族安全保护与回滚
+#   - 端口释放支持识别 systemd 或 OpenRC 服务；OpenRC 通过 PID 文件映射服务，无法识别时仍保留安全进程模式
+#   - TG-BOT 在 systemd 使用 timer，在 Alpine/OpenRC 使用 root crond 每分钟任务；不停止或接管系统其他 cron 任务
+#   - SSH 新端口支持 systemd/OpenRC reload，并兼容没有 sshd_config.d Include 的 Alpine 配置
+#   - Alpine/musl 明确禁用无效的 /etc/gai.conf 地址优先级修改，业务地址族仍由现有分流规则控制
 #
 # v1.9.0-dev8:
 #   - Alpine / OpenRC 开放 VLESS Reality（独立 Xray-core）与 Realm 端口转发
@@ -386,11 +395,12 @@
 #   v1.9.0-dev6 Alpine 3.21 gcompat + 完整 release 归档兼容
 #   v1.9.0-dev7 SS2022/ShadowTLS IPv4+IPv6 双栈入站 / 双节点输出
 #   v1.9.0-dev8 Alpine VLESS Reality / Realm OpenRC
+#   v1.9.0-dev9 Alpine/OpenRC 服务器管理完整适配
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev8"
+SCRIPT_VERSION="v1.9.0-dev9"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -474,6 +484,7 @@ IP_FAMILY_MODE_FILE="${STATE_DIR}/ip-family-mode"
 IP_FAMILY_APPLY_HELPER="/usr/local/lib/ss2022/ip-family-apply.sh"
 IP_FAMILY_SERVICE_NAME="ss2022-ip-family"
 IP_FAMILY_SERVICE="/etc/systemd/system/${IP_FAMILY_SERVICE_NAME}.service"
+IP_FAMILY_OPENRC_SERVICE="/etc/init.d/${IP_FAMILY_SERVICE_NAME}"
 # ----------------------------- TG-BOT 流量监控 ---------------------------------
 TG_MONITOR_CONF="${STATE_DIR}/tg-monitor.conf"
 TG_MONITOR_STATE="${STATE_DIR}/tg-monitor.state"
@@ -481,6 +492,8 @@ SYSTEM_INFO_TRAFFIC_STATE="${STATE_DIR}/system-info-traffic.state"
 TG_MONITOR_WORKER="/usr/local/lib/ss2022/tg-traffic-monitor.sh"
 TG_MONITOR_SERVICE="/etc/systemd/system/ss2022-tg-monitor.service"
 TG_MONITOR_TIMER="/etc/systemd/system/ss2022-tg-monitor.timer"
+TG_MONITOR_CRON_FILE="/etc/crontabs/root"
+TG_MONITOR_CRON_TAG="# ss2022-tg-monitor"
 # ----------------------------- sing-box tag -----------------------------------
 TAG_SS="ss-in"
 TAG_STLS="ss-shadowtls-in"
@@ -655,6 +668,24 @@ service_restart() {
     case "$PLATFORM_INIT" in
         systemd) systemctl restart "$svc" ;;
         openrc) rc-service "$svc" restart ;;
+        *) return 1 ;;
+    esac
+}
+
+service_reload() {
+    local svc="$1"
+    case "$PLATFORM_INIT" in
+        systemd) systemctl reload "$svc" ;;
+        openrc) rc-service "$svc" reload ;;
+        *) return 1 ;;
+    esac
+}
+
+service_exists() {
+    local svc="$1"
+    case "$PLATFORM_INIT" in
+        systemd) systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx "${svc}.service" ;;
+        openrc) [[ -x "/etc/init.d/$svc" ]] ;;
         *) return 1 ;;
     esac
 }
@@ -7458,6 +7489,7 @@ full_uninstall() {
         rm -f "$SNELL_USER_MARKER"
     fi
 
+    [[ -f "$TG_MONITOR_CRON_FILE" ]] && sed -i "/ss2022-tg-monitor/d" "$TG_MONITOR_CRON_FILE" 2>/dev/null || true
     service_daemon_reload || true
     echo -e "${GREEN}✔ 已彻底卸载。${PLAIN}"
     exit 0
@@ -8457,29 +8489,36 @@ server_tool_swap_create() {
         return 1
     fi
 
+    if platform_is_alpine; then
+        ensure_test_dependency mkswap util-linux-misc || {
+            echo -e "${RED}[错误] Alpine 无法安装 util-linux-misc，不能安全管理 Swap。${PLAIN}"
+            return 1
+        }
+    fi
+    for cmd in mkswap swapon swapoff; do
+        command -v "$cmd" >/dev/null 2>&1 || {
+            echo -e "${RED}[错误] 缺少 $cmd，无法管理 Swap。${PLAIN}"
+            return 1
+        }
+    done
+
     if swapon --show=NAME --noheadings 2>/dev/null | grep -qx '/swapfile'; then
         swapoff /swapfile || return 1
     fi
-
     rm -f /swapfile
-
     echo -e "${YELLOW}>> 创建 ${size_mb} MB /swapfile...${PLAIN}"
     if command -v fallocate >/dev/null 2>&1; then
         fallocate -l "${size_mb}M" /swapfile || return 1
     else
         dd if=/dev/zero of=/swapfile bs=1M count="$size_mb" status=progress || return 1
     fi
-
     chmod 600 /swapfile
     mkswap /swapfile >/dev/null || { rm -f /swapfile; return 1; }
     swapon /swapfile || { rm -f /swapfile; return 1; }
-
     sed -i '\|^/swapfile[[:space:]]|d' /etc/fstab
     echo '/swapfile none swap sw 0 0' >> /etc/fstab
-
     echo -e "${GREEN}✔ /swapfile 已启用。${PLAIN}"
 }
-
 server_tool_swap_remove() {
     local ans=""
     if [[ ! -f /swapfile ]] && ! grep -qE '^/swapfile[[:space:]]' /etc/fstab 2>/dev/null; then
@@ -8750,15 +8789,28 @@ server_tool_dns_management() {
 }
 
 server_tool_ip_priority_status() {
+    if platform_is_alpine; then
+        echo "Alpine/musl：不使用 gai.conf"
+        return
+    fi
     if grep -q '^precedence ::ffff:0:0/96[[:space:]]\+100[[:space:]]*# ss2022-prefer-ipv4$' /etc/gai.conf 2>/dev/null; then
         echo "IPv4 优先"
     else
         echo "系统默认（通常 IPv6 优先）"
     fi
 }
-
 server_tool_ip_priority_management() {
     local c
+    if platform_is_alpine; then
+        clear
+        echo -e "${CYAN}════════════ IPv4 / IPv6 地址优先级 ════════════${PLAIN}"
+        echo -e "${YELLOW}Alpine 使用 musl libc，/etc/gai.conf 的 glibc precedence 规则不会生效。${PLAIN}"
+        echo "因此这里不写入无效配置。"
+        echo "vps-bootstrap 业务流量请使用“全局业务出口地址族 / 应用地址族分流”；"
+        echo "需要彻底关闭某地址族时使用下方 IPv4 / IPv6 协议族管理。"
+        pause
+        return
+    fi
     while true; do
         clear
         echo -e "${CYAN}════════════ IPv4 / IPv6 优先级 ════════════${PLAIN}"
@@ -8773,20 +8825,15 @@ server_tool_ip_priority_management() {
                 touch /etc/gai.conf
                 sed -i '/# ss2022-prefer-ipv4$/d' /etc/gai.conf
                 echo 'precedence ::ffff:0:0/96  100 # ss2022-prefer-ipv4' >> /etc/gai.conf
-                echo -e "${GREEN}✔ 已设置 IPv4 优先。${PLAIN}"
-                pause
-                ;;
+                echo -e "${GREEN}✔ 已设置 IPv4 优先。${PLAIN}"; pause ;;
             2)
                 [[ -f /etc/gai.conf ]] && sed -i '/# ss2022-prefer-ipv4$/d' /etc/gai.conf
-                echo -e "${GREEN}✔ 已恢复系统默认地址优先级。${PLAIN}"
-                pause
-                ;;
+                echo -e "${GREEN}✔ 已恢复系统默认地址优先级。${PLAIN}"; pause ;;
             0) return ;;
             *) sleep 1 ;;
         esac
     done
 }
-
 server_tool_ip_family_mode() {
     local mode="dual"
     if [[ -f "$IP_FAMILY_MODE_FILE" ]]; then
@@ -8881,10 +8928,8 @@ server_tool_install_ip_family_guard() {
         echo -e "${RED}[错误] nftables 不可用，无法安全管理 IPv4 / IPv6 关闭状态。${PLAIN}"
         return 1
     }
-
     mkdir -p "$STATE_DIR" /usr/local/lib/ss2022 || return 1
     chmod 700 "$STATE_DIR"
-
     cat > "$IP_FAMILY_APPLY_HELPER" <<'EOF'
 #!/bin/bash
 set -u
@@ -8892,20 +8937,16 @@ STATE_FILE="/etc/ss2022/ip-family-mode"
 TABLE="ss2022_ip_family"
 mode="dual"
 [[ -f "$STATE_FILE" ]] && mode=$(tr -d '[:space:]' < "$STATE_FILE" 2>/dev/null)
-
 command -v nft >/dev/null 2>&1 || exit 1
 nft delete table inet "$TABLE" >/dev/null 2>&1 || true
-
 case "$mode" in
   dual) exit 0 ;;
   ipv4-only|ipv6-only) ;;
   *) exit 1 ;;
 esac
-
 nft add table inet "$TABLE"
 nft 'add chain inet ss2022_ip_family input { type filter hook input priority -20; policy accept; }'
 nft 'add chain inet ss2022_ip_family output { type filter hook output priority -20; policy accept; }'
-
 if [[ "$mode" == "ipv4-only" ]]; then
     nft 'add rule inet ss2022_ip_family input meta nfproto ipv6 iifname != "lo" drop'
     nft 'add rule inet ss2022_ip_family output meta nfproto ipv6 oifname != "lo" drop'
@@ -8916,12 +8957,13 @@ fi
 EOF
     chmod 700 "$IP_FAMILY_APPLY_HELPER"
 
-    cat > "$IP_FAMILY_SERVICE" <<EOF
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        cat > "$IP_FAMILY_SERVICE" <<EOF
 [Unit]
 Description=vps-bootstrap IPv4/IPv6 family guard
 After=network-online.target
 Wants=network-online.target
-Before=sing-box.service ${XRAY_SERVICE_NAME}.service
+Before=sing-box.service ${XRAY_SERVICE_NAME}.service ${REALM_SERVICE_NAME}.service
 
 [Service]
 Type=oneshot
@@ -8931,11 +8973,29 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-    chmod 644 "$IP_FAMILY_SERVICE"
-    systemctl daemon-reload || return 1
-    systemctl enable "$IP_FAMILY_SERVICE_NAME" >/dev/null 2>&1 || return 1
+        chmod 644 "$IP_FAMILY_SERVICE"
+        service_daemon_reload || return 1
+    else
+        cat > "$IP_FAMILY_OPENRC_SERVICE" <<EOF
+#!/sbin/openrc-run
+description="vps-bootstrap IPv4/IPv6 family guard"
+depend() {
+    need net
+    before sing-box ${XRAY_SERVICE_NAME} ${REALM_SERVICE_NAME}
 }
-
+start() {
+    ebegin "Applying vps-bootstrap IP family guard"
+    ${IP_FAMILY_APPLY_HELPER}
+    eend $?
+}
+stop() {
+    return 0
+}
+EOF
+        chmod 755 "$IP_FAMILY_OPENRC_SERVICE"
+    fi
+    service_enable "$IP_FAMILY_SERVICE_NAME" || return 1
+}
 server_tool_set_ip_family_mode() {
     local new_mode="$1" old_mode ssh_family keep_family label
     old_mode=$(server_tool_ip_family_mode)
@@ -8980,11 +9040,11 @@ server_tool_set_ip_family_mode() {
 ' "$new_mode" > "$IP_FAMILY_MODE_FILE" || return 1
     chmod 600 "$IP_FAMILY_MODE_FILE"
 
-    if ! systemctl restart "$IP_FAMILY_SERVICE_NAME"; then
+    if ! service_restart "$IP_FAMILY_SERVICE_NAME"; then
         echo -e "${RED}[错误] 新协议族策略应用失败，正在恢复。${PLAIN}"
         printf '%s
 ' "$old_mode" > "$IP_FAMILY_MODE_FILE"
-        systemctl restart "$IP_FAMILY_SERVICE_NAME" >/dev/null 2>&1 || true
+        service_restart "$IP_FAMILY_SERVICE_NAME" >/dev/null 2>&1 || true
         return 1
     fi
 
@@ -9135,24 +9195,39 @@ server_tool_port_listener_pids() {
 }
 
 server_tool_pid_systemd_unit() {
-    local pid="$1"
-    local unit=""
-
+    local pid="$1" unit="" pf="" pf_pid="" svc=""
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
 
-    if [[ -r "/proc/${pid}/cgroup" ]]; then
-        unit=$(sed -nE 's#.*[/]([^/]+\.service)(/.*)?$#\1#p' "/proc/${pid}/cgroup" 2>/dev/null | head -n1)
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        if [[ -r "/proc/${pid}/cgroup" ]]; then
+            unit=$(sed -nE 's#.*[/]([^/]+\.service)(/.*)?$#\1#p' "/proc/${pid}/cgroup" 2>/dev/null | head -n1)
+        fi
+        if [[ -z "$unit" ]]; then
+            unit=$(systemctl status "$pid" --no-pager 2>/dev/null | sed -nE 's/^[[:space:]]*●[[:space:]]+([^[:space:]]+\.service).*/\1/p' | head -n1)
+        fi
+        [[ -n "$unit" ]] && printf '%s\n' "$unit"
+        return
     fi
 
-    if [[ -z "$unit" ]] && command -v systemctl >/dev/null 2>&1; then
-        unit=$(systemctl status "$pid" --no-pager 2>/dev/null \
-            | sed -nE 's/^[[:space:]]*●[[:space:]]+([^[:space:]]+\.service).*/\1/p' \
-            | head -n1)
-    fi
+    # OpenRC 没有 systemd cgroup unit 映射；优先从常见 pidfile 反查 init.d 服务。
+    for pf in /run/*.pid /run/*/*.pid /var/run/*.pid /var/run/*/*.pid; do
+        [[ -r "$pf" ]] || continue
+        pf_pid=$(head -n1 "$pf" 2>/dev/null | tr -dc '0-9')
+        [[ "$pf_pid" == "$pid" ]] || continue
+        svc=${pf##*/}; svc=${svc%.pid}
+        [[ -x "/etc/init.d/$svc" ]] || continue
+        printf '%s\n' "$svc"
+        return 0
+    done
 
-    [[ -n "$unit" ]] && printf '%s\n' "$unit"
+    for svc in sing-box "$XRAY_SERVICE_NAME" "$REALM_SERVICE_NAME" sshd chronyd ntpd crond; do
+        [[ -x "/etc/init.d/$svc" ]] || continue
+        [[ "$(service_main_pid "$svc" 2>/dev/null || true)" == "$pid" ]] || continue
+        printf '%s\n' "$svc"
+        return 0
+    done
+    return 1
 }
-
 server_tool_port_docker_containers() {
     local port="$1"
 
@@ -9226,22 +9301,12 @@ server_tool_port_release_show_targets() {
 }
 
 server_tool_port_stop_systemd_units() {
-    local port="$1"
-    local disable="${2:-no}"
-    local pids pid unit
+    local port="$1" disable="${2:-no}" pids pid unit svc
     local -A seen_units=()
     local found=0 failed=0
 
-    command -v systemctl >/dev/null 2>&1 || {
-        echo -e "${YELLOW}[提示] 当前系统没有 systemctl，无法按 systemd 服务停止。${PLAIN}"
-        return 1
-    }
-
     pids=$(server_tool_port_listener_pids "$port" 2>/dev/null || true)
-    [[ -n "$pids" ]] || {
-        echo -e "${YELLOW}没有发现可识别的监听 PID。${PLAIN}"
-        return 1
-    }
+    [[ -n "$pids" ]] || { echo -e "${YELLOW}没有发现可识别的监听 PID。${PLAIN}"; return 1; }
 
     while read -r pid; do
         [[ -n "$pid" ]] || continue
@@ -9250,47 +9315,37 @@ server_tool_port_stop_systemd_units() {
         [[ -n "${seen_units[$unit]:-}" ]] && continue
         seen_units["$unit"]=1
         found=1
-
-        case "$unit" in
-            ssh.service|sshd.service)
-                echo -e "${RED}[拒绝] 不允许通过端口释放工具停止 SSH 服务：${unit}${PLAIN}"
-                failed=1
-                continue
-                ;;
+        svc=${unit%.service}
+        case "$svc" in
+            ssh|sshd)
+                echo -e "${RED}[拒绝] 不允许通过端口释放工具停止 SSH 服务：${svc}${PLAIN}"
+                failed=1; continue ;;
         esac
-
-        echo -e "${YELLOW}>> 处理服务 ${unit}...${PLAIN}"
+        echo -e "${YELLOW}>> 处理服务 ${svc}...${PLAIN}"
         if [[ "$disable" == "yes" ]]; then
-            if systemctl disable --now "$unit"; then
-                echo -e "${GREEN}✔ ${unit} 已停止并禁用开机自启。${PLAIN}"
+            service_disable_now "$svc"
+            if service_is_active "$svc"; then
+                echo -e "${RED}[错误] ${svc} 停止/禁用失败。${PLAIN}"; failed=1
             else
-                echo -e "${RED}[错误] ${unit} 停止/禁用失败。${PLAIN}"
-                failed=1
+                echo -e "${GREEN}✔ ${svc} 已停止并移除开机自启。${PLAIN}"
             fi
         else
-            if systemctl stop "$unit"; then
-                echo -e "${GREEN}✔ ${unit} 已停止。${PLAIN}"
+            if service_stop "$svc"; then
+                echo -e "${GREEN}✔ ${svc} 已停止。${PLAIN}"
             else
-                echo -e "${RED}[错误] ${unit} 停止失败。${PLAIN}"
-                failed=1
+                echo -e "${RED}[错误] ${svc} 停止失败。${PLAIN}"; failed=1
             fi
         fi
     done <<<"$pids"
 
-    [[ $found -eq 1 ]] || {
-        echo -e "${YELLOW}没有检测到对应的 systemd 服务。${PLAIN}"
-        return 1
-    }
-
+    [[ $found -eq 1 ]] || { echo -e "${YELLOW}没有检测到对应的系统服务。${PLAIN}"; return 1; }
     sleep 1
-    if [[ -n "$(server_tool_port_listener_lines "$port" 2>/dev/null || true)" ]]; then
+    [[ -z "$(server_tool_port_listener_lines "$port" 2>/dev/null || true)" ]] || {
         echo -e "${YELLOW}[提示] 端口 ${port} 仍有监听进程，请重新查看占用详情。${PLAIN}"
         return 1
-    fi
-
+    }
     [[ $failed -eq 0 ]]
 }
-
 server_tool_port_stop_docker() {
     local port="$1"
     local docker_lines cid cname cports
@@ -9396,7 +9451,7 @@ server_tool_port_terminate_processes() {
         return 0
     fi
 
-    echo -e "${YELLOW}[提示] 端口 ${port} 仍被占用。若进程自动重启，通常说明背后还有 systemd / Docker / Supervisor 等守护机制。${PLAIN}"
+    echo -e "${YELLOW}[提示] 端口 ${port} 仍被占用。若进程自动重启，通常说明背后还有 systemd / OpenRC / Docker / Supervisor 等守护机制。${PLAIN}"
     return 1
 }
 
@@ -9447,11 +9502,11 @@ server_tool_port_release() {
 
     echo "请选择释放方式："
     if [[ $has_unit -eq 1 ]]; then
-        echo "  1. 停止对应 systemd 服务"
-        echo "  2. 停止并禁用对应 systemd 服务"
+        echo "  1. 停止对应系统服务"
+        echo "  2. 停止并禁用对应系统服务"
     else
-        echo "  1. 停止对应 systemd 服务（未检测到）"
-        echo "  2. 停止并禁用对应 systemd 服务（未检测到）"
+        echo "  1. 停止对应系统服务（未检测到）"
+        echo "  2. 停止并禁用对应系统服务（未检测到）"
     fi
 
     if [[ -n "$docker_lines" ]]; then
@@ -9536,6 +9591,9 @@ server_tool_port_usage() {
 
 server_tool_timezone_management() {
     local c zone
+    if platform_is_alpine && [[ ! -e /usr/share/zoneinfo/UTC ]]; then
+        pkg_install tzdata || { echo -e "${RED}[错误] tzdata 安装失败。${PLAIN}"; pause; return; }
+    fi
     while true; do
         clear
         echo -e "${CYAN}════════════════════ 时区管理 ════════════════════${PLAIN}"
@@ -9583,101 +9641,92 @@ server_tool_ssh_ports() {
 }
 
 server_tool_ssh_add_port() {
-    local new_port old_ports tmp_conf target_conf service_name backup
+    local new_port old_ports target_conf service_name backup ans tmp_main use_dropin="no"
     local include_dir="/etc/ssh/sshd_config.d"
     local dropin="${include_dir}/99-ss2022-port.conf"
+    local main_conf="/etc/ssh/sshd_config"
 
-    command -v sshd >/dev/null 2>&1 || {
-        echo -e "${RED}[错误] 未找到 sshd。${PLAIN}"
-        return 1
-    }
-
+    command -v sshd >/dev/null 2>&1 || { echo -e "${RED}[错误] 未找到 sshd。${PLAIN}"; return 1; }
     old_ports=$(server_tool_ssh_ports)
-    echo "当前 SSH 端口: $(tr '
-' ' ' <<<"$old_ports")"
+    echo "当前 SSH 端口: $(tr '\n' ' ' <<<"$old_ports")"
     read -rp "请输入要新增的 SSH 端口: " new_port
-    validate_port_number "$new_port" || {
-        echo -e "${RED}[错误] 端口无效。${PLAIN}"
-        return 1
-    }
-
+    validate_port_number "$new_port" || { echo -e "${RED}[错误] 端口无效。${PLAIN}"; return 1; }
     if grep -qx "$new_port" <<<"$old_ports"; then
-        echo -e "${YELLOW}该端口已经是 SSH 监听端口。${PLAIN}"
-        return 0
+        echo -e "${YELLOW}该端口已经是 SSH 监听端口。${PLAIN}"; return 0
     fi
-
     if port_in_use_by_other_process "$new_port" "" >/tmp/ss2022-ssh-port.$$ 2>/dev/null; then
         echo -e "${RED}[错误] 端口 ${new_port} 已被其他进程占用。${PLAIN}"
-        cat /tmp/ss2022-ssh-port.$$ 2>/dev/null || true
-        rm -f /tmp/ss2022-ssh-port.$$
-        return 1
+        cat /tmp/ss2022-ssh-port.$$ 2>/dev/null || true; rm -f /tmp/ss2022-ssh-port.$$; return 1
     fi
     rm -f /tmp/ss2022-ssh-port.$$ 2>/dev/null || true
-
-    echo -e "${YELLOW}[安全策略] 新端口会与现有 SSH 端口同时保留，不会直接删除旧端口。${PLAIN}"
+    echo -e "${YELLOW}[安全策略] 新端口会与现有 SSH 端口同时保留，不会删除旧端口。${PLAIN}"
     echo -e "${YELLOW}还需确认云厂商安全组/防火墙已放行 ${new_port}/TCP。${PLAIN}"
-    local ans
     read -rp "确认新增？[y/N]: " ans
     [[ "$ans" =~ ^[Yy]$ ]] || return 0
 
-    mkdir -p "$include_dir"
-    backup="${dropin}.bak.$(date +%Y%m%d-%H%M%S)"
-    [[ -f "$dropin" ]] && cp -a "$dropin" "$backup"
-
-    {
-        echo "# Managed by ss2022.sh - preserve existing SSH ports"
-        while read -r p; do
-            [[ -n "$p" ]] && echo "Port $p"
-        done <<<"$old_ports"
-        echo "Port $new_port"
-    } > "$dropin"
+    if grep -Eiq '^[[:space:]]*Include[[:space:]]+.*sshd_config\.d' "$main_conf" 2>/dev/null; then
+        use_dropin="yes"
+        mkdir -p "$include_dir"
+        target_conf="$dropin"
+        backup="${dropin}.bak.$(date +%Y%m%d-%H%M%S)"
+        [[ -f "$dropin" ]] && cp -a "$dropin" "$backup"
+        {
+            echo "# Managed by ss2022.sh - preserve existing SSH ports"
+            while read -r p; do [[ -n "$p" ]] && echo "Port $p"; done <<<"$old_ports"
+            echo "Port $new_port"
+        } > "$dropin"
+    else
+        target_conf="$main_conf"
+        backup="${STATE_DIR}/sshd_config.bak.$(date +%Y%m%d-%H%M%S)"
+        mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
+        cp -a "$main_conf" "$backup" || return 1
+        tmp_main=$(mktemp /tmp/ss2022-sshd.XXXXXX) || return 1
+        awk '
+          $0=="# BEGIN ss2022 managed ports" {skip=1; next}
+          $0=="# END ss2022 managed ports" {skip=0; next}
+          !skip {print}
+        ' "$main_conf" > "$tmp_main"
+        {
+            cat "$tmp_main"
+            echo "# BEGIN ss2022 managed ports"
+            while read -r p; do [[ -n "$p" ]] && echo "Port $p"; done <<<"$old_ports"
+            echo "Port $new_port"
+            echo "# END ss2022 managed ports"
+        } > "$main_conf"
+        rm -f "$tmp_main"
+    fi
 
     if ! sshd -t; then
         echo -e "${RED}[错误] sshd 配置校验失败，正在回滚。${PLAIN}"
-        if [[ -f "$backup" ]]; then
-            mv -f "$backup" "$dropin"
+        if [[ "$use_dropin" == "yes" ]]; then
+            [[ -f "$backup" ]] && mv -f "$backup" "$dropin" || rm -f "$dropin"
         else
-            rm -f "$dropin"
+            cp -af "$backup" "$main_conf"
         fi
         sshd -t >/dev/null 2>&1 || true
         return 1
     fi
 
-    if systemctl list-unit-files 2>/dev/null | grep -q '^ssh\.service'; then
-        service_name="ssh"
-    else
-        service_name="sshd"
-    fi
-
-    if ! systemctl reload "$service_name" 2>/dev/null; then
+    if service_exists ssh; then service_name="ssh"; else service_name="sshd"; fi
+    if ! service_reload "$service_name" 2>/dev/null; then
         echo -e "${RED}[错误] SSH reload 失败，正在回滚。${PLAIN}"
-        if [[ -f "$backup" ]]; then
-            mv -f "$backup" "$dropin"
+        if [[ "$use_dropin" == "yes" ]]; then
+            [[ -f "$backup" ]] && mv -f "$backup" "$dropin" || rm -f "$dropin"
         else
-            rm -f "$dropin"
+            cp -af "$backup" "$main_conf"
         fi
-        systemctl reload "$service_name" >/dev/null 2>&1 || true
+        service_reload "$service_name" >/dev/null 2>&1 || true
         return 1
     fi
-
     sleep 1
-    if ss -H -lnt 2>/dev/null | awk -v p="$new_port" '
-        {
-            addr=$4
-            n=split(addr,a,":")
-            if (a[n] == p) found=1
-        }
-        END {exit !found}
-    '; then
+    if ss -H -lnt 2>/dev/null | awk -v p="$new_port" '{addr=$4; n=split(addr,a,":"); if (a[n]==p) found=1} END {exit !found}'; then
         echo -e "${GREEN}✔ SSH 已新增端口 ${new_port}，旧端口继续保留。${PLAIN}"
         echo -e "${YELLOW}请先新开一个 SSH 会话验证 ${new_port} 可登录，再考虑手工移除旧端口。${PLAIN}"
         return 0
     fi
-
     echo -e "${YELLOW}[警告] sshd 配置已通过，但暂未检测到 ${new_port} 正在监听。请不要关闭当前 SSH 会话。${PLAIN}"
     return 1
 }
-
 server_tool_ssh_management() {
     local c
     while true; do
@@ -9701,171 +9750,72 @@ server_tool_tg_monitor_ensure_worker() {
     install -d -m 755 /usr/local/lib/ss2022 || return 1
     mkdir -p "$STATE_DIR" || return 1
     chmod 700 "$STATE_DIR"
-
     cat > "$TG_MONITOR_WORKER" <<'TGWORKER'
 #!/bin/bash
 set -u
-
 CONF="/etc/ss2022/tg-monitor.conf"
 STATE="/etc/ss2022/tg-monitor.state"
-LOCK="/run/ss2022-tg-monitor.lock"
-
+LOCKDIR="/run/ss2022-tg-monitor.lockdir"
 [[ -f "$CONF" ]] || exit 0
 # shellcheck disable=SC1090
 source "$CONF"
-
-exec 9>"$LOCK" || exit 1
-flock -n 9 || exit 0
+if ! mkdir "$LOCKDIR" 2>/dev/null; then exit 0; fi
+trap 'rmdir "$LOCKDIR" >/dev/null 2>&1 || true' EXIT INT TERM
 
 send_tg() {
     local msg="$1"
     [[ -n "${TG_BOT_TOKEN:-}" && -n "${TG_CHAT_ID:-}" ]] || return 0
-    curl -fsS --connect-timeout 5 --max-time 10 \
-        -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-        --data-urlencode "chat_id=${TG_CHAT_ID}" \
-        --data-urlencode "text=${msg}" >/dev/null 2>&1 || true
+    curl -fsS --connect-timeout 5 --max-time 10 -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" --data-urlencode "chat_id=${TG_CHAT_ID}" --data-urlencode "text=${msg}" >/dev/null 2>&1 || true
 }
-
 traffic_bytes() {
-    awk '
-    BEGIN { rx=0; tx=0 }
-    {
-        iface=$1
-        gsub(":","",iface)
-        if (iface ~ /^(eth|ens|enp|eno|venet|bond)[A-Za-z0-9_.-]*$/) {
-            rx += $2
-            tx += $10
-        }
-    }
-    END { printf "%.0f %.0f\n", rx, tx }
-    ' /proc/net/dev
+    awk 'BEGIN {rx=0;tx=0} {iface=$1;gsub(":","",iface); if (iface ~ /^(eth|ens|enp|eno|venet|bond)[A-Za-z0-9_.-]*$/) {rx+=$2;tx+=$10}} END {printf "%.0f %.0f\n",rx,tx}' /proc/net/dev
 }
-
 period_key() {
-    local day now_day current previous
-    day="${RESET_DAY:-1}"
-    now_day=$(date +%d | sed 's/^0//')
-    current=$(date +%Y-%m)
-
-    if [[ "$now_day" -ge "$day" ]]; then
-        printf '%s' "$current"
-    else
-        previous=$(date -d '1 month ago' +%Y-%m 2>/dev/null || date +%Y-%m)
-        printf '%s' "$previous"
-    fi
+    local day now_day year month prev_year prev_month
+    day="${RESET_DAY:-1}"; now_day=$(date +%d | sed 's/^0//'); year=$(date +%Y); month=$(date +%m | sed 's/^0//')
+    if [[ "$now_day" -ge "$day" ]]; then printf "%04d-%02d" "$year" "$month"; return; fi
+    if [[ "$month" -eq 1 ]]; then prev_year=$((year-1)); prev_month=12; else prev_year=$year; prev_month=$((month-1)); fi
+    printf "%04d-%02d" "$prev_year" "$prev_month"
 }
-
-human_gb() {
-    awk -v b="$1" 'BEGIN { printf "%.2f", b/1073741824 }'
-}
-
-percent_of() {
-    local bytes="$1" limit_gb="$2"
-    if [[ ! "$limit_gb" =~ ^[0-9]+$ ]] || [[ "$limit_gb" -le 0 ]]; then
-        echo 0
-        return
-    fi
-    awk -v b="$bytes" -v g="$limit_gb" 'BEGIN { printf "%.0f", (b/(g*1073741824))*100 }'
-}
-
-CURRENT_RX=0
-CURRENT_TX=0
-read -r CURRENT_RX CURRENT_TX < <(traffic_bytes)
-
+human_gb() { awk -v b="$1" 'BEGIN {printf "%.2f",b/1073741824}'; }
+percent_of() { local bytes="$1" limit_gb="$2"; if [[ ! "$limit_gb" =~ ^[0-9]+$ || "$limit_gb" -le 0 ]]; then echo 0; else awk -v b="$bytes" -v g="$limit_gb" 'BEGIN {printf "%.0f",(b/(g*1073741824))*100}'; fi; }
+CURRENT_RX=0; CURRENT_TX=0; read -r CURRENT_RX CURRENT_TX < <(traffic_bytes)
 PERIOD="$(period_key)"
-LAST_RX=0
-LAST_TX=0
-TOTAL_RX=0
-TOTAL_TX=0
-STATE_PERIOD=""
-RX_WARN1=0
-RX_WARN2=0
-RX_CRITICAL=0
-TX_WARN1=0
-TX_WARN2=0
-TX_CRITICAL=0
-
+LAST_RX=0; LAST_TX=0; TOTAL_RX=0; TOTAL_TX=0; STATE_PERIOD=""
+RX_WARN1=0; RX_WARN2=0; RX_CRITICAL=0; TX_WARN1=0; TX_WARN2=0; TX_CRITICAL=0
 if [[ -f "$STATE" ]]; then
-    # 该状态文件由 root 管理且仅包含整数/周期字符串。
     # shellcheck disable=SC1090
     source "$STATE"
 fi
-
 if [[ "$STATE_PERIOD" != "$PERIOD" ]]; then
-    STATE_PERIOD="$PERIOD"
-    LAST_RX="$CURRENT_RX"
-    LAST_TX="$CURRENT_TX"
-    TOTAL_RX=0
-    TOTAL_TX=0
-    RX_WARN1=0
-    RX_WARN2=0
-    RX_CRITICAL=0
-    TX_WARN1=0
-    TX_WARN2=0
-    TX_CRITICAL=0
+    STATE_PERIOD="$PERIOD"; LAST_RX="$CURRENT_RX"; LAST_TX="$CURRENT_TX"; TOTAL_RX=0; TOTAL_TX=0
+    RX_WARN1=0; RX_WARN2=0; RX_CRITICAL=0; TX_WARN1=0; TX_WARN2=0; TX_CRITICAL=0
 else
-    if [[ "$CURRENT_RX" -ge "$LAST_RX" ]]; then
-        TOTAL_RX=$((TOTAL_RX + CURRENT_RX - LAST_RX))
-    else
-        # 网卡计数因 VPS 重启/网卡重置归零：保留历史累计，并把重启后的当前值作为新增量。
-        TOTAL_RX=$((TOTAL_RX + CURRENT_RX))
-    fi
-
-    if [[ "$CURRENT_TX" -ge "$LAST_TX" ]]; then
-        TOTAL_TX=$((TOTAL_TX + CURRENT_TX - LAST_TX))
-    else
-        TOTAL_TX=$((TOTAL_TX + CURRENT_TX))
-    fi
-
-    LAST_RX="$CURRENT_RX"
-    LAST_TX="$CURRENT_TX"
+    if [[ "$CURRENT_RX" -ge "$LAST_RX" ]]; then TOTAL_RX=$((TOTAL_RX+CURRENT_RX-LAST_RX)); else TOTAL_RX=$((TOTAL_RX+CURRENT_RX)); fi
+    if [[ "$CURRENT_TX" -ge "$LAST_TX" ]]; then TOTAL_TX=$((TOTAL_TX+CURRENT_TX-LAST_TX)); else TOTAL_TX=$((TOTAL_TX+CURRENT_TX)); fi
+    LAST_RX="$CURRENT_RX"; LAST_TX="$CURRENT_TX"
 fi
-
-HOST_LABEL="${HOST_LABEL:-$(hostname)}"
-WARN1_PERCENT="${WARN1_PERCENT:-80}"
-WARN2_PERCENT="${WARN2_PERCENT:-90}"
-AUTO_SHUTDOWN="${AUTO_SHUTDOWN:-no}"
-SHUTDOWN_PERCENT="${SHUTDOWN_PERCENT:-95}"
-
-rx_percent=$(percent_of "$TOTAL_RX" "${RX_LIMIT_GB:-0}")
-tx_percent=$(percent_of "$TOTAL_TX" "${TX_LIMIT_GB:-0}")
-rx_gb=$(human_gb "$TOTAL_RX")
-tx_gb=$(human_gb "$TOTAL_TX")
-
+HOST_LABEL="${HOST_LABEL:-$(hostname)}"; WARN1_PERCENT="${WARN1_PERCENT:-80}"; WARN2_PERCENT="${WARN2_PERCENT:-90}"; AUTO_SHUTDOWN="${AUTO_SHUTDOWN:-no}"; SHUTDOWN_PERCENT="${SHUTDOWN_PERCENT:-95}"
+rx_percent=$(percent_of "$TOTAL_RX" "${RX_LIMIT_GB:-0}"); tx_percent=$(percent_of "$TOTAL_TX" "${TX_LIMIT_GB:-0}")
+rx_gb=$(human_gb "$TOTAL_RX"); tx_gb=$(human_gb "$TOTAL_TX")
 notify_threshold() {
-    local direction="$1" percent="$2" used_gb="$3" limit="$4"
-    local warn1_var warn2_var critical_var
-    if [[ "$direction" == "入站" ]]; then
-        warn1_var="RX_WARN1"; warn2_var="RX_WARN2"; critical_var="RX_CRITICAL"
-    else
-        warn1_var="TX_WARN1"; warn2_var="TX_WARN2"; critical_var="TX_CRITICAL"
-    fi
-
+    local direction="$1" percent="$2" used_gb="$3" limit="$4" warn1_var warn2_var critical_var
+    if [[ "$direction" == "入站" ]]; then warn1_var="RX_WARN1"; warn2_var="RX_WARN2"; critical_var="RX_CRITICAL"; else warn1_var="TX_WARN1"; warn2_var="TX_WARN2"; critical_var="TX_CRITICAL"; fi
     [[ "$limit" =~ ^[0-9]+$ && "$limit" -gt 0 ]] || return 0
-
     if [[ "$percent" -ge 100 && "${!critical_var}" -eq 0 ]]; then
-        printf -v "$critical_var" '%s' 1
-        send_tg "🚨 ${HOST_LABEL}
-${direction}流量已达到 ${used_gb} GB / ${limit} GB（${percent}%）
-已达到流量上限。"
+        printf -v "$critical_var" 1
+        send_tg "🚨 ${HOST_LABEL}\n${direction}流量已达到 ${used_gb} GB / ${limit} GB（${percent}%）\n已达到流量上限。"
     elif [[ "$percent" -ge "$WARN2_PERCENT" && "${!warn2_var}" -eq 0 ]]; then
-        printf -v "$warn2_var" '%s' 1
-        send_tg "⚠️ ${HOST_LABEL}
-${direction}流量已达到 ${used_gb} GB / ${limit} GB（${percent}%）
-已达到第二预警线 ${WARN2_PERCENT}%。"
+        printf -v "$warn2_var" 1
+        send_tg "⚠️ ${HOST_LABEL}\n${direction}流量已达到 ${used_gb} GB / ${limit} GB（${percent}%）\n已达到第二预警线 ${WARN2_PERCENT}%。"
     elif [[ "$percent" -ge "$WARN1_PERCENT" && "${!warn1_var}" -eq 0 ]]; then
-        printf -v "$warn1_var" '%s' 1
-        send_tg "⚠️ ${HOST_LABEL}
-${direction}流量已达到 ${used_gb} GB / ${limit} GB（${percent}%）
-已达到第一预警线 ${WARN1_PERCENT}%。"
+        printf -v "$warn1_var" 1
+        send_tg "⚠️ ${HOST_LABEL}\n${direction}流量已达到 ${used_gb} GB / ${limit} GB（${percent}%）\n已达到第一预警线 ${WARN1_PERCENT}%。"
     fi
 }
-
 notify_threshold "入站" "$rx_percent" "$rx_gb" "${RX_LIMIT_GB:-0}"
 notify_threshold "出站" "$tx_percent" "$tx_gb" "${TX_LIMIT_GB:-0}"
-
-tmp="${STATE}.tmp.$$"
-umask 077
+tmp="${STATE}.tmp.$$"; umask 077
 cat > "$tmp" <<EOF
 STATE_PERIOD='${STATE_PERIOD}'
 LAST_RX=${LAST_RX}
@@ -9879,28 +9829,20 @@ TX_WARN1=${TX_WARN1}
 TX_WARN2=${TX_WARN2}
 TX_CRITICAL=${TX_CRITICAL}
 EOF
-mv -f "$tmp" "$STATE"
-chmod 600 "$STATE"
-
+mv -f "$tmp" "$STATE"; chmod 600 "$STATE"
 shutdown_needed=0
-if [[ "${RX_LIMIT_GB:-0}" =~ ^[0-9]+$ && "${RX_LIMIT_GB:-0}" -gt 0 && "$rx_percent" -ge "$SHUTDOWN_PERCENT" ]]; then
-    shutdown_needed=1
-fi
-if [[ "${TX_LIMIT_GB:-0}" =~ ^[0-9]+$ && "${TX_LIMIT_GB:-0}" -gt 0 && "$tx_percent" -ge "$SHUTDOWN_PERCENT" ]]; then
-    shutdown_needed=1
-fi
-
+if [[ "${RX_LIMIT_GB:-0}" =~ ^[0-9]+$ && "${RX_LIMIT_GB:-0}" -gt 0 && "$rx_percent" -ge "$SHUTDOWN_PERCENT" ]]; then shutdown_needed=1; fi
+if [[ "${TX_LIMIT_GB:-0}" =~ ^[0-9]+$ && "${TX_LIMIT_GB:-0}" -gt 0 && "$tx_percent" -ge "$SHUTDOWN_PERCENT" ]]; then shutdown_needed=1; fi
 if [[ "$shutdown_needed" -eq 1 && "$AUTO_SHUTDOWN" == "yes" ]]; then
-    send_tg "⛔ ${HOST_LABEL}
-流量达到自动关机阈值 ${SHUTDOWN_PERCENT}%，服务器即将自动关机。"
+    send_tg "⛔ ${HOST_LABEL}\n流量达到自动关机阈值 ${SHUTDOWN_PERCENT}%，服务器即将自动关机。"
     sync
     shutdown -h now
 fi
 TGWORKER
-
     chmod 700 "$TG_MONITOR_WORKER"
 
-    cat > "$TG_MONITOR_SERVICE" <<EOF
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        cat > "$TG_MONITOR_SERVICE" <<EOF
 [Unit]
 Description=ss2022 TG-BOT Traffic Monitor
 After=network-online.target
@@ -9910,8 +9852,7 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=${TG_MONITOR_WORKER}
 EOF
-
-    cat > "$TG_MONITOR_TIMER" <<'EOF'
+        cat > "$TG_MONITOR_TIMER" <<'EOF'
 [Unit]
 Description=Run ss2022 TG-BOT Traffic Monitor Every Minute
 
@@ -9925,8 +9866,17 @@ Unit=ss2022-tg-monitor.service
 [Install]
 WantedBy=timers.target
 EOF
-
-    systemctl daemon-reload || return 1
+        service_daemon_reload || return 1
+    else
+        mkdir -p "$(dirname "$TG_MONITOR_CRON_FILE")"
+        touch "$TG_MONITOR_CRON_FILE"
+        sed -i "/ss2022-tg-monitor/d" "$TG_MONITOR_CRON_FILE"
+        echo "* * * * * $TG_MONITOR_WORKER >/dev/null 2>&1 $TG_MONITOR_CRON_TAG" >> "$TG_MONITOR_CRON_FILE"
+        service_enable_now crond >/dev/null 2>&1 || {
+            echo -e "${RED}[错误] OpenRC crond 启动失败。${PLAIN}"
+            return 1
+        }
+    fi
 }
 
 server_tool_tg_monitor_send_test() {
@@ -10075,14 +10025,13 @@ EOF
         return
     }
 
-    systemctl enable --now ss2022-tg-monitor.timer >/dev/null 2>&1 || {
-        echo -e "${RED}[错误] TG-BOT 监控 timer 启动失败。${PLAIN}"
-        pause
-        return
-    }
-
-    # 立即运行一次，建立初始状态。
-    systemctl start ss2022-tg-monitor.service >/dev/null 2>&1 || true
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        systemctl enable --now ss2022-tg-monitor.timer >/dev/null 2>&1 || {
+            echo -e "${RED}[错误] TG-BOT 监控 timer 启动失败。${PLAIN}"; pause; return
+        }
+    fi
+    # 立即运行一次，建立初始状态。OpenRC 后续由 crond 每分钟执行。
+    "$TG_MONITOR_WORKER" >/dev/null 2>&1 || true
 
     echo -e "${GREEN}✔ TG-BOT 流量监控已启用。${PLAIN}"
     server_tool_tg_monitor_send_test
@@ -10092,39 +10041,24 @@ EOF
 server_tool_tg_monitor_status() {
     local enabled="未启用" rx_limit="-" tx_limit="-" reset_day="-" warn1="-" warn2="-" shutdown_percent="95" auto="-"
     local total_rx=0 total_tx=0 period="-" rx_gb tx_gb token_masked="-"
-
     [[ -f "$TG_MONITOR_CONF" ]] && {
         # shellcheck disable=SC1090
         source "$TG_MONITOR_CONF"
-        rx_limit="${RX_LIMIT_GB:-0}"
-        tx_limit="${TX_LIMIT_GB:-0}"
-        reset_day="${RESET_DAY:-1}"
-        warn1="${WARN1_PERCENT:-80}"
-        warn2="${WARN2_PERCENT:-90}"
-        shutdown_percent="${SHUTDOWN_PERCENT:-95}"
-        auto="${AUTO_SHUTDOWN:-no}"
-        if [[ -n "${TG_BOT_TOKEN:-}" ]]; then
-            token_masked="${TG_BOT_TOKEN:0:6}******"
-        fi
+        rx_limit="${RX_LIMIT_GB:-0}"; tx_limit="${TX_LIMIT_GB:-0}"; reset_day="${RESET_DAY:-1}"
+        warn1="${WARN1_PERCENT:-80}"; warn2="${WARN2_PERCENT:-90}"; shutdown_percent="${SHUTDOWN_PERCENT:-95}"; auto="${AUTO_SHUTDOWN:-no}"
+        [[ -n "${TG_BOT_TOKEN:-}" ]] && token_masked="${TG_BOT_TOKEN:0:6}******"
     }
-
     [[ -f "$TG_MONITOR_STATE" ]] && {
         # shellcheck disable=SC1090
         source "$TG_MONITOR_STATE"
-        total_rx="${TOTAL_RX:-0}"
-        total_tx="${TOTAL_TX:-0}"
-        period="${STATE_PERIOD:--}"
+        total_rx="${TOTAL_RX:-0}"; total_tx="${TOTAL_TX:-0}"; period="${STATE_PERIOD:--}"
     }
-
-    if systemctl is-active --quiet ss2022-tg-monitor.timer 2>/dev/null; then
-        enabled="运行中"
-    elif systemctl is-enabled --quiet ss2022-tg-monitor.timer 2>/dev/null; then
-        enabled="已启用但未运行"
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        if systemctl is-active --quiet ss2022-tg-monitor.timer 2>/dev/null; then enabled="运行中"; elif systemctl is-enabled --quiet ss2022-tg-monitor.timer 2>/dev/null; then enabled="已启用但未运行"; fi
+    else
+        if grep -q "ss2022-tg-monitor" "$TG_MONITOR_CRON_FILE" 2>/dev/null && service_is_active crond; then enabled="运行中（OpenRC crond）"; elif grep -q "ss2022-tg-monitor" "$TG_MONITOR_CRON_FILE" 2>/dev/null; then enabled="已配置但 crond 未运行"; fi
     fi
-
-    rx_gb=$(awk -v b="$total_rx" 'BEGIN {printf "%.2f", b/1073741824}')
-    tx_gb=$(awk -v b="$total_tx" 'BEGIN {printf "%.2f", b/1073741824}')
-
+    rx_gb=$(awk -v b="$total_rx" 'BEGIN {printf "%.2f",b/1073741824}'); tx_gb=$(awk -v b="$total_tx" 'BEGIN {printf "%.2f",b/1073741824}')
     clear
     echo -e "${CYAN}════════════ TG-BOT 流量监控状态 ════════════${PLAIN}"
     echo "  状态         : ${enabled}"
@@ -10138,37 +10072,38 @@ server_tool_tg_monitor_status() {
     echo "  自动关机     : $([[ "$auto" == "yes" ]] && echo "开启" || echo "关闭")"
     echo -e "${CYAN}═══════════════════════════════════════════════${PLAIN}"
 }
-
 server_tool_tg_monitor_disable() {
     local ans
     read -rp "确认停用 TG-BOT 流量监控？配置和累计数据会保留。[y/N]: " ans
     [[ "$ans" =~ ^[Yy]$ ]] || return 0
-
-    systemctl disable --now ss2022-tg-monitor.timer >/dev/null 2>&1 || true
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        systemctl disable --now ss2022-tg-monitor.timer >/dev/null 2>&1 || true
+    else
+        [[ -f "$TG_MONITOR_CRON_FILE" ]] && sed -i "/ss2022-tg-monitor/d" "$TG_MONITOR_CRON_FILE"
+    fi
     echo -e "${GREEN}✔ TG-BOT 流量监控已停用。${PLAIN}"
 }
-
 server_tool_tg_monitor_reset() {
     local ans
     read -rp "确认清零当前累计流量和预警状态？[y/N]: " ans
     [[ "$ans" =~ ^[Yy]$ ]] || return 0
     rm -f "$TG_MONITOR_STATE"
-    systemctl start ss2022-tg-monitor.service >/dev/null 2>&1 || true
+    [[ -x "$TG_MONITOR_WORKER" ]] && "$TG_MONITOR_WORKER" >/dev/null 2>&1 || true
     echo -e "${GREEN}✔ 流量累计已重新从当前时刻开始统计。${PLAIN}"
 }
-
 server_tool_tg_monitor_remove() {
     local ans
     read -rp "确认彻底删除 TG-BOT 流量监控配置、Token 和累计数据？[y/N]: " ans
     [[ "$ans" =~ ^[Yy]$ ]] || return 0
-
-    systemctl disable --now ss2022-tg-monitor.timer >/dev/null 2>&1 || true
-    rm -f "$TG_MONITOR_TIMER" "$TG_MONITOR_SERVICE" "$TG_MONITOR_WORKER" \
-          "$TG_MONITOR_CONF" "$TG_MONITOR_STATE"
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        systemctl disable --now ss2022-tg-monitor.timer >/dev/null 2>&1 || true
+    else
+        [[ -f "$TG_MONITOR_CRON_FILE" ]] && sed -i "/ss2022-tg-monitor/d" "$TG_MONITOR_CRON_FILE"
+    fi
+    rm -f "$TG_MONITOR_TIMER" "$TG_MONITOR_SERVICE" "$TG_MONITOR_WORKER" "$TG_MONITOR_CONF" "$TG_MONITOR_STATE"
     service_daemon_reload >/dev/null 2>&1 || true
     echo -e "${GREEN}✔ TG-BOT 流量监控已彻底删除。${PLAIN}"
 }
-
 server_tool_tg_monitor_management() {
     local c
     while true; do
@@ -10211,22 +10146,6 @@ server_tool_reboot() {
 }
 
 server_management_tools() {
-    if platform_is_alpine; then
-        while true; do
-            clear
-            echo -e "$CYAN════════════ Alpine / OpenRC 服务器工具（dev1） ════════════$PLAIN"
-            echo "  1. 系统信息"
-            echo "  2. 查看端口占用"
-            echo "  0. 返回"
-            read -rp "请选择 [0-2]: " c
-            case "$c" in
-                1) server_tool_system_info; pause ;;
-                2) server_tool_port_usage ;;
-                0) return ;;
-                *) sleep 1 ;;
-            esac
-        done
-    fi
     while true; do
         clear
         echo -e "${CYAN}════════════════════ 服务器管理工具 ════════════════════${PLAIN}"
