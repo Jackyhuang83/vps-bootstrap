@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev31
+# 当前版本: v1.9.0-dev32
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,11 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev32:
+#   - 修复服务账号 ownership：仅本脚本新建的 sing-box / Xray / Realm / Snell 用户与组才写 managed marker
+#   - 完全卸载仅删除有对应 managed marker 的用户/组，避免误删服务器预先存在的同名账号
+#   - Snell 不再因“用户由脚本创建”而无条件删除可能预先存在的 snell 组
 #
 # v1.9.0-dev31:
 #   - 明确“完全卸载”边界：协议核心/服务/运行文件清零，用户主动系统设置默认保留
@@ -546,11 +551,12 @@
 #   v1.9.0-dev29 修复 WARP 异常安装卸载残留
 #   v1.9.0-dev30 完全卸载文件残留收口
 #   v1.9.0-dev31 明确完全卸载系统设置保留边界
+#   v1.9.0-dev32 服务用户/组 ownership 保护
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev31"
+SCRIPT_VERSION="v1.9.0-dev32"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -577,6 +583,7 @@ SINGBOX_SERVICE="/etc/systemd/system/sing-box.service"
 SINGBOX_USER="sing-box"
 SINGBOX_GROUP="sing-box"
 SINGBOX_USER_MARKER="/etc/ss2022-singbox-user-managed"
+SINGBOX_GROUP_MARKER="/etc/ss2022-singbox-group-managed"
 SINGBOX_ALPINE_PKG_MARKER="/etc/ss2022-singbox-apk-managed"
 SINGBOX_ALPINE_RUNTIME_DIR="/usr/local/lib/ss2022/sing-box-runtime"
 SINGBOX_ALPINE_RUNTIME_BIN="${SINGBOX_ALPINE_RUNTIME_DIR}/sing-box"
@@ -590,6 +597,7 @@ XRAY_SERVICE="/etc/systemd/system/${XRAY_SERVICE_NAME}.service"
 XRAY_USER="ss2022-xray"
 XRAY_GROUP="ss2022-xray"
 XRAY_USER_MARKER="/etc/ss2022-xray-user-managed"
+XRAY_GROUP_MARKER="/etc/ss2022-xray-group-managed"
 XRAY_OPENRC_SERVICE="/etc/init.d/${XRAY_SERVICE_NAME}"
 XRAY_OPENRC_PID="/run/${XRAY_SERVICE_NAME}.pid"
 XRAY_OPENRC_LOG="/var/log/ss2022/${XRAY_SERVICE_NAME}.log"
@@ -603,6 +611,7 @@ SNELL_SERVICE="/etc/systemd/system/snell-v5.service"
 SNELL_USER="snell"
 SNELL_GROUP="snell"
 SNELL_USER_MARKER="/etc/ss2022-snell-user-managed"
+SNELL_GROUP_MARKER="/etc/ss2022-snell-group-managed"
 SNELL_OPENRC_SERVICE="/etc/init.d/snell-v5"
 SNELL_OPENRC_PID="/run/snell-v5.pid"
 SNELL_OPENRC_LOG="/var/log/ss2022/snell-v5.log"
@@ -619,6 +628,7 @@ REALM_SERVICE="/etc/systemd/system/${REALM_SERVICE_NAME}.service"
 REALM_USER="ss2022-realm"
 REALM_GROUP="ss2022-realm"
 REALM_USER_MARKER="/etc/ss2022-realm-user-managed"
+REALM_GROUP_MARKER="/etc/ss2022-realm-group-managed"
 REALM_OPENRC_SERVICE="/etc/init.d/${REALM_SERVICE_NAME}"
 REALM_OPENRC_PID="/run/${REALM_SERVICE_NAME}.pid"
 REALM_OPENRC_LOG="/var/log/ss2022/${REALM_SERVICE_NAME}.log"
@@ -967,6 +977,26 @@ create_system_user() {
         [[ -n "$nologin_shell" ]] || nologin_shell="/usr/sbin/nologin"
         useradd --system --gid "$group" --no-create-home --home-dir /nonexistent --shell "$nologin_shell" "$user"
     fi
+}
+
+ensure_managed_system_user() {
+    local user="$1" group="$2" user_marker="$3" group_marker="$4"
+    local user_existed=0 group_existed=0
+
+    id -u "$user" >/dev/null 2>&1 && user_existed=1
+    system_group_exists "$group" && group_existed=1
+
+    create_system_user "$user" "$group" || return 1
+
+    if [[ $user_existed -eq 0 ]]; then
+        touch "$user_marker" || return 1
+        chmod 600 "$user_marker"
+    fi
+    if [[ $group_existed -eq 0 ]]; then
+        touch "$group_marker" || return 1
+        chmod 600 "$group_marker"
+    fi
+    return 0
 }
 
 delete_system_user() {
@@ -1751,10 +1781,7 @@ node_name_management() {
     done
 }
 ensure_singbox_user() {
-    create_system_user "$SINGBOX_USER" "$SINGBOX_GROUP" || return 1
-    touch "$SINGBOX_USER_MARKER"
-    chmod 600 "$SINGBOX_USER_MARKER"
-    return 0
+    ensure_managed_system_user "$SINGBOX_USER" "$SINGBOX_GROUP" "$SINGBOX_USER_MARKER" "$SINGBOX_GROUP_MARKER"
 }
 write_singbox_service() {
     ensure_singbox_user || return 1
@@ -3584,10 +3611,7 @@ deploy_vless_reality() {
 }
 
 ensure_xray_user() {
-    create_system_user "$XRAY_USER" "$XRAY_GROUP" || return 1
-    touch "$XRAY_USER_MARKER"
-    chmod 600 "$XRAY_USER_MARKER"
-    return 0
+    ensure_managed_system_user "$XRAY_USER" "$XRAY_GROUP" "$XRAY_USER_MARKER" "$XRAY_GROUP_MARKER"
 }
 write_xray_service() {
     ensure_xray_user || return 1
@@ -3778,16 +3802,7 @@ write_xray_vless_config() {
 }
 
 ensure_snell_user() {
-    local existed=0
-    id -u "$SNELL_USER" >/dev/null 2>&1 && existed=1
-
-    create_system_user "$SNELL_USER" "$SNELL_GROUP" || return 1
-
-    if [[ $existed -eq 0 ]]; then
-        touch "$SNELL_USER_MARKER"
-        chmod 600 "$SNELL_USER_MARKER"
-    fi
-    return 0
+    ensure_managed_system_user "$SNELL_USER" "$SNELL_GROUP" "$SNELL_USER_MARKER" "$SNELL_GROUP_MARKER"
 }
 
 snell_port_from_config() {
@@ -6685,10 +6700,7 @@ routing_management() {
 # ==============================================================================
 
 ensure_realm_user() {
-    create_system_user "$REALM_USER" "$REALM_GROUP" || return 1
-    touch "$REALM_USER_MARKER"
-    chmod 600 "$REALM_USER_MARKER"
-    return 0
+    ensure_managed_system_user "$REALM_USER" "$REALM_GROUP" "$REALM_USER_MARKER" "$REALM_GROUP_MARKER"
 }
 write_realm_service() {
     ensure_realm_user || return 1
@@ -7751,18 +7763,17 @@ full_uninstall() {
         rm -f "$DNS_MARKER"
     fi
 
-    if [[ -f "$SINGBOX_USER_MARKER" ]]; then
-        delete_system_user "$SINGBOX_USER"
-        rm -f "$SINGBOX_USER_MARKER"
-    fi
+    if [[ -f "$SINGBOX_USER_MARKER" ]]; then delete_system_user "$SINGBOX_USER"; rm -f "$SINGBOX_USER_MARKER"; fi
+    if [[ -f "$SINGBOX_GROUP_MARKER" ]]; then delete_system_group "$SINGBOX_GROUP"; rm -f "$SINGBOX_GROUP_MARKER"; fi
 
     if [[ -f "$XRAY_USER_MARKER" ]]; then delete_system_user "$XRAY_USER"; rm -f "$XRAY_USER_MARKER"; fi
+    if [[ -f "$XRAY_GROUP_MARKER" ]]; then delete_system_group "$XRAY_GROUP"; rm -f "$XRAY_GROUP_MARKER"; fi
+
     if [[ -f "$REALM_USER_MARKER" ]]; then delete_system_user "$REALM_USER"; rm -f "$REALM_USER_MARKER"; fi
-    if [[ -f "$SNELL_USER_MARKER" ]]; then
-        delete_system_user "$SNELL_USER"
-        delete_system_group "$SNELL_GROUP"
-        rm -f "$SNELL_USER_MARKER"
-    fi
+    if [[ -f "$REALM_GROUP_MARKER" ]]; then delete_system_group "$REALM_GROUP"; rm -f "$REALM_GROUP_MARKER"; fi
+
+    if [[ -f "$SNELL_USER_MARKER" ]]; then delete_system_user "$SNELL_USER"; rm -f "$SNELL_USER_MARKER"; fi
+    if [[ -f "$SNELL_GROUP_MARKER" ]]; then delete_system_group "$SNELL_GROUP"; rm -f "$SNELL_GROUP_MARKER"; fi
 
     [[ -f "$TG_MONITOR_CRON_FILE" ]] && sed -i "/ss2022-tg-monitor/d" "$TG_MONITOR_CRON_FILE" 2>/dev/null || true
     rm -f "$SINGBOX_OPENRC_PID" "$XRAY_OPENRC_PID" "$SNELL_OPENRC_PID" "$REALM_OPENRC_PID"
