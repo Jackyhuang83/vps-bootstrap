@@ -2,12 +2,13 @@
 
 一体化 VPS 网络协议、服务端分流、端口转发与日常运维脚本。
 
-当前正式版本：**v1.8.1**
+当前正式版本：**v1.8.1**  
+当前开发版本：**v1.9.0-dev25**
 
 项目以单一交互式 Bash 脚本 `ss2022.sh` 为入口，整合 **SS2022、SS2022 + ShadowTLS v3、VLESS Reality、Snell v5**，并提供 WARP 出口、链式落地、规则分流、Realm L4 端口转发、组件管理、服务器工具、服务器测试与脚本自更新。
 
-> 当前 v1.8.x 正式支持 **Debian / Ubuntu + systemd**。  
-> Alpine / OpenRC 暂未正式支持，计划在后续 v1.9.x 适配。
+> v1.8.1 为当前稳定正式版，正式支持 **Debian / Ubuntu + systemd**。  
+> v1.9.x 为当前开发线，已接入 **Alpine 3.21 + OpenRC**；核心 OpenRC 服务路径已通过 Alpine 3.21 CI smoke test。Snell v5 在 Alpine 上仍需通过官方二进制运行时自检；Cloudflare WARP 官方客户端暂不在 Alpine 开放。
 
 ---
 
@@ -30,15 +31,16 @@
 
 | 维度 | 当前支持 |
 |---|---|
-| **操作系统** | Debian / Ubuntu（systemd） |
+| **稳定正式版** | v1.8.1：Debian / Ubuntu + systemd |
+| **v1.9 开发版** | Debian / Ubuntu + systemd；Alpine 3.21 + OpenRC |
 | **CPU 架构** | x86_64 / amd64、aarch64 / arm64 |
 | **网络环境** | IPv4-only、IPv6-only、IPv4 + IPv6 双栈 |
 | **NAT VPS** | 可使用服务商映射端口部署节点 |
 | **权限要求** | root |
 | **Shell** | Bash |
-| **当前正式版本** | v1.8.1 |
+| **Alpine 注意** | Snell v5 需运行时自检；WARP 官方客户端暂不支持 Alpine |
 
-### v1.8.0 固定 / 推荐组件版本
+### 当前固定 / 推荐组件版本
 
 | 组件 | 版本 |
 |---|---|
@@ -142,7 +144,7 @@ ShadowTLS 主要用于增加 TLS-like 流量特征与主动探测抵抗能力，
 设计原则：
 
 - Xray 使用独立二进制与配置目录
-- systemd 服务名为 `ss2022-xray`
+- Debian / Ubuntu 使用 systemd 服务 `ss2022-xray`；Alpine 使用对应 OpenRC 服务
 - 不覆盖服务器已有的 Xray 安装
 - 支持 Reality 参数自动生成
 - 支持节点名称修改
@@ -312,7 +314,7 @@ Realm 使用独立二进制、配置和独立服务；Debian/Ubuntu 使用 syste
 
 # 服务器管理工具
 
-v1.8.0 集成了一组轻量服务器运维工具，不做“大而全”的系统工具箱。
+当前脚本集成了一组轻量服务器运维工具，不做“大而全”的系统工具箱。
 
 ## 系统信息
 
@@ -348,13 +350,13 @@ v1.8.0 集成了一组轻量服务器运维工具，不做“大而全”的系�
 
 - 查看全部监听端口
 - 查询指定端口
-- 显示 PID / 进程 / systemd 服务 / Docker 映射
+- 显示 PID / 进程 / systemd 或 OpenRC 服务 / Docker 映射
 - 安全释放指定端口
 
 释放端口支持：
 
-- 停止 systemd 服务
-- 停止并禁用 systemd 服务
+- 停止 systemd / OpenRC 服务
+- 停止并禁用 systemd / OpenRC 服务
 - 停止 Docker 容器
 - 结束监听进程
 
@@ -610,7 +612,7 @@ ss -lntup
 
 # 安全设计
 
-v1.8.0 的主要安全原则：
+当前脚本的主要安全原则：
 
 - 配置修改前生成候选配置
 - 核心配置通过自检后才覆盖正式配置
@@ -645,7 +647,7 @@ v1.8.0 的主要安全原则：
 
 ## v1.8.x
 
-v1.8.0 已进入稳定阶段。
+v1.8.1 为当前稳定正式版。
 
 后续 v1.8.x 仅处理：
 
@@ -657,17 +659,16 @@ v1.8.0 已进入稳定阶段。
 
 ## v1.9.x
 
-当前开发重点：
+当前开发版为 **v1.9.0-dev25**，重点是 Alpine / OpenRC 收口：
 
-- Alpine Linux / OpenRC / `apk`
 - SS2022、ShadowTLS v3、VLESS Reality、Realm 已接入 OpenRC
 - Snell v5 已接入 OpenRC；由于 Surge 官方二进制依赖 glibc，Alpine 部署必须通过本机运行时自检
 - 服务器管理工具与服务器测试已完成主要 Alpine 适配
+- Alpine 3.21 / OpenRC 已加入 GitHub Actions smoke test，覆盖平台识别、服务生成、runlevel、PID 与完全卸载闭环
 - WARP 官方 Linux 客户端在 Alpine 暂不开放
-- 轻量 NAT VPS 环境适配
-- systemd / OpenRC 服务抽象
+- Debian / Ubuntu + systemd 路径继续保持兼容
 
-v1.8.1 仍是当前正式版；v1.9.x 在完成 Alpine 实机验证前仍属于开发分支。
+v1.9.x 在完成更充分的 Alpine 实机验证前仍属于开发线，不替代 v1.8.1 稳定版。
 
 ---
 
