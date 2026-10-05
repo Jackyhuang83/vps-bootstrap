@@ -291,6 +291,43 @@ jobs:
           grep -Fq 'backup="${STATE_DIR}/sshd_config.bak.$(date +%Y%m%d-%H%M%S)"' <<<"$body"
           grep -Fq 'rm -f "$backup"' <<<"$body"
 
+      - name: Guard proxy shortcut ownership
+        shell: bash
+        run: |
+          export SS2022_LIB_ONLY=1
+          # shellcheck disable=SC1091
+          source ./ss2022.sh
+
+          update_body=$(declare -f check_script_update)
+          full_body=$(declare -f full_uninstall)
+
+          grep -Fq 'ensure_proxy_shortcut' <<<"$update_body"
+          if grep -Fq 'ln -sf "$SCRIPT_INSTALL_PATH" "$SCRIPT_PROXY_LINK"' <<<"$update_body"; then
+            echo "ERROR: script update must not force-overwrite /usr/local/bin/proxy."
+            exit 1
+          fi
+          grep -Fq 'proxy_link_managed' <<<"$full_body"
+          if grep -Fq 'rm -f /usr/local/bin/proxy' <<<"$full_body"; then
+            echo "ERROR: full uninstall must not unconditionally delete /usr/local/bin/proxy."
+            exit 1
+          fi
+
+          tmpdir=$(mktemp -d)
+          trap 'rm -rf "$tmpdir"' EXIT
+          SCRIPT_INSTALL_PATH="$tmpdir/ss2022"
+          SCRIPT_PROXY_LINK="$tmpdir/proxy"
+          printf 'project\n' > "$SCRIPT_INSTALL_PATH"
+
+          printf 'external\n' > "$SCRIPT_PROXY_LINK"
+          ensure_proxy_shortcut
+          [[ ! -L "$SCRIPT_PROXY_LINK" ]]
+          grep -Fxq external "$SCRIPT_PROXY_LINK"
+
+          rm -f "$SCRIPT_PROXY_LINK"
+          ensure_proxy_shortcut
+          [[ -L "$SCRIPT_PROXY_LINK" ]]
+          proxy_shortcut_is_project_managed
+
       - name: Guard current dev changelog uniqueness
         shell: bash
         run: |
