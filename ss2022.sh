@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev30
+# 当前版本: v1.9.0-dev31
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,11 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev31:
+#   - 明确“完全卸载”边界：协议核心/服务/运行文件清零，用户主动系统设置默认保留
+#   - 卸载前明确提示 BBR、DNS、SSH 端口、IPv4/IPv6 地址优先级不会自动回滚
+#   - 避免卸载脚本自动恢复系统设置导致 SSH 失联、DNS 变化或用户调优被意外撤销
 #
 # v1.9.0-dev30:
 #   - 完全卸载补齐 /usr/local/bin/ss2022.bak、OpenRC PID 与 TG-BOT lockdir 清理
@@ -540,11 +545,12 @@
 #   v1.9.0-dev28 IPv6-only 不再改写 APT 镜像
 #   v1.9.0-dev29 修复 WARP 异常安装卸载残留
 #   v1.9.0-dev30 完全卸载文件残留收口
+#   v1.9.0-dev31 明确完全卸载系统设置保留边界
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev30"
+SCRIPT_VERSION="v1.9.0-dev31"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -7673,6 +7679,8 @@ full_uninstall() {
     echo -e "${RED}========== 完全卸载 ss2022.sh ==========${PLAIN}"
     echo ""
     echo -e "${RED}此操作会删除本脚本管理的协议核心、节点/分流/端口转发配置与服务。不会删除服务器原有 xray.service 或 realm.service。${PLAIN}"
+    echo -e "${YELLOW}[保留] 服务器工具中由你主动设置的 BBR、DNS、SSH 端口和 IPv4/IPv6 地址优先级不会自动回滚。${PLAIN}"
+    echo -e "${YELLOW}[说明] 这些属于服务器系统设置；自动恢复可能改变网络或 SSH 可达性，需要时请在卸载前通过对应菜单手动恢复。${PLAIN}"
     echo ""
     read -rp "确认彻底卸载？请输入 DELETE: " yes
     [[ "$yes" == "DELETE" ]] || { echo "已取消。"; sleep 1; return; }
@@ -7760,7 +7768,8 @@ full_uninstall() {
     rm -f "$SINGBOX_OPENRC_PID" "$XRAY_OPENRC_PID" "$SNELL_OPENRC_PID" "$REALM_OPENRC_PID"
     rm -rf /run/ss2022-tg-monitor.lockdir
     service_daemon_reload || true
-    echo -e "${GREEN}✔ 已彻底卸载。${PLAIN}"
+    echo -e "${GREEN}✔ vps-bootstrap 协议核心、服务与运行文件已清理完成。${PLAIN}"
+    echo -e "${YELLOW}[保留] BBR / DNS / SSH 端口 / IPv4-IPv6 地址优先级等用户主动系统设置保持当前状态。${PLAIN}"
     exit 0
 }
 get_singbox_version_raw() {
