@@ -99,7 +99,7 @@
 #   - 完成完全卸载闭环：systemd/OpenRC 服务、PID、日志、临时文件、候选/回滚文件、WARP 资产与脚本备份均按 ownership 清理
 #   - 完成 sing-box、Snell、proxy 快捷命令、IPv6 Keepalive、ForceIPv6、DNS 备份、WARP APT 仓库与共享配置目录 ownership 保护
 #   - 保留用户主动设置的 BBR、DNS、SSH 端口和 IPv4/IPv6 地址优先级，避免卸载时破坏系统网络可达性
-#   - GitHub Actions 覆盖 Bash 语法、ShellCheck、关键 ownership 回归保护与 Alpine 3.21/OpenRC smoke test
+#   - GitHub Actions 覆盖 Bash 语法、ShellCheck、关键 ownership 回归保护、Alpine 3.21/OpenRC smoke test 与正式发布版本一致性校验
 #
 # v1.9.0-dev43:
 #   - 首页仅在 /usr/local/bin/proxy 确认属于本项目时显示 proxy 快捷命令
