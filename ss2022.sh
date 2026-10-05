@@ -91,7 +91,7 @@
 #   - Alpine 仅使用系统仓库 gcompat/libstdc++/libgcc 兼容官方 snell-server，不注入第三方 glibc、不改用非官方实现
 #   - 官方二进制下载/SHA256 校验后立即运行时自检；兼容失败则拒绝启动并输出 ldd/gcompat 诊断
 #   - Snell 用户创建、PID、状态、日志、重启、回滚、删除、组件管理与完全卸载完成 OpenRC 适配
-#   - OpenRC Snell 使用 supervise-daemon、独立非 root 用户、独立日志与低端口 capability
+#   - OpenRC Snell 使用 supervise-daemon、独立非 root 用户、独立日志与 ambient CAP_NET_BIND_SERVICE，不修改官方二进制文件 capability
 #
 # v1.9.0-dev22:
 #   - 修复 Alpine/OpenRC 完全卸载未停用 ss2022-ip-family 服务的问题
@@ -3909,28 +3909,6 @@ install_snell_v5_core() {
         return 1
     fi
 
-    if platform_is_alpine; then
-        command -v setcap >/dev/null 2>&1 || {
-            echo -e "${RED}[错误] Alpine 缺少 setcap，无法安全支持低端口监听。${PLAIN}"
-            rm -rf "$tmp"
-            rm -f "$candidate"
-            return 1
-        }
-        setcap cap_net_bind_service=+ep "$candidate" || {
-            echo -e "${RED}[错误] 无法为 Snell v5 设置低端口 capability。${PLAIN}"
-            rm -rf "$tmp"
-            rm -f "$candidate"
-            return 1
-        }
-        if ! snell_binary_works "$candidate"; then
-            echo -e "${RED}[错误] Snell v5 设置 capability 后运行时自检失败，拒绝替换现有二进制。${PLAIN}"
-            getcap "$candidate" 2>/dev/null || true
-            rm -rf "$tmp"
-            rm -f "$candidate"
-            return 1
-        fi
-    fi
-
     mv -f "$candidate" "$SNELL_BIN" || {
         rm -rf "$tmp"
         rm -f "$candidate"
@@ -3997,6 +3975,8 @@ supervisor="supervise-daemon"
 pidfile="$SNELL_OPENRC_PID"
 output_log="$SNELL_OPENRC_LOG"
 error_log="$SNELL_OPENRC_LOG"
+capabilities="^cap_net_bind_service"
+no_new_privs=true
 respawn_delay=5
 respawn_max=0
 umask=0077
