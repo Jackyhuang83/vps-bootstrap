@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev13
+# 当前版本: v1.9.0-dev14
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,11 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev14:
+#   - 流媒体解锁测试增加 IPv4 / IPv6 各自出口 IP 与出口国家/地区显示
+#   - 出口地区与平台自身 Region 分开显示：前者表示 VPS 出口地，后者表示平台识别/解锁区服
+#   - 通信软件与流媒体复用同一套 Cloudflare trace 出口地区识别逻辑
 #
 # v1.9.0-dev13:
 #   - 通信软件测试增加 IPv4 / IPv6 各自出口 IP 与出口国家/地区显示
@@ -428,11 +433,12 @@
 #   v1.9.0-dev11 流媒体地区选择 / IPv4+IPv6 独立检测
 #   v1.9.0-dev12 流媒体/AI拆分 / 通用平台 / 通信软件检测
 #   v1.9.0-dev13 通信软件出口地区识别
+#   v1.9.0-dev14 流媒体出口地区识别
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev13"
+SCRIPT_VERSION="v1.9.0-dev14"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -10539,6 +10545,51 @@ server_test_select_streaming_region() {
     done
 }
 
+server_test_show_exit_info_for_mode() {
+    local mode="${1:-0}" family
+    family=$(server_test_detect_family_mode)
+    case "$mode" in
+        4)
+            case "$family" in
+                both|ipv4)
+                    echo "===========[ IPV4 流媒体出口 ]============"
+                    server_test_exit_info "ipv4"
+                    ;;
+                *) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv4。${PLAIN}" ;;
+            esac
+            ;;
+        6)
+            case "$family" in
+                both|ipv6)
+                    echo "===========[ IPV6 流媒体出口 ]============"
+                    server_test_exit_info "ipv6"
+                    ;;
+                *) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv6。${PLAIN}" ;;
+            esac
+            ;;
+        *)
+            case "$family" in
+                both)
+                    echo "===========[ IPV4 流媒体出口 ]============"
+                    server_test_exit_info "ipv4"
+                    echo ""
+                    echo "===========[ IPV6 流媒体出口 ]============"
+                    server_test_exit_info "ipv6"
+                    ;;
+                ipv4)
+                    echo "===========[ IPV4 流媒体出口 ]============"
+                    server_test_exit_info "ipv4"
+                    ;;
+                ipv6)
+                    echo "===========[ IPV6 流媒体出口 ]============"
+                    server_test_exit_info "ipv6"
+                    ;;
+                *) echo -e "${RED}[错误] 未检测到可用公网 IPv4 / IPv6。${PLAIN}" ;;
+            esac
+            ;;
+    esac
+}
+
 test_streaming_unlock() {
     local common_platforms
     common_platforms="Netflix,Netflix CDN,Disney+,Amazon Prime Video,Youtube Premium,YouTube CDN,YouTube Region,GoogleSearch,Google Play Store,Apple"
@@ -10554,6 +10605,8 @@ test_streaming_unlock() {
         6) echo -e "${CYAN}地址族: 仅 IPv6${PLAIN}" ;;
         *) echo -e "${CYAN}地址族: IPv4 + IPv6${PLAIN}" ;;
     esac
+    echo ""
+    server_test_show_exit_info_for_mode "$SERVER_TEST_IP_MODE"
     echo ""
     server_test_run_unlocktests "$common_platforms" "通用流媒体 / 平台" "$SERVER_TEST_IP_MODE" "test" || true
     if [[ -n "$SERVER_TEST_REGION_SELECTION" ]]; then
@@ -10601,7 +10654,7 @@ server_test_communication_probe() {
     printf " %-25s %s\n" "$name" "$status"
 }
 
-server_test_communication_exit_info() {
+server_test_exit_info() {
     local family="$1" family_flag ip trace country
     [[ "$family" == "ipv6" ]] && family_flag="-6" || family_flag="-4"
 
@@ -10624,7 +10677,7 @@ server_test_run_communication_family() {
     local family="$1" title
     [[ "$family" == "ipv6" ]] && title="IPV6" || title="IPV4"
     echo "===========[ ${title} 通信软件 ]============"
-    server_test_communication_exit_info "$family"
+    server_test_exit_info "$family"
     server_test_communication_probe "$family" "Telegram" "https://web.telegram.org/"
     server_test_communication_probe "$family" "WhatsApp" "https://web.whatsapp.com/"
     server_test_communication_probe "$family" "Signal" "https://signal.org/"
