@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev21
+# 当前版本: v1.9.0-dev22
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,11 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev22:
+#   - 修复 Alpine/OpenRC 完全卸载未停用 ss2022-ip-family 服务的问题
+#   - 完全卸载补齐 Xray / Realm / IP-family 的 OpenRC init.d 服务脚本清理
+#   - 保持 TG-BOT 仅删除本项目 crond 任务，不停止或修改系统其他 cron 任务
 #
 # v1.9.0-dev21:
 #   - 修复 Realm 规则测试在 Alpine/OpenRC 下仍直接调用 systemctl 的残留
@@ -483,11 +488,12 @@
 #   v1.9.0-dev19 合并平台流媒体AI通信软件解锁测试
 #   v1.9.0-dev20 修复 systemd 服务状态递归
 #   v1.9.0-dev21 修复 Realm OpenRC 状态残留
+#   v1.9.0-dev22 修复 OpenRC 完全卸载残留
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev21"
+SCRIPT_VERSION="v1.9.0-dev22"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -7541,6 +7547,7 @@ full_uninstall() {
         service_disable_now sing-box
         service_disable_now "$XRAY_SERVICE_NAME"
         service_disable_now "$REALM_SERVICE_NAME"
+        service_disable_now "$IP_FAMILY_SERVICE_NAME"
         service_disable_now ss2022-ipv6-keepalive
     fi
 
@@ -7561,7 +7568,25 @@ full_uninstall() {
     fi
 
     rm -rf /etc/sing-box /etc/snell /etc/ss2022-xray /etc/ss2022-realm "$STATE_DIR" /usr/local/lib/ss2022 /var/log/ss2022
-    rm -f         /usr/local/bin/ss2022         /usr/local/bin/proxy         "$SINGBOX_BIN"         "$SINGBOX_OPENRC_SERVICE"         "$XRAY_BIN"         "$SNELL_BIN"         "$SINGBOX_SERVICE"         "$XRAY_SERVICE"         "$SNELL_SERVICE"         "$REALM_SERVICE"         "$IP_FAMILY_SERVICE"         "$IPV6_KEEPALIVE_OPENRC_SERVICE"         /etc/systemd/system/ipv6-keepalive.service         /etc/systemd/system/ipv6-keepalive.timer         "$FORCE_IPV6_CONF"
+    rm -f \
+        /usr/local/bin/ss2022 \
+        /usr/local/bin/proxy \
+        "$SINGBOX_BIN" \
+        "$XRAY_BIN" \
+        "$SNELL_BIN" \
+        "$SINGBOX_SERVICE" \
+        "$XRAY_SERVICE" \
+        "$SNELL_SERVICE" \
+        "$REALM_SERVICE" \
+        "$IP_FAMILY_SERVICE" \
+        "$SINGBOX_OPENRC_SERVICE" \
+        "$XRAY_OPENRC_SERVICE" \
+        "$REALM_OPENRC_SERVICE" \
+        "$IP_FAMILY_OPENRC_SERVICE" \
+        "$IPV6_KEEPALIVE_OPENRC_SERVICE" \
+        /etc/systemd/system/ipv6-keepalive.service \
+        /etc/systemd/system/ipv6-keepalive.timer \
+        "$FORCE_IPV6_CONF"
 
     if [[ -f "$DNS_MARKER" && -f "$BACKUP_DNS" && ! -L /etc/resolv.conf ]]; then
         cp -f "$BACKUP_DNS" /etc/resolv.conf 2>/dev/null || true
