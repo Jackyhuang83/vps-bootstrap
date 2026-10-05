@@ -77,14 +77,13 @@ jobs:
               chmod 755 "$tmp/snell-server"
               snell_binary_works "$tmp/snell-server"
 
-              cat > "$tmp/snell.conf" <<'"'"'EOF'"'"'
-              [snell-server]
-              listen = 127.0.0.1:63333
-              psk = ci-runtime-test
-              version = 5
-              ipv6 = false
-              obfs = off
-              EOF
+              printf '%s\n' \
+                '[snell-server]' \
+                'listen = 127.0.0.1:63333' \
+                'psk = ci-runtime-test' \
+                'version = 5' \
+                'ipv6 = false' \
+                'obfs = off' > "$tmp/snell.conf"
 
               "$tmp/snell-server" -c "$tmp/snell.conf" >"$tmp/snell.log" 2>&1 &
               pid=$!
