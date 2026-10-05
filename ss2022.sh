@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev9
+# 当前版本: v1.9.0-dev10
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,14 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev10:
+#   - 服务器测试统一改为跨发行版零依赖 Go 测试组件，Debian/Ubuntu 与 Alpine/OpenRC 共用同一条路径
+#   - IP 质量测试替换旧 IP.Check.Place 入口，改用 oneclickvirt/securityCheck，避免旧入口配额/网页异常
+#   - 回程路由替换 AutoTrace Shell 依赖，改用 oneclickvirt/backtrace，并自动覆盖可用 IPv4 / IPv6
+#   - 流媒体与 AI 测试统一使用 oneclickvirt/UnlockTests；流媒体使用全部平台，AI 使用 AI-only
+#   - 第三方测试二进制通过 GitHub Release API 获取官方 asset digest，并在执行前强制 SHA256 校验
+#   - 测试组件只落到 /tmp，用后即删；不写系统服务、不修改协议配置、不长期安装第三方测试程序
 #
 # v1.9.0-dev9:
 #   - Alpine / OpenRC 服务器管理工具由精简预览升级为完整菜单
@@ -396,11 +404,12 @@
 #   v1.9.0-dev7 SS2022/ShadowTLS IPv4+IPv6 双栈入站 / 双节点输出
 #   v1.9.0-dev8 Alpine VLESS Reality / Realm OpenRC
 #   v1.9.0-dev9 Alpine/OpenRC 服务器管理完整适配
+#   v1.9.0-dev10 跨发行版服务器测试组件重构
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev9"
+SCRIPT_VERSION="v1.9.0-dev10"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -10209,12 +10218,78 @@ ensure_test_dependency() {
 show_external_test_source() {
     local name="$1"
     local source="$2"
-
     echo ""
     echo -e "${CYAN}════════════════════ ${name} ════════════════════${PLAIN}"
     echo -e "${YELLOW}测试来源: ${source}${PLAIN}"
-    echo -e "${YELLOW}说明: 以下功能调用第三方开源测试脚本，仅用于检测，不修改 ss2022 协议或分流配置。${PLAIN}"
+    echo -e "${YELLOW}说明: 测试组件仅用于检测；临时下载到 /tmp，校验 SHA256 后执行，用完删除，不修改协议或分流配置。${PLAIN}"
     echo ""
+}
+server_test_download_release_asset() {
+    local repo="$1" tag="$2" asset="$3" out="$4"
+    local api meta url digest expected actual source ok=0
+
+    ensure_test_dependency curl curl || return 1
+    ensure_test_dependency jq jq || return 1
+    command -v sha256sum >/dev/null 2>&1 || ensure_test_dependency sha256sum coreutils || return 1
+
+    if [[ "$tag" == "latest" ]]; then
+        api="https://api.github.com/repos/${repo}/releases/latest"
+    else
+        api="https://api.github.com/repos/${repo}/releases/tags/${tag}"
+    fi
+    meta=$(mktemp /tmp/ss2022-test-release.XXXXXX.json) || return 1
+    if ! curl -fsSL --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 30 -H "Accept: application/vnd.github+json" "$api" -o "$meta"; then
+        rm -f "$meta"
+        echo -e "${RED}[错误] 无法获取 ${repo} Release 元数据。${PLAIN}"
+        return 1
+    fi
+    url=$(jq -r --arg a "$asset" '.assets[]? | select(.name==$a) | .browser_download_url // empty' "$meta" | head -n1)
+    digest=$(jq -r --arg a "$asset" '.assets[]? | select(.name==$a) | .digest // empty' "$meta" | head -n1)
+    rm -f "$meta"
+    expected=${digest#sha256:}
+    if [[ -z "$url" || ! "$expected" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        echo -e "${RED}[错误] Release 中未找到 ${asset} 或缺少官方 SHA256 digest。${PLAIN}"
+        return 1
+    fi
+
+    local sources=("$url" "https://ghproxy.net/${url}" "https://gh-proxy.com/${url}")
+    for source in "${sources[@]}"; do
+        rm -f "$out"
+        echo -e "${YELLOW}>> 下载并校验 ${asset}...${PLAIN}"
+        if ! curl -fL --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 120 "$source" -o "$out"; then
+            continue
+        fi
+        actual=$(sha256sum "$out" | awk '{print $1}')
+        if [[ "${actual,,}" == "${expected,,}" ]]; then
+            ok=1
+            break
+        fi
+        echo -e "${RED}[警告] SHA256 不匹配，拒绝执行当前下载结果。${PLAIN}"
+    done
+    [[ $ok -eq 1 ]] || { rm -f "$out"; echo -e "${RED}[错误] ${asset} 下载失败或 SHA256 校验失败。${PLAIN}"; return 1; }
+    chmod 700 "$out"
+    return 0
+}
+
+server_test_arch_asset() {
+    local prefix="$1"
+    case "$(uname -m)" in
+        x86_64|amd64) printf "%s-linux-amd64" "$prefix" ;;
+        aarch64|arm64) printf "%s-linux-arm64" "$prefix" ;;
+        i386|i686) printf "%s-linux-386" "$prefix" ;;
+        armv7l|armv7*) printf "%s-linux-arm" "$prefix" ;;
+        *) return 1 ;;
+    esac
+}
+
+server_test_detect_family_mode() {
+    local has4=0 has6=0
+    get_public_ipv4 >/dev/null 2>&1 && has4=1 || true
+    get_public_ipv6 >/dev/null 2>&1 && has6=1 || true
+    if [[ $has4 -eq 1 && $has6 -eq 1 ]]; then echo "both"
+    elif [[ $has4 -eq 1 ]]; then echo "ipv4"
+    elif [[ $has6 -eq 1 ]]; then echo "ipv6"
+    else echo "none"; fi
 }
 
 run_external_curl_test() {
@@ -10253,142 +10328,97 @@ run_external_curl_test() {
 }
 
 test_ip_quality() {
+    local asset tmp family check_mode
     clear
-    show_external_test_source "IP 质量测试" "IP.Check.Place"
-
-    ensure_test_dependency curl curl || {
-        echo -e "${RED}[错误] curl 安装失败。${PLAIN}"
-        pause
-        return
+    show_external_test_source "IP 质量测试" "oneclickvirt/securityCheck"
+    asset=$(server_test_arch_asset "securityCheck") || {
+        echo -e "${RED}[错误] 当前 CPU 架构暂无 securityCheck 测试资产。${PLAIN}"; pause; return
     }
-
-    run_external_curl_test "IP 质量测试" "https://IP.Check.Place"
-
-    echo ""
-    pause
-}
-
-test_return_route() {
-    local tmp=""
-    clear
-    show_external_test_source \
-        "回程路由测试" \
-        "https://github.com/Chennhaoo/Shell_Bash/blob/master/AutoTrace.sh"
-
-    ensure_test_dependency wget wget || {
-        echo -e "${RED}[错误] wget 安装失败。${PLAIN}"
-        pause
-        return
-    }
-
-    tmp=$(mktemp /tmp/ss2022-autotrace.XXXXXX.sh) || {
-        echo -e "${RED}[错误] 无法创建临时文件。${PLAIN}"
-        pause
-        return
-    }
-
-    if wget -q --no-check-certificate \
-        -O "$tmp" \
-        "https://raw.githubusercontent.com/Chennhaoo/Shell_Bash/master/AutoTrace.sh"; then
-        chmod +x "$tmp"
-        # AutoTrace 的返回码由第三方脚本自行定义，不在外层二次判定。
-        bash "$tmp" || true
-    else
-        echo -e "${RED}[错误] AutoTrace 下载失败。${PLAIN}"
+    family=$(server_test_detect_family_mode)
+    case "$family" in
+        both) check_mode="both" ;;
+        ipv4) check_mode="ipv4" ;;
+        ipv6) check_mode="ipv6" ;;
+        *) echo -e "${RED}[错误] 未检测到可用公网 IPv4 / IPv6。${PLAIN}"; pause; return ;;
+    esac
+    tmp=$(mktemp /tmp/ss2022-securitycheck.XXXXXX) || { pause; return; }
+    if server_test_download_release_asset "oneclickvirt/securityCheck" "output" "$asset" "$tmp"; then
+        echo -e "${CYAN}检测地址族: ${check_mode}${PLAIN}"
+        "$tmp" -l zh -c "$check_mode" -e yes || true
     fi
-
     rm -f "$tmp"
     echo ""
     pause
+}
+test_return_route() {
+    local asset tmp has4=0 has6=0
+    clear
+    show_external_test_source "回程路由测试" "oneclickvirt/backtrace"
+    asset=$(server_test_arch_asset "backtrace") || {
+        echo -e "${RED}[错误] 当前 CPU 架构暂无 backtrace 测试资产。${PLAIN}"; pause; return
+    }
+    get_public_ipv4 >/dev/null 2>&1 && has4=1 || true
+    get_public_ipv6 >/dev/null 2>&1 && has6=1 || true
+    [[ $has4 -eq 1 || $has6 -eq 1 ]] || { echo -e "${RED}[错误] 未检测到可用公网地址。${PLAIN}"; pause; return; }
+    tmp=$(mktemp /tmp/ss2022-backtrace.XXXXXX) || { pause; return; }
+    if server_test_download_release_asset "oneclickvirt/backtrace" "latest" "$asset" "$tmp"; then
+        if [[ $has4 -eq 1 ]]; then
+            echo -e "${CYAN}════════ IPv4 回程 ════════${PLAIN}"
+            "$tmp" -dns-mode auto || true
+        fi
+        if [[ $has6 -eq 1 ]]; then
+            echo ""
+            echo -e "${CYAN}════════ IPv6 回程 ════════${PLAIN}"
+            "$tmp" -ipv6 -dns-mode auto || true
+        fi
+    fi
+    rm -f "$tmp"
+    echo ""
+    pause
+}
+server_test_run_unlocktests() {
+    local selection="$1" label="$2" asset tmp
+    asset=$(server_test_arch_asset "ut") || {
+        echo -e "${RED}[错误] 当前 CPU 架构暂无 UnlockTests 测试资产。${PLAIN}"
+        return 1
+    }
+    tmp=$(mktemp /tmp/ss2022-unlocktests.XXXXXX) || return 1
+    if ! server_test_download_release_asset "oneclickvirt/UnlockTests" "output" "$asset" "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    echo -e "${CYAN}${label}${PLAIN}"
+    "$tmp" -L zh -m 0 -f "$selection" -b=false -cache || true
+    rm -f "$tmp"
 }
 
 test_streaming_unlock() {
     clear
-    show_external_test_source \
-        "流媒体解锁测试" \
-        "https://github.com/1-stream/RegionRestrictionCheck"
-
-    ensure_test_dependency curl curl || {
-        echo -e "${RED}[错误] curl 安装失败。${PLAIN}"
-        pause
-        return
-    }
-
-    run_external_curl_test \
-        "流媒体解锁测试" \
-        "https://github.com/1-stream/RegionRestrictionCheck/raw/main/check.sh"
-
+    show_external_test_source "流媒体解锁测试" "oneclickvirt/UnlockTests"
+    echo -e "${YELLOW}检测范围: 全部平台；IPv4 / IPv6 按当前 VPS 实际可用性自动测试。${PLAIN}"
+    echo ""
+    server_test_run_unlocktests "20" "流媒体 / 直播 / 区域平台检测" || true
     echo ""
     pause
 }
-
 test_ai_unlock() {
-    local arch asset tmp url
-
     clear
-    show_external_test_source \
-        "AI 工具测试" \
-        "https://github.com/oneclickvirt/UnlockTests（oneclickvirt/ecs 使用的解锁模块）"
-
+    show_external_test_source "AI 工具测试" "oneclickvirt/UnlockTests"
     echo -e "${CYAN}检测模式: AI-only（ChatGPT / Gemini / Claude / Copilot / Grok / Perplexity / Poe 等）${PLAIN}"
-    echo -e "${YELLOW}说明: 区分 YES / NO / Restricted / Banned / RateLimited / TIMEOUT / DNS失败等状态。${PLAIN}"
+    echo -e "${YELLOW}结果区分 YES / NO / Restricted / Banned / TIMEOUT / DNS失败等状态。${PLAIN}"
     echo ""
-
-    ensure_test_dependency curl curl || {
-        echo -e "${RED}[错误] curl 安装失败。${PLAIN}"
-        pause
-        return
-    }
-
-    arch=$(uname -m)
-    case "$arch" in
-        x86_64|amd64) asset="ut-linux-amd64" ;;
-        aarch64|arm64) asset="ut-linux-arm64" ;;
-        i386|i686) asset="ut-linux-386" ;;
-        armv7l|armv7*) asset="ut-linux-arm" ;;
-        *)
-            echo -e "${RED}[错误] 当前 CPU 架构暂未在本菜单中适配: ${arch}${PLAIN}"
-            pause
-            return
-            ;;
-    esac
-
-    tmp=$(mktemp /tmp/ss2022-unlocktests.XXXXXX) || {
-        echo -e "${RED}[错误] 无法创建临时测试文件。${PLAIN}"
-        pause
-        return
-    }
-
-    url="https://github.com/oneclickvirt/UnlockTests/releases/download/output/${asset}"
-
-    echo -e "${YELLOW}>> 下载 UnlockTests ${asset}...${PLAIN}"
-    if ! curl -fL --retry 2 --retry-delay 1 \
-        --connect-timeout 10 --max-time 120 \
-        "$url" -o "$tmp"; then
-        rm -f "$tmp"
-        echo -e "${RED}[错误] AI 测试组件下载失败。${PLAIN}"
-        pause
-        return
-    fi
-
-    chmod 700 "$tmp"
-
-    # -f 21 = 仅 AI 平台；关闭进度条以便终端输出更清晰。
-    "$tmp" -L zh -f 21 -b=false || true
-
-    rm -f "$tmp"
+    server_test_run_unlocktests "21" "AI 平台检测" || true
     echo ""
     pause
 }
-
 server_test_management() {
     while true; do
         clear
         echo -e "${CYAN}════════════════════ 服务器测试管理 ════════════════════${PLAIN}"
-        echo "  1. IP 质量测试"
-        echo "  2. 回程路由测试"
-        echo "  3. 流媒体解锁测试"
-        echo "  4. AI 工具测试"
+        echo "  1. IP 质量 / 风险测试"
+        echo "  2. IPv4 / IPv6 回程路由"
+        echo "  3. 流媒体 / 区域解锁测试"
+        echo "  4. AI 工具解锁测试"
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
         read -rp "请选择 [0-4]: " c
@@ -10402,7 +10432,6 @@ server_test_management() {
         esac
     done
 }
-
 protocol_operations_management() {
     while true; do
         clear
