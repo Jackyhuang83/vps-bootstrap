@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev11
+# 当前版本: v1.9.0-dev12
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,13 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev12:
+#   - 流媒体与 AI 检测彻底拆分；不再使用会混入 AI 平台的“跨国平台”作为流媒体默认入口
+#   - 流媒体固定增加 Netflix、YouTube、Disney+、Amazon Prime Video、Google、Apple 等通用平台白名单
+#   - 选择欧洲/亚洲等地区时，先输出通用平台，再追加所选地区平台；“全部流媒体”明确排除 AI-only
+#   - 新增通信软件网络可达性测试：Telegram、WhatsApp、Signal、Discord
+#   - 通信软件按 IPv4 / IPv6 分开检测 DNS、TCP、TLS、HTTPS 可达性，不读取账号或凭据
 #
 # v1.9.0-dev11:
 #   - 流媒体 / 区域解锁测试新增地区选择，不再固定扫描“全部平台”
@@ -413,11 +420,13 @@
 #   v1.9.0-dev8 Alpine VLESS Reality / Realm OpenRC
 #   v1.9.0-dev9 Alpine/OpenRC 服务器管理完整适配
 #   v1.9.0-dev10 跨发行版服务器测试组件重构
+#   v1.9.0-dev11 流媒体地区选择 / IPv4+IPv6 独立检测
+#   v1.9.0-dev12 流媒体/AI拆分 / 通用平台 / 通信软件检测
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev11"
+SCRIPT_VERSION="v1.9.0-dev12"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -10398,6 +10407,7 @@ server_test_run_unlocktests() {
     echo -e "${CYAN}${label}${PLAIN}"
     case "$selector" in
         region) "$tmp" -L zh -m "$mode" -region "$selection" -b=false -cache || true ;;
+        test) "$tmp" -L zh -m "$mode" -test "$selection" -b=false -cache || true ;;
         *) "$tmp" -L zh -m "$mode" -f "$selection" -b=false -cache || true ;;
     esac
     rm -f "$tmp"
@@ -10426,7 +10436,6 @@ server_test_select_ip_mode() {
 
 server_test_region_map_local_choice() {
     case "$1" in
-        1) echo "0" ;;
         2) echo "10" ;;
         3) echo "11" ;;
         4) echo "12" ;;
@@ -10438,19 +10447,18 @@ server_test_region_map_local_choice() {
         10) echo "22" ;;
         11) echo "18" ;;
         12) echo "19" ;;
-        13) echo "20" ;;
         *) return 1 ;;
     esac
 }
 
 server_test_select_streaming_region() {
     local c raw token mapped result="" label=""
-    SERVER_TEST_REGION_SELECTION="0"
-    SERVER_TEST_REGION_LABEL="跨国平台"
+    SERVER_TEST_REGION_SELECTION=""
+    SERVER_TEST_REGION_LABEL="通用流媒体"
     while true; do
         echo ""
         echo "请选择流媒体 / 区域检测范围："
-        echo "  1. 跨国平台"
+        echo "  1. 通用流媒体（Netflix / YouTube / Disney+ / Prime Video / Google / Apple）"
         echo "  2. 台湾"
         echo "  3. 香港"
         echo "  4. 日本"
@@ -10462,13 +10470,13 @@ server_test_select_streaming_region() {
         echo " 10. 东南亚"
         echo " 11. 大洋洲"
         echo " 12. 体育平台"
-        echo " 13. 全部平台"
+        echo " 13. 全部流媒体平台（不含 AI）"
         echo " 14. 自定义多地区组合"
         echo "  0. 返回"
         read -rp "请选择 [0-14，默认 1]: " c
         c=${c:-1}
         case "$c" in
-            1) SERVER_TEST_REGION_SELECTION="0"; SERVER_TEST_REGION_LABEL="跨国平台"; return 0 ;;
+            1) SERVER_TEST_REGION_SELECTION=""; SERVER_TEST_REGION_LABEL="通用流媒体"; return 0 ;;
             2) SERVER_TEST_REGION_SELECTION="10"; SERVER_TEST_REGION_LABEL="台湾平台"; return 0 ;;
             3) SERVER_TEST_REGION_SELECTION="11"; SERVER_TEST_REGION_LABEL="香港平台"; return 0 ;;
             4) SERVER_TEST_REGION_SELECTION="12"; SERVER_TEST_REGION_LABEL="日本平台"; return 0 ;;
@@ -10480,23 +10488,26 @@ server_test_select_streaming_region() {
             10) SERVER_TEST_REGION_SELECTION="22"; SERVER_TEST_REGION_LABEL="东南亚平台"; return 0 ;;
             11) SERVER_TEST_REGION_SELECTION="18"; SERVER_TEST_REGION_LABEL="大洋洲平台"; return 0 ;;
             12) SERVER_TEST_REGION_SELECTION="19"; SERVER_TEST_REGION_LABEL="体育平台"; return 0 ;;
-            13) SERVER_TEST_REGION_SELECTION="20"; SERVER_TEST_REGION_LABEL="全部平台"; return 0 ;;
+            13)
+                SERVER_TEST_REGION_SELECTION="10,11,12,13,14,15,16,17,22,18,19"
+                SERVER_TEST_REGION_LABEL="全部地区平台"
+                return 0
+                ;;
             14)
                 echo ""
                 echo "输入上面地区编号，可选多个，以空格分隔。"
                 echo "示例：3 4 10 = 香港 + 日本 + 东南亚"
-                echo "可组合 1-12；13（全部平台）不参与组合。"
+                echo "可组合 2-12；通用流媒体会固定先检测，不需要重复选择。"
                 read -rp "地区编号: " raw
                 result=""; label=""
                 for token in $raw; do
-                    [[ "$token" =~ ^([1-9]|1[0-2])$ ]] || {
+                    [[ "$token" =~ ^([2-9]|1[0-2])$ ]] || {
                         echo -e "${RED}[错误] 无效地区编号: ${token}${PLAIN}"; result=""; break
                     }
                     mapped=$(server_test_region_map_local_choice "$token") || { result=""; break; }
                     if [[ ",${result}," != *",${mapped},"* ]]; then
                         result="${result:+${result},}${mapped}"
                         case "$token" in
-                            1) label="${label:+${label} + }跨国" ;;
                             2) label="${label:+${label} + }台湾" ;;
                             3) label="${label:+${label} + }香港" ;;
                             4) label="${label:+${label} + }日本" ;;
@@ -10523,23 +10534,30 @@ server_test_select_streaming_region() {
 }
 
 test_streaming_unlock() {
+    local common_platforms
+    common_platforms="Netflix,Netflix CDN,Disney+,Amazon Prime Video,Youtube Premium,YouTube CDN,YouTube Region,GoogleSearch,Google Play Store,Apple"
     clear
     show_external_test_source "流媒体 / 区域解锁测试" "oneclickvirt/UnlockTests"
-    echo -e "${YELLOW}可按地区选择检测范围，也可单独选择 IPv4 / IPv6。${PLAIN}"
+    echo -e "${YELLOW}通用流媒体固定检测；地区平台可按范围追加。AI 平台不会混入本项。${PLAIN}"
     server_test_select_streaming_region || return
     server_test_select_ip_mode || return
     echo ""
-    echo -e "${CYAN}检测范围: ${SERVER_TEST_REGION_LABEL}${PLAIN}"
+    echo -e "${CYAN}检测范围: 通用流媒体${SERVER_TEST_REGION_SELECTION:+ + ${SERVER_TEST_REGION_LABEL}}${PLAIN}"
     case "$SERVER_TEST_IP_MODE" in
         4) echo -e "${CYAN}地址族: 仅 IPv4${PLAIN}" ;;
         6) echo -e "${CYAN}地址族: 仅 IPv6${PLAIN}" ;;
         *) echo -e "${CYAN}地址族: IPv4 + IPv6${PLAIN}" ;;
     esac
     echo ""
-    server_test_run_unlocktests "$SERVER_TEST_REGION_SELECTION" "${SERVER_TEST_REGION_LABEL}检测" "$SERVER_TEST_IP_MODE" "region" || true
+    server_test_run_unlocktests "$common_platforms" "通用流媒体 / 平台" "$SERVER_TEST_IP_MODE" "test" || true
+    if [[ -n "$SERVER_TEST_REGION_SELECTION" ]]; then
+        echo ""
+        server_test_run_unlocktests "$SERVER_TEST_REGION_SELECTION" "${SERVER_TEST_REGION_LABEL}检测" "$SERVER_TEST_IP_MODE" "region" || true
+    fi
     echo ""
     pause
 }
+
 test_ai_unlock() {
     clear
     show_external_test_source "AI 工具测试" "oneclickvirt/UnlockTests"
@@ -10557,6 +10575,74 @@ test_ai_unlock() {
     echo ""
     pause
 }
+
+server_test_communication_probe() {
+    local family="$1" name="$2" url="$3" family_flag errfile http_code rc status
+    [[ "$family" == "ipv6" ]] && family_flag="-6" || family_flag="-4"
+    errfile=$(mktemp /tmp/ss2022-comm.XXXXXX) || return 1
+    http_code=$(curl "$family_flag" -sS -o /dev/null -w '%{http_code}' \
+        --connect-timeout 6 --max-time 12 "$url" 2>"$errfile")
+    rc=$?
+    rm -f "$errfile"
+    case "$rc" in
+        0) status="YES${http_code:+ (HTTP ${http_code})}" ;;
+        6) status="N/A (DNS Resolve Failed)" ;;
+        7) status="NO (Connect Failed)" ;;
+        28) status="TIMEOUT" ;;
+        35|60) status="NO (TLS Failed)" ;;
+        *) status="NO (curl ${rc})" ;;
+    esac
+    printf " %-25s %s\n" "$name" "$status"
+}
+
+server_test_run_communication_family() {
+    local family="$1" title
+    [[ "$family" == "ipv6" ]] && title="IPV6" || title="IPV4"
+    echo "===========[ ${title} 通信软件 ]============"
+    server_test_communication_probe "$family" "Telegram" "https://web.telegram.org/"
+    server_test_communication_probe "$family" "WhatsApp" "https://web.whatsapp.com/"
+    server_test_communication_probe "$family" "Signal" "https://signal.org/"
+    server_test_communication_probe "$family" "Discord" "https://discord.com/api/v10/gateway"
+}
+
+test_communication_access() {
+    local family
+    clear
+    echo -e "${CYAN}════════════════════ 通信软件网络可达性测试 ════════════════════${PLAIN}"
+    echo -e "${YELLOW}检测 DNS / TCP / TLS / HTTPS 可达性，不登录账号，也不代表消息发送功能。${PLAIN}"
+    server_test_select_ip_mode || return
+    family=$(server_test_detect_family_mode)
+    echo ""
+    case "$SERVER_TEST_IP_MODE" in
+        4)
+            case "$family" in
+                both|ipv4) server_test_run_communication_family "ipv4" ;;
+                *) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv4。${PLAIN}" ;;
+            esac
+            ;;
+        6)
+            case "$family" in
+                both|ipv6) server_test_run_communication_family "ipv6" ;;
+                *) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv6。${PLAIN}" ;;
+            esac
+            ;;
+        *)
+            case "$family" in
+                both)
+                    server_test_run_communication_family "ipv4"
+                    echo ""
+                    server_test_run_communication_family "ipv6"
+                    ;;
+                ipv4) server_test_run_communication_family "ipv4" ;;
+                ipv6) server_test_run_communication_family "ipv6" ;;
+                *) echo -e "${RED}[错误] 未检测到可用公网 IPv4 / IPv6。${PLAIN}" ;;
+            esac
+            ;;
+    esac
+    echo ""
+    pause
+}
+
 server_test_management() {
     while true; do
         clear
@@ -10565,19 +10651,22 @@ server_test_management() {
         echo "  2. IPv4 / IPv6 回程路由"
         echo "  3. 流媒体 / 区域解锁测试"
         echo "  4. AI 工具解锁测试"
+        echo "  5. 通信软件网络可达性"
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0-4]: " c
+        read -rp "请选择 [0-5]: " c
         case "$c" in
             1) test_ip_quality ;;
             2) test_return_route ;;
             3) test_streaming_unlock ;;
             4) test_ai_unlock ;;
+            5) test_communication_access ;;
             0) return ;;
             *) sleep 1 ;;
         esac
     done
 }
+
 protocol_operations_management() {
     while true; do
         clear
