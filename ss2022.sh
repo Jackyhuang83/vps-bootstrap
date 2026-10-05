@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev24
+# 当前版本: v1.9.0-dev25
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,11 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev25:
+#   - 收口 v1.9 当前状态文案：移除 Alpine “dev1 首批开放”等过期提示
+#   - Alpine 启动提示改为当前 OpenRC 支持范围，并明确 Snell 运行时自检与 WARP 官方客户端限制
+#   - 不改变协议、路由、服务器工具或测试业务逻辑
 #
 # v1.9.0-dev24:
 #   - 增加 SS2022_LIB_ONLY 测试加载模式，CI 可 source 全部函数而不进入交互主菜单
@@ -504,11 +509,12 @@
 #   v1.9.0-dev22 修复 OpenRC 完全卸载残留
 #   v1.9.0-dev23 Snell v5 Alpine/OpenRC 运行时自检适配
 #   v1.9.0-dev24 Alpine/OpenRC CI smoke test
+#   v1.9.0-dev25 v1.9 支持状态文案收口
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev24"
+SCRIPT_VERSION="v1.9.0-dev25"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -878,8 +884,9 @@ service_log_follow() {
 platform_feature_unavailable() {
     local feature="$1"
     echo ""
-    echo "[开发预览] Alpine / OpenRC 的 $feature 尚未在 v1.9.0-dev1 开放。"
-    echo "当前 Alpine 已开放: SS2022、ShadowTLS v3、VLESS Reality、Realm；Snell v5 采用官方二进制运行时自检；WARP 官方客户端暂未开放。"
+    echo "[提示] Alpine / OpenRC 当前不提供：$feature"
+    echo "v1.9 开发版已适配 SS2022、ShadowTLS v3、VLESS Reality、Realm、服务器工具与测试；Snell v5 需通过官方二进制运行时自检。"
+    echo "Cloudflare WARP 官方 Linux 客户端当前未提供 Alpine 支持，因此本脚本不在 Alpine 上强行安装。"
     return 1
 }
 
@@ -11218,7 +11225,8 @@ main() {
     check_root
     detect_platform || exit 1
     if platform_is_alpine; then
-        echo "[v1.9 开发预览] 已检测到 Alpine / OpenRC；dev1 首批开放 SS2022 / ShadowTLS。"
+        echo "[v1.9 开发版] 已检测到 Alpine / OpenRC；核心协议、服务管理、服务器工具与测试已接入 OpenRC。"
+        echo "[提示] Snell v5 部署需通过官方二进制运行时自检；Cloudflare WARP 官方客户端暂不在 Alpine 开放。"
     fi
 
     # 兼容旧安装：已有 local-dns 缺少 prefer_go:true 时执行一次安全迁移。
