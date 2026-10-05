@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev19
+# 当前版本: v1.9.0-dev20
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,10 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev20:
+#   - 修复 systemd 服务状态抽象递归：service_is_active() 现在正确调用 systemctl is-active
+#   - 避免 Debian/Ubuntu 下仪表盘、组件升级与服务状态判断进入递归调用
 #
 # v1.9.0-dev19:
 #   - 服务器测试菜单收敛为三个入口：IP质量、三网逐跳回程、平台流媒体AI通信软件解锁测试
@@ -472,11 +476,12 @@
 #   v1.9.0-dev17 回程路由结构化检测
 #   v1.9.0-dev18 三网逐跳回程 NextTrace
 #   v1.9.0-dev19 合并平台流媒体AI通信软件解锁测试
+#   v1.9.0-dev20 修复 systemd 服务状态递归
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev19"
+SCRIPT_VERSION="v1.9.0-dev20"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -697,7 +702,7 @@ service_daemon_reload() {
 service_is_active() {
     local svc="$1"
     case "$PLATFORM_INIT" in
-        systemd) service_is_active "$svc" 2>/dev/null ;;
+        systemd) systemctl is-active --quiet "$svc" 2>/dev/null ;;
         openrc) rc-service "$svc" status >/dev/null 2>&1 ;;
         *) return 1 ;;
     esac
