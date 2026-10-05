@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev18
+# 当前版本: v1.9.0-dev19
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,12 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev19:
+#   - 服务器测试菜单收敛为三个入口：IP质量、三网逐跳回程、平台流媒体AI通信软件解锁测试
+#   - 流媒体 / AI / 通信软件合并为一次测试流程，只选择一次地址族
+#   - 流媒体地区选择后依次执行 RegionRestrictionCheck、UnlockTests AI-only 与通信软件可达性检测
+#   - 保留三个检测模块各自成熟实现，不强行依赖单一万能上游
 #
 # v1.9.0-dev18:
 #   - 修正回程测试定位：核心改为“逐跳 traceroute”，不再以线路分类汇总表作为主结果
@@ -465,11 +471,12 @@
 #   v1.9.0-dev16 流媒体上游切换 RegionRestrictionCheck
 #   v1.9.0-dev17 回程路由结构化检测
 #   v1.9.0-dev18 三网逐跳回程 NextTrace
+#   v1.9.0-dev19 合并平台流媒体AI通信软件解锁测试
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev18"
+SCRIPT_VERSION="v1.9.0-dev19"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -10952,24 +10959,84 @@ test_communication_access() {
     pause
 }
 
+test_platform_media_ai_communication_unlock() {
+    local family
+    clear
+    echo -e "${CYAN}════════════ 平台流媒体AI通信软件解锁测试 ════════════${PLAIN}"
+    echo -e "${YELLOW}一次选择地址族后，依次执行流媒体、AI、通信软件检测。${PLAIN}"
+    echo -e "${YELLOW}通信软件部分检测网络可达性，不登录账号，也不代表消息发送功能。${PLAIN}"
+
+    server_test_select_streaming_region || return
+    server_test_select_ip_mode || return
+    family=$(server_test_detect_family_mode)
+
+    echo ""
+    echo -e "${CYAN}════════════ 1/3 流媒体解锁 ════════════${PLAIN}"
+    show_external_test_source "流媒体 / 区域解锁测试" "1-stream/RegionRestrictionCheck"
+    echo -e "${CYAN}检测范围: 通用流媒体${SERVER_TEST_REGION_SELECTION:+ + ${SERVER_TEST_REGION_LABEL}}${PLAIN}"
+    case "$SERVER_TEST_IP_MODE" in
+        4) echo -e "${CYAN}地址族: 仅 IPv4${PLAIN}" ;;
+        6) echo -e "${CYAN}地址族: 仅 IPv6${PLAIN}" ;;
+        *) echo -e "${CYAN}地址族: IPv4 + IPv6${PLAIN}" ;;
+    esac
+    echo ""
+    server_test_show_exit_info_for_mode "$SERVER_TEST_IP_MODE"
+    echo ""
+    server_test_run_region_restriction_check "$SERVER_TEST_REGION_SELECTION" "$SERVER_TEST_IP_MODE" || true
+
+    echo ""
+    echo -e "${CYAN}════════════ 2/3 AI 工具解锁 ════════════${PLAIN}"
+    show_external_test_source "AI 工具测试" "oneclickvirt/UnlockTests"
+    server_test_run_unlocktests "21" "AI 平台检测" "$SERVER_TEST_IP_MODE" "region" || true
+
+    echo ""
+    echo -e "${CYAN}════════════ 3/3 通信软件解锁 ════════════${PLAIN}"
+    echo -e "${YELLOW}此处“解锁”表示网络可达性检测，不代表账号区服或消息发送能力。${PLAIN}"
+    case "$SERVER_TEST_IP_MODE" in
+        4)
+            case "$family" in
+                both|ipv4) server_test_run_communication_family "ipv4" ;;
+                *) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv4。${PLAIN}" ;;
+            esac
+            ;;
+        6)
+            case "$family" in
+                both|ipv6) server_test_run_communication_family "ipv6" ;;
+                *) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv6。${PLAIN}" ;;
+            esac
+            ;;
+        *)
+            case "$family" in
+                both)
+                    server_test_run_communication_family "ipv4"
+                    echo ""
+                    server_test_run_communication_family "ipv6"
+                    ;;
+                ipv4) server_test_run_communication_family "ipv4" ;;
+                ipv6) server_test_run_communication_family "ipv6" ;;
+                *) echo -e "${RED}[错误] 未检测到可用公网 IPv4 / IPv6。${PLAIN}" ;;
+            esac
+            ;;
+    esac
+
+    echo ""
+    pause
+}
+
 server_test_management() {
     while true; do
         clear
         echo -e "${CYAN}════════════════════ 服务器测试管理 ════════════════════${PLAIN}"
         echo "  1. IP 质量 / 风险测试"
-        echo "  2. IPv4 / IPv6 回程路由"
-        echo "  3. 流媒体 / 区域解锁测试"
-        echo "  4. AI 工具解锁测试"
-        echo "  5. 通信软件网络可达性"
+        echo "  2. IPv4 / IPv6 三网逐跳回程"
+        echo "  3. 平台流媒体AI通信软件解锁测试"
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0-5]: " c
+        read -rp "请选择 [0-3]: " c
         case "$c" in
             1) test_ip_quality ;;
             2) test_return_route ;;
-            3) test_streaming_unlock ;;
-            4) test_ai_unlock ;;
-            5) test_communication_access ;;
+            3) test_platform_media_ai_communication_unlock ;;
             0) return ;;
             *) sleep 1 ;;
         esac
