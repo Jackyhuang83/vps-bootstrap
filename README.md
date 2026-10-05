@@ -451,6 +451,8 @@ SSH 端口修改采用安全方式：
 - 仅 IPv4
 - 仅 IPv6
 
+流媒体测试还会在平台检测前分别显示 IPv4 / IPv6 的出口 IP 与出口国家/地区代码。这里的“出口地区”表示 VPS 网络出口所在地；Netflix、YouTube、Prime Video 等平台结果中的 `Region` 则表示平台自身识别到的解锁区服，两者会分开显示。
+
 ## AI 工具测试
 
 AI 测试使用 UnlockTests 的 AI-only 模式，可检测包括：
