@@ -3,7 +3,7 @@
 一体化 VPS 网络协议、服务端分流、端口转发与日常运维脚本。
 
 当前正式版本：**v1.8.1**  
-当前开发版本：**v1.9.0-dev40**
+当前开发版本：**v1.9.0-dev41**
 
 项目以单一交互式 Bash 脚本 `ss2022.sh` 为入口，整合 **SS2022、SS2022 + ShadowTLS v3、VLESS Reality、Snell v5**，并提供 WARP 出口、链式落地、规则分流、Realm L4 端口转发、组件管理、服务器工具、服务器测试与脚本自更新。
 
@@ -677,7 +677,7 @@ v1.8.1 为当前稳定正式版。
 
 ## v1.9.x
 
-当前开发版为 **v1.9.0-dev40**，重点是 Alpine / OpenRC 与卸载闭环收口：
+当前开发版为 **v1.9.0-dev41**，重点是 Alpine / OpenRC 与卸载闭环收口：
 
 - SS2022、ShadowTLS v3、VLESS Reality、Realm 已接入 OpenRC
 - Snell v5 官方二进制已确认无法在 Alpine 3.21 + gcompat 下启动，因此 Alpine 暂不开放 Snell；Debian / Ubuntu 保持支持
@@ -688,6 +688,8 @@ v1.8.1 为当前稳定正式版。
 - Snell 安装候选文件使用 vps-bootstrap 专属隐藏前缀，异常中断后可由完全卸载安全清理；SSH 端口修改成功后会删除本次事务回滚备份
 - systemd IPv6 Keepalive 使用 `ss2022-ipv6-keepalive.service/timer`；旧 `ipv6-keepalive.*` 只有在内容签名确认属于历史 vps-bootstrap 时才迁移/清理
 - `/usr/local/bin/proxy` 快捷命令只在路径空闲或已属于本项目时创建/更新；已有外部文件或链接会原样保留，完全卸载也只删除本项目链接
+- IPv6-only 的 APT 强制配置使用 `/etc/apt/apt.conf.d/99ss2022-force-ipv6`；历史通用 `99force-ipv6` 仅提示人工确认，不自动删除
+- WARP 软件包与 Cloudflare APT 仓库分别记录 ownership；已有标准 Cloudflare source/keyring 只复用，卸载不会删除外部仓库配置
 - IPv6-only 临时 DNS 使用 vps-bootstrap 专属备份路径；旧 /root/resolv.conf.orig 仅用于兼容历史版本恢复，不再由新版本创建
 - Debian / Ubuntu + systemd 路径继续保持兼容
 
