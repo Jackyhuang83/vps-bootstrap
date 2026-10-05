@@ -423,28 +423,33 @@ SSH 端口修改采用安全方式：
 | 测试 | 使用项目 / 方式 |
 |---|---|
 | IP 质量 / 风险测试 | oneclickvirt / securityCheck |
-| IPv4 / IPv6 回程路由 | oneclickvirt / backtrace（结构化回程报告） |
+| IPv4 / IPv6 回程路由 | nxtrace / NTrace-core（NextTrace 逐跳 traceroute） |
 | 流媒体 / 区域解锁测试 | 1-stream / RegionRestrictionCheck |
 | AI 工具解锁测试 | oneclickvirt / UnlockTests（AI-only） |
 | 通信软件网络可达性 | curl，按 IPv4 / IPv6 分别检测 |
 
 ## IPv4 / IPv6 回程路由
 
-回程测试使用 `oneclickvirt/backtrace` 的 `backtrace.routes/v1` 结构化报告，不再依赖旧版终端输出解析。
+回程测试使用 `nxtrace/NTrace-core` 的 NextTrace，核心目标是显示**完整逐跳回程路径**，而不是只给线路分类结果。
+
+默认测试：
+
+- 北京：电信 / 联通 / 移动
+- 上海：电信 / 联通 / 移动
+- 广州：电信 / 联通 / 移动
+
+共 9 条线路 / 地址族。每条线路使用 TCP 80 traceroute，最大 30 跳，并逐跳显示经过的 IP、ASN、运营商 / 地区信息和延迟。
 
 支持：
 
 - IPv4 + IPv6
 - 仅 IPv4
 - 仅 IPv6
-- 北京 / 上海 / 广州 / 成都等国内运营商目标
-- 电信 CN2 GIA / CN2 GT / CTGNET / 163 等线路判断
-- 联通 9929 / CUG / 4837 等线路判断
-- 移动 CMIN2 / CMI / CMNET 等线路判断
 
-每个目标默认探测 3 次，并输出线路分类、确认度和成功次数。双栈 VPS 一次生成结构化报告，再分别显示 IPv4 与 IPv6 结果，避免旧模式重复执行和 `ipinfo.io` / PreCheck 展示逻辑干扰。
+测试目标使用 NextTrace 官方维护的运营商 endpoint；NextTrace tiny 二进制从官方 Release 临时下载，校验 SHA256 后执行，用完删除，不常驻安装。
 
-结果中的“确认 / 混合 / 证据不足”表示上游根据实际回程 hop ASN 得出的线路证据强度；线路检测仍只作为网络路径判断参考。
+逐跳结果才是判断实际回程路径的主要依据。线路名称（例如 CN2、9929、CMIN2、4837、CMI）应结合路由中出现的 ASN 和实际 hop 判断，而不是只依赖自动汇总标签。
+
 
 ## 流媒体 / 区域解锁
 
