@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev41
+# 当前版本: v1.9.0-dev42
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,12 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.9.0-dev42:
+#   - sing-box / Snell 配置目录增加独立 dir ownership marker；预先存在目录不再被 chown/chmod 接管
+#   - 完全卸载只删除本项目配置与 .ss2022-* 临时文件，不再 rm -rf 整个 /etc/sing-box 或 /etc/snell
+#   - sing-box / Snell 配置事务临时文件统一使用 .ss2022-* 前缀
+#   - local-dns 自动迁移仅对确认属于 vps-bootstrap 的 sing-box 执行
 #
 # v1.9.0-dev41:
 #   - IPv6-only APT 强制配置改为 99ss2022-force-ipv6，停止创建/删除通用 99force-ipv6
@@ -606,11 +612,12 @@
 #   v1.9.0-dev39 IPv6 Keepalive systemd ownership 收口
 #   v1.9.0-dev40 proxy 快捷命令 ownership 收口
 #   v1.9.0-dev41 APT ForceIPv6 / WARP 仓库 ownership 收口
+#   v1.9.0-dev42 sing-box / Snell 配置目录 ownership 收口
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev41"
+SCRIPT_VERSION="v1.9.0-dev42"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -637,7 +644,9 @@ IPV6_KEEPALIVE_OPENRC_SERVICE="/etc/init.d/ss2022-ipv6-keepalive"
 IPV6_KEEPALIVE_HELPER="/usr/local/lib/ss2022/ipv6-keepalive.sh"
 # ----------------------------- sing-box ---------------------------------------
 SINGBOX_BIN="/usr/local/bin/sing-box"
-SINGBOX_CONF="/etc/sing-box/config.json"
+SINGBOX_CONF_DIR="/etc/sing-box"
+SINGBOX_CONF="${SINGBOX_CONF_DIR}/config.json"
+SINGBOX_DIR_MARKER="/etc/ss2022-singbox-dir-managed"
 SINGBOX_SERVICE="/etc/systemd/system/sing-box.service"
 SINGBOX_USER="sing-box"
 SINGBOX_GROUP="sing-box"
@@ -666,7 +675,9 @@ XRAY_SHA256_ARM64="4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde804
 # ----------------------------- Snell v5 ---------------------------------------
 SNELL_VERSION="5.0.1"
 SNELL_BIN="/usr/local/bin/snell-server-v5"
-SNELL_CONF="/etc/snell/snell-v5.conf"
+SNELL_CONF_DIR="/etc/snell"
+SNELL_CONF="${SNELL_CONF_DIR}/snell-v5.conf"
+SNELL_DIR_MARKER="/etc/ss2022-snell-dir-managed"
 SNELL_SERVICE="/etc/systemd/system/snell-v5.service"
 SNELL_USER="snell"
 SNELL_GROUP="snell"
@@ -1936,8 +1947,30 @@ mark_singbox_project_managed() {
     chmod 600 "$SINGBOX_MANAGED_MARKER"
 }
 
+ensure_project_config_dir() {
+    local dir="$1" group="$2" marker="$3"
+    if [[ -e "$dir" && ! -d "$dir" ]]; then
+        echo -e "${RED}[错误] ${dir} 已存在但不是目录，停止操作。${PLAIN}"
+        return 1
+    fi
+    if [[ ! -d "$dir" ]]; then
+        mkdir -p "$dir" || return 1
+        chown root:"$group" "$dir" || return 1
+        chmod 750 "$dir" || return 1
+        touch "$marker" || return 1
+        chmod 600 "$marker"
+    elif [[ -f "$marker" ]]; then
+        chown root:"$group" "$dir" || return 1
+        chmod 750 "$dir" || return 1
+    fi
+    return 0
+}
+
 ensure_singbox_user() {
     ensure_managed_system_user "$SINGBOX_USER" "$SINGBOX_GROUP" "$SINGBOX_USER_MARKER" "$SINGBOX_GROUP_MARKER"
+}
+ensure_singbox_config_dir() {
+    ensure_project_config_dir "$SINGBOX_CONF_DIR" "$SINGBOX_GROUP" "$SINGBOX_DIR_MARKER"
 }
 write_singbox_service() {
     ensure_singbox_user || return 1
@@ -2184,9 +2217,7 @@ WRAPPER
 }
 ensure_base_singbox_config() {
     ensure_singbox_user || return 1
-    mkdir -p /etc/sing-box || return 1
-    chown root:"$SINGBOX_GROUP" /etc/sing-box
-    chmod 750 /etc/sing-box
+    ensure_singbox_config_dir || return 1
 
     if [[ -f "$SINGBOX_CONF" ]]; then
         return 0
@@ -2218,6 +2249,7 @@ CONFIG
 migrate_singbox_local_dns_prefer_go() {
     local candidate="" backup="" was_active=0
 
+    singbox_is_project_managed || return 0
     [[ -f "$SINGBOX_CONF" && -x "$SINGBOX_BIN" ]] || return 0
     command -v jq >/dev/null 2>&1 || return 0
 
@@ -2238,7 +2270,7 @@ migrate_singbox_local_dns_prefer_go() {
         ((.prefer_go // false) != true))
     ' "$SINGBOX_CONF" >/dev/null 2>&1 || return 0
 
-    candidate=$(mktemp "/etc/sing-box/config.dns-migrate.XXXXXX.json") || {
+    candidate=$(mktemp "/etc/sing-box/.ss2022-dns-migrate.XXXXXX.json") || {
         echo -e "${RED}[错误] 无法创建 sing-box DNS 迁移候选配置；原配置保持不变。${PLAIN}"
         return 1
     }
@@ -2271,7 +2303,7 @@ migrate_singbox_local_dns_prefer_go() {
         return 1
     fi
 
-    backup=$(mktemp "/etc/sing-box/config.dns-rollback.XXXXXX.json") || {
+    backup=$(mktemp "/etc/sing-box/.ss2022-dns-rollback.XXXXXX.json") || {
         rm -f "$candidate"
         echo -e "${RED}[错误] 无法创建 DNS 迁移回滚备份；原配置保持不变。${PLAIN}"
         return 1
@@ -2337,7 +2369,7 @@ apply_singbox_candidate() {
 
     if [[ -f "$SINGBOX_CONF" ]]; then
         had_old=1
-        backup=$(mktemp "${conf_dir}/config.json.rollback.XXXXXX") || {
+        backup=$(mktemp "${conf_dir}/.ss2022-config-rollback.XXXXXX") || {
             rm -f "$candidate"
             return 1
         }
@@ -2395,7 +2427,7 @@ update_singbox_inbounds() {
 
     ensure_base_singbox_config || return 1
 
-    tmp=$(mktemp "/etc/sing-box/config.json.tmp.XXXXXX") || return 1
+    tmp=$(mktemp "/etc/sing-box/.ss2022-config.XXXXXX.json") || return 1
     chmod 600 "$tmp"
 
     if ! jq \
@@ -3452,8 +3484,9 @@ update_snell_v5() {
         fi
 
         ensure_snell_user || { pause; continue; }
+        ensure_snell_config_dir || { pause; continue; }
         write_snell_service || { pause; continue; }
-        tmp=$(mktemp "/etc/snell-v5.conf.tmp.XXXXXX") || continue
+        tmp=$(mktemp "${SNELL_CONF_DIR}/.ss2022-config.XXXXXX") || continue
         chmod 600 "$tmp"
         cat > "$tmp" <<CONFIG
 [snell-server]
@@ -3993,6 +4026,9 @@ write_xray_vless_config() {
 ensure_snell_user() {
     ensure_managed_system_user "$SNELL_USER" "$SNELL_GROUP" "$SNELL_USER_MARKER" "$SNELL_GROUP_MARKER"
 }
+ensure_snell_config_dir() {
+    ensure_project_config_dir "$SNELL_CONF_DIR" "$SNELL_GROUP" "$SNELL_DIR_MARKER"
+}
 
 snell_port_from_config() {
     [[ -f "$SNELL_CONF" ]] || return 1
@@ -4255,13 +4291,11 @@ apply_snell_config() {
     local candidate="$1"
     local backup="" had_old=0
 
-    mkdir -p /etc/snell || return 1
-    chown root:"$SNELL_GROUP" /etc/snell
-    chmod 750 /etc/snell
+    ensure_snell_config_dir || return 1
 
     if [[ -f "$SNELL_CONF" ]]; then
         had_old=1
-        backup=$(mktemp "/etc/snell/snell-v5.conf.rollback.XXXXXX") || return 1
+        backup=$(mktemp "/etc/snell/.ss2022-rollback.XXXXXX") || return 1
         cp -a "$SNELL_CONF" "$backup" || {
             rm -f "$backup"
             return 1
@@ -4334,7 +4368,8 @@ deploy_snell_v5() {
     ask_server_host
     ask_node_name "snell" || return
 
-    tmp=$(mktemp "/etc/snell-v5.conf.tmp.XXXXXX") || return
+    ensure_snell_config_dir || { pause; return; }
+    tmp=$(mktemp "${SNELL_CONF_DIR}/.ss2022-config.XXXXXX") || return
     chmod 600 "$tmp"
     cat > "$tmp" <<CONFIG
 [snell-server]
@@ -5488,7 +5523,7 @@ apply_routing_config() {
     local sb_tmp="" xr_tmp="" sb_backup="" xr_backup="" sb_active=0 xr_active=0 failed=0
 
     if [[ -f "$SINGBOX_CONF" && -x "$SINGBOX_BIN" ]]; then
-        sb_tmp=$(mktemp "/etc/sing-box/config.routing.XXXXXX.json") || return 1
+        sb_tmp=$(mktemp "/etc/sing-box/.ss2022-routing.XXXXXX.json") || return 1
         build_singbox_routing_candidate "$sb_tmp" || { rm -f "$sb_tmp"; return 1; }
         echo -e "${YELLOW}>> 校验 sing-box 分流配置...${PLAIN}"
         if ! "$SINGBOX_BIN" check -c "$sb_tmp"; then
@@ -5519,7 +5554,7 @@ apply_routing_config() {
     fi
 
     if [[ $sb_active -eq 1 ]]; then
-        sb_backup=$(mktemp "/etc/sing-box/config.routing.rollback.XXXXXX.json") || { rm -f "$sb_tmp" "$xr_tmp"; return 1; }
+        sb_backup=$(mktemp "/etc/sing-box/.ss2022-routing-rollback.XXXXXX.json") || { rm -f "$sb_tmp" "$xr_tmp"; return 1; }
         cp -a "$SINGBOX_CONF" "$sb_backup" || return 1
     fi
     if [[ $xr_active -eq 1 ]]; then
@@ -7967,15 +8002,23 @@ full_uninstall() {
         warp_remove_managed_install_assets
     fi
 
-    [[ $singbox_managed -eq 1 ]] && rm -rf /etc/sing-box
-    [[ $snell_managed -eq 1 ]] && rm -rf /etc/snell
-    rm -rf /etc/ss2022-xray /etc/ss2022-realm "$STATE_DIR" /usr/local/lib/ss2022 /var/log/ss2022
     if [[ $singbox_managed -eq 1 ]]; then
+        rm -f "$SINGBOX_CONF" "${SINGBOX_CONF_DIR}"/.ss2022-*
         rm -f "$SINGBOX_BIN" "$SINGBOX_SERVICE" "$SINGBOX_OPENRC_SERVICE" "$SINGBOX_MANAGED_MARKER"
+        if [[ -f "$SINGBOX_DIR_MARKER" ]]; then
+            rmdir "$SINGBOX_CONF_DIR" 2>/dev/null || true
+            rm -f "$SINGBOX_DIR_MARKER"
+        fi
     fi
     if [[ $snell_managed -eq 1 ]]; then
+        rm -f "$SNELL_CONF" "${SNELL_CONF_DIR}"/.ss2022-*
         rm -f "$SNELL_BIN" "$SNELL_SERVICE" "$SNELL_OPENRC_SERVICE" "$SNELL_MANAGED_MARKER"
+        if [[ -f "$SNELL_DIR_MARKER" ]]; then
+            rmdir "$SNELL_CONF_DIR" 2>/dev/null || true
+            rm -f "$SNELL_DIR_MARKER"
+        fi
     fi
+    rm -rf /etc/ss2022-xray /etc/ss2022-realm "$STATE_DIR" /usr/local/lib/ss2022 /var/log/ss2022
 
     [[ $proxy_link_managed -eq 1 ]] && rm -f "$SCRIPT_PROXY_LINK"
     rm -f \
