@@ -90,6 +90,7 @@
 #   - 增加 SS2022_LIB_ONLY 测试加载模式，CI 可 source 全部函数而不进入交互主菜单
 #   - 新增 Alpine 3.21 / OpenRC smoke test：平台识别、四核心服务生成、runlevel、PID 与完全卸载闭环
 #   - 正常交互运行路径保持不变；测试加载模式仅由 CI 显式启用
+#   - 修复 Alpine /etc/os-release 缺少 ID_LIKE 时严格模式读取未定义变量的问题
 #
 # v1.9.0-dev23:
 #   - Snell v5 接入 systemd/OpenRC 统一服务抽象，Alpine 菜单正式开放运行时自检入口
@@ -636,9 +637,9 @@ detect_platform() {
     if [[ -r /etc/os-release ]]; then
         # shellcheck disable=SC1091
         . /etc/os-release
-        os_id="$ID"
-        os_like="$ID_LIKE"
-        pretty="$PRETTY_NAME"
+        os_id="${ID:-}"
+        os_like="${ID_LIKE:-}"
+        pretty="${PRETTY_NAME:-${NAME:-}}"
     fi
 
     case "$os_id" in
