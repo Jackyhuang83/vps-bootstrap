@@ -464,8 +464,10 @@ jobs:
               flags=re.M,
           )
 
-          if '-dev' in text.splitlines()[4] if len(text.splitlines()) > 4 else False:
-              raise SystemExit('README still exposes a development version at the top after stable promotion')
+          if re.search(r'^当前开发版本：\*\*v\d+\.\d+\.\d+-dev\d+\*\*', text, flags=re.M):
+              raise SystemExit('README still exposes a development version after stable promotion')
+          if re.search(r'^当前开发版为 \*\*v\d+\.\d+\.\d+-dev\d+\*\*', text, flags=re.M):
+              raise SystemExit('README release-strategy section still exposes a development version')
 
           p.write_text(text, encoding="utf-8")
           PY
