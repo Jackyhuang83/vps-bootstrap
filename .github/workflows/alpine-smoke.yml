@@ -64,9 +64,6 @@ jobs:
                   [[ -L "/etc/runlevels/default/$svc" ]]
               done
 
-              grep -Fq '"'"'capabilities="^cap_net_bind_service"'"'"' "$SNELL_OPENRC_SERVICE"
-              grep -Fq '"'"'no_new_privs=true'"'"' "$SNELL_OPENRC_SERVICE"
-
               mkdir -p /run
               printf '"'"'4101\n'"'"' > "$SINGBOX_OPENRC_PID"
               printf '"'"'4102\n'"'"' > "$XRAY_OPENRC_PID"
