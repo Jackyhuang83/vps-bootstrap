@@ -98,6 +98,48 @@ jobs:
             exit 1
           fi
 
+      - name: Guard IPv6-only APT mirror preservation
+        shell: bash
+        run: |
+          export SS2022_LIB_ONLY=1
+          # shellcheck disable=SC1091
+          source ./ss2022.sh
+          body=$(declare -f prepare_ipv6_env)
+
+          if grep -Fq '/etc/apt/mirrors/' <<<"$body"; then
+            echo "ERROR: prepare_ipv6_env must not rewrite administrator APT mirror files."
+            exit 1
+          fi
+
+      - name: Guard managed WARP cleanup
+        shell: bash
+        run: |
+          export SS2022_LIB_ONLY=1
+          # shellcheck disable=SC1091
+          source ./ss2022.sh
+          full_body=$(declare -f full_uninstall)
+          menu_body=$(declare -f warp_uninstall_client)
+
+          grep -Fq '[[ -f "$WARP_MANAGED_MARKER" ]]' <<<"$full_body"
+          grep -Fq 'rm -f "$WARP_MANAGED_MARKER"' <<<"$full_body"
+          grep -Fq '[[ -f "$WARP_MANAGED_MARKER" ]]' <<<"$menu_body"
+          grep -Fq 'rm -f "$WARP_MANAGED_MARKER"' <<<"$menu_body"
+
+      - name: Guard uninstall runtime-file cleanup
+        shell: bash
+        run: |
+          export SS2022_LIB_ONLY=1
+          # shellcheck disable=SC1091
+          source ./ss2022.sh
+          body=$(declare -f full_uninstall)
+
+          grep -Fq '"$SCRIPT_BACKUP_PATH"' <<<"$body"
+          grep -Fq '"$SINGBOX_OPENRC_PID"' <<<"$body"
+          grep -Fq '"$XRAY_OPENRC_PID"' <<<"$body"
+          grep -Fq '"$SNELL_OPENRC_PID"' <<<"$body"
+          grep -Fq '"$REALM_OPENRC_PID"' <<<"$body"
+          grep -Fq '/run/ss2022-tg-monitor.lockdir' <<<"$body"
+
       - name: Summary
         run: |
           echo "CI passed."
