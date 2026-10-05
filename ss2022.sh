@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev35
+# 当前版本: v1.9.0-dev36
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,11 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.9.0-dev36:
+#   - 增加 Snell 安装 ownership 保护，拒绝覆盖服务器预先存在的非 vps-bootstrap Snell
+#   - 旧版项目 Snell 通过用户 marker / state.json 自动认领迁移
+#   - 完全卸载仅在确认 Snell 属于本项目时停止并删除通用 Snell 二进制、配置和服务
 #
 # v1.9.0-dev35:
 #   - Alpine 3.21 CI 实测确认 Surge 官方 Snell v5.0.1 在 gcompat 下无法启动（Not a valid dynamic program）
@@ -575,7 +580,7 @@
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev35"
+SCRIPT_VERSION="v1.9.0-dev36"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -632,6 +637,7 @@ SNELL_USER="snell"
 SNELL_GROUP="snell"
 SNELL_USER_MARKER="/etc/ss2022-snell-user-managed"
 SNELL_GROUP_MARKER="/etc/ss2022-snell-group-managed"
+SNELL_MANAGED_MARKER="/etc/ss2022-snell-install-managed"
 SNELL_OPENRC_SERVICE="/etc/init.d/snell-v5"
 SNELL_OPENRC_PID="/run/snell-v5.pid"
 SNELL_OPENRC_LOG="/var/log/ss2022/snell-v5.log"
@@ -2917,8 +2923,37 @@ infer_network_from_listen() {
     [[ "$listen" == "::" ]] && printf 'ipv6' || printf 'ipv4'
 }
 
+snell_is_project_managed() {
+    [[ -f "$SNELL_MANAGED_MARKER" ]] && return 0
+    [[ -f "$SNELL_USER_MARKER" ]] && return 0
+    if [[ -f "$STATE_FILE" ]] && command -v jq >/dev/null 2>&1; then
+        jq -e '.snell? != null' "$STATE_FILE" >/dev/null 2>&1 && return 0
+    fi
+    return 1
+}
+
+snell_assert_safe_ownership() {
+    if snell_is_project_managed; then
+        touch "$SNELL_MANAGED_MARKER" || return 1
+        chmod 600 "$SNELL_MANAGED_MARKER"
+        return 0
+    fi
+
+    if [[ -e "$SNELL_BIN" || -e "$SNELL_CONF" || -e "$SNELL_SERVICE" || -e "$SNELL_OPENRC_SERVICE" ]]; then
+        echo -e "${RED}[错误] 检测到服务器已有非 vps-bootstrap 管理的 Snell v5。${PLAIN}"
+        echo -e "${YELLOW}为避免覆盖现有二进制、配置或服务，本脚本停止安装 Snell。${PLAIN}"
+        return 1
+    fi
+    return 0
+}
+
+mark_snell_project_managed() {
+    touch "$SNELL_MANAGED_MARKER" || return 1
+    chmod 600 "$SNELL_MANAGED_MARKER"
+}
+
 protocol_exists_snell() {
-    [[ -f "$SNELL_CONF" ]]
+    [[ -f "$SNELL_CONF" ]] && snell_is_project_managed
 }
 
 # ==============================================================================
@@ -3934,6 +3969,7 @@ install_snell_v5_core() {
         return 1
     fi
 
+    snell_assert_safe_ownership || return 1
     install_dependencies || return 1
 
     arch=$(uname -m)
@@ -4040,6 +4076,10 @@ install_snell_v5_core() {
     mv -f "$candidate" "$SNELL_BIN" || {
         rm -rf "$tmp"
         rm -f "$candidate"
+        return 1
+    }
+    mark_snell_project_managed || {
+        rm -rf "$tmp"
         return 1
     }
     rm -rf "$tmp"
@@ -7754,8 +7794,9 @@ show_service_status() {
     ss -lntup 2>/dev/null | grep -E 'sing-box|xray|snell-server|ss2022-realm|realm' || echo "未检测到相关监听"
 }
 full_uninstall() {
-    local yes="" singbox_managed=0
+    local yes="" singbox_managed=0 snell_managed=0
     singbox_is_project_managed && singbox_managed=1 || true
+    snell_is_project_managed && snell_managed=1 || true
     echo -e "${RED}========== 完全卸载 ss2022.sh ==========${PLAIN}"
     echo ""
     echo -e "${RED}此操作会删除本脚本管理的协议核心、节点/分流/端口转发配置与服务。不会删除服务器原有 xray.service 或 realm.service。${PLAIN}"
@@ -7767,13 +7808,14 @@ full_uninstall() {
 
     if [[ "$PLATFORM_INIT" == "systemd" ]]; then
         [[ $singbox_managed -eq 1 ]] && systemctl disable --now sing-box >/dev/null 2>&1 || true
-        systemctl disable --now "$XRAY_SERVICE_NAME" snell-v5 "$REALM_SERVICE_NAME" ipv6-keepalive.timer >/dev/null 2>&1 || true
+        [[ $snell_managed -eq 1 ]] && systemctl disable --now snell-v5 >/dev/null 2>&1 || true
+        systemctl disable --now "$XRAY_SERVICE_NAME" "$REALM_SERVICE_NAME" ipv6-keepalive.timer >/dev/null 2>&1 || true
         systemctl disable --now "$IP_FAMILY_SERVICE_NAME" ss2022-tg-monitor.timer >/dev/null 2>&1 || true
         systemctl stop ipv6-keepalive.service ss2022-tg-monitor.service >/dev/null 2>&1 || true
     else
         [[ $singbox_managed -eq 1 ]] && service_disable_now sing-box
         service_disable_now "$XRAY_SERVICE_NAME"
-        service_disable_now snell-v5
+        [[ $snell_managed -eq 1 ]] && service_disable_now snell-v5
         service_disable_now "$REALM_SERVICE_NAME"
         service_disable_now "$IP_FAMILY_SERVICE_NAME"
         service_disable_now ss2022-ipv6-keepalive
@@ -7799,9 +7841,13 @@ full_uninstall() {
     fi
 
     [[ $singbox_managed -eq 1 ]] && rm -rf /etc/sing-box
-    rm -rf /etc/snell /etc/ss2022-xray /etc/ss2022-realm "$STATE_DIR" /usr/local/lib/ss2022 /var/log/ss2022
+    [[ $snell_managed -eq 1 ]] && rm -rf /etc/snell
+    rm -rf /etc/ss2022-xray /etc/ss2022-realm "$STATE_DIR" /usr/local/lib/ss2022 /var/log/ss2022
     if [[ $singbox_managed -eq 1 ]]; then
         rm -f "$SINGBOX_BIN" "$SINGBOX_SERVICE" "$SINGBOX_OPENRC_SERVICE" "$SINGBOX_MANAGED_MARKER"
+    fi
+    if [[ $snell_managed -eq 1 ]]; then
+        rm -f "$SNELL_BIN" "$SNELL_SERVICE" "$SNELL_OPENRC_SERVICE" "$SNELL_MANAGED_MARKER"
     fi
 
     rm -f \
@@ -7809,10 +7855,7 @@ full_uninstall() {
         /usr/local/bin/proxy \
         "$SCRIPT_BACKUP_PATH" \
         "$XRAY_BIN" \
-        "$SNELL_BIN" \
         "$XRAY_SERVICE" \
-        "$SNELL_SERVICE" \
-        "$SNELL_OPENRC_SERVICE" \
         "$REALM_SERVICE" \
         "$IP_FAMILY_SERVICE" \
         "$XRAY_OPENRC_SERVICE" \
