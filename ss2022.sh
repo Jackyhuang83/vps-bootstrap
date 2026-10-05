@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev10
+# 当前版本: v1.9.0-dev11
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,14 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev11:
+#   - 流媒体 / 区域解锁测试新增地区选择，不再固定扫描“全部平台”
+#   - 地区菜单覆盖跨国、台湾、香港、日本、韩国、北美、南美、欧洲、非洲、东南亚、大洋洲、体育与全部平台
+#   - 支持自定义多地区组合，并转换为 UnlockTests 官方 -region 参数
+#   - 流媒体测试新增地址族选择：IPv4+IPv6 / 仅 IPv4 / 仅 IPv6
+#   - AI 测试同样新增地址族选择，便于单独验证 IPv4/IPv6 AI 解锁状态
+#   - 默认流媒体范围改为“跨国平台”，避免一次输出所有区域造成结果过长
 #
 # v1.9.0-dev10:
 #   - 服务器测试统一改为跨发行版零依赖 Go 测试组件，Debian/Ubuntu 与 Alpine/OpenRC 共用同一条路径
@@ -409,7 +417,7 @@
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev10"
+SCRIPT_VERSION="v1.9.0-dev11"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -10377,7 +10385,7 @@ test_return_route() {
     pause
 }
 server_test_run_unlocktests() {
-    local selection="$1" label="$2" asset tmp
+    local selection="$1" label="$2" mode="${3:-0}" selector="${4:-f}" asset tmp
     asset=$(server_test_arch_asset "ut") || {
         echo -e "${RED}[错误] 当前 CPU 架构暂无 UnlockTests 测试资产。${PLAIN}"
         return 1
@@ -10388,16 +10396,147 @@ server_test_run_unlocktests() {
         return 1
     fi
     echo -e "${CYAN}${label}${PLAIN}"
-    "$tmp" -L zh -m 0 -f "$selection" -b=false -cache || true
+    case "$selector" in
+        region) "$tmp" -L zh -m "$mode" -region "$selection" -b=false -cache || true ;;
+        *) "$tmp" -L zh -m "$mode" -f "$selection" -b=false -cache || true ;;
+    esac
     rm -f "$tmp"
+}
+server_test_select_ip_mode() {
+    local c
+    SERVER_TEST_IP_MODE="0"
+    while true; do
+        echo ""
+        echo "请选择测试地址族："
+        echo "  1. IPv4 + IPv6（按 VPS 实际可用性）"
+        echo "  2. 仅 IPv4"
+        echo "  3. 仅 IPv6"
+        echo "  0. 返回"
+        read -rp "请选择 [0-3，默认 1]: " c
+        c=${c:-1}
+        case "$c" in
+            1) SERVER_TEST_IP_MODE="0"; return 0 ;;
+            2) SERVER_TEST_IP_MODE="4"; return 0 ;;
+            3) SERVER_TEST_IP_MODE="6"; return 0 ;;
+            0) return 1 ;;
+            *) echo -e "${RED}输入无效。${PLAIN}" ;;
+        esac
+    done
+}
+
+server_test_region_map_local_choice() {
+    case "$1" in
+        1) echo "0" ;;
+        2) echo "10" ;;
+        3) echo "11" ;;
+        4) echo "12" ;;
+        5) echo "13" ;;
+        6) echo "14" ;;
+        7) echo "15" ;;
+        8) echo "16" ;;
+        9) echo "17" ;;
+        10) echo "22" ;;
+        11) echo "18" ;;
+        12) echo "19" ;;
+        13) echo "20" ;;
+        *) return 1 ;;
+    esac
+}
+
+server_test_select_streaming_region() {
+    local c raw token mapped result="" label=""
+    SERVER_TEST_REGION_SELECTION="0"
+    SERVER_TEST_REGION_LABEL="跨国平台"
+    while true; do
+        echo ""
+        echo "请选择流媒体 / 区域检测范围："
+        echo "  1. 跨国平台"
+        echo "  2. 台湾"
+        echo "  3. 香港"
+        echo "  4. 日本"
+        echo "  5. 韩国"
+        echo "  6. 北美"
+        echo "  7. 南美"
+        echo "  8. 欧洲"
+        echo "  9. 非洲"
+        echo " 10. 东南亚"
+        echo " 11. 大洋洲"
+        echo " 12. 体育平台"
+        echo " 13. 全部平台"
+        echo " 14. 自定义多地区组合"
+        echo "  0. 返回"
+        read -rp "请选择 [0-14，默认 1]: " c
+        c=${c:-1}
+        case "$c" in
+            1) SERVER_TEST_REGION_SELECTION="0"; SERVER_TEST_REGION_LABEL="跨国平台"; return 0 ;;
+            2) SERVER_TEST_REGION_SELECTION="10"; SERVER_TEST_REGION_LABEL="台湾平台"; return 0 ;;
+            3) SERVER_TEST_REGION_SELECTION="11"; SERVER_TEST_REGION_LABEL="香港平台"; return 0 ;;
+            4) SERVER_TEST_REGION_SELECTION="12"; SERVER_TEST_REGION_LABEL="日本平台"; return 0 ;;
+            5) SERVER_TEST_REGION_SELECTION="13"; SERVER_TEST_REGION_LABEL="韩国平台"; return 0 ;;
+            6) SERVER_TEST_REGION_SELECTION="14"; SERVER_TEST_REGION_LABEL="北美平台"; return 0 ;;
+            7) SERVER_TEST_REGION_SELECTION="15"; SERVER_TEST_REGION_LABEL="南美平台"; return 0 ;;
+            8) SERVER_TEST_REGION_SELECTION="16"; SERVER_TEST_REGION_LABEL="欧洲平台"; return 0 ;;
+            9) SERVER_TEST_REGION_SELECTION="17"; SERVER_TEST_REGION_LABEL="非洲平台"; return 0 ;;
+            10) SERVER_TEST_REGION_SELECTION="22"; SERVER_TEST_REGION_LABEL="东南亚平台"; return 0 ;;
+            11) SERVER_TEST_REGION_SELECTION="18"; SERVER_TEST_REGION_LABEL="大洋洲平台"; return 0 ;;
+            12) SERVER_TEST_REGION_SELECTION="19"; SERVER_TEST_REGION_LABEL="体育平台"; return 0 ;;
+            13) SERVER_TEST_REGION_SELECTION="20"; SERVER_TEST_REGION_LABEL="全部平台"; return 0 ;;
+            14)
+                echo ""
+                echo "输入上面地区编号，可选多个，以空格分隔。"
+                echo "示例：3 4 10 = 香港 + 日本 + 东南亚"
+                echo "可组合 1-12；13（全部平台）不参与组合。"
+                read -rp "地区编号: " raw
+                result=""; label=""
+                for token in $raw; do
+                    [[ "$token" =~ ^([1-9]|1[0-2])$ ]] || {
+                        echo -e "${RED}[错误] 无效地区编号: ${token}${PLAIN}"; result=""; break
+                    }
+                    mapped=$(server_test_region_map_local_choice "$token") || { result=""; break; }
+                    if [[ ",${result}," != *",${mapped},"* ]]; then
+                        result="${result:+${result},}${mapped}"
+                        case "$token" in
+                            1) label="${label:+${label} + }跨国" ;;
+                            2) label="${label:+${label} + }台湾" ;;
+                            3) label="${label:+${label} + }香港" ;;
+                            4) label="${label:+${label} + }日本" ;;
+                            5) label="${label:+${label} + }韩国" ;;
+                            6) label="${label:+${label} + }北美" ;;
+                            7) label="${label:+${label} + }南美" ;;
+                            8) label="${label:+${label} + }欧洲" ;;
+                            9) label="${label:+${label} + }非洲" ;;
+                            10) label="${label:+${label} + }东南亚" ;;
+                            11) label="${label:+${label} + }大洋洲" ;;
+                            12) label="${label:+${label} + }体育" ;;
+                        esac
+                    fi
+                done
+                [[ -n "$result" ]] || { echo -e "${RED}[错误] 未选择有效地区。${PLAIN}"; continue; }
+                SERVER_TEST_REGION_SELECTION="$result"
+                SERVER_TEST_REGION_LABEL="$label"
+                return 0
+                ;;
+            0) return 1 ;;
+            *) echo -e "${RED}输入无效。${PLAIN}" ;;
+        esac
+    done
 }
 
 test_streaming_unlock() {
     clear
-    show_external_test_source "流媒体解锁测试" "oneclickvirt/UnlockTests"
-    echo -e "${YELLOW}检测范围: 全部平台；IPv4 / IPv6 按当前 VPS 实际可用性自动测试。${PLAIN}"
+    show_external_test_source "流媒体 / 区域解锁测试" "oneclickvirt/UnlockTests"
+    echo -e "${YELLOW}可按地区选择检测范围，也可单独选择 IPv4 / IPv6。${PLAIN}"
+    server_test_select_streaming_region || return
+    server_test_select_ip_mode || return
     echo ""
-    server_test_run_unlocktests "20" "流媒体 / 直播 / 区域平台检测" || true
+    echo -e "${CYAN}检测范围: ${SERVER_TEST_REGION_LABEL}${PLAIN}"
+    case "$SERVER_TEST_IP_MODE" in
+        4) echo -e "${CYAN}地址族: 仅 IPv4${PLAIN}" ;;
+        6) echo -e "${CYAN}地址族: 仅 IPv6${PLAIN}" ;;
+        *) echo -e "${CYAN}地址族: IPv4 + IPv6${PLAIN}" ;;
+    esac
+    echo ""
+    server_test_run_unlocktests "$SERVER_TEST_REGION_SELECTION" "${SERVER_TEST_REGION_LABEL}检测" "$SERVER_TEST_IP_MODE" "region" || true
     echo ""
     pause
 }
@@ -10406,8 +10545,15 @@ test_ai_unlock() {
     show_external_test_source "AI 工具测试" "oneclickvirt/UnlockTests"
     echo -e "${CYAN}检测模式: AI-only（ChatGPT / Gemini / Claude / Copilot / Grok / Perplexity / Poe 等）${PLAIN}"
     echo -e "${YELLOW}结果区分 YES / NO / Restricted / Banned / TIMEOUT / DNS失败等状态。${PLAIN}"
+    server_test_select_ip_mode || return
     echo ""
-    server_test_run_unlocktests "21" "AI 平台检测" || true
+    case "$SERVER_TEST_IP_MODE" in
+        4) echo -e "${CYAN}地址族: 仅 IPv4${PLAIN}" ;;
+        6) echo -e "${CYAN}地址族: 仅 IPv6${PLAIN}" ;;
+        *) echo -e "${CYAN}地址族: IPv4 + IPv6${PLAIN}" ;;
+    esac
+    echo ""
+    server_test_run_unlocktests "21" "AI 平台检测" "$SERVER_TEST_IP_MODE" "region" || true
     echo ""
     pause
 }
