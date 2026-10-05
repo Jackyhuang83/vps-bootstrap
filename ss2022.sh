@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev40
+# 当前版本: v1.9.0-dev41
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,12 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.9.0-dev41:
+#   - IPv6-only APT 强制配置改为 99ss2022-force-ipv6，停止创建/删除通用 99force-ipv6
+#   - 历史 99force-ipv6 因无法可靠证明 ownership，仅提示人工确认，不自动删除
+#   - WARP ownership 拆分为软件包与 APT 仓库两层；已有 Cloudflare 仓库只复用、不接管
+#   - 新增 WARP ownership v2 marker，兼容旧版单 marker 的卸载语义
 #
 # v1.9.0-dev40:
 #   - /usr/local/bin/proxy 快捷命令增加 ownership 保护，不再覆盖服务器已有同名文件/链接
@@ -599,11 +605,12 @@
 #   v1.9.0-dev38 Snell 候选文件与 SSH 事务备份残留收口
 #   v1.9.0-dev39 IPv6 Keepalive systemd ownership 收口
 #   v1.9.0-dev40 proxy 快捷命令 ownership 收口
+#   v1.9.0-dev41 APT ForceIPv6 / WARP 仓库 ownership 收口
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev40"
+SCRIPT_VERSION="v1.9.0-dev41"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -693,12 +700,17 @@ REALM_MAX_RANGE_PORTS=1000
 BACKUP_DNS="/root/.ss2022-resolv.conf.bak"
 LEGACY_BACKUP_DNS="/root/resolv.conf.orig"
 DNS_MARKER="/etc/ss2022-ipv6-dns-managed"
-FORCE_IPV6_CONF="/etc/apt/apt.conf.d/99force-ipv6"
+FORCE_IPV6_CONF="/etc/apt/apt.conf.d/99ss2022-force-ipv6"
+FORCE_IPV6_LEGACY_CONF="/etc/apt/apt.conf.d/99force-ipv6"
 STATE_DIR="/etc/ss2022"
 STATE_FILE="${STATE_DIR}/state.json"
 ROUTING_FILE="${STATE_DIR}/routing.json"
 WARP_DEFAULT_PORT=40000
 WARP_MANAGED_MARKER="${STATE_DIR}/warp-package-managed"
+WARP_REPO_MANAGED_MARKER="${STATE_DIR}/warp-repo-managed"
+WARP_OWNERSHIP_V2_MARKER="${STATE_DIR}/warp-ownership-v2"
+WARP_APT_SOURCE="/etc/apt/sources.list.d/cloudflare-client.list"
+WARP_APT_KEYRING="/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg"
 IP_FAMILY_MODE_FILE="${STATE_DIR}/ip-family-mode"
 IP_FAMILY_APPLY_HELPER="/usr/local/lib/ss2022/ip-family-apply.sh"
 IP_FAMILY_SERVICE_NAME="ss2022-ip-family"
@@ -1327,6 +1339,10 @@ show_dashboard() {
 restore_ipv4_apt_and_dns_if_needed() {
     local should_restore=0 backup=""
     rm -f "$FORCE_IPV6_CONF"
+    if [[ -f "$FORCE_IPV6_LEGACY_CONF" ]] &&
+       grep -Fqx 'Acquire::ForceIPv6 "true";' "$FORCE_IPV6_LEGACY_CONF" 2>/dev/null; then
+        echo -e "${YELLOW}[提示] 检测到历史 /etc/apt/apt.conf.d/99force-ipv6。其 ownership 无法可靠判定，dev41 起不再自动删除；如确认由旧版 vps-bootstrap 创建，可手动移除。${PLAIN}"
+    fi
 
     if [[ -f "$DNS_MARKER" ]]; then
         should_restore=1
@@ -5537,8 +5553,33 @@ apply_routing_config() {
     echo -e "${GREEN}✔ 分流配置已通过双核心校验并安全应用。${PLAIN}"
 }
 
+warp_package_is_project_managed() {
+    [[ -f "$WARP_MANAGED_MARKER" ]]
+}
+
+warp_repo_is_project_managed() {
+    [[ -f "$WARP_REPO_MANAGED_MARKER" ]] && return 0
+    # v1 legacy marker represented both the package and the repository assets.
+    [[ -f "$WARP_MANAGED_MARKER" && ! -f "$WARP_OWNERSHIP_V2_MARKER" ]] && return 0
+    return 1
+}
+
+warp_remove_managed_install_assets() {
+    local package_managed=0 repo_managed=0
+    warp_package_is_project_managed && package_managed=1 || true
+    warp_repo_is_project_managed && repo_managed=1 || true
+
+    if [[ $package_managed -eq 1 && "$PLATFORM_PKG" == "apt" ]]; then
+        pkg_remove cloudflare-warp >/dev/null 2>&1 || true
+    fi
+    if [[ $repo_managed -eq 1 && "$PLATFORM_PKG" == "apt" ]]; then
+        rm -f "$WARP_APT_SOURCE" "$WARP_APT_KEYRING"
+    fi
+    rm -f "$WARP_MANAGED_MARKER" "$WARP_REPO_MANAGED_MARKER" "$WARP_OWNERSHIP_V2_MARKER"
+}
+
 warp_install_client() {
-    local managed=0 codename port
+    local codename port
     routing_init_state || return 1
     port=$(warp_proxy_port)
 
@@ -5564,15 +5605,29 @@ warp_install_client() {
     if ! command -v warp-cli >/dev/null 2>&1; then
         echo -e "${YELLOW}>> 安装 Cloudflare 官方 WARP Linux 客户端...${PLAIN}"
         apt-get install -y curl ca-certificates gnupg lsb-release || return 1
-        touch "$WARP_MANAGED_MARKER" || return 1
-        chmod 600 "$WARP_MANAGED_MARKER"
-        managed=1
-        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg || return 1
-        codename=$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-}")
-        [[ -n "$codename" ]] || codename=$(lsb_release -cs 2>/dev/null || true)
-        [[ -n "$codename" ]] || { echo -e "${RED}[错误] 无法识别 Debian/Ubuntu 发行版代号。${PLAIN}"; return 1; }
-        echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${codename} main" > /etc/apt/sources.list.d/cloudflare-client.list
+
+        if [[ -e "$WARP_APT_SOURCE" || -e "$WARP_APT_KEYRING" ]]; then
+            if [[ ! -f "$WARP_APT_SOURCE" || ! -f "$WARP_APT_KEYRING" ]] ||
+               ! grep -Fq 'https://pkg.cloudflareclient.com/' "$WARP_APT_SOURCE" ||
+               ! grep -Fq 'signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg' "$WARP_APT_SOURCE"; then
+                echo -e "${RED}[错误] 检测到服务器已有不完整或非标准 Cloudflare APT 仓库配置。${PLAIN}"
+                echo -e "${YELLOW}为避免覆盖外部软件源，脚本不会修改现有 source/keyring；请先自行检查后重试。${PLAIN}"
+                return 1
+            fi
+            echo -e "${YELLOW}[提示] 检测到服务器已有 Cloudflare 官方 APT 仓库，当前仅复用，不接管其 ownership。${PLAIN}"
+        else
+            touch "$WARP_OWNERSHIP_V2_MARKER" "$WARP_REPO_MANAGED_MARKER" || return 1
+            chmod 600 "$WARP_OWNERSHIP_V2_MARKER" "$WARP_REPO_MANAGED_MARKER"
+            curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output "$WARP_APT_KEYRING" || return 1
+            codename=$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-}")
+            [[ -n "$codename" ]] || codename=$(lsb_release -cs 2>/dev/null || true)
+            [[ -n "$codename" ]] || { echo -e "${RED}[错误] 无法识别 Debian/Ubuntu 发行版代号。${PLAIN}"; return 1; }
+            echo "deb [signed-by=${WARP_APT_KEYRING}] https://pkg.cloudflareclient.com/ ${codename} main" > "$WARP_APT_SOURCE"
+        fi
+
         apt-get update -y || return 1
+        touch "$WARP_OWNERSHIP_V2_MARKER" "$WARP_MANAGED_MARKER" || return 1
+        chmod 600 "$WARP_OWNERSHIP_V2_MARKER" "$WARP_MANAGED_MARKER"
         apt-get install -y cloudflare-warp || return 1
     fi
 
@@ -5693,31 +5748,28 @@ warp_reregister() {
 }
 
 warp_uninstall_client() {
-    local managed=0
+    local package_managed=0 repo_managed=0
     if warp_is_referenced; then
         echo -e "${RED}[错误] 当前默认出口或分流规则仍引用 WARP。请先修改这些规则再卸载。${PLAIN}"
         return 1
     fi
 
-    [[ -f "$WARP_MANAGED_MARKER" ]] && managed=1
+    warp_package_is_project_managed && package_managed=1 || true
+    warp_repo_is_project_managed && repo_managed=1 || true
 
     if command -v warp-cli >/dev/null 2>&1; then
         warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
-        [[ $managed -eq 1 ]] && warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
-    elif [[ $managed -eq 0 ]]; then
+        [[ $package_managed -eq 1 ]] && warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
+    elif [[ $package_managed -eq 0 && $repo_managed -eq 0 ]]; then
         echo -e "${YELLOW}WARP 未安装。${PLAIN}"
         return 0
     fi
 
-    if [[ $managed -eq 1 ]]; then
-        if [[ "$PLATFORM_PKG" == "apt" ]]; then
-            pkg_remove cloudflare-warp >/dev/null 2>&1 || true
-            rm -f /etc/apt/sources.list.d/cloudflare-client.list /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-        fi
-        rm -f "$WARP_MANAGED_MARKER"
-        echo -e "${GREEN}✔ 已清理由 ss2022.sh 管理的 Cloudflare WARP 及其软件源记录。${PLAIN}"
+    if [[ $package_managed -eq 1 || $repo_managed -eq 1 ]]; then
+        warp_remove_managed_install_assets
+        echo -e "${GREEN}✔ 已清理由 ss2022.sh 管理的 Cloudflare WARP 资产；外部 APT 仓库配置保持不变。${PLAIN}"
     else
-        echo -e "${YELLOW}[提示] WARP 不是由本脚本安装，仅执行断开，不删除软件包。${PLAIN}"
+        echo -e "${YELLOW}[提示] WARP 不是由本脚本安装，仅执行断开，不删除软件包或软件源。${PLAIN}"
     fi
 }
 
@@ -7869,9 +7921,12 @@ show_service_status() {
 }
 full_uninstall() {
     local yes="" singbox_managed=0 snell_managed=0 proxy_link_managed=0
+    local warp_package_managed=0 warp_repo_managed=0
     singbox_is_project_managed && singbox_managed=1 || true
     snell_is_project_managed && snell_managed=1 || true
     proxy_shortcut_is_project_managed && proxy_link_managed=1 || true
+    warp_package_is_project_managed && warp_package_managed=1 || true
+    warp_repo_is_project_managed && warp_repo_managed=1 || true
     echo -e "${RED}========== 完全卸载 ss2022.sh ==========${PLAIN}"
     echo ""
     echo -e "${RED}此操作会删除本脚本管理的协议核心、节点/分流/端口转发配置与服务。不会删除服务器原有 xray.service 或 realm.service。${PLAIN}"
@@ -7904,16 +7959,12 @@ full_uninstall() {
         rm -f "$SINGBOX_ALPINE_PKG_MARKER"
     fi
 
-    if [[ -f "$WARP_MANAGED_MARKER" ]]; then
+    if [[ $warp_package_managed -eq 1 || $warp_repo_managed -eq 1 ]]; then
         if command -v warp-cli >/dev/null 2>&1; then
             warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
-            warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
+            [[ $warp_package_managed -eq 1 ]] && warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
         fi
-        if [[ "$PLATFORM_PKG" == "apt" ]]; then
-            pkg_remove cloudflare-warp >/dev/null 2>&1 || true
-            rm -f /etc/apt/sources.list.d/cloudflare-client.list /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-        fi
-        rm -f "$WARP_MANAGED_MARKER"
+        warp_remove_managed_install_assets
     fi
 
     [[ $singbox_managed -eq 1 ]] && rm -rf /etc/sing-box
