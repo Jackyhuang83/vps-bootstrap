@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev22
+# 当前版本: v1.9.0-dev23
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,13 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev23:
+#   - Snell v5 接入 systemd/OpenRC 统一服务抽象，Alpine 菜单正式开放运行时自检入口
+#   - Alpine 仅使用系统仓库 gcompat/libstdc++/libgcc 兼容官方 snell-server，不注入第三方 glibc、不改用非官方实现
+#   - 官方二进制下载/SHA256 校验后立即运行时自检；兼容失败则拒绝启动并输出 ldd/gcompat 诊断
+#   - Snell 用户创建、PID、状态、日志、重启、回滚、删除、组件管理与完全卸载完成 OpenRC 适配
+#   - OpenRC Snell 使用 supervise-daemon、独立非 root 用户、独立日志与低端口 capability
 #
 # v1.9.0-dev22:
 #   - 修复 Alpine/OpenRC 完全卸载未停用 ss2022-ip-family 服务的问题
@@ -489,11 +496,12 @@
 #   v1.9.0-dev20 修复 systemd 服务状态递归
 #   v1.9.0-dev21 修复 Realm OpenRC 状态残留
 #   v1.9.0-dev22 修复 OpenRC 完全卸载残留
+#   v1.9.0-dev23 Snell v5 Alpine/OpenRC 运行时自检适配
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev22"
+SCRIPT_VERSION="v1.9.0-dev23"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -546,6 +554,9 @@ SNELL_SERVICE="/etc/systemd/system/snell-v5.service"
 SNELL_USER="snell"
 SNELL_GROUP="snell"
 SNELL_USER_MARKER="/etc/ss2022-snell-user-managed"
+SNELL_OPENRC_SERVICE="/etc/init.d/snell-v5"
+SNELL_OPENRC_PID="/run/snell-v5.pid"
+SNELL_OPENRC_LOG="/var/log/ss2022/snell-v5.log"
 # Snell 官方 v5.0.1 固定资产 SHA256（参考成熟模板并固定到官方 dl.nssurge.com 资产）
 SNELL_SHA256_AMD64="9bea1c2b9e35b73b31634856c04d18c393072b9e5dcde6a32781d8b8f908c539"
 SNELL_SHA256_ARM64="2f178bf5ac468ce1a130454efa40a0603fbbe4e47ecc4880a989f4abc7f824cf"
@@ -805,6 +816,7 @@ service_main_pid() {
     case "$svc" in
         sing-box) pidfile="$SINGBOX_OPENRC_PID" ;;
         "$XRAY_SERVICE_NAME") pidfile="$XRAY_OPENRC_PID" ;;
+        snell-v5) pidfile="$SNELL_OPENRC_PID" ;;
         "$REALM_SERVICE_NAME") pidfile="$REALM_OPENRC_PID" ;;
     esac
     if [[ -n "$pidfile" && -r "$pidfile" ]]; then
@@ -860,7 +872,7 @@ platform_feature_unavailable() {
     local feature="$1"
     echo ""
     echo "[开发预览] Alpine / OpenRC 的 $feature 尚未在 v1.9.0-dev1 开放。"
-    echo "当前 Alpine 已开放: SS2022、ShadowTLS v3、VLESS Reality、Realm；Snell v5 与 WARP 暂未开放。"
+    echo "当前 Alpine 已开放: SS2022、ShadowTLS v3、VLESS Reality、Realm；Snell v5 采用官方二进制运行时自检；WARP 官方客户端暂未开放。"
     return 1
 }
 
@@ -3191,7 +3203,7 @@ CONFIG
             save_mode_state "snell" "$(jq -n --arg host "$current_host" --arg network "$new_network" '{host:$host,network:$network}')" || true
             echo -e "${GREEN}✔ Snell v5 更新成功。${PLAIN}"
         else
-            journalctl -u snell-v5 -n 30 --no-pager 2>/dev/null || true
+            service_log_tail snell-v5 30 || true
         fi
         pause
     done
@@ -3230,10 +3242,10 @@ delete_snell_v5() {
     if ! protocol_exists_snell; then echo -e "${YELLOW}未部署 Snell v5。${PLAIN}"; pause; return; fi
     local yes=""; read -rp "确认删除 Snell v5 配置与服务？[y/N]: " yes
     if [[ "$yes" =~ ^[Yy]$ ]]; then
-        systemctl disable --now snell-v5 >/dev/null 2>&1 || true
-        rm -f "$SNELL_CONF" "$SNELL_SERVICE"
+        service_disable_now snell-v5
+        rm -f "$SNELL_CONF" "$SNELL_SERVICE" "$SNELL_OPENRC_SERVICE" "$SNELL_OPENRC_PID" "$SNELL_OPENRC_LOG"
         remove_mode_state "snell" || true
-        systemctl daemon-reload || true
+        service_daemon_reload || true
         echo -e "${GREEN}✔ Snell v5 节点已删除，官方二进制保留。${PLAIN}"
     fi
     pause
@@ -3717,17 +3729,15 @@ write_xray_vless_config() {
 }
 
 ensure_snell_user() {
-    local nologin_shell=""
+    local existed=0
+    id -u "$SNELL_USER" >/dev/null 2>&1 && existed=1
 
-    if id -u "$SNELL_USER" >/dev/null 2>&1; then
-        return 0
+    create_system_user "$SNELL_USER" "$SNELL_GROUP" || return 1
+
+    if [[ $existed -eq 0 ]]; then
+        touch "$SNELL_USER_MARKER"
+        chmod 600 "$SNELL_USER_MARKER"
     fi
-
-    nologin_shell=$(command -v nologin 2>/dev/null || true)
-    nologin_shell=${nologin_shell:-/usr/sbin/nologin}
-    useradd --system --user-group --no-create-home --home-dir /nonexistent --shell "$nologin_shell" "$SNELL_USER" || return 1
-    touch "$SNELL_USER_MARKER"
-    chmod 600 "$SNELL_USER_MARKER"
     return 0
 }
 
@@ -3741,7 +3751,7 @@ port_is_available_for_snell() {
     local current_port="" snell_pid=""
 
     current_port=$(snell_port_from_config 2>/dev/null || true)
-    snell_pid=$(systemctl show -p MainPID --value snell-v5 2>/dev/null || true)
+    snell_pid=$(service_main_pid snell-v5 2>/dev/null || true)
 
     # 允许重新使用当前 Snell 自身端口。
     if [[ "$current_port" == "$port" && "$snell_pid" =~ ^[0-9]+$ && "$snell_pid" -gt 0 ]]; then
@@ -3807,6 +3817,14 @@ install_snell_v5_core() {
 
     [[ "$NETWORK_MODE" == "ipv6" ]] && curl_family="-6" || curl_family="-4"
 
+    if platform_is_alpine; then
+        echo -e "${YELLOW}>> Alpine: 准备官方 Snell v5 的 glibc 兼容运行环境...${PLAIN}"
+        pkg_install gcompat libstdc++ libgcc || {
+            echo -e "${RED}[错误] Alpine 无法安装 gcompat / libstdc++ / libgcc。${PLAIN}"
+            return 1
+        }
+    fi
+
     if [[ -x "$SNELL_BIN" ]]; then
         echo -e "${GREEN}✔ 已检测到 Snell v5 二进制，将重新核验固定版本包后覆盖安装。${PLAIN}"
     fi
@@ -3863,8 +3881,31 @@ install_snell_v5_core() {
     rm -rf "$tmp"
 
     if ! snell_binary_works "$SNELL_BIN"; then
-        echo -e "${RED}[错误] Snell v5 二进制安装后无法正常加载/执行。${PLAIN}"
+        echo -e "${RED}[错误] Snell v5 官方二进制安装后无法正常加载/执行。${PLAIN}"
+        if platform_is_alpine; then
+            echo -e "${YELLOW}Surge 官方 Snell 依赖 glibc；当前 Alpine 的 gcompat 兼容层未通过运行时自检。${PLAIN}"
+            echo -e "${YELLOW}为避免注入第三方 glibc 或改用非官方实现，本脚本停止部署。${PLAIN}"
+            echo -e "${YELLOW}ldd 诊断：${PLAIN}"
+            ldd "$SNELL_BIN" 2>&1 || true
+            apk info gcompat libstdc++ libgcc 2>&1 | head -n 30 || true
+        fi
         return 1
+    fi
+
+    if platform_is_alpine; then
+        command -v setcap >/dev/null 2>&1 || {
+            echo -e "${RED}[错误] Alpine 缺少 setcap，无法安全支持低端口监听。${PLAIN}"
+            return 1
+        }
+        setcap cap_net_bind_service=+ep "$SNELL_BIN" || {
+            echo -e "${RED}[错误] 无法为 Snell v5 设置低端口 capability。${PLAIN}"
+            return 1
+        }
+        if ! snell_binary_works "$SNELL_BIN"; then
+            echo -e "${RED}[错误] Snell v5 设置 capability 后运行时自检失败。${PLAIN}"
+            getcap "$SNELL_BIN" 2>/dev/null || true
+            return 1
+        fi
     fi
 
     echo -e "${GREEN}✔ Snell v${SNELL_VERSION} 官方二进制安装并校验完成。${PLAIN}"
@@ -3874,7 +3915,8 @@ install_snell_v5_core() {
 write_snell_service() {
     ensure_snell_user || return 1
 
-    cat > "$SNELL_SERVICE" <<'SERVICE'
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        cat > "$SNELL_SERVICE" <<'SERVICE'
 [Unit]
 Description=Snell Server v5
 After=network-online.target
@@ -3905,9 +3947,40 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 [Install]
 WantedBy=multi-user.target
 SERVICE
+        service_daemon_reload || return 1
+        service_enable snell-v5 || return 1
+        return 0
+    fi
 
-    systemctl daemon-reload || return 1
-    systemctl enable snell-v5 >/dev/null 2>&1 || return 1
+    mkdir -p /var/log/ss2022 || return 1
+    touch "$SNELL_OPENRC_LOG" || return 1
+    chown "$SNELL_USER:$SNELL_GROUP" "$SNELL_OPENRC_LOG" || return 1
+    chmod 640 "$SNELL_OPENRC_LOG"
+
+    cat > "$SNELL_OPENRC_SERVICE" <<SERVICE
+#!/sbin/openrc-run
+description="vps-bootstrap Snell Server v5"
+command="$SNELL_BIN"
+command_args="-c $SNELL_CONF"
+command_user="$SNELL_USER:$SNELL_GROUP"
+supervisor="supervise-daemon"
+pidfile="$SNELL_OPENRC_PID"
+output_log="$SNELL_OPENRC_LOG"
+error_log="$SNELL_OPENRC_LOG"
+respawn_delay=5
+respawn_max=0
+umask=0077
+
+depend() {
+    need net
+    use dns
+}
+SERVICE
+    chmod 755 "$SNELL_OPENRC_SERVICE"
+    if ! service_enable snell-v5; then
+        echo -e "${RED}[错误] OpenRC 无法把 Snell v5 加入 default runlevel。${PLAIN}"
+        return 1
+    fi
     return 0
 }
 
@@ -3935,16 +4008,16 @@ apply_snell_config() {
     chown root:"$SNELL_GROUP" "$SNELL_CONF"
     chmod 640 "$SNELL_CONF"
 
-    if ! systemctl restart snell-v5; then
+    if ! service_restart snell-v5; then
         echo -e "${RED}[错误] Snell v5 启动失败，正在回滚配置...${PLAIN}"
         if [[ $had_old -eq 1 && -f "$backup" ]]; then
             mv -f "$backup" "$SNELL_CONF"
             chown root:"$SNELL_GROUP" "$SNELL_CONF"
             chmod 640 "$SNELL_CONF"
-            systemctl restart snell-v5 >/dev/null 2>&1 || true
+            service_restart snell-v5 >/dev/null 2>&1 || true
         else
             rm -f "$SNELL_CONF"
-            systemctl stop snell-v5 >/dev/null 2>&1 || true
+            service_stop snell-v5 >/dev/null 2>&1 || true
         fi
         return 1
     fi
@@ -4010,7 +4083,7 @@ CONFIG
         save_mode_state "snell" "$(jq -n --arg host "$SERVER_HOST" --arg network "$NETWORK_MODE" --arg name "$NODE_NAME" '{host:$host,network:$network,name:$name}')" || true
         show_snell_details "$SERVER_HOST" "$snell_port" "$psk" "$NODE_NAME"
     else
-        journalctl -u snell-v5 -n 30 --no-pager 2>/dev/null || true
+        service_log_tail snell-v5 30 || true
     fi
     pause
 }
@@ -7546,6 +7619,7 @@ full_uninstall() {
     else
         service_disable_now sing-box
         service_disable_now "$XRAY_SERVICE_NAME"
+        service_disable_now snell-v5
         service_disable_now "$REALM_SERVICE_NAME"
         service_disable_now "$IP_FAMILY_SERVICE_NAME"
         service_disable_now ss2022-ipv6-keepalive
@@ -7577,6 +7651,7 @@ full_uninstall() {
         "$SINGBOX_SERVICE" \
         "$XRAY_SERVICE" \
         "$SNELL_SERVICE" \
+        "$SNELL_OPENRC_SERVICE" \
         "$REALM_SERVICE" \
         "$IP_FAMILY_SERVICE" \
         "$SINGBOX_OPENRC_SERVICE" \
@@ -7600,8 +7675,9 @@ full_uninstall() {
 
     if [[ -f "$XRAY_USER_MARKER" ]]; then delete_system_user "$XRAY_USER"; rm -f "$XRAY_USER_MARKER"; fi
     if [[ -f "$REALM_USER_MARKER" ]]; then delete_system_user "$REALM_USER"; rm -f "$REALM_USER_MARKER"; fi
-    if [[ "$PLATFORM_INIT" == "systemd" && -f "$SNELL_USER_MARKER" ]]; then
-        userdel "$SNELL_USER" >/dev/null 2>&1 || true
+    if [[ -f "$SNELL_USER_MARKER" ]]; then
+        delete_system_user "$SNELL_USER"
+        delete_system_group "$SNELL_GROUP"
         rm -f "$SNELL_USER_MARKER"
     fi
 
@@ -7710,10 +7786,6 @@ component_validate_existing_config() {
 
 component_install_recommended() {
     local c="$1" label bin svc tmp old_active=0 had_bin=0 ok=0
-    if platform_is_alpine && [[ "$c" == "snell" ]]; then
-        platform_feature_unavailable "$(component_label "$c")"
-        return 1
-    fi
     label=$(component_label "$c")
     bin=$(component_bin_path "$c")
     svc=$(component_service_name "$c")
@@ -8171,7 +8243,7 @@ protocol_management() {
         echo "  2. SS2022 + ShadowTLS v3（增强伪装）"
         echo "  3. VLESS Reality"
         if platform_is_alpine; then
-            echo "  4. Snell v5                [Alpine 暂未开放]"
+            echo "  4. Snell v5                [官方二进制运行时自检]"
         else
             echo "  4. Snell v5"
         fi
@@ -8182,7 +8254,7 @@ protocol_management() {
             1) protocol_action_menu "SS2022" deploy_ss2022 update_ss2022 delete_ss2022 ;;
             2) protocol_action_menu "SS2022 + ShadowTLS v3" deploy_shadowtls update_shadowtls delete_shadowtls ;;
             3) protocol_action_menu "VLESS Reality" deploy_vless_reality update_vless_reality delete_vless_reality ;;
-            4) if platform_is_alpine; then platform_feature_unavailable "Snell v5"; pause; else protocol_action_menu "Snell v5" deploy_snell_v5 update_snell_v5 delete_snell_v5; fi ;;
+            4) protocol_action_menu "Snell v5" deploy_snell_v5 update_snell_v5 delete_snell_v5 ;;
             0) return ;;
             *) sleep 1 ;;
         esac
