@@ -3,12 +3,12 @@
 一体化 VPS 网络协议、服务端分流、端口转发与日常运维脚本。
 
 当前正式版本：**v1.8.1**  
-当前开发版本：**v1.9.0-dev33**
+当前开发版本：**v1.9.0-dev34**
 
 项目以单一交互式 Bash 脚本 `ss2022.sh` 为入口，整合 **SS2022、SS2022 + ShadowTLS v3、VLESS Reality、Snell v5**，并提供 WARP 出口、链式落地、规则分流、Realm L4 端口转发、组件管理、服务器工具、服务器测试与脚本自更新。
 
 > v1.8.1 为当前稳定正式版，正式支持 **Debian / Ubuntu + systemd**。  
-> v1.9.x 为当前开发线，已接入 **Alpine 3.21 + OpenRC**；核心 OpenRC 服务路径已通过 Alpine 3.21 CI smoke test。Snell v5 在 Alpine 上仍需通过官方二进制运行时自检；Cloudflare WARP 官方客户端暂不在 Alpine 开放。
+> v1.9.x 为当前开发线，已接入 **Alpine 3.21 + OpenRC**；核心 OpenRC 服务路径已通过 Alpine 3.21 CI smoke test。**Snell v5 官方二进制已确认无法在 Alpine 3.21 + gcompat 下正常启动，因此 Alpine 暂不开放 Snell；Cloudflare WARP 官方客户端也暂不在 Alpine 开放。**
 
 ---
 
@@ -38,7 +38,7 @@
 | **NAT VPS** | 可使用服务商映射端口部署节点 |
 | **权限要求** | root |
 | **Shell** | Bash |
-| **Alpine 注意** | Snell v5 需运行时自检；WARP 官方客户端暂不支持 Alpine |
+| **Alpine 注意** | Snell v5 官方二进制不兼容 Alpine 3.21 + gcompat；WARP 官方客户端暂不支持 Alpine |
 
 ### 当前固定 / 推荐组件版本
 
@@ -159,10 +159,10 @@ ShadowTLS 主要用于增加 TLS-like 流量特征与主动探测抵抗能力，
 设计原则：
 
 - 始终使用 Surge 官方 Snell Server v5，不替换成兼容实现
-- Debian / Ubuntu 使用 systemd；v1.9 开发版在 Alpine 使用 OpenRC
-- Alpine 仅使用系统仓库 `gcompat + libstdc++ + libgcc` 尝试兼容官方 glibc 二进制
-- 下载后先校验固定 SHA256，再执行运行时自检；若当前 Alpine 无法兼容则停止部署，不注入第三方 glibc
-- OpenRC 下使用独立非 root 用户、独立日志、`supervise-daemon` 与 ambient `CAP_NET_BIND_SERVICE`
+- Debian / Ubuntu 使用 systemd，Snell v5 保持正式支持
+- Alpine 3.21 + gcompat 已通过 CI 实测：官方 Snell v5.0.1 无法启动，报 `Not a valid dynamic program`
+- 因此 v1.9 在 Alpine 上暂不开放 Snell；不注入第三方 glibc，也不改用非官方 Snell 实现
+- 早期 v1.9 dev 版本若留下 Snell OpenRC 服务，“完全卸载”仍会负责清理
 - 不经过 sing-box
 - 不参与 VPS 服务端分流
 - 如需 Snell 分流，建议在 Surge 客户端使用 Rules
@@ -663,10 +663,10 @@ v1.8.1 为当前稳定正式版。
 
 ## v1.9.x
 
-当前开发版为 **v1.9.0-dev33**，重点是 Alpine / OpenRC 收口：
+当前开发版为 **v1.9.0-dev34**，重点是 Alpine / OpenRC 收口：
 
 - SS2022、ShadowTLS v3、VLESS Reality、Realm 已接入 OpenRC
-- Snell v5 已接入 OpenRC；由于 Surge 官方二进制依赖 glibc，Alpine 部署必须通过本机运行时自检
+- Snell v5 官方二进制已确认无法在 Alpine 3.21 + gcompat 下启动，因此 Alpine 暂不开放 Snell；Debian / Ubuntu 保持支持
 - 服务器管理工具与服务器测试已完成主要 Alpine 适配
 - Alpine 3.21 / OpenRC 已加入 GitHub Actions smoke test，覆盖平台识别、服务生成、runlevel、PID 与完全卸载闭环
 - WARP 官方 Linux 客户端在 Alpine 暂不开放
