@@ -3797,7 +3797,8 @@ snell_binary_works() {
 }
 
 install_snell_v5_core() {
-    local arch sarch expected_sha url tmp zip actual curl_family
+    local arch sarch expected_sha url tmp zip actual curl_family candidate
+    install_dependencies || return 1
 
     arch=$(uname -m)
     case "$arch" in
@@ -3815,7 +3816,20 @@ install_snell_v5_core() {
             ;;
     esac
 
-    [[ "$NETWORK_MODE" == "ipv6" ]] && curl_family="-6" || curl_family="-4"
+    case "$NETWORK_MODE" in
+        ipv6) curl_family="-6" ;;
+        ipv4|dual) curl_family="-4" ;;
+        *)
+            if get_public_ipv4 >/dev/null 2>&1; then
+                curl_family="-4"
+            elif get_public_ipv6 >/dev/null 2>&1; then
+                curl_family="-6"
+            else
+                echo -e "${RED}[错误] 未检测到可用公网 IPv4 / IPv6，无法下载 Snell。${PLAIN}"
+                return 1
+            fi
+            ;;
+    esac
 
     if platform_is_alpine; then
         echo -e "${YELLOW}>> Alpine: 准备官方 Snell v5 的 glibc 兼容运行环境...${PLAIN}"
@@ -3826,11 +3840,12 @@ install_snell_v5_core() {
     fi
 
     if [[ -x "$SNELL_BIN" ]]; then
-        echo -e "${GREEN}✔ 已检测到 Snell v5 二进制，将重新核验固定版本包后覆盖安装。${PLAIN}"
+        echo -e "${GREEN}✔ 已检测到 Snell v5 二进制；新文件通过完整校验与运行时自检后才会替换。${PLAIN}"
     fi
 
-    tmp=$(mktemp -d) || return 1
+    tmp=$(mktemp -d /tmp/snell-v5-install.XXXXXX) || return 1
     zip="$tmp/snell.zip"
+    candidate="${SNELL_BIN}.new.$$"
     url="https://dl.nssurge.com/snell/snell-server-v${SNELL_VERSION}-linux-${sarch}.zip"
 
     echo -e "${YELLOW}>> 从 Surge 官方下载 Snell v${SNELL_VERSION}...${PLAIN}"
@@ -3856,7 +3871,6 @@ install_snell_v5_core() {
         return 1
     fi
 
-    # 防止压缩包路径穿越。
     if unzip -Z1 "$zip" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
         echo -e "${RED}[错误] Snell ZIP 包含不安全路径，拒绝解压。${PLAIN}"
         rm -rf "$tmp"
@@ -3874,41 +3888,57 @@ install_snell_v5_core() {
         return 1
     fi
 
-    install -m 755 "$tmp/snell-server" "$SNELL_BIN" || {
+    rm -f "$candidate"
+    install -m 755 "$tmp/snell-server" "$candidate" || {
         rm -rf "$tmp"
+        rm -f "$candidate"
         return 1
     }
-    rm -rf "$tmp"
 
-    if ! snell_binary_works "$SNELL_BIN"; then
-        echo -e "${RED}[错误] Snell v5 官方二进制安装后无法正常加载/执行。${PLAIN}"
+    if ! snell_binary_works "$candidate"; then
+        echo -e "${RED}[错误] Snell v5 官方二进制无法在当前系统正常加载/执行。${PLAIN}"
         if platform_is_alpine; then
             echo -e "${YELLOW}Surge 官方 Snell 依赖 glibc；当前 Alpine 的 gcompat 兼容层未通过运行时自检。${PLAIN}"
-            echo -e "${YELLOW}为避免注入第三方 glibc 或改用非官方实现，本脚本停止部署。${PLAIN}"
+            echo -e "${YELLOW}为避免注入第三方 glibc 或改用非官方实现，本脚本停止部署；现有 Snell 二进制不会被覆盖。${PLAIN}"
             echo -e "${YELLOW}ldd 诊断：${PLAIN}"
-            ldd "$SNELL_BIN" 2>&1 || true
+            ldd "$candidate" 2>&1 || true
             apk info gcompat libstdc++ libgcc 2>&1 | head -n 30 || true
         fi
+        rm -rf "$tmp"
+        rm -f "$candidate"
         return 1
     fi
 
     if platform_is_alpine; then
         command -v setcap >/dev/null 2>&1 || {
             echo -e "${RED}[错误] Alpine 缺少 setcap，无法安全支持低端口监听。${PLAIN}"
+            rm -rf "$tmp"
+            rm -f "$candidate"
             return 1
         }
-        setcap cap_net_bind_service=+ep "$SNELL_BIN" || {
+        setcap cap_net_bind_service=+ep "$candidate" || {
             echo -e "${RED}[错误] 无法为 Snell v5 设置低端口 capability。${PLAIN}"
+            rm -rf "$tmp"
+            rm -f "$candidate"
             return 1
         }
-        if ! snell_binary_works "$SNELL_BIN"; then
-            echo -e "${RED}[错误] Snell v5 设置 capability 后运行时自检失败。${PLAIN}"
-            getcap "$SNELL_BIN" 2>/dev/null || true
+        if ! snell_binary_works "$candidate"; then
+            echo -e "${RED}[错误] Snell v5 设置 capability 后运行时自检失败，拒绝替换现有二进制。${PLAIN}"
+            getcap "$candidate" 2>/dev/null || true
+            rm -rf "$tmp"
+            rm -f "$candidate"
             return 1
         fi
     fi
 
-    echo -e "${GREEN}✔ Snell v${SNELL_VERSION} 官方二进制安装并校验完成。${PLAIN}"
+    mv -f "$candidate" "$SNELL_BIN" || {
+        rm -rf "$tmp"
+        rm -f "$candidate"
+        return 1
+    }
+    rm -rf "$tmp"
+
+    echo -e "${GREEN}✔ Snell v${SNELL_VERSION} 官方二进制已通过 SHA256 与运行时自检。${PLAIN}"
     return 0
 }
 
