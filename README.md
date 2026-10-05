@@ -3,7 +3,7 @@
 一体化 VPS 网络协议、服务端分流、端口转发与日常运维脚本。
 
 当前正式版本：**v1.8.1**  
-当前开发版本：**v1.9.0-dev35**
+当前开发版本：**v1.9.0-dev36**
 
 项目以单一交互式 Bash 脚本 `ss2022.sh` 为入口，整合 **SS2022、SS2022 + ShadowTLS v3、VLESS Reality、Snell v5**，并提供 WARP 出口、链式落地、规则分流、Realm L4 端口转发、组件管理、服务器工具、服务器测试与脚本自更新。
 
@@ -634,7 +634,7 @@ ss -lntup
 - sing-box / Xray / Snell 使用独立运行用户
 - Xray / Realm 使用 `ss2022` 独立命名空间
 - Xray / Realm 使用项目独立命名空间，不覆盖服务器已有同名服务
-- sing-box 使用通用路径，但安装前会执行 ownership 检查；检测到外部 sing-box 时拒绝覆盖
+- sing-box 与 Snell 使用通用路径，但安装前都会执行 ownership 检查；检测到外部安装时拒绝覆盖
 - 服务用户/组仅在确认由本脚本创建时才会在卸载阶段删除
 - 下载核心进行来源 / SHA256 校验
 - SSH 端口修改保留旧端口并验证配置
@@ -653,7 +653,7 @@ ss -lntup
 10. 完全卸载脚本
 ```
 
-用于清理本项目创建的协议核心、服务、节点/分流/端口转发配置、状态文件和运行文件。Debian/Ubuntu 会清理对应 systemd 单元；Alpine/OpenRC 会同时移除本项目注册的 runlevel 服务与 `/etc/init.d` 脚本。
+用于清理本项目创建的协议核心、服务、节点/分流/端口转发配置、状态文件和运行文件。Debian/Ubuntu 会清理对应 systemd 单元；Alpine/OpenRC 会同时移除本项目注册的 runlevel 服务与 `/etc/init.d` 脚本。对通用路径上的 sing-box / Snell，只有确认由 vps-bootstrap 管理时才会删除；外部已有安装会保留。
 
 “完全卸载”**不会自动回滚用户通过服务器工具主动修改的系统设置**，包括 BBR、DNS、SSH 端口以及 IPv4/IPv6 地址优先级。这样做是为了避免卸载过程中意外改变网络或 SSH 可达性。需要恢复这些设置时，请在卸载前进入对应管理菜单手动恢复。
 
@@ -677,7 +677,7 @@ v1.8.1 为当前稳定正式版。
 
 ## v1.9.x
 
-当前开发版为 **v1.9.0-dev35**，重点是 Alpine / OpenRC 收口：
+当前开发版为 **v1.9.0-dev36**，重点是 Alpine / OpenRC 收口：
 
 - SS2022、ShadowTLS v3、VLESS Reality、Realm 已接入 OpenRC
 - Snell v5 官方二进制已确认无法在 Alpine 3.21 + gcompat 下启动，因此 Alpine 暂不开放 Snell；Debian / Ubuntu 保持支持
