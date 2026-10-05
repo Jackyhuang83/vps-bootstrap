@@ -272,7 +272,7 @@ Snell v5 保持官方 `snell-server` 架构，不参与 VPS 服务端分流。
 - 测试规则
 - Realm 服务管理
 
-Realm 使用独立二进制、配置和 systemd 服务，不覆盖服务器已有同名服务。
+Realm 使用独立二进制、配置和独立服务；Debian/Ubuntu 使用 systemd，Alpine 使用 OpenRC，不覆盖服务器已有同名服务。
 
 ---
 
