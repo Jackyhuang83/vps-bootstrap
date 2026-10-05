@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev17
+# 当前版本: v1.9.0-dev18
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,14 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev18:
+#   - 修正回程测试定位：核心改为“逐跳 traceroute”，不再以线路分类汇总表作为主结果
+#   - 回程上游切换为 nxtrace/NTrace-core（NextTrace）
+#   - 固定测试北京 / 上海 / 广州 × 电信 / 联通 / 移动，共 9 条线路/地址族
+#   - 每条线路使用 TCP/80，逐跳显示 IP / ASN / 地区 / 延迟，最大 30 跳
+#   - IPv4+IPv6 / 仅 IPv4 / 仅 IPv6 继续独立选择
+#   - NextTrace 使用官方 Release tiny 二进制，SHA256 校验后临时执行，用完删除
 #
 # v1.9.0-dev17:
 #   - 回程路由从 backtrace legacy 终端模式切换到 backtrace.routes/v1 结构化报告
@@ -456,11 +464,12 @@
 #   v1.9.0-dev15 修复通用流媒体白名单
 #   v1.9.0-dev16 流媒体上游切换 RegionRestrictionCheck
 #   v1.9.0-dev17 回程路由结构化检测
+#   v1.9.0-dev18 三网逐跳回程 NextTrace
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev17"
+SCRIPT_VERSION="v1.9.0-dev18"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -10401,102 +10410,120 @@ test_ip_quality() {
     echo ""
     pause
 }
-server_test_render_route_json() {
-    local report="$1" family="$2" title row name status label confidence successes attempts fallback
-    [[ "$family" == "v6" ]] && title="IPv6" || title="IPv4"
+server_test_nexttrace_asset() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo "nexttrace-tiny_linux_amd64" ;;
+        aarch64|arm64) echo "nexttrace-tiny_linux_arm64" ;;
+        i386|i686) echo "nexttrace-tiny_linux_386" ;;
+        armv7l|armv7*) echo "nexttrace-tiny_linux_armv7" ;;
+        *) return 1 ;;
+    esac
+}
 
-    echo -e "${CYAN}════════ ${title} 回程线路 ════════${PLAIN}"
+server_test_write_return_targets() {
+    local family="$1" out="$2"
+    case "$family" in
+        4)
+            cat >"$out" <<'EOF'
+ipv4.pek-4134.endpoint.nxtrace.org 北京电信
+ipv4.pek-4837.endpoint.nxtrace.org 北京联通
+ipv4.pek-9808.endpoint.nxtrace.org 北京移动
+ipv4.sha-4134.endpoint.nxtrace.org 上海电信
+ipv4.sha-4837.endpoint.nxtrace.org 上海联通
+ipv4.sha-9808.endpoint.nxtrace.org 上海移动
+ipv4.can-4134.endpoint.nxtrace.org 广州电信
+ipv4.can-4837.endpoint.nxtrace.org 广州联通
+ipv4.can-9808.endpoint.nxtrace.org 广州移动
+EOF
+            ;;
+        6)
+            cat >"$out" <<'EOF'
+ipv6.pek-4134.endpoint.nxtrace.org 北京电信
+ipv6.pek-4837.endpoint.nxtrace.org 北京联通
+ipv6.pek-9808.endpoint.nxtrace.org 北京移动
+ipv6.sha-4134.endpoint.nxtrace.org 上海电信
+ipv6.sha-4837.endpoint.nxtrace.org 上海联通
+ipv6.sha-9808.endpoint.nxtrace.org 上海移动
+ipv6.can-4134.endpoint.nxtrace.org 广州电信
+ipv6.can-4837.endpoint.nxtrace.org 广州联通
+ipv6.can-9808.endpoint.nxtrace.org 广州移动
+EOF
+            ;;
+        *) return 1 ;;
+    esac
+}
 
-    while IFS=$'\t' read -r name status label confidence successes attempts fallback; do
-        [[ -n "$name" ]] || continue
-        case "$status" in
-            available)
-                case "$confidence" in
-                    confirmed) confidence="确认" ;;
-                    mixed) confidence="混合" ;;
-                    inconclusive) confidence="证据不足" ;;
-                    *) confidence="${confidence:-未知}" ;;
-                esac
-                printf " %-16s %s" "$name" "${label:-线路证据不足}"
-                printf "  [%s, %s/%s" "$confidence" "${successes:-0}" "${attempts:-0}"
-                [[ "$fallback" == "true" ]] && printf ", 备用目标"
-                printf "]\n"
-                ;;
-            timeout) printf " %-16s %s\n" "$name" "TIMEOUT" ;;
-            canceled) printf " %-16s %s\n" "$name" "CANCELED" ;;
-            *) printf " %-16s %s\n" "$name" "UNAVAILABLE" ;;
-        esac
-    done < <(
-        jq -r --arg family "$family" '
-          .targets[]
-          | select(.target.ip_version == $family)
-          | [
-              .target.name,
-              .status,
-              (.classification.label // ""),
-              (.classification.confidence // ""),
-              (.successful_attempts // 0),
-              (.attempts // 0),
-              (.fallback // false)
-            ]
-          | @tsv
-        ' "$report"
-    )
+server_test_run_nexttrace_family() {
+    local bin="$1" family="$2" targets title
+    targets=$(mktemp /tmp/ss2022-nexttrace-targets.XXXXXX) || return 1
+    server_test_write_return_targets "$family" "$targets" || {
+        rm -f "$targets"
+        return 1
+    }
+
+    [[ "$family" == "6" ]] && title="IPv6" || title="IPv4"
+    echo ""
+    echo -e "${CYAN}════════ ${title} 三网逐跳回程 ════════${PLAIN}"
+    echo -e "${YELLOW}目标: 北京 / 上海 / 广州 × 电信 / 联通 / 移动；TCP 80；每一跳显示 IP / ASN / 地区 / 延迟。${PLAIN}"
+    echo ""
+
+    "$bin" --traceroute --file "$targets"         --tcp --port 80         --queries 1 --max-hops 30 --timeout 2000         --language cn --no-color -M || true
+
+    rm -f "$targets"
 }
 
 test_return_route() {
-    local asset tmp report family mode include_v6=0
+    local asset tmp family
     clear
-    show_external_test_source "IPv4 / IPv6 回程路由" "oneclickvirt/backtrace"
-    echo -e "${YELLOW}使用上游结构化回程报告；每个目标默认探测 3 次，再综合判断线路。${PLAIN}"
+    show_external_test_source "IPv4 / IPv6 三网逐跳回程" "nxtrace/NTrace-core"
+    echo -e "${YELLOW}本项显示完整 traceroute，每个目标会逐跳列出经过的 IP、ASN、地区与延迟。${PLAIN}"
+    echo -e "${CYAN}检测目标: 北京 / 上海 / 广州 × 电信 / 联通 / 移动，共 9 条/地址族。${PLAIN}"
 
     server_test_select_ip_mode || return
     family=$(server_test_detect_family_mode)
 
-    case "$SERVER_TEST_IP_MODE:$family" in
-        4:both|4:ipv4) mode="4" ;;
-        4:*) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv4。${PLAIN}"; pause; return ;;
-        6:both|6:ipv6) mode="6"; include_v6=1 ;;
-        6:*) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv6。${PLAIN}"; pause; return ;;
-        0:both) mode="both"; include_v6=1 ;;
-        0:ipv4) mode="4" ;;
-        0:ipv6) mode="6"; include_v6=1 ;;
-        *) echo -e "${RED}[错误] 未检测到可用公网 IPv4 / IPv6。${PLAIN}"; pause; return ;;
-    esac
-
-    asset=$(server_test_arch_asset "backtrace") || {
-        echo -e "${RED}[错误] 当前 CPU 架构暂无 backtrace 测试资产。${PLAIN}"; pause; return
+    asset=$(server_test_nexttrace_asset) || {
+        echo -e "${RED}[错误] 当前 CPU 架构暂无 NextTrace 测试资产。${PLAIN}"
+        pause
+        return
     }
-    tmp=$(mktemp /tmp/ss2022-backtrace.XXXXXX) || { pause; return; }
-    report=$(mktemp /tmp/ss2022-backtrace-report.XXXXXX.json) || { rm -f "$tmp"; pause; return; }
 
-    if server_test_download_release_asset "oneclickvirt/backtrace" "latest" "$asset" "$tmp"; then
-        if [[ $include_v6 -eq 1 ]]; then
-            "$tmp" -route-json -ipv6 -route-attempts 3 -timeout 20s -dns-mode auto >"$report" 2>/dev/null || true
-        else
-            "$tmp" -route-json -route-attempts 3 -timeout 20s -dns-mode auto >"$report" 2>/dev/null || true
-        fi
-
-        if jq -e '.schema_version == "backtrace.routes/v1" and (.targets | type == "array")' "$report" >/dev/null 2>&1; then
-            echo ""
-            case "$mode" in
-                4) server_test_render_route_json "$report" "v4" ;;
-                6) server_test_render_route_json "$report" "v6" ;;
-                both)
-                    server_test_render_route_json "$report" "v4"
-                    echo ""
-                    server_test_render_route_json "$report" "v6"
-                    ;;
-            esac
-            echo ""
-            echo -e "${YELLOW}说明: confirmed=确认，mixed=路径混合，证据不足表示未观察到足够骨干 ASN；结果仅供线路判断参考。${PLAIN}"
-        else
-            echo -e "${RED}[错误] backtrace 未返回有效结构化回程报告。${PLAIN}"
-            echo -e "${YELLOW}可稍后重试；不会修改服务器网络配置。${PLAIN}"
-        fi
+    tmp=$(mktemp /tmp/ss2022-nexttrace.XXXXXX) || { pause; return; }
+    if ! server_test_download_release_asset "nxtrace/NTrace-core" "latest" "$asset" "$tmp"; then
+        rm -f "$tmp"
+        pause
+        return
     fi
 
-    rm -f "$tmp" "$report"
+    case "$SERVER_TEST_IP_MODE:$family" in
+        4:both|4:ipv4)
+            server_test_run_nexttrace_family "$tmp" 4
+            ;;
+        4:*)
+            echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv4。${PLAIN}"
+            ;;
+        6:both|6:ipv6)
+            server_test_run_nexttrace_family "$tmp" 6
+            ;;
+        6:*)
+            echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv6。${PLAIN}"
+            ;;
+        0:both)
+            server_test_run_nexttrace_family "$tmp" 4
+            server_test_run_nexttrace_family "$tmp" 6
+            ;;
+        0:ipv4)
+            server_test_run_nexttrace_family "$tmp" 4
+            ;;
+        0:ipv6)
+            server_test_run_nexttrace_family "$tmp" 6
+            ;;
+        *)
+            echo -e "${RED}[错误] 未检测到可用公网 IPv4 / IPv6。${PLAIN}"
+            ;;
+    esac
+
+    rm -f "$tmp"
     echo ""
     pause
 }
