@@ -10623,7 +10623,7 @@ server_test_download_rrc_source() {
         size=$(wc -c <"$out" | tr -d '[:space:]')
         actual=$(
             {
-                printf 'blob %s\\0' "$size"
+                printf 'blob %s\0' "$size"
                 cat "$out"
             } | sha1sum | awk '{print $1}'
         )
