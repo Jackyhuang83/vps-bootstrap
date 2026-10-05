@@ -424,26 +424,25 @@ SSH 端口修改采用安全方式：
 |---|---|
 | IP 质量 / 风险测试 | oneclickvirt / securityCheck |
 | IPv4 / IPv6 回程路由 | oneclickvirt / backtrace |
-| 流媒体 / 区域解锁测试 | oneclickvirt / UnlockTests |
+| 流媒体 / 区域解锁测试 | 1-stream / RegionRestrictionCheck |
 | AI 工具解锁测试 | oneclickvirt / UnlockTests（AI-only） |
 | 通信软件网络可达性 | curl，按 IPv4 / IPv6 分别检测 |
 
 ## 流媒体 / 区域解锁
 
-流媒体与 AI 已完全分开。
+流媒体与 AI 完全分开。流媒体检测改用 `1-stream/RegionRestrictionCheck`，脚本固定到已验证的上游 commit，临时下载并校验 Git blob SHA 后执行，用完删除。
 
-流媒体测试会固定检测一组通用平台：
+通用流媒体固定检测包括：
 
-- Netflix / Netflix CDN
-- YouTube Region / YouTube CDN
+- Netflix
+- YouTube Premium
 - Disney+
 - Amazon Prime Video
-- Google Search / Google Play Store
-- Apple
+- Spotify
+- Google Location
+- YouTube CDN / Netflix CDN 等辅助项目
 
-随后可按需追加台湾、香港、日本、韩国、北美、南美、欧洲、非洲、东南亚、大洋洲、体育平台或自定义多地区组合。
-
-“全部流媒体平台”不会调用 AI-only 组，因此不会再把 ChatGPT、Gemini、Claude 等 AI 服务混入流媒体结果。
+随后可按需追加台湾、香港、日本、韩国、北美、南美、欧洲、非洲、东南亚、大洋洲、体育平台或自定义多地区组合。通用流媒体只执行一次；“全部流媒体平台”不会调用上游 AI 检测函数。
 
 流媒体与 AI 均支持：
 
@@ -451,7 +450,8 @@ SSH 端口修改采用安全方式：
 - 仅 IPv4
 - 仅 IPv6
 
-流媒体测试还会在平台检测前分别显示 IPv4 / IPv6 的出口 IP 与出口国家/地区代码。这里的“出口地区”表示 VPS 网络出口所在地；Netflix、YouTube、Prime Video 等平台结果中的 `Region` 则表示平台自身识别到的解锁区服，两者会分开显示。
+流媒体测试会先分别显示 IPv4 / IPv6 的出口 IP 与出口国家/地区代码。这里的“出口地区”表示 VPS 网络出口所在地；Netflix、YouTube Premium、Prime Video 等平台结果中的 `Region` 表示平台自身识别到的解锁区服，两者分开显示。
+
 
 ## AI 工具测试
 
