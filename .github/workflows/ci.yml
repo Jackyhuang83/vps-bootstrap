@@ -85,6 +85,19 @@ jobs:
           grep -Fq '"$TG_MONITOR_SERVICE"' <<<"$body"
           grep -Fq '"$TG_MONITOR_TIMER"' <<<"$body"
 
+      - name: Guard IPv6-only hosts preservation
+        shell: bash
+        run: |
+          export SS2022_LIB_ONLY=1
+          # shellcheck disable=SC1091
+          source ./ss2022.sh
+          body=$(declare -f prepare_ipv6_env)
+
+          if grep -Fq '/etc/hosts' <<<"$body"; then
+            echo "ERROR: prepare_ipv6_env must not modify /etc/hosts."
+            exit 1
+          fi
+
       - name: Summary
         run: |
           echo "CI passed."
