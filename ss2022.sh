@@ -91,6 +91,12 @@
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
 #
+# v1.9.0-dev34:
+#   - Alpine 3.21 CI 实测确认 Surge 官方 Snell v5.0.1 在 gcompat 下无法启动（Not a valid dynamic program）
+#   - Alpine 协议/组件菜单正式关闭 Snell v5，避免反复下载已知不可运行的官方二进制
+#   - 坚持仅使用 Surge 官方 snell-server：不注入第三方 glibc、不改用非官方实现
+#   - Debian / Ubuntu 的 Snell v5 路径保持不变；完全卸载仍兼容清理早期 dev 版本可能留下的 Alpine Snell 文件
+#
 # v1.9.0-dev33:
 #   - 增加 sing-box 安装 ownership 保护，拒绝覆盖服务器预先存在的非 vps-bootstrap sing-box
 #   - 旧版 vps-bootstrap 通过 legacy user marker / 状态 / Alpine runtime 自动认领迁移，不影响升级
@@ -563,6 +569,7 @@
 #   v1.9.0-dev31 明确完全卸载系统设置保留边界
 #   v1.9.0-dev32 服务用户/组 ownership 保护
 #   v1.9.0-dev33 sing-box 安装 ownership 保护
+#   v1.9.0-dev34 Alpine Snell 官方二进制兼容性结论收口
 #   v1.9.0-dev34 Realm 单独卸载 ownership 收口
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
@@ -944,8 +951,9 @@ platform_feature_unavailable() {
     local feature="$1"
     echo ""
     echo "[提示] Alpine / OpenRC 当前不提供：$feature"
-    echo "v1.9 开发版已适配 SS2022、ShadowTLS v3、VLESS Reality、Realm、服务器工具与测试；Snell v5 需通过官方二进制运行时自检。"
-    echo "Cloudflare WARP 官方 Linux 客户端当前未提供 Alpine 支持，因此本脚本不在 Alpine 上强行安装。"
+    echo "v1.9 开发版已适配 SS2022、ShadowTLS v3、VLESS Reality、Realm、服务器工具与测试。"
+    echo "Snell v5 官方 Linux 二进制依赖 glibc，已确认无法在 Alpine 3.21 + gcompat 下正常启动；本脚本不注入第三方 glibc，也不替换非官方实现。"
+    echo "Cloudflare WARP 官方 Linux 客户端当前未提供 Alpine 支持，因此本脚本也不在 Alpine 上强行安装。"
     return 1
 }
 
@@ -3919,6 +3927,13 @@ snell_binary_works() {
 
 install_snell_v5_core() {
     local arch sarch expected_sha url tmp zip actual curl_family candidate
+
+    if platform_is_alpine; then
+        echo -e "${RED}[错误] Snell v5 官方 Linux 二进制无法在 Alpine 3.21 + gcompat 下正常启动。${PLAIN}"
+        echo -e "${YELLOW}为保持官方实现与系统安全，本脚本不注入第三方 glibc，也不改用非官方 Snell 实现。${PLAIN}"
+        return 1
+    fi
+
     install_dependencies || return 1
 
     arch=$(uname -m)
@@ -3951,14 +3966,6 @@ install_snell_v5_core() {
             fi
             ;;
     esac
-
-    if platform_is_alpine; then
-        echo -e "${YELLOW}>> Alpine: 准备官方 Snell v5 的 glibc 兼容运行环境...${PLAIN}"
-        pkg_install gcompat libstdc++ libgcc || {
-            echo -e "${RED}[错误] Alpine 无法安装 gcompat / libstdc++ / libgcc。${PLAIN}"
-            return 1
-        }
-    fi
 
     if [[ -x "$SNELL_BIN" ]]; then
         echo -e "${GREEN}✔ 已检测到 Snell v5 二进制；新文件通过完整校验与运行时自检后才会替换。${PLAIN}"
@@ -8019,7 +8026,11 @@ show_component_versions() {
     echo "【协议核心】"
     printf '  sing-box      已安装: %-12s 推荐: %s\n' "$sb" "$SINGBOX_VERSION"
     printf '  Xray-core     已安装: %-12s 推荐: %s\n' "$xr" "$XRAY_VERSION"
-    printf '  Snell Server  已安装: %-12s 推荐: %s\n' "$sn" "$SNELL_VERSION"
+    if platform_is_alpine; then
+        printf '  Snell Server  已安装: %-12s 推荐: %s  [Alpine 暂不支持]\n' "$sn" "$SNELL_VERSION"
+    else
+        printf '  Snell Server  已安装: %-12s 推荐: %s\n' "$sn" "$SNELL_VERSION"
+    fi
     echo ""
     echo "【网络组件】"
     printf '  Realm         已安装: %-12s 推荐: %s\n' "$re" "$REALM_VERSION"
@@ -8054,6 +8065,11 @@ check_upstream_versions() {
 
 component_single_menu() {
     local c="$1" label current recommended choice
+    if platform_is_alpine && [[ "$c" == "snell" ]]; then
+        platform_feature_unavailable "Snell v5（Surge 官方 snell-server）"
+        pause
+        return
+    fi
     label=$(component_label "$c")
     while true; do
         clear
@@ -8079,6 +8095,10 @@ component_single_menu() {
 upgrade_all_to_recommended() {
     local c current target failed=0
     for c in singbox xray snell realm; do
+        if platform_is_alpine && [[ "$c" == "snell" ]]; then
+            echo -e "${YELLOW}○ Snell Server：Alpine 3.21 暂不支持官方 snell-server，跳过。${PLAIN}"
+            continue
+        fi
         current=$(component_current_version "$c")
         target=$(component_recommended_version "$c")
         if [[ -z "$current" ]]; then
@@ -8404,7 +8424,7 @@ protocol_management() {
         echo "  2. SS2022 + ShadowTLS v3（增强伪装）"
         echo "  3. VLESS Reality"
         if platform_is_alpine; then
-            echo "  4. Snell v5                [官方二进制运行时自检]"
+            echo "  4. Snell v5                [Alpine 暂不支持]"
         else
             echo "  4. Snell v5"
         fi
@@ -8415,7 +8435,14 @@ protocol_management() {
             1) protocol_action_menu "SS2022" deploy_ss2022 update_ss2022 delete_ss2022 ;;
             2) protocol_action_menu "SS2022 + ShadowTLS v3" deploy_shadowtls update_shadowtls delete_shadowtls ;;
             3) protocol_action_menu "VLESS Reality" deploy_vless_reality update_vless_reality delete_vless_reality ;;
-            4) protocol_action_menu "Snell v5" deploy_snell_v5 update_snell_v5 delete_snell_v5 ;;
+            4)
+                if platform_is_alpine; then
+                    platform_feature_unavailable "Snell v5（Surge 官方 snell-server）"
+                    pause
+                else
+                    protocol_action_menu "Snell v5" deploy_snell_v5 update_snell_v5 delete_snell_v5
+                fi
+                ;;
             0) return ;;
             *) sleep 1 ;;
         esac
@@ -11363,7 +11390,7 @@ main() {
     detect_platform || exit 1
     if platform_is_alpine; then
         echo "[v1.9 开发版] 已检测到 Alpine / OpenRC；核心协议、服务管理、服务器工具与测试已接入 OpenRC。"
-        echo "[提示] Snell v5 部署需通过官方二进制运行时自检；Cloudflare WARP 官方客户端暂不在 Alpine 开放。"
+        echo "[提示] Snell v5 官方二进制与 Cloudflare WARP 官方客户端暂不在 Alpine 开放。"
     fi
 
     # 兼容旧安装：已有 local-dns 缺少 prefer_go:true 时执行一次安全迁移。
