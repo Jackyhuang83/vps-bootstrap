@@ -117,13 +117,23 @@ jobs:
           export SS2022_LIB_ONLY=1
           # shellcheck disable=SC1091
           source ./ss2022.sh
+
           full_body=$(declare -f full_uninstall)
           menu_body=$(declare -f warp_uninstall_client)
+          repo_body=$(declare -f warp_repo_is_project_managed)
+          remove_body=$(declare -f warp_remove_managed_install_assets)
 
-          grep -Fq '[[ -f "$WARP_MANAGED_MARKER" ]]' <<<"$full_body"
-          grep -Fq 'rm -f "$WARP_MANAGED_MARKER"' <<<"$full_body"
-          grep -Fq '[[ -f "$WARP_MANAGED_MARKER" ]]' <<<"$menu_body"
-          grep -Fq 'rm -f "$WARP_MANAGED_MARKER"' <<<"$menu_body"
+          grep -Fq 'warp_package_is_project_managed' <<<"$full_body"
+          grep -Fq 'warp_repo_is_project_managed' <<<"$full_body"
+          grep -Fq 'warp_remove_managed_install_assets' <<<"$full_body"
+          grep -Fq 'warp_package_is_project_managed' <<<"$menu_body"
+          grep -Fq 'warp_repo_is_project_managed' <<<"$menu_body"
+          grep -Fq 'warp_remove_managed_install_assets' <<<"$menu_body"
+
+          grep -Fq '[[ -f "$WARP_REPO_MANAGED_MARKER" ]]' <<<"$repo_body"
+          grep -Fq '[[ -f "$WARP_MANAGED_MARKER" && ! -f "$WARP_OWNERSHIP_V2_MARKER" ]]' <<<"$repo_body"
+          grep -Fq 'rm -f "$WARP_APT_SOURCE" "$WARP_APT_KEYRING"' <<<"$remove_body"
+          grep -Fq 'rm -f "$WARP_MANAGED_MARKER" "$WARP_REPO_MANAGED_MARKER" "$WARP_OWNERSHIP_V2_MARKER"' <<<"$remove_body"
 
       - name: Guard WARP partial-install ownership
         shell: bash
@@ -133,15 +143,21 @@ jobs:
           source ./ss2022.sh
           body=$(declare -f warp_install_client)
 
-          marker_line=$(grep -nF 'touch "$WARP_MANAGED_MARKER"' <<<"$body" | head -n1 | cut -d: -f1)
-          keyring_line=$(grep -nF 'cloudflare-warp-archive-keyring.gpg' <<<"$body" | head -n1 | cut -d: -f1)
-          source_line=$(grep -nF '/etc/apt/sources.list.d/cloudflare-client.list' <<<"$body" | head -n1 | cut -d: -f1)
+          repo_marker_line=$(grep -nF 'touch "$WARP_OWNERSHIP_V2_MARKER" "$WARP_REPO_MANAGED_MARKER"' <<<"$body" | head -n1 | cut -d: -f1)
+          keyring_line=$(grep -nF 'gpg --yes --dearmor --output "$WARP_APT_KEYRING"' <<<"$body" | head -n1 | cut -d: -f1)
+          source_line=$(grep -nF '> "$WARP_APT_SOURCE"' <<<"$body" | head -n1 | cut -d: -f1)
+          package_marker_line=$(grep -nF 'touch "$WARP_OWNERSHIP_V2_MARKER" "$WARP_MANAGED_MARKER"' <<<"$body" | head -n1 | cut -d: -f1)
+          package_install_line=$(grep -nF 'apt-get install -y cloudflare-warp' <<<"$body" | head -n1 | cut -d: -f1)
 
-          [[ "$marker_line" =~ ^[0-9]+$ ]]
-          [[ "$keyring_line" =~ ^[0-9]+$ ]]
-          [[ "$source_line" =~ ^[0-9]+$ ]]
-          [[ "$marker_line" -lt "$keyring_line" ]]
-          [[ "$marker_line" -lt "$source_line" ]]
+          for n in "$repo_marker_line" "$keyring_line" "$source_line" "$package_marker_line" "$package_install_line"; do
+            [[ "$n" =~ ^[0-9]+$ ]]
+          done
+          [[ "$repo_marker_line" -lt "$keyring_line" ]]
+          [[ "$repo_marker_line" -lt "$source_line" ]]
+          [[ "$package_marker_line" -lt "$package_install_line" ]]
+
+          grep -Fq '[[ -e "$WARP_APT_SOURCE" || -e "$WARP_APT_KEYRING" ]]' <<<"$body"
+          grep -Fq '当前仅复用，不接管其 ownership' <<<"$body"
 
       - name: Guard uninstall runtime-file cleanup
         shell: bash
@@ -158,6 +174,27 @@ jobs:
           grep -Fq '"$REALM_OPENRC_PID"' <<<"$body"
           grep -Fq '/run/ss2022-tg-monitor.lockdir' <<<"$body"
           grep -Fq 'rm -rf /tmp/ss2022-*' <<<"$body"
+
+      - name: Guard ForceIPv6 ownership
+        shell: bash
+        run: |
+          export SS2022_LIB_ONLY=1
+          # shellcheck disable=SC1091
+          source ./ss2022.sh
+
+          [[ "$FORCE_IPV6_CONF" == "/etc/apt/apt.conf.d/99ss2022-force-ipv6" ]]
+          [[ "$FORCE_IPV6_LEGACY_CONF" == "/etc/apt/apt.conf.d/99force-ipv6" ]]
+
+          prepare_body=$(declare -f prepare_ipv6_env)
+          restore_body=$(declare -f restore_ipv4_apt_and_dns_if_needed)
+
+          grep -Fq '"$FORCE_IPV6_CONF"' <<<"$prepare_body"
+          grep -Fq 'rm -f "$FORCE_IPV6_CONF"' <<<"$restore_body"
+          grep -Fq '"$FORCE_IPV6_LEGACY_CONF"' <<<"$restore_body"
+          if grep -Eq 'rm -f[^\n]*FORCE_IPV6_LEGACY_CONF' ss2022.sh; then
+            echo "ERROR: legacy generic 99force-ipv6 must not be auto-deleted."
+            exit 1
+          fi
 
       - name: Guard DNS backup ownership
         shell: bash
