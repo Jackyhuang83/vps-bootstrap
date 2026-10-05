@@ -140,6 +140,39 @@ jobs:
           grep -Fq '"$REALM_OPENRC_PID"' <<<"$body"
           grep -Fq '/run/ss2022-tg-monitor.lockdir' <<<"$body"
 
+      - name: Guard service ownership markers
+        shell: bash
+        run: |
+          export SS2022_LIB_ONLY=1
+          # shellcheck disable=SC1091
+          source ./ss2022.sh
+
+          grep -Fq 'ensure_managed_system_user' <<<"$(declare -f ensure_singbox_user)"
+          grep -Fq 'ensure_managed_system_user' <<<"$(declare -f ensure_xray_user)"
+          grep -Fq 'ensure_managed_system_user' <<<"$(declare -f ensure_realm_user)"
+          grep -Fq 'ensure_managed_system_user' <<<"$(declare -f ensure_snell_user)"
+
+          full_body=$(declare -f full_uninstall)
+          grep -Fq '"$SINGBOX_GROUP_MARKER"' <<<"$full_body"
+          grep -Fq '"$XRAY_GROUP_MARKER"' <<<"$full_body"
+          grep -Fq '"$REALM_GROUP_MARKER"' <<<"$full_body"
+          grep -Fq '"$SNELL_GROUP_MARKER"' <<<"$full_body"
+
+      - name: Guard external sing-box ownership
+        shell: bash
+        run: |
+          export SS2022_LIB_ONLY=1
+          # shellcheck disable=SC1091
+          source ./ss2022.sh
+
+          install_body=$(declare -f install_singbox_core)
+          full_body=$(declare -f full_uninstall)
+
+          grep -Fq 'singbox_assert_safe_ownership' <<<"$install_body"
+          grep -Fq 'mark_singbox_project_managed' <<<"$install_body"
+          grep -Fq 'singbox_managed' <<<"$full_body"
+          grep -Fq '"$SINGBOX_MANAGED_MARKER"' <<<"$full_body"
+
       - name: Summary
         run: |
           echo "CI passed."
