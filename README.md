@@ -423,10 +423,28 @@ SSH 端口修改采用安全方式：
 | 测试 | 使用项目 / 方式 |
 |---|---|
 | IP 质量 / 风险测试 | oneclickvirt / securityCheck |
-| IPv4 / IPv6 回程路由 | oneclickvirt / backtrace |
+| IPv4 / IPv6 回程路由 | oneclickvirt / backtrace（结构化回程报告） |
 | 流媒体 / 区域解锁测试 | 1-stream / RegionRestrictionCheck |
 | AI 工具解锁测试 | oneclickvirt / UnlockTests（AI-only） |
 | 通信软件网络可达性 | curl，按 IPv4 / IPv6 分别检测 |
+
+## IPv4 / IPv6 回程路由
+
+回程测试使用 `oneclickvirt/backtrace` 的 `backtrace.routes/v1` 结构化报告，不再依赖旧版终端输出解析。
+
+支持：
+
+- IPv4 + IPv6
+- 仅 IPv4
+- 仅 IPv6
+- 北京 / 上海 / 广州 / 成都等国内运营商目标
+- 电信 CN2 GIA / CN2 GT / CTGNET / 163 等线路判断
+- 联通 9929 / CUG / 4837 等线路判断
+- 移动 CMIN2 / CMI / CMNET 等线路判断
+
+每个目标默认探测 3 次，并输出线路分类、确认度和成功次数。双栈 VPS 一次生成结构化报告，再分别显示 IPv4 与 IPv6 结果，避免旧模式重复执行和 `ipinfo.io` / PreCheck 展示逻辑干扰。
+
+结果中的“确认 / 混合 / 证据不足”表示上游根据实际回程 hop ASN 得出的线路证据强度；线路检测仍只作为网络路径判断参考。
 
 ## 流媒体 / 区域解锁
 
