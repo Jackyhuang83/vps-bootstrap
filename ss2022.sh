@@ -5488,17 +5488,29 @@ warp_reregister() {
 }
 
 warp_uninstall_client() {
+    local managed=0
     if warp_is_referenced; then
         echo -e "${RED}[错误] 当前默认出口或分流规则仍引用 WARP。请先修改这些规则再卸载。${PLAIN}"
         return 1
     fi
-    command -v warp-cli >/dev/null 2>&1 || { echo -e "${YELLOW}WARP 未安装。${PLAIN}"; return 0; }
-    warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
-    if [[ -f "$WARP_MANAGED_MARKER" ]]; then
-        warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
-        apt-get remove -y cloudflare-warp || return 1
-        rm -f /etc/apt/sources.list.d/cloudflare-client.list /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg "$WARP_MANAGED_MARKER"
-        echo -e "${GREEN}✔ 已卸载由 ss2022.sh 安装的 Cloudflare WARP。${PLAIN}"
+
+    [[ -f "$WARP_MANAGED_MARKER" ]] && managed=1
+
+    if command -v warp-cli >/dev/null 2>&1; then
+        warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
+        [[ $managed -eq 1 ]] && warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
+    elif [[ $managed -eq 0 ]]; then
+        echo -e "${YELLOW}WARP 未安装。${PLAIN}"
+        return 0
+    fi
+
+    if [[ $managed -eq 1 ]]; then
+        if [[ "$PLATFORM_PKG" == "apt" ]]; then
+            pkg_remove cloudflare-warp >/dev/null 2>&1 || true
+            rm -f /etc/apt/sources.list.d/cloudflare-client.list /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+        fi
+        rm -f "$WARP_MANAGED_MARKER"
+        echo -e "${GREEN}✔ 已清理由 ss2022.sh 管理的 Cloudflare WARP 及其软件源记录。${PLAIN}"
     else
         echo -e "${YELLOW}[提示] WARP 不是由本脚本安装，仅执行断开，不删除软件包。${PLAIN}"
     fi
