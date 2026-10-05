@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev15
+# 当前版本: v1.9.0-dev16
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,13 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev16:
+#   - 流媒体检测上游从 oneclickvirt/UnlockTests 切换为 1-stream/RegionRestrictionCheck
+#   - 通用流媒体恢复原生 YouTube Premium，并保留 Netflix / Disney+ / Prime Video / Spotify / Google 等
+#   - 上游作为临时函数库执行：通用平台只跑一次，再追加所选地区；AI 函数不会在流媒体模块调用
+#   - 保留台湾/香港/日本/韩国/北美/南美/欧洲/非洲/东南亚/大洋洲/体育与自定义多地区组合
+#   - 上游固定到已验证 commit，并使用 Git blob SHA 校验；执行完成后删除临时文件
 #
 # v1.9.0-dev15:
 #   - 修复通用流媒体整组无输出：白名单误用了 UnlockTests 不存在的 YoutubePremium 检测名
@@ -440,11 +447,12 @@
 #   v1.9.0-dev13 通信软件出口地区识别
 #   v1.9.0-dev14 流媒体出口地区识别
 #   v1.9.0-dev15 修复通用流媒体白名单
+#   v1.9.0-dev16 流媒体上游切换 RegionRestrictionCheck
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev15"
+SCRIPT_VERSION="v1.9.0-dev16"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -10256,7 +10264,7 @@ show_external_test_source() {
     echo ""
     echo -e "${CYAN}════════════════════ ${name} ════════════════════${PLAIN}"
     echo -e "${YELLOW}测试来源: ${source}${PLAIN}"
-    echo -e "${YELLOW}说明: 测试组件仅用于检测；临时下载到 /tmp，校验 SHA256 后执行，用完删除，不修改协议或分流配置。${PLAIN}"
+    echo -e "${YELLOW}说明: 测试组件仅用于检测；临时下载到 /tmp，校验来源完整性后执行，用完删除，不修改协议或分流配置。${PLAIN}"
     echo ""
 }
 server_test_download_release_asset() {
@@ -10454,17 +10462,17 @@ server_test_select_ip_mode() {
 
 server_test_region_map_local_choice() {
     case "$1" in
-        2) echo "10" ;;
-        3) echo "11" ;;
-        4) echo "12" ;;
-        5) echo "13" ;;
-        6) echo "14" ;;
-        7) echo "15" ;;
-        8) echo "16" ;;
-        9) echo "17" ;;
-        10) echo "22" ;;
-        11) echo "18" ;;
-        12) echo "19" ;;
+        2) echo "TW_UnlockTest" ;;
+        3) echo "HK_UnlockTest" ;;
+        4) echo "JP_UnlockTest" ;;
+        5) echo "KR_UnlockTest" ;;
+        6) echo "NA_UnlockTest" ;;
+        7) echo "SA_UnlockTest" ;;
+        8) echo "EU_UnlockTest" ;;
+        9) echo "AF_UnlockTest" ;;
+        10) echo "SEA_UnlockTest" ;;
+        11) echo "OA_UnlockTest" ;;
+        12) echo "Sport_UnlockTest" ;;
         *) return 1 ;;
     esac
 }
@@ -10476,7 +10484,7 @@ server_test_select_streaming_region() {
     while true; do
         echo ""
         echo "请选择流媒体 / 区域检测范围："
-        echo "  1. 通用流媒体（Netflix / YouTube / Disney+ / Prime Video / Google / Apple）"
+        echo "  1. 通用流媒体（Netflix / YouTube Premium / Disney+ / Prime Video / Google 等）"
         echo "  2. 台湾"
         echo "  3. 香港"
         echo "  4. 日本"
@@ -10495,19 +10503,19 @@ server_test_select_streaming_region() {
         c=${c:-1}
         case "$c" in
             1) SERVER_TEST_REGION_SELECTION=""; SERVER_TEST_REGION_LABEL="通用流媒体"; return 0 ;;
-            2) SERVER_TEST_REGION_SELECTION="10"; SERVER_TEST_REGION_LABEL="台湾平台"; return 0 ;;
-            3) SERVER_TEST_REGION_SELECTION="11"; SERVER_TEST_REGION_LABEL="香港平台"; return 0 ;;
-            4) SERVER_TEST_REGION_SELECTION="12"; SERVER_TEST_REGION_LABEL="日本平台"; return 0 ;;
-            5) SERVER_TEST_REGION_SELECTION="13"; SERVER_TEST_REGION_LABEL="韩国平台"; return 0 ;;
-            6) SERVER_TEST_REGION_SELECTION="14"; SERVER_TEST_REGION_LABEL="北美平台"; return 0 ;;
-            7) SERVER_TEST_REGION_SELECTION="15"; SERVER_TEST_REGION_LABEL="南美平台"; return 0 ;;
-            8) SERVER_TEST_REGION_SELECTION="16"; SERVER_TEST_REGION_LABEL="欧洲平台"; return 0 ;;
-            9) SERVER_TEST_REGION_SELECTION="17"; SERVER_TEST_REGION_LABEL="非洲平台"; return 0 ;;
-            10) SERVER_TEST_REGION_SELECTION="22"; SERVER_TEST_REGION_LABEL="东南亚平台"; return 0 ;;
-            11) SERVER_TEST_REGION_SELECTION="18"; SERVER_TEST_REGION_LABEL="大洋洲平台"; return 0 ;;
-            12) SERVER_TEST_REGION_SELECTION="19"; SERVER_TEST_REGION_LABEL="体育平台"; return 0 ;;
+            2) SERVER_TEST_REGION_SELECTION="TW_UnlockTest"; SERVER_TEST_REGION_LABEL="台湾平台"; return 0 ;;
+            3) SERVER_TEST_REGION_SELECTION="HK_UnlockTest"; SERVER_TEST_REGION_LABEL="香港平台"; return 0 ;;
+            4) SERVER_TEST_REGION_SELECTION="JP_UnlockTest"; SERVER_TEST_REGION_LABEL="日本平台"; return 0 ;;
+            5) SERVER_TEST_REGION_SELECTION="KR_UnlockTest"; SERVER_TEST_REGION_LABEL="韩国平台"; return 0 ;;
+            6) SERVER_TEST_REGION_SELECTION="NA_UnlockTest"; SERVER_TEST_REGION_LABEL="北美平台"; return 0 ;;
+            7) SERVER_TEST_REGION_SELECTION="SA_UnlockTest"; SERVER_TEST_REGION_LABEL="南美平台"; return 0 ;;
+            8) SERVER_TEST_REGION_SELECTION="EU_UnlockTest"; SERVER_TEST_REGION_LABEL="欧洲平台"; return 0 ;;
+            9) SERVER_TEST_REGION_SELECTION="AF_UnlockTest"; SERVER_TEST_REGION_LABEL="非洲平台"; return 0 ;;
+            10) SERVER_TEST_REGION_SELECTION="SEA_UnlockTest"; SERVER_TEST_REGION_LABEL="东南亚平台"; return 0 ;;
+            11) SERVER_TEST_REGION_SELECTION="OA_UnlockTest"; SERVER_TEST_REGION_LABEL="大洋洲平台"; return 0 ;;
+            12) SERVER_TEST_REGION_SELECTION="Sport_UnlockTest"; SERVER_TEST_REGION_LABEL="体育平台"; return 0 ;;
             13)
-                SERVER_TEST_REGION_SELECTION="10,11,12,13,14,15,16,17,22,18,19"
+                SERVER_TEST_REGION_SELECTION="TW_UnlockTest,HK_UnlockTest,JP_UnlockTest,KR_UnlockTest,NA_UnlockTest,SA_UnlockTest,EU_UnlockTest,AF_UnlockTest,SEA_UnlockTest,OA_UnlockTest,Sport_UnlockTest"
                 SERVER_TEST_REGION_LABEL="全部地区平台"
                 return 0
                 ;;
@@ -10515,7 +10523,7 @@ server_test_select_streaming_region() {
                 echo ""
                 echo "输入上面地区编号，可选多个，以空格分隔。"
                 echo "示例：3 4 10 = 香港 + 日本 + 东南亚"
-                echo "可组合 2-12；通用流媒体会固定先检测，不需要重复选择。"
+                echo "可组合 2-12；通用流媒体固定只检测一次。"
                 read -rp "地区编号: " raw
                 result=""; label=""
                 for token in $raw; do
@@ -10596,12 +10604,123 @@ server_test_show_exit_info_for_mode() {
     esac
 }
 
+server_test_download_rrc_source() {
+    local out="$1"
+    local commit="ab6829eb07c4c592c1f8f3dac736d675667d1a08"
+    local blob="9cd4e7fd81f49acfa4336ee48322114f8d88a6ad"
+    local raw="https://raw.githubusercontent.com/1-stream/RegionRestrictionCheck/${commit}/check.sh"
+    local source size actual ok=0
+
+    ensure_test_dependency curl curl || return 1
+    command -v sha1sum >/dev/null 2>&1 || ensure_test_dependency sha1sum coreutils || return 1
+
+    for source in "$raw" "https://ghproxy.net/$raw" "https://gh-proxy.com/$raw"; do
+        rm -f "$out"
+        echo -e "${YELLOW}>> 下载并校验 RegionRestrictionCheck...${PLAIN}"
+        if ! curl -fL --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 90 "$source" -o "$out"; then
+            continue
+        fi
+        size=$(wc -c <"$out" | tr -d '[:space:]')
+        actual=$(
+            {
+                printf 'blob %s\\0' "$size"
+                cat "$out"
+            } | sha1sum | awk '{print $1}'
+        )
+        if [[ "${actual,,}" == "${blob,,}" ]]; then
+            ok=1
+            break
+        fi
+        echo -e "${RED}[警告] Git blob 校验失败，拒绝执行当前下载结果。${PLAIN}"
+    done
+
+    [[ $ok -eq 1 ]] || {
+        rm -f "$out"
+        echo -e "${RED}[错误] RegionRestrictionCheck 下载失败或来源完整性校验失败。${PLAIN}"
+        return 1
+    }
+    chmod 700 "$out"
+    return 0
+}
+
+server_test_run_region_restriction_check() {
+    local selection="$1" mode="${2:-0}"
+    local source runner family run_mode
+    source=$(mktemp /tmp/ss2022-rrc-source.XXXXXX.sh) || return 1
+    runner=$(mktemp /tmp/ss2022-rrc-runner.XXXXXX.sh) || { rm -f "$source"; return 1; }
+
+    ensure_test_dependency jq jq || { rm -f "$source" "$runner"; return 1; }
+    ensure_test_dependency python3 python3 || { rm -f "$source" "$runner"; return 1; }
+    ensure_test_dependency grep grep || { rm -f "$source" "$runner"; return 1; }
+    ensure_test_dependency openssl openssl || { rm -f "$source" "$runner"; return 1; }
+
+    if ! server_test_download_rrc_source "$source"; then
+        rm -f "$source" "$runner"
+        return 1
+    fi
+
+    if ! grep -q '^function ScriptTitle()' "$source" ||
+       ! grep -q '^function Global_UnlockTest()' "$source"; then
+        echo -e "${RED}[错误] 上游脚本结构发生变化，已停止执行以避免误调用。${PLAIN}"
+        rm -f "$source" "$runner"
+        return 1
+    fi
+
+    sed '/^function ScriptTitle()/,$d' "$source" >"$runner"
+    cat >>"$runner" <<'RRC_RUNNER'
+
+ss2022_rrc_run_family() {
+    local fam="$1" fn
+    echo ""
+    echo "===========[ IPV$fam 通用流媒体 ]============"
+    Global_UnlockTest "$fam"
+
+    if [[ -n "$SS2022_RRC_REGIONS" ]]; then
+        IFS=',' read -r -a ss2022_rrc_funcs <<<"$SS2022_RRC_REGIONS"
+        for fn in "${ss2022_rrc_funcs[@]}"; do
+            case "$fn" in
+                TW_UnlockTest|HK_UnlockTest|JP_UnlockTest|KR_UnlockTest|NA_UnlockTest|SA_UnlockTest|EU_UnlockTest|AF_UnlockTest|SEA_UnlockTest|OA_UnlockTest|Sport_UnlockTest)
+                    "$fn" "$fam"
+                    ;;
+            esac
+        done
+    fi
+}
+
+case "$SS2022_RRC_MODE" in
+    4) ss2022_rrc_run_family 4 ;;
+    6) ss2022_rrc_run_family 6 ;;
+    *)
+        ss2022_rrc_run_family 4
+        ss2022_rrc_run_family 6
+        ;;
+esac
+RRC_RUNNER
+    chmod 700 "$runner"
+
+    family=$(server_test_detect_family_mode)
+    run_mode="$mode"
+    case "$mode:$family" in
+        4:both|4:ipv4) run_mode=4 ;;
+        4:*) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv4，跳过流媒体 IPv4 检测。${PLAIN}"; rm -f "$source" "$runner"; return 0 ;;
+        6:both|6:ipv6) run_mode=6 ;;
+        6:*) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv6，跳过流媒体 IPv6 检测。${PLAIN}"; rm -f "$source" "$runner"; return 0 ;;
+        0:both) run_mode=0 ;;
+        0:ipv4) run_mode=4 ;;
+        0:ipv6) run_mode=6 ;;
+        0:*) echo -e "${RED}[错误] 未检测到可用公网 IPv4 / IPv6。${PLAIN}"; rm -f "$source" "$runner"; return 1 ;;
+    esac
+
+    SS2022_RRC_REGIONS="$selection" SS2022_RRC_MODE="$run_mode" bash "$runner" || true
+    rm -f "$source" "$runner"
+    return 0
+}
+
 test_streaming_unlock() {
-    local common_platforms
-    common_platforms="Netflix,NetflixCDN,DisneyPlus,PrimeVideo,Youtube,YoutubeCDN,GoogleSearch,GooglePlayStore,Apple"
     clear
-    show_external_test_source "流媒体 / 区域解锁测试" "oneclickvirt/UnlockTests"
-    echo -e "${YELLOW}通用流媒体固定检测；地区平台可按范围追加。AI 平台不会混入本项。${PLAIN}"
+    show_external_test_source "流媒体 / 区域解锁测试" "1-stream/RegionRestrictionCheck"
+    echo -e "${YELLOW}通用流媒体固定检测；地区平台按选择追加。AI 平台不会在本项执行。${PLAIN}"
+    echo -e "${CYAN}通用项目包含 Netflix / YouTube Premium / Disney+ / Prime Video / Spotify / Google 等。${PLAIN}"
     server_test_select_streaming_region || return
     server_test_select_ip_mode || return
     echo ""
@@ -10614,11 +10733,7 @@ test_streaming_unlock() {
     echo ""
     server_test_show_exit_info_for_mode "$SERVER_TEST_IP_MODE"
     echo ""
-    server_test_run_unlocktests "$common_platforms" "通用流媒体 / 平台" "$SERVER_TEST_IP_MODE" "test" || true
-    if [[ -n "$SERVER_TEST_REGION_SELECTION" ]]; then
-        echo ""
-        server_test_run_unlocktests "$SERVER_TEST_REGION_SELECTION" "${SERVER_TEST_REGION_LABEL}检测" "$SERVER_TEST_IP_MODE" "region" || true
-    fi
+    server_test_run_region_restriction_check "$SERVER_TEST_REGION_SELECTION" "$SERVER_TEST_IP_MODE" || true
     echo ""
     pause
 }
