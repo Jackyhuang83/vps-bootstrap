@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev23
+# 当前版本: v1.9.0-dev24
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,11 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev24:
+#   - 增加 SS2022_LIB_ONLY 测试加载模式，CI 可 source 全部函数而不进入交互主菜单
+#   - 新增 Alpine 3.21 / OpenRC smoke test：平台识别、四核心服务生成、runlevel、PID 与完全卸载闭环
+#   - 正常交互运行路径保持不变；测试加载模式仅由 CI 显式启用
 #
 # v1.9.0-dev23:
 #   - Snell v5 接入 systemd/OpenRC 统一服务抽象，Alpine 菜单正式开放运行时自检入口
@@ -497,11 +502,12 @@
 #   v1.9.0-dev21 修复 Realm OpenRC 状态残留
 #   v1.9.0-dev22 修复 OpenRC 完全卸载残留
 #   v1.9.0-dev23 Snell v5 Alpine/OpenRC 运行时自检适配
+#   v1.9.0-dev24 Alpine/OpenRC CI smoke test
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev23"
+SCRIPT_VERSION="v1.9.0-dev24"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -11257,5 +11263,10 @@ main() {
                 ;;
         esac
     done
-}
-main
+} 
+
+# CI / smoke test can load the function library without entering the interactive UI.
+# Normal users never need to set this variable.
+if [[ "${SS2022_LIB_ONLY:-0}" != "1" ]]; then
+    main
+fi
