@@ -209,8 +209,8 @@ jobs:
           text = p.read_text(encoding="utf-8")
 
           # Promote the public README atomically with a stable script release.
-          text = re.sub(r'当前正式版本：\*\*v\d+\.\d+\.\d+\*\*',
-                        f'当前正式版本：**{version}**', text)
+          text = re.sub(r'^当前正式版本：\*\*v\d+\.\d+\.\d+\*\*[ \t]*$',
+                        f'当前正式版本：**{version}**', text, flags=re.M)
           text = re.sub(r'^当前开发版本：\*\*v\d+\.\d+\.\d+-dev\d+\*\*\s*\n?',
                         '', text, flags=re.M)
 
