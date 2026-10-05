@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev20
+# 当前版本: v1.9.0-dev21
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,11 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev21:
+#   - 修复 Realm 规则测试在 Alpine/OpenRC 下仍直接调用 systemctl 的残留
+#   - Realm 服务状态统一使用 service_is_active() 抽象层
+#   - Realm 配置页根据当前 init 正确显示 systemd 或 OpenRC 服务信息
 #
 # v1.9.0-dev20:
 #   - 修复 systemd 服务状态抽象递归：service_is_active() 现在正确调用 systemctl is-active
@@ -477,11 +482,12 @@
 #   v1.9.0-dev18 三网逐跳回程 NextTrace
 #   v1.9.0-dev19 合并平台流媒体AI通信软件解锁测试
 #   v1.9.0-dev20 修复 systemd 服务状态递归
+#   v1.9.0-dev21 修复 Realm OpenRC 状态残留
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev20"
+SCRIPT_VERSION="v1.9.0-dev21"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -7349,7 +7355,7 @@ forwarding_test_rule() {
 
     echo ""
     echo "【服务状态】"
-    if systemctl is-active --quiet "$REALM_SERVICE_NAME"; then
+    if service_is_active "$REALM_SERVICE_NAME"; then
         echo -e "  Realm : ${GREEN}Running${PLAIN}"
     else
         echo -e "  Realm : ${RED}Stopped${PLAIN}"
@@ -7397,7 +7403,11 @@ forwarding_show_config() {
     fi
     echo "Realm 配置   : ${REALM_CONF}"
     echo "规则状态文件 : ${FORWARDING_FILE}"
-    echo "systemd      : ${REALM_SERVICE_NAME}.service"
+    case "$PLATFORM_INIT" in
+        systemd) echo "服务管理     : systemd (${REALM_SERVICE_NAME}.service)" ;;
+        openrc) echo "服务管理     : OpenRC (${REALM_OPENRC_SERVICE})" ;;
+        *) echo "服务管理     : 未知" ;;
+    esac
 }
 
 uninstall_realm_forwarding() {
