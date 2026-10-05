@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev25
+# 当前版本: v1.9.0-dev26
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,11 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev26:
+#   - 修复完全卸载未停用/删除 TG-BOT systemd timer/service 的残留
+#   - Debian/Ubuntu 卸载时先 disable --now ss2022-tg-monitor.timer，再删除对应 service/timer 单元
+#   - OpenRC crond 路径保持原有仅删除本项目 cron 条目的行为，不影响系统其他 cron 任务
 #
 # v1.9.0-dev25:
 #   - 收口 v1.9 当前状态文案：移除 Alpine “dev1 首批开放”等过期提示
@@ -510,11 +515,12 @@
 #   v1.9.0-dev23 Snell v5 Alpine/OpenRC 运行时自检适配
 #   v1.9.0-dev24 Alpine/OpenRC CI smoke test
 #   v1.9.0-dev25 v1.9 支持状态文案收口
+#   v1.9.0-dev26 修复 TG-BOT systemd 完全卸载残留
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev25"
+SCRIPT_VERSION="v1.9.0-dev26"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -7638,8 +7644,8 @@ full_uninstall() {
 
     if [[ "$PLATFORM_INIT" == "systemd" ]]; then
         systemctl disable --now sing-box "$XRAY_SERVICE_NAME" snell-v5 "$REALM_SERVICE_NAME" ipv6-keepalive.timer >/dev/null 2>&1 || true
-        systemctl disable --now "$IP_FAMILY_SERVICE_NAME" >/dev/null 2>&1 || true
-        systemctl stop ipv6-keepalive.service >/dev/null 2>&1 || true
+        systemctl disable --now "$IP_FAMILY_SERVICE_NAME" ss2022-tg-monitor.timer >/dev/null 2>&1 || true
+        systemctl stop ipv6-keepalive.service ss2022-tg-monitor.service >/dev/null 2>&1 || true
     else
         service_disable_now sing-box
         service_disable_now "$XRAY_SERVICE_NAME"
@@ -7683,6 +7689,8 @@ full_uninstall() {
         "$REALM_OPENRC_SERVICE" \
         "$IP_FAMILY_OPENRC_SERVICE" \
         "$IPV6_KEEPALIVE_OPENRC_SERVICE" \
+        "$TG_MONITOR_SERVICE" \
+        "$TG_MONITOR_TIMER" \
         /etc/systemd/system/ipv6-keepalive.service \
         /etc/systemd/system/ipv6-keepalive.timer \
         "$FORCE_IPV6_CONF"
