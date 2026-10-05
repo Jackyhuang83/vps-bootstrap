@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev28
+# 当前版本: v1.9.0-dev29
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,11 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev29:
+#   - 修复 WARP 中途安装失败后完全卸载可能遗留 Cloudflare apt 源/keyring 的问题
+#   - WARP managed marker 成为清理主判断；warp-cli 缺失时仍清理脚本创建的软件源与标记
+#   - warp-cli 仅用于可选 disconnect/registration delete，不再阻断卸载闭环
 #
 # v1.9.0-dev28:
 #   - IPv6-only 不再改写 /etc/apt/mirrors/debian.list 与 debian-security.list
@@ -528,11 +533,12 @@
 #   v1.9.0-dev26 修复 TG-BOT systemd 完全卸载残留
 #   v1.9.0-dev27 禁止 IPv6-only 误删用户 hosts
 #   v1.9.0-dev28 IPv6-only 不再改写 APT 镜像
+#   v1.9.0-dev29 修复 WARP 异常安装卸载残留
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev28"
+SCRIPT_VERSION="v1.9.0-dev29"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -7673,13 +7679,16 @@ full_uninstall() {
         rm -f "$SINGBOX_ALPINE_PKG_MARKER"
     fi
 
-    if [[ -f "$WARP_MANAGED_MARKER" ]] && command -v warp-cli >/dev/null 2>&1; then
-        warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
-        warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
+    if [[ -f "$WARP_MANAGED_MARKER" ]]; then
+        if command -v warp-cli >/dev/null 2>&1; then
+            warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
+            warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
+        fi
         if [[ "$PLATFORM_PKG" == "apt" ]]; then
             pkg_remove cloudflare-warp >/dev/null 2>&1 || true
             rm -f /etc/apt/sources.list.d/cloudflare-client.list /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
         fi
+        rm -f "$WARP_MANAGED_MARKER"
     fi
 
     rm -rf /etc/sing-box /etc/snell /etc/ss2022-xray /etc/ss2022-realm "$STATE_DIR" /usr/local/lib/ss2022 /var/log/ss2022
