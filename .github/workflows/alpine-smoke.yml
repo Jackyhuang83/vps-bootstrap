@@ -80,6 +80,8 @@ jobs:
               description="CI legacy Snell cleanup fixture"
               EOF
               chmod 755 "$SNELL_OPENRC_SERVICE"
+              touch "$SNELL_USER_MARKER"
+              chmod 600 "$SNELL_USER_MARKER"
               rc-update add snell-v5 default >/dev/null
 
               # Add the other OpenRC files managed by full_uninstall so the
