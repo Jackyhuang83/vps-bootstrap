@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev38
+# 当前版本: v1.9.0-dev39
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,11 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.9.0-dev39:
+#   - systemd IPv6 Keepalive unit 改为 ss2022-ipv6-keepalive.service/timer，避免占用通用服务名
+#   - 历史 ipv6-keepalive.service/timer 仅在内容签名确认属于旧版 vps-bootstrap 时迁移/清理
+#   - 完全卸载不再无条件 stop/delete 通用 ipv6-keepalive unit
 #
 # v1.9.0-dev38:
 #   - Snell 安装候选文件改用 vps-bootstrap 专属隐藏前缀，完全卸载可安全清理中断残留
@@ -588,11 +593,12 @@
 #   v1.9.0-dev36 Snell 安装 ownership 保护
 #   v1.9.0-dev37 完全卸载临时/备份残留与 WARP 失败路径收口
 #   v1.9.0-dev38 Snell 候选文件与 SSH 事务备份残留收口
+#   v1.9.0-dev39 IPv6 Keepalive systemd ownership 收口
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev38"
+SCRIPT_VERSION="v1.9.0-dev39"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -610,6 +616,11 @@ PLATFORM_NAME=""
 SINGBOX_OPENRC_SERVICE="/etc/init.d/sing-box"
 SINGBOX_OPENRC_PID="/run/sing-box.pid"
 SINGBOX_OPENRC_LOG="/var/log/ss2022/sing-box.log"
+IPV6_KEEPALIVE_SYSTEMD_SERVICE_NAME="ss2022-ipv6-keepalive"
+IPV6_KEEPALIVE_SYSTEMD_SERVICE="/etc/systemd/system/${IPV6_KEEPALIVE_SYSTEMD_SERVICE_NAME}.service"
+IPV6_KEEPALIVE_SYSTEMD_TIMER="/etc/systemd/system/${IPV6_KEEPALIVE_SYSTEMD_SERVICE_NAME}.timer"
+IPV6_KEEPALIVE_LEGACY_SERVICE="/etc/systemd/system/ipv6-keepalive.service"
+IPV6_KEEPALIVE_LEGACY_TIMER="/etc/systemd/system/ipv6-keepalive.timer"
 IPV6_KEEPALIVE_OPENRC_SERVICE="/etc/init.d/ss2022-ipv6-keepalive"
 IPV6_KEEPALIVE_HELPER="/usr/local/lib/ss2022/ipv6-keepalive.sh"
 # ----------------------------- sing-box ---------------------------------------
@@ -1064,8 +1075,27 @@ keepalive_service_name() {
     if [[ "$PLATFORM_INIT" == "openrc" ]]; then
         echo "ss2022-ipv6-keepalive"
     else
-        echo "ipv6-keepalive.timer"
+        echo "${IPV6_KEEPALIVE_SYSTEMD_SERVICE_NAME}.timer"
     fi
+}
+
+legacy_ipv6_keepalive_is_project_managed() {
+    [[ -f "$IPV6_KEEPALIVE_LEGACY_SERVICE" && -f "$IPV6_KEEPALIVE_LEGACY_TIMER" ]] || return 1
+    grep -Fqx 'Description=IPv6 HTTPS Keepalive Probe' "$IPV6_KEEPALIVE_LEGACY_SERVICE" 2>/dev/null || return 1
+    grep -Fqx 'ExecStart=/usr/bin/curl -6fsSI --max-time 5 https://www.cloudflare.com' "$IPV6_KEEPALIVE_LEGACY_SERVICE" 2>/dev/null || return 1
+    grep -Fqx 'Description=Run IPv6 Keepalive Every 5 Minutes' "$IPV6_KEEPALIVE_LEGACY_TIMER" 2>/dev/null || return 1
+    grep -Fqx 'Unit=ipv6-keepalive.service' "$IPV6_KEEPALIVE_LEGACY_TIMER" 2>/dev/null || return 1
+    return 0
+}
+
+cleanup_legacy_ipv6_keepalive_if_managed() {
+    legacy_ipv6_keepalive_is_project_managed || return 0
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now ipv6-keepalive.timer >/dev/null 2>&1 || true
+        systemctl stop ipv6-keepalive.service >/dev/null 2>&1 || true
+    fi
+    rm -f "$IPV6_KEEPALIVE_LEGACY_SERVICE" "$IPV6_KEEPALIVE_LEGACY_TIMER"
+    service_daemon_reload >/dev/null 2>&1 || true
 }
 pause() {
     read -rp "按回车继续..."
@@ -1542,9 +1572,10 @@ DNS
 setup_keepalive() {
     if [[ "$PLATFORM_INIT" == "systemd" ]]; then
         echo -e "$YELLOW>> 部署 IPv6 HTTPS 链路保活定时器...$PLAIN"
-        cat > /etc/systemd/system/ipv6-keepalive.service <<'KSERVICE'
+        cleanup_legacy_ipv6_keepalive_if_managed
+        cat > "$IPV6_KEEPALIVE_SYSTEMD_SERVICE" <<'KSERVICE'
 [Unit]
-Description=IPv6 HTTPS Keepalive Probe
+Description=vps-bootstrap IPv6 HTTPS Keepalive Probe
 After=network-online.target
 Wants=network-online.target
 [Service]
@@ -1553,18 +1584,18 @@ ExecStart=/usr/bin/curl -6fsSI --max-time 5 https://www.cloudflare.com
 StandardOutput=null
 StandardError=null
 KSERVICE
-        cat > /etc/systemd/system/ipv6-keepalive.timer <<'KTIMER'
+        cat > "$IPV6_KEEPALIVE_SYSTEMD_TIMER" <<'KTIMER'
 [Unit]
-Description=Run IPv6 Keepalive Every 5 Minutes
+Description=Run vps-bootstrap IPv6 Keepalive Every 5 Minutes
 [Timer]
 OnBootSec=1min
 OnUnitActiveSec=5min
-Unit=ipv6-keepalive.service
+Unit=ss2022-ipv6-keepalive.service
 [Install]
 WantedBy=timers.target
 KTIMER
         service_daemon_reload || return 1
-        systemctl enable --now ipv6-keepalive.timer >/dev/null 2>&1 || return 1
+        systemctl enable --now "${IPV6_KEEPALIVE_SYSTEMD_SERVICE_NAME}.timer" >/dev/null 2>&1 || return 1
         echo -e "$GREEN✔ IPv6 Keepalive 定时器已激活。$PLAIN"
         return 0
     fi
@@ -1600,9 +1631,11 @@ disable_keepalive_for_ipv4() {
         return 0
     fi
     if [[ "$PLATFORM_INIT" == "systemd" ]]; then
-        if systemctl is-enabled --quiet ipv6-keepalive.timer 2>/dev/null ||            systemctl is-active --quiet ipv6-keepalive.timer 2>/dev/null; then
-            systemctl disable --now ipv6-keepalive.timer >/dev/null 2>&1 || true
+        if systemctl is-enabled --quiet "${IPV6_KEEPALIVE_SYSTEMD_SERVICE_NAME}.timer" 2>/dev/null ||
+           systemctl is-active --quiet "${IPV6_KEEPALIVE_SYSTEMD_SERVICE_NAME}.timer" 2>/dev/null; then
+            systemctl disable --now "${IPV6_KEEPALIVE_SYSTEMD_SERVICE_NAME}.timer" >/dev/null 2>&1 || true
         fi
+        cleanup_legacy_ipv6_keepalive_if_managed
     else
         service_disable_now ss2022-ipv6-keepalive
     fi
@@ -7845,9 +7878,10 @@ full_uninstall() {
     if [[ "$PLATFORM_INIT" == "systemd" ]]; then
         [[ $singbox_managed -eq 1 ]] && systemctl disable --now sing-box >/dev/null 2>&1 || true
         [[ $snell_managed -eq 1 ]] && systemctl disable --now snell-v5 >/dev/null 2>&1 || true
-        systemctl disable --now "$XRAY_SERVICE_NAME" "$REALM_SERVICE_NAME" ipv6-keepalive.timer >/dev/null 2>&1 || true
+        systemctl disable --now "$XRAY_SERVICE_NAME" "$REALM_SERVICE_NAME" "${IPV6_KEEPALIVE_SYSTEMD_SERVICE_NAME}.timer" >/dev/null 2>&1 || true
         systemctl disable --now "$IP_FAMILY_SERVICE_NAME" ss2022-tg-monitor.timer >/dev/null 2>&1 || true
-        systemctl stop ipv6-keepalive.service ss2022-tg-monitor.service >/dev/null 2>&1 || true
+        systemctl stop "${IPV6_KEEPALIVE_SYSTEMD_SERVICE_NAME}.service" ss2022-tg-monitor.service >/dev/null 2>&1 || true
+        cleanup_legacy_ipv6_keepalive_if_managed
     else
         [[ $singbox_managed -eq 1 ]] && service_disable_now sing-box
         service_disable_now "$XRAY_SERVICE_NAME"
@@ -7899,10 +7933,10 @@ full_uninstall() {
         "$REALM_OPENRC_SERVICE" \
         "$IP_FAMILY_OPENRC_SERVICE" \
         "$IPV6_KEEPALIVE_OPENRC_SERVICE" \
+        "$IPV6_KEEPALIVE_SYSTEMD_SERVICE" \
+        "$IPV6_KEEPALIVE_SYSTEMD_TIMER" \
         "$TG_MONITOR_SERVICE" \
         "$TG_MONITOR_TIMER" \
-        /etc/systemd/system/ipv6-keepalive.service \
-        /etc/systemd/system/ipv6-keepalive.timer \
         "$FORCE_IPV6_CONF"
 
     if [[ -f "$DNS_MARKER" || -f "$BACKUP_DNS" ]]; then
