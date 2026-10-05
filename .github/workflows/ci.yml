@@ -8,6 +8,8 @@ on:
       - "ss2022.sh"
       - "README.md"
       - ".github/workflows/ci.yml"
+      - ".github/workflows/promote-ss2022.yml"
+      - ".github/workflows/promote-ss2022.yml"
 
   pull_request:
     branches:
@@ -49,6 +51,23 @@ jobs:
 
           version=$(grep -E '^SCRIPT_VERSION=' ss2022.sh | head -n1)
           echo "Detected ${version}"
+
+      - name: Validate workflow YAML
+        shell: bash
+        run: |
+          ruby -e 'require "yaml"; Dir[".github/workflows/*.yml"].each { |f| YAML.load_file(f); puts "OK: #{f}" }'
+
+      - name: Guard stable promotion README sync
+        shell: bash
+        run: |
+          workflow=".github/workflows/promote-ss2022.yml"
+
+          grep -Fq "Promote the public README atomically with a stable script release." "$workflow"
+          grep -Fq "当前开发版本" "$workflow"
+          grep -Fq "稳定正式版" "$workflow"
+          grep -Fq "当前开发策略" "$workflow"
+          grep -Fq "README still exposes a development version after stable promotion" "$workflow"
+          grep -Fq "README release-strategy section still exposes a development version" "$workflow"
 
       - name: Check critical functions
         shell: bash
