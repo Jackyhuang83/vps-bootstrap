@@ -232,6 +232,39 @@ jobs:
           grep -Fq '[[ "$c" == "snell" ]]' <<<"$upgrade_body"
           grep -Fq 'Snell v5                [Alpine 暂不支持]' <<<"$protocol_body"
 
+      - name: Guard IPv6 keepalive ownership
+        shell: bash
+        run: |
+          export SS2022_LIB_ONLY=1
+          # shellcheck disable=SC1091
+          source ./ss2022.sh
+
+          [[ "$IPV6_KEEPALIVE_SYSTEMD_SERVICE" == "/etc/systemd/system/ss2022-ipv6-keepalive.service" ]]
+          [[ "$IPV6_KEEPALIVE_SYSTEMD_TIMER" == "/etc/systemd/system/ss2022-ipv6-keepalive.timer" ]]
+
+          setup_body=$(declare -f setup_keepalive)
+          full_body=$(declare -f full_uninstall)
+          legacy_body=$(declare -f legacy_ipv6_keepalive_is_project_managed)
+          cleanup_body=$(declare -f cleanup_legacy_ipv6_keepalive_if_managed)
+
+          grep -Fq '"$IPV6_KEEPALIVE_SYSTEMD_SERVICE"' <<<"$setup_body"
+          grep -Fq '"$IPV6_KEEPALIVE_SYSTEMD_TIMER"' <<<"$setup_body"
+          grep -Fq 'cleanup_legacy_ipv6_keepalive_if_managed' <<<"$setup_body"
+          grep -Fq '"$IPV6_KEEPALIVE_SYSTEMD_SERVICE"' <<<"$full_body"
+          grep -Fq '"$IPV6_KEEPALIVE_SYSTEMD_TIMER"' <<<"$full_body"
+          grep -Fq 'cleanup_legacy_ipv6_keepalive_if_managed' <<<"$full_body"
+
+          if grep -Fq 'systemctl disable --now ipv6-keepalive.timer' <<<"$full_body" ||
+             grep -Fq '/etc/systemd/system/ipv6-keepalive.service' <<<"$full_body" ||
+             grep -Fq '/etc/systemd/system/ipv6-keepalive.timer' <<<"$full_body"; then
+            echo "ERROR: full_uninstall must not directly stop/delete generic IPv6 keepalive units."
+            exit 1
+          fi
+
+          grep -Fq 'Description=IPv6 HTTPS Keepalive Probe' <<<"$legacy_body"
+          grep -Fq 'ExecStart=/usr/bin/curl -6fsSI --max-time 5 https://www.cloudflare.com' <<<"$legacy_body"
+          grep -Fq 'legacy_ipv6_keepalive_is_project_managed || return 0' <<<"$cleanup_body"
+
       - name: Guard Snell candidate cleanup
         shell: bash
         run: |
