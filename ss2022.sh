@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev26
+# 当前版本: v1.9.0-dev27
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,11 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev27:
+#   - 移除 IPv6-only 初始化对 /etc/hosts 中 github / ghproxy / danwin 记录的无条件删除
+#   - 避免误删用户自定义 hosts、内网映射或第三方加速记录
+#   - IPv6-only 仅检测 DNS/连通性，不再修改非本脚本拥有的 hosts 内容
 #
 # v1.9.0-dev26:
 #   - 修复完全卸载未停用/删除 TG-BOT systemd timer/service 的残留
@@ -516,11 +521,12 @@
 #   v1.9.0-dev24 Alpine/OpenRC CI smoke test
 #   v1.9.0-dev25 v1.9 支持状态文案收口
 #   v1.9.0-dev26 修复 TG-BOT systemd 完全卸载残留
+#   v1.9.0-dev27 禁止 IPv6-only 误删用户 hosts
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev26"
+SCRIPT_VERSION="v1.9.0-dev27"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -1376,9 +1382,8 @@ prepare_ipv6_env() {
         echo -e "${RED}[错误] 未检测到全局 IPv6 地址，无法使用 IPv6-only 模式。$PLAIN"
         return 1
     fi
-    sed -i '/github/d' /etc/hosts 2>/dev/null || true
-    sed -i '/ghproxy/d' /etc/hosts 2>/dev/null || true
-    sed -i '/danwin/d' /etc/hosts 2>/dev/null || true
+    # Do not rewrite /etc/hosts here. It may contain user-managed GitHub/proxy entries.
+    # vps-bootstrap only mutates system files when it owns a clearly marked entry.
     if dns_ipv6_resolution_works; then
         echo -e "$GREEN✔ 当前 DNS 可正常解析 IPv6 地址，不修改 /etc/resolv.conf。$PLAIN"
     else
