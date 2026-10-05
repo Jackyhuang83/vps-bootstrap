@@ -418,14 +418,40 @@ SSH 端口修改采用安全方式：
 
 # 服务器测试管理
 
-集成四类常用 VPS 测试：
+当前服务器测试分为五类：
 
-| 测试 | 使用项目 / 来源 |
+| 测试 | 使用项目 / 方式 |
 |---|---|
-| IP 质量测试 | IP.Check.Place |
-| 回程路由测试 | Chennhaoo / AutoTrace |
-| 流媒体解锁测试 | 1-stream / RegionRestrictionCheck |
-| AI 工具测试 | oneclickvirt / UnlockTests |
+| IP 质量 / 风险测试 | oneclickvirt / securityCheck |
+| IPv4 / IPv6 回程路由 | oneclickvirt / backtrace |
+| 流媒体 / 区域解锁测试 | oneclickvirt / UnlockTests |
+| AI 工具解锁测试 | oneclickvirt / UnlockTests（AI-only） |
+| 通信软件网络可达性 | curl，按 IPv4 / IPv6 分别检测 |
+
+## 流媒体 / 区域解锁
+
+流媒体与 AI 已完全分开。
+
+流媒体测试会固定检测一组通用平台：
+
+- Netflix / Netflix CDN
+- YouTube Premium / YouTube CDN / YouTube Region
+- Disney+
+- Amazon Prime Video
+- Google Search / Google Play Store
+- Apple
+
+随后可按需追加台湾、香港、日本、韩国、北美、南美、欧洲、非洲、东南亚、大洋洲、体育平台或自定义多地区组合。
+
+“全部流媒体平台”不会调用 AI-only 组，因此不会再把 ChatGPT、Gemini、Claude 等 AI 服务混入流媒体结果。
+
+流媒体与 AI 均支持：
+
+- IPv4 + IPv6
+- 仅 IPv4
+- 仅 IPv6
+
+## AI 工具测试
 
 AI 测试使用 UnlockTests 的 AI-only 模式，可检测包括：
 
@@ -437,9 +463,20 @@ AI 测试使用 UnlockTests 的 AI-only 模式，可检测包括：
 - Perplexity
 - Poe
 
-并区分 YES、NO、Restricted、Banned、RateLimited、TIMEOUT、DNS 失败等状态。
+结果会区分 YES、NO、Restricted、Banned、RateLimited、TIMEOUT、DNS 失败等状态。
 
-第三方测试脚本的自身退出码不会被简单误判成 `ss2022.sh` 执行失败。
+## 通信软件网络可达性
+
+当前检测：
+
+- Telegram
+- WhatsApp
+- Signal
+- Discord
+
+通信软件测试按 IPv4 / IPv6 分开执行，仅检测 DNS、TCP、TLS 与 HTTPS 可达性，不登录账号、不读取账号凭据，也不把“网页可达”解释为消息一定可以正常发送。
+
+第三方测试组件通过临时文件运行，用后删除；第三方组件自身退出码不会被简单误判为 `ss2022.sh` 执行失败。
 
 ---
 
