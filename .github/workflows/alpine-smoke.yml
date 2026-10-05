@@ -1,0 +1,108 @@
+name: Alpine OpenRC Smoke
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "ss2022.sh"
+      - ".github/workflows/alpine-smoke.yml"
+
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "ss2022.sh"
+      - ".github/workflows/alpine-smoke.yml"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  alpine-openrc:
+    name: Alpine 3.21 / OpenRC
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run OpenRC smoke test
+        shell: bash
+        run: |
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            alpine:3.21 \
+            sh -euxc '
+              apk add --no-cache bash openrc coreutils grep sed
+
+              export SS2022_LIB_ONLY=1
+              bash -n ./ss2022.sh
+
+              bash <<'"'"'SMOKE'"'"'
+              set -euo pipefail
+              export SS2022_LIB_ONLY=1
+              # shellcheck disable=SC1091
+              source ./ss2022.sh
+
+              detect_platform
+              [[ "$PLATFORM_OS" == "alpine" ]]
+              [[ "$PLATFORM_INIT" == "openrc" ]]
+              [[ "$PLATFORM_PKG" == "apk" ]]
+
+              write_singbox_service
+              write_xray_service
+              write_realm_service
+              service_enable "$REALM_SERVICE_NAME"
+              write_snell_service
+
+              for svc in sing-box ss2022-xray ss2022-realm snell-v5; do
+                  [[ -x "/etc/init.d/$svc" ]]
+                  grep -Fq '"'"'supervisor="supervise-daemon"'"'"' "/etc/init.d/$svc"
+                  [[ -L "/etc/runlevels/default/$svc" ]]
+              done
+
+              grep -Fq '"'"'capabilities="^cap_net_bind_service"'"'"' "$SNELL_OPENRC_SERVICE"
+              grep -Fq '"'"'no_new_privs=true'"'"' "$SNELL_OPENRC_SERVICE"
+
+              mkdir -p /run
+              printf '"'"'4101\n'"'"' > "$SINGBOX_OPENRC_PID"
+              printf '"'"'4102\n'"'"' > "$XRAY_OPENRC_PID"
+              printf '"'"'4103\n'"'"' > "$SNELL_OPENRC_PID"
+              printf '"'"'4104\n'"'"' > "$REALM_OPENRC_PID"
+              [[ "$(service_main_pid sing-box)" == "4101" ]]
+              [[ "$(service_main_pid "$XRAY_SERVICE_NAME")" == "4102" ]]
+              [[ "$(service_main_pid snell-v5)" == "4103" ]]
+              [[ "$(service_main_pid "$REALM_SERVICE_NAME")" == "4104" ]]
+
+              # Add the other OpenRC files managed by full_uninstall so the
+              # smoke test verifies their cleanup path as well.
+              cat > "$IP_FAMILY_OPENRC_SERVICE" <<'"'"'EOF'"'"'
+              #!/sbin/openrc-run
+              description="CI dummy IP family service"
+              EOF
+              chmod 755 "$IP_FAMILY_OPENRC_SERVICE"
+              rc-update add "$IP_FAMILY_SERVICE_NAME" default >/dev/null
+
+              cat > "$IPV6_KEEPALIVE_OPENRC_SERVICE" <<'"'"'EOF'"'"'
+              #!/sbin/openrc-run
+              description="CI dummy IPv6 keepalive service"
+              EOF
+              chmod 755 "$IPV6_KEEPALIVE_OPENRC_SERVICE"
+              rc-update add ss2022-ipv6-keepalive default >/dev/null
+
+              (
+                  printf '"'"'DELETE\n'"'"' | full_uninstall
+              )
+
+              for svc in sing-box ss2022-xray ss2022-realm snell-v5 ss2022-ip-family ss2022-ipv6-keepalive; do
+                  [[ ! -e "/etc/init.d/$svc" ]]
+                  [[ ! -e "/etc/runlevels/default/$svc" ]]
+              done
+
+              echo "Alpine/OpenRC smoke test passed."
+              SMOKE
+            '
