@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev14
+# 当前版本: v1.9.0-dev15
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,11 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev15:
+#   - 修复通用流媒体整组无输出：白名单误用了 UnlockTests 不存在的 YoutubePremium 检测名
+#   - 通用流媒体改用已核对的上游函数短名：Netflix / NetflixCDN / DisneyPlus / PrimeVideo / Youtube / YoutubeCDN / GoogleSearch / GooglePlayStore / Apple
+#   - 避免单个无效平台名触发 RunNamedTests 整组失败，恢复 Netflix / Google / Disney+ / Prime Video 等通用检测输出
 #
 # v1.9.0-dev14:
 #   - 流媒体解锁测试增加 IPv4 / IPv6 各自出口 IP 与出口国家/地区显示
@@ -434,11 +439,12 @@
 #   v1.9.0-dev12 流媒体/AI拆分 / 通用平台 / 通信软件检测
 #   v1.9.0-dev13 通信软件出口地区识别
 #   v1.9.0-dev14 流媒体出口地区识别
+#   v1.9.0-dev15 修复通用流媒体白名单
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev14"
+SCRIPT_VERSION="v1.9.0-dev15"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -10592,7 +10598,7 @@ server_test_show_exit_info_for_mode() {
 
 test_streaming_unlock() {
     local common_platforms
-    common_platforms="Netflix,Netflix CDN,Disney+,Amazon Prime Video,Youtube Premium,YouTube CDN,YouTube Region,GoogleSearch,Google Play Store,Apple"
+    common_platforms="Netflix,NetflixCDN,DisneyPlus,PrimeVideo,Youtube,YoutubeCDN,GoogleSearch,GooglePlayStore,Apple"
     clear
     show_external_test_source "流媒体 / 区域解锁测试" "oneclickvirt/UnlockTests"
     echo -e "${YELLOW}通用流媒体固定检测；地区平台可按范围追加。AI 平台不会混入本项。${PLAIN}"
