@@ -232,6 +232,32 @@ jobs:
           grep -Fq '[[ "$c" == "snell" ]]' <<<"$upgrade_body"
           grep -Fq 'Snell v5                [Alpine 暂不支持]' <<<"$protocol_body"
 
+      - name: Guard Snell candidate cleanup
+        shell: bash
+        run: |
+          export SS2022_LIB_ONLY=1
+          # shellcheck disable=SC1091
+          source ./ss2022.sh
+
+          install_body=$(declare -f install_snell_v5_core)
+          full_body=$(declare -f full_uninstall)
+
+          [[ "$SNELL_CANDIDATE_PREFIX" == "/usr/local/bin/.ss2022-snell-server-v5.new" ]]
+          grep -Fq 'candidate="${SNELL_CANDIDATE_PREFIX}.$"' <<<"$install_body"
+          grep -Fq '"${SNELL_CANDIDATE_PREFIX}".*' <<<"$full_body"
+
+      - name: Guard SSH transactional backup cleanup
+        shell: bash
+        run: |
+          export SS2022_LIB_ONLY=1
+          # shellcheck disable=SC1091
+          source ./ss2022.sh
+          body=$(declare -f server_tool_ssh_add_port)
+
+          grep -Fq 'backup="${dropin}.bak.$(date +%Y%m%d-%H%M%S)"' <<<"$body"
+          grep -Fq 'backup="${STATE_DIR}/sshd_config.bak.$(date +%Y%m%d-%H%M%S)"' <<<"$body"
+          grep -Fq 'rm -f "$backup"' <<<"$body"
+
       - name: Guard current dev changelog uniqueness
         shell: bash
         run: |
