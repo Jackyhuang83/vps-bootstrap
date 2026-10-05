@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev36
+# 当前版本: v1.9.0-dev37
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,11 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.9.0-dev37:
+#   - WARP managed marker 提前到 keyring / apt 源写入之前，覆盖中途安装失败清理路径
+#   - IPv6-only DNS 备份改用 vps-bootstrap 专属路径，旧 /root/resolv.conf.orig 仅兼容读取
+#   - 所有可识别安装/测试临时目录统一进入 /tmp/ss2022-* 命名空间，完全卸载统一清理
 #
 # v1.9.0-dev36:
 #   - 增加 Snell 安装 ownership 保护，拒绝覆盖服务器预先存在的非 vps-bootstrap Snell
@@ -574,13 +579,15 @@
 #   v1.9.0-dev31 明确完全卸载系统设置保留边界
 #   v1.9.0-dev32 服务用户/组 ownership 保护
 #   v1.9.0-dev33 sing-box 安装 ownership 保护
-#   v1.9.0-dev34 Alpine Snell 官方二进制兼容性结论收口
 #   v1.9.0-dev34 Realm 单独卸载 ownership 收口
+#   v1.9.0-dev35 Alpine Snell 官方二进制兼容性结论收口
+#   v1.9.0-dev36 Snell 安装 ownership 保护
+#   v1.9.0-dev37 完全卸载临时/备份残留与 WARP 失败路径收口
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev36"
+SCRIPT_VERSION="v1.9.0-dev37"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -661,7 +668,8 @@ REALM_OPENRC_LOG="/var/log/ss2022/${REALM_SERVICE_NAME}.log"
 FORWARDING_FILE="/etc/ss2022/forwarding.json"
 REALM_MAX_RANGE_PORTS=1000
 # ----------------------------- 网络环境 ----------------------------------------
-BACKUP_DNS="/root/resolv.conf.orig"
+BACKUP_DNS="/root/.ss2022-resolv.conf.bak"
+LEGACY_BACKUP_DNS="/root/resolv.conf.orig"
 DNS_MARKER="/etc/ss2022-ipv6-dns-managed"
 FORCE_IPV6_CONF="/etc/apt/apt.conf.d/99force-ipv6"
 STATE_DIR="/etc/ss2022"
@@ -1276,23 +1284,44 @@ show_dashboard() {
 # [03] 系统网络环境：DNS / 时间同步 / IPv4 / IPv6
 # ==============================================================================
 restore_ipv4_apt_and_dns_if_needed() {
+    local should_restore=0 backup=""
     rm -f "$FORCE_IPV6_CONF"
-    local should_restore=0
+
     if [[ -f "$DNS_MARKER" ]]; then
         should_restore=1
+        if [[ -f "$BACKUP_DNS" ]]; then
+            backup="$BACKUP_DNS"
+        elif [[ -f "$LEGACY_BACKUP_DNS" ]]; then
+            backup="$LEGACY_BACKUP_DNS"
+        fi
     elif [[ -f "$BACKUP_DNS" && -f /etc/resolv.conf && ! -L /etc/resolv.conf ]] \
          && grep -q '2001:4860:4860::8888' /etc/resolv.conf \
          && grep -q '2606:4700:4700::1111' /etc/resolv.conf; then
         should_restore=1
+        backup="$BACKUP_DNS"
     fi
-    if [[ $should_restore -eq 1 && -f "$BACKUP_DNS" && ! -L /etc/resolv.conf ]]; then
-        if cp -f "$BACKUP_DNS" /etc/resolv.conf; then
-            rm -f "$DNS_MARKER"
-            echo -e "${GREEN}✔ 已恢复 IPv4/双栈环境原 DNS 配置。${PLAIN}"
-        else
-            echo -e "${YELLOW}[警告] DNS 自动恢复失败，请手动检查 /etc/resolv.conf。${PLAIN}"
-        fi
+
+    [[ $should_restore -eq 1 ]] || return 0
+
+    if [[ -L /etc/resolv.conf ]]; then
+        rm -f "$DNS_MARKER" "$BACKUP_DNS"
+        return 0
     fi
+
+    if [[ -z "$backup" || ! -f "$backup" ]]; then
+        echo -e "${YELLOW}[警告] 未找到 IPv6-only DNS 备份，请手动检查 /etc/resolv.conf。${PLAIN}"
+        return 1
+    fi
+
+    if cp -f "$backup" /etc/resolv.conf; then
+        rm -f "$DNS_MARKER"
+        [[ "$backup" == "$BACKUP_DNS" ]] && rm -f "$BACKUP_DNS"
+        echo -e "${GREEN}✔ 已恢复 IPv4/双栈环境原 DNS 配置。${PLAIN}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}[警告] DNS 自动恢复失败，请手动检查 /etc/resolv.conf。备份仍保留在: ${backup}${PLAIN}"
+    return 1
 }
 ensure_time_sync() {
     local attempt=0 chrony_svc="" skew=""
@@ -1963,25 +1992,25 @@ install_singbox_core() {
     )
 
     cd /tmp || return 1
-    rm -rf /tmp/sb-temp "/tmp/${tar_file}"
+    rm -rf /tmp/ss2022-sb-temp "/tmp/ss2022-${tar_file}"
     for download_url in "${download_sources[@]}"; do
         echo -e "   尝试下载: ${CYAN}${download_url}${PLAIN}"
-        rm -f "/tmp/${tar_file}"
-        if ! curl -fL "$curl_family" --retry 2 --retry-delay 1 --connect-timeout 8 --max-time 90             "$download_url" -o "/tmp/${tar_file}"; then
+        rm -f "/tmp/ss2022-${tar_file}"
+        if ! curl -fL "$curl_family" --retry 2 --retry-delay 1 --connect-timeout 8 --max-time 90             "$download_url" -o "/tmp/ss2022-${tar_file}"; then
             echo -e "${YELLOW}   下载失败，尝试下一个源。${PLAIN}"
             continue
         fi
-        actual_sha256=$(sha256sum "/tmp/${tar_file}" | awk '{print $1}')
+        actual_sha256=$(sha256sum "/tmp/ss2022-${tar_file}" | awk '{print $1}')
         if [[ "$actual_sha256" != "$expected_sha256" ]]; then
             echo -e "${RED}   SHA256 校验失败，拒绝安装该文件！${PLAIN}"
             echo -e "${YELLOW}   期望: ${expected_sha256}${PLAIN}"
             echo -e "${YELLOW}   实际: ${actual_sha256}${PLAIN}"
-            rm -f "/tmp/${tar_file}"
+            rm -f "/tmp/ss2022-${tar_file}"
             continue
         fi
-        if ! tar -tzf "/tmp/${tar_file}" >/dev/null 2>&1; then
+        if ! tar -tzf "/tmp/ss2022-${tar_file}" >/dev/null 2>&1; then
             echo -e "${RED}   压缩包结构校验失败。${PLAIN}"
-            rm -f "/tmp/${tar_file}"
+            rm -f "/tmp/ss2022-${tar_file}"
             continue
         fi
         success=1
@@ -1993,11 +2022,11 @@ install_singbox_core() {
         return 1
     fi
 
-    mkdir -p /tmp/sb-temp
-    tar -xzf "/tmp/${tar_file}" -C /tmp/sb-temp --strip-components=1 || return 1
-    if [[ ! -f /tmp/sb-temp/sing-box ]]; then
+    mkdir -p /tmp/ss2022-sb-temp
+    tar -xzf "/tmp/ss2022-${tar_file}" -C /tmp/ss2022-sb-temp --strip-components=1 || return 1
+    if [[ ! -f /tmp/ss2022-sb-temp/sing-box ]]; then
         echo -e "${RED}[错误] 压缩包中未找到 sing-box 二进制。${PLAIN}"
-        rm -rf /tmp/sb-temp "/tmp/${tar_file}"
+        rm -rf /tmp/ss2022-sb-temp "/tmp/ss2022-${tar_file}"
         return 1
     fi
 
@@ -2012,9 +2041,9 @@ install_singbox_core() {
             }
         fi
 
-        if [[ ! -f /tmp/sb-temp/libcronet.so ]]; then
+        if [[ ! -f /tmp/ss2022-sb-temp/libcronet.so ]]; then
             echo -e "${RED}[错误] 官方 release 归档缺少 libcronet.so，拒绝安装不完整运行时。${PLAIN}"
-            ls -la /tmp/sb-temp 2>/dev/null || true
+            ls -la /tmp/ss2022-sb-temp 2>/dev/null || true
             return 1
         fi
 
@@ -2027,8 +2056,8 @@ install_singbox_core() {
         runtime_tmp="${SINGBOX_ALPINE_RUNTIME_DIR}.new"
         rm -rf "$runtime_tmp"
         mkdir -p "$runtime_tmp" || return 1
-        install -m 755 /tmp/sb-temp/sing-box "$runtime_tmp/sing-box" || return 1
-        install -m 755 /tmp/sb-temp/libcronet.so "$runtime_tmp/libcronet.so" || return 1
+        install -m 755 /tmp/ss2022-sb-temp/sing-box "$runtime_tmp/sing-box" || return 1
+        install -m 755 /tmp/ss2022-sb-temp/libcronet.so "$runtime_tmp/libcronet.so" || return 1
 
         echo -e "${YELLOW}>> 验证 Alpine sing-box 完整运行时...${PLAIN}"
         if ! LD_LIBRARY_PATH="$runtime_tmp" "$runtime_tmp/sing-box" version >/dev/null 2>&1; then
@@ -2073,7 +2102,7 @@ WRAPPER
             return 1
         fi
 
-        rm -rf /tmp/sb-temp "/tmp/${tar_file}"
+        rm -rf /tmp/ss2022-sb-temp "/tmp/ss2022-${tar_file}"
         write_singbox_service || return 1
         mark_singbox_project_managed || return 1
         echo -e "${GREEN}✔ sing-box ${SINGBOX_VERSION}（Alpine + gcompat）核心与 OpenRC 服务已就绪。${PLAIN}"
@@ -2081,8 +2110,8 @@ WRAPPER
     fi
 
     # Debian / Ubuntu 保持 v1.8.1 原有安装路径。
-    install -m 755 /tmp/sb-temp/sing-box "$SINGBOX_BIN" || return 1
-    rm -rf /tmp/sb-temp "/tmp/${tar_file}"
+    install -m 755 /tmp/ss2022-sb-temp/sing-box "$SINGBOX_BIN" || return 1
+    rm -rf /tmp/ss2022-sb-temp "/tmp/ss2022-${tar_file}"
     "$SINGBOX_BIN" version >/dev/null 2>&1 || {
         echo -e "${RED}[错误] sing-box 安装后无法执行。${PLAIN}"
         return 1
@@ -2427,7 +2456,7 @@ validate_ss2022_key() {
     [[ -n "$key" ]] || return 1
     [[ "$key" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || return 1
 
-    tmp=$(mktemp) || return 1
+    tmp=$(mktemp /tmp/ss2022-keycheck.XXXXXX) || return 1
     if ! printf '%s' "$key" | base64 --decode > "$tmp" 2>/dev/null; then
         rm -f "$tmp"
         return 1
@@ -3792,7 +3821,7 @@ install_xray_core() {
         *) echo -e "${RED}[错误] Xray 暂不支持当前 CPU 架构: ${arch}${PLAIN}"; return 1 ;;
     esac
     [[ "$NETWORK_MODE" == "ipv6" ]] && curl_family="-6" || curl_family="-4"
-    tmp=$(mktemp -d /tmp/xray-install.XXXXXX) || return 1
+    tmp=$(mktemp -d /tmp/ss2022-xray-install.XXXXXX) || return 1
     zip="$tmp/$asset"
     url="https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/${asset}"
     echo -e "${YELLOW}>> 下载 Xray-core ${XRAY_VERSION} 官方稳定版并校验 SHA256...${PLAIN}"
@@ -4007,7 +4036,7 @@ install_snell_v5_core() {
         echo -e "${GREEN}✔ 已检测到 Snell v5 二进制；新文件通过完整校验与运行时自检后才会替换。${PLAIN}"
     fi
 
-    tmp=$(mktemp -d /tmp/snell-v5-install.XXXXXX) || return 1
+    tmp=$(mktemp -d /tmp/ss2022-snell-install.XXXXXX) || return 1
     zip="$tmp/snell.zip"
     candidate="${SNELL_BIN}.new.$$"
     url="https://dl.nssurge.com/snell/snell-server-v${SNELL_VERSION}-linux-${sarch}.zip"
@@ -5491,6 +5520,9 @@ warp_install_client() {
     if ! command -v warp-cli >/dev/null 2>&1; then
         echo -e "${YELLOW}>> 安装 Cloudflare 官方 WARP Linux 客户端...${PLAIN}"
         apt-get install -y curl ca-certificates gnupg lsb-release || return 1
+        touch "$WARP_MANAGED_MARKER" || return 1
+        chmod 600 "$WARP_MANAGED_MARKER"
+        managed=1
         curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg || return 1
         codename=$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-}")
         [[ -n "$codename" ]] || codename=$(lsb_release -cs 2>/dev/null || true)
@@ -5498,8 +5530,6 @@ warp_install_client() {
         echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${codename} main" > /etc/apt/sources.list.d/cloudflare-client.list
         apt-get update -y || return 1
         apt-get install -y cloudflare-warp || return 1
-        managed=1
-        touch "$WARP_MANAGED_MARKER"
     fi
 
     systemctl enable --now warp-svc >/dev/null 2>&1 || true
@@ -6912,7 +6942,7 @@ realm_asset_name() {
 realm_fetch_asset_metadata() {
     local asset="$1" api tmp expected url
     api="https://api.github.com/repos/zhboner/realm/releases/tags/v${REALM_VERSION}"
-    tmp=$(mktemp) || return 1
+    tmp=$(mktemp /tmp/ss2022-realm-meta.XXXXXX) || return 1
 
     if ! curl -fsSL --retry 2 --connect-timeout 10 --max-time 30 \
         -H 'Accept: application/vnd.github+json' "$api" -o "$tmp"; then
@@ -6946,7 +6976,7 @@ install_realm_core() {
     url=${metadata%%$'\t'*}
     expected=${metadata#*$'\t'}
 
-    archive="/tmp/${asset}"
+    archive="/tmp/ss2022-${asset}"
     rm -f "$archive"
     local sources=(
         "$url"
@@ -6983,7 +7013,7 @@ install_realm_core() {
     done
     [[ $ok -eq 1 ]] || { rm -f "$archive"; return 1; }
 
-    tmpdir=$(mktemp -d) || { rm -f "$archive"; return 1; }
+    tmpdir=$(mktemp -d /tmp/ss2022-realm-install.XXXXXX) || { rm -f "$archive"; return 1; }
     tar -xzf "$archive" -C "$tmpdir" || { rm -rf "$tmpdir" "$archive"; return 1; }
     src=$(find "$tmpdir" -type f -name realm -perm -u+x -print -quit 2>/dev/null || true)
     if [[ -z "$src" ]]; then
@@ -7868,14 +7898,12 @@ full_uninstall() {
         /etc/systemd/system/ipv6-keepalive.timer \
         "$FORCE_IPV6_CONF"
 
-    if [[ -f "$DNS_MARKER" ]]; then
-        if [[ -f "$BACKUP_DNS" && ! -L /etc/resolv.conf ]]; then
-            cp -f "$BACKUP_DNS" /etc/resolv.conf 2>/dev/null || true
-        else
-            echo -e "${YELLOW}[提示] 未能自动恢复 IPv6-only 临时 DNS；请在卸载后确认 /etc/resolv.conf。${PLAIN}"
+    if [[ -f "$DNS_MARKER" || -f "$BACKUP_DNS" ]]; then
+        if ! restore_ipv4_apt_and_dns_if_needed; then
+            echo -e "${YELLOW}[提示] IPv6-only 临时 DNS 未能自动恢复；脚本专属备份会保留供手动恢复。${PLAIN}"
         fi
-        rm -f "$DNS_MARKER"
     fi
+    rm -f "$DNS_MARKER"
 
     if [[ -f "$SINGBOX_USER_MARKER" ]]; then delete_system_user "$SINGBOX_USER"; rm -f "$SINGBOX_USER_MARKER"; fi
     if [[ -f "$SINGBOX_GROUP_MARKER" ]]; then delete_system_group "$SINGBOX_GROUP"; rm -f "$SINGBOX_GROUP_MARKER"; fi
@@ -7892,6 +7920,7 @@ full_uninstall() {
     [[ -f "$TG_MONITOR_CRON_FILE" ]] && sed -i "/ss2022-tg-monitor/d" "$TG_MONITOR_CRON_FILE" 2>/dev/null || true
     rm -f "$SINGBOX_OPENRC_PID" "$XRAY_OPENRC_PID" "$SNELL_OPENRC_PID" "$REALM_OPENRC_PID"
     rm -rf /run/ss2022-tg-monitor.lockdir
+    rm -rf /tmp/ss2022-* 2>/dev/null || true
     service_daemon_reload || true
     echo -e "${GREEN}✔ vps-bootstrap 协议核心、服务与运行文件已清理完成。${PLAIN}"
     echo -e "${YELLOW}[保留] BBR / DNS / SSH 端口 / IPv4-IPv6 地址优先级等用户主动系统设置保持当前状态。${PLAIN}"
