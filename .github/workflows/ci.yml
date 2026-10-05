@@ -201,6 +201,23 @@ jobs:
             exit 1
           fi
 
+      - name: Guard external Snell ownership
+        shell: bash
+        run: |
+          export SS2022_LIB_ONLY=1
+          # shellcheck disable=SC1091
+          source ./ss2022.sh
+
+          install_body=$(declare -f install_snell_v5_core)
+          full_body=$(declare -f full_uninstall)
+          protocol_body=$(declare -f protocol_exists_snell)
+
+          grep -Fq 'snell_assert_safe_ownership' <<<"$install_body"
+          grep -Fq 'mark_snell_project_managed' <<<"$install_body"
+          grep -Fq 'snell_managed' <<<"$full_body"
+          grep -Fq '"$SNELL_MANAGED_MARKER"' <<<"$full_body"
+          grep -Fq 'snell_is_project_managed' <<<"$protocol_body"
+
       - name: Summary
         run: |
           echo "CI passed."
