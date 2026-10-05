@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - "ss2022.sh"
+      - "README.md"
       - ".github/workflows/ci.yml"
 
   pull_request:
@@ -13,6 +14,7 @@ on:
       - main
     paths:
       - "ss2022.sh"
+      - "README.md"
       - ".github/workflows/ci.yml"
 
   workflow_dispatch:
@@ -256,7 +258,7 @@ jobs:
 
           grep -Fq '[[ ! -d "$dir" ]]' <<<"$dir_body"
           grep -Fq 'touch "$marker"' <<<"$dir_body"
-          grep -Fq 'elif [[ -f "$marker" ]]' <<<"$dir_body"
+          grep -Fq '[[ -f "$marker" ]]' <<<"$dir_body"
           grep -Fq 'ensure_singbox_config_dir' <<<"$sb_body"
           grep -Fq 'ensure_snell_config_dir' <<<"$snell_body"
           grep -Fq 'singbox_is_project_managed || return 0' <<<"$migrate_body"
@@ -406,6 +408,21 @@ jobs:
           ensure_proxy_shortcut
           [[ -L "$SCRIPT_PROXY_LINK" ]]
           proxy_shortcut_is_project_managed
+
+      - name: Guard proxy shortcut presentation
+        shell: bash
+        run: |
+          export SS2022_LIB_ONLY=1
+          # shellcheck disable=SC1091
+          source ./ss2022.sh
+
+          dashboard_body=$(declare -f show_dashboard)
+          grep -Fq 'proxy_shortcut_is_project_managed' <<<"$dashboard_body"
+
+          if grep -Fq 'ln -sf /usr/local/bin/ss2022 /usr/local/bin/proxy' README.md; then
+            echo "ERROR: README must not force-overwrite an existing /usr/local/bin/proxy."
+            exit 1
+          fi
 
       - name: Guard current dev changelog uniqueness
         shell: bash
