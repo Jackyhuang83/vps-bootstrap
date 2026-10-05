@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev29
+# 当前版本: v1.9.0-dev30
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,11 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev30:
+#   - 完全卸载补齐 /usr/local/bin/ss2022.bak、OpenRC PID 与 TG-BOT lockdir 清理
+#   - IPv6-only DNS marker 在卸载结束前无条件移除；无法自动恢复 DNS 时给出明确提示
+#   - 仅清理脚本自身运行残留，不自动回滚用户主动设置的 BBR / SSH / DNS 管理项
 #
 # v1.9.0-dev29:
 #   - 修复 WARP 中途安装失败后完全卸载可能遗留 Cloudflare apt 源/keyring 的问题
@@ -534,11 +539,12 @@
 #   v1.9.0-dev27 禁止 IPv6-only 误删用户 hosts
 #   v1.9.0-dev28 IPv6-only 不再改写 APT 镜像
 #   v1.9.0-dev29 修复 WARP 异常安装卸载残留
+#   v1.9.0-dev30 完全卸载文件残留收口
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev29"
+SCRIPT_VERSION="v1.9.0-dev30"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -7707,6 +7713,7 @@ full_uninstall() {
     rm -f \
         /usr/local/bin/ss2022 \
         /usr/local/bin/proxy \
+        "$SCRIPT_BACKUP_PATH" \
         "$SINGBOX_BIN" \
         "$XRAY_BIN" \
         "$SNELL_BIN" \
@@ -7727,8 +7734,12 @@ full_uninstall() {
         /etc/systemd/system/ipv6-keepalive.timer \
         "$FORCE_IPV6_CONF"
 
-    if [[ -f "$DNS_MARKER" && -f "$BACKUP_DNS" && ! -L /etc/resolv.conf ]]; then
-        cp -f "$BACKUP_DNS" /etc/resolv.conf 2>/dev/null || true
+    if [[ -f "$DNS_MARKER" ]]; then
+        if [[ -f "$BACKUP_DNS" && ! -L /etc/resolv.conf ]]; then
+            cp -f "$BACKUP_DNS" /etc/resolv.conf 2>/dev/null || true
+        else
+            echo -e "${YELLOW}[提示] 未能自动恢复 IPv6-only 临时 DNS；请在卸载后确认 /etc/resolv.conf。${PLAIN}"
+        fi
         rm -f "$DNS_MARKER"
     fi
 
@@ -7746,6 +7757,8 @@ full_uninstall() {
     fi
 
     [[ -f "$TG_MONITOR_CRON_FILE" ]] && sed -i "/ss2022-tg-monitor/d" "$TG_MONITOR_CRON_FILE" 2>/dev/null || true
+    rm -f "$SINGBOX_OPENRC_PID" "$XRAY_OPENRC_PID" "$SNELL_OPENRC_PID" "$REALM_OPENRC_PID"
+    rm -rf /run/ss2022-tg-monitor.lockdir
     service_daemon_reload || true
     echo -e "${GREEN}✔ 已彻底卸载。${PLAIN}"
     exit 0
