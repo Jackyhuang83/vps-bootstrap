@@ -3,6 +3,7 @@
 一体化 VPS 网络协议、服务端分流、端口转发与日常运维脚本。
 
 当前正式版本：**v1.9.0**
+
 项目以单一交互式 Bash 脚本 `ss2022.sh` 为入口，整合 **SS2022、SS2022 + ShadowTLS v3、VLESS Reality、Snell v5**，并提供 WARP 出口、链式落地、规则分流、Realm L4 端口转发、组件管理、服务器工具、服务器测试与脚本自更新。
 
 > v1.9.0 为当前稳定正式版。Debian / Ubuntu + systemd 正式支持；Alpine 3.21 + OpenRC 正式支持 SS2022、ShadowTLS v3、VLESS Reality、Realm 以及服务器管理/测试。Snell v5 与 Cloudflare WARP 在 Alpine 暂不开放。
