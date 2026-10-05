@@ -156,8 +156,11 @@ ShadowTLS 主要用于增加 TLS-like 流量特征与主动探测抵抗能力，
 
 设计原则：
 
-- 使用官方 Snell Server
-- 独立配置和 systemd 服务
+- 始终使用 Surge 官方 Snell Server v5，不替换成兼容实现
+- Debian / Ubuntu 使用 systemd；v1.9 开发版在 Alpine 使用 OpenRC
+- Alpine 仅使用系统仓库 `gcompat + libstdc++ + libgcc` 尝试兼容官方 glibc 二进制
+- 下载后先校验固定 SHA256，再执行运行时自检；若当前 Alpine 无法兼容则停止部署，不注入第三方 glibc
+- OpenRC 下使用独立非 root 用户、独立日志、`supervise-daemon` 与 ambient `CAP_NET_BIND_SERVICE`
 - 不经过 sing-box
 - 不参与 VPS 服务端分流
 - 如需 Snell 分流，建议在 Surge 客户端使用 Rules
@@ -654,15 +657,17 @@ v1.8.0 已进入稳定阶段。
 
 ## v1.9.x
 
-计划重点：
+当前开发重点：
 
-- Alpine Linux
-- OpenRC
-- `apk`
+- Alpine Linux / OpenRC / `apk`
+- SS2022、ShadowTLS v3、VLESS Reality、Realm 已接入 OpenRC
+- Snell v5 已接入 OpenRC；由于 Surge 官方二进制依赖 glibc，Alpine 部署必须通过本机运行时自检
+- 服务器管理工具与服务器测试已完成主要 Alpine 适配
+- WARP 官方 Linux 客户端在 Alpine 暂不开放
 - 轻量 NAT VPS 环境适配
 - systemd / OpenRC 服务抽象
 
-当前 v1.8.0 **不要在 Alpine 上作为正式支持版本使用**。
+v1.8.1 仍是当前正式版；v1.9.x 在完成 Alpine 实机验证前仍属于开发分支。
 
 ---
 
