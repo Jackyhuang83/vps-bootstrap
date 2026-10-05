@@ -73,6 +73,18 @@ jobs:
 
           exit "${missing}"
 
+      - name: Check full uninstall managed units
+        shell: bash
+        run: |
+          export SS2022_LIB_ONLY=1
+          # shellcheck disable=SC1091
+          source ./ss2022.sh
+          body=$(declare -f full_uninstall)
+
+          grep -Fq 'ss2022-tg-monitor.timer' <<<"$body"
+          grep -Fq '"$TG_MONITOR_SERVICE"' <<<"$body"
+          grep -Fq '"$TG_MONITOR_TIMER"' <<<"$body"
+
       - name: Summary
         run: |
           echo "CI passed."
