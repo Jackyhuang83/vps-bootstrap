@@ -3,7 +3,7 @@
 一体化 VPS 网络协议、服务端分流、端口转发与日常运维脚本。
 
 当前正式版本：**v1.8.1**  
-当前开发版本：**v1.9.0-dev27**
+当前开发版本：**v1.9.0-dev31**
 
 项目以单一交互式 Bash 脚本 `ss2022.sh` 为入口，整合 **SS2022、SS2022 + ShadowTLS v3、VLESS Reality、Snell v5**，并提供 WARP 出口、链式落地、规则分流、Realm L4 端口转发、组件管理、服务器工具、服务器测试与脚本自更新。
 
@@ -637,7 +637,9 @@ ss -lntup
 10. 完全卸载脚本
 ```
 
-用于清理本项目创建的协议服务、配置、状态文件和相关组件。Debian/Ubuntu 会清理对应 systemd 单元；Alpine/OpenRC 会同时移除本项目注册的 runlevel 服务与 `/etc/init.d` 脚本。
+用于清理本项目创建的协议核心、服务、节点/分流/端口转发配置、状态文件和运行文件。Debian/Ubuntu 会清理对应 systemd 单元；Alpine/OpenRC 会同时移除本项目注册的 runlevel 服务与 `/etc/init.d` 脚本。
+
+“完全卸载”**不会自动回滚用户通过服务器工具主动修改的系统设置**，包括 BBR、DNS、SSH 端口以及 IPv4/IPv6 地址优先级。这样做是为了避免卸载过程中意外改变网络或 SSH 可达性。需要恢复这些设置时，请在卸载前进入对应管理菜单手动恢复。
 
 执行前请确认不再需要当前节点配置。
 
@@ -659,7 +661,7 @@ v1.8.1 为当前稳定正式版。
 
 ## v1.9.x
 
-当前开发版为 **v1.9.0-dev27**，重点是 Alpine / OpenRC 收口：
+当前开发版为 **v1.9.0-dev31**，重点是 Alpine / OpenRC 收口：
 
 - SS2022、ShadowTLS v3、VLESS Reality、Realm 已接入 OpenRC
 - Snell v5 已接入 OpenRC；由于 Surge 官方二进制依赖 glibc，Alpine 部署必须通过本机运行时自检
