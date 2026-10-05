@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev16
+# 当前版本: v1.9.0-dev17
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,13 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev17:
+#   - 回程路由从 backtrace legacy 终端模式切换到 backtrace.routes/v1 结构化报告
+#   - 增加 IPv4+IPv6 / 仅 IPv4 / 仅 IPv6 地址族选择，与其他服务器测试保持一致
+#   - 每个国内运营商目标默认并发探测 3 次，输出线路分类、确认度与成功次数
+#   - 避免 legacy 模式自身 ipinfo.io / PreCheck / BGP 展示逻辑干扰回程结果
+#   - 双栈时一次生成结构化报告，再分别渲染 IPv4 / IPv6，避免重复执行整套旧测试
 #
 # v1.9.0-dev16:
 #   - 流媒体检测上游从 oneclickvirt/UnlockTests 切换为 1-stream/RegionRestrictionCheck
@@ -448,11 +455,12 @@
 #   v1.9.0-dev14 流媒体出口地区识别
 #   v1.9.0-dev15 修复通用流媒体白名单
 #   v1.9.0-dev16 流媒体上游切换 RegionRestrictionCheck
+#   v1.9.0-dev17 回程路由结构化检测
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev16"
+SCRIPT_VERSION="v1.9.0-dev17"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -10393,32 +10401,106 @@ test_ip_quality() {
     echo ""
     pause
 }
+server_test_render_route_json() {
+    local report="$1" family="$2" title row name status label confidence successes attempts fallback
+    [[ "$family" == "v6" ]] && title="IPv6" || title="IPv4"
+
+    echo -e "${CYAN}════════ ${title} 回程线路 ════════${PLAIN}"
+
+    while IFS=$'\t' read -r name status label confidence successes attempts fallback; do
+        [[ -n "$name" ]] || continue
+        case "$status" in
+            available)
+                case "$confidence" in
+                    confirmed) confidence="确认" ;;
+                    mixed) confidence="混合" ;;
+                    inconclusive) confidence="证据不足" ;;
+                    *) confidence="${confidence:-未知}" ;;
+                esac
+                printf " %-16s %s" "$name" "${label:-线路证据不足}"
+                printf "  [%s, %s/%s" "$confidence" "${successes:-0}" "${attempts:-0}"
+                [[ "$fallback" == "true" ]] && printf ", 备用目标"
+                printf "]\n"
+                ;;
+            timeout) printf " %-16s %s\n" "$name" "TIMEOUT" ;;
+            canceled) printf " %-16s %s\n" "$name" "CANCELED" ;;
+            *) printf " %-16s %s\n" "$name" "UNAVAILABLE" ;;
+        esac
+    done < <(
+        jq -r --arg family "$family" '
+          .targets[]
+          | select(.target.ip_version == $family)
+          | [
+              .target.name,
+              .status,
+              (.classification.label // ""),
+              (.classification.confidence // ""),
+              (.successful_attempts // 0),
+              (.attempts // 0),
+              (.fallback // false)
+            ]
+          | @tsv
+        ' "$report"
+    )
+}
+
 test_return_route() {
-    local asset tmp has4=0 has6=0
+    local asset tmp report family mode include_v6=0
     clear
-    show_external_test_source "回程路由测试" "oneclickvirt/backtrace"
+    show_external_test_source "IPv4 / IPv6 回程路由" "oneclickvirt/backtrace"
+    echo -e "${YELLOW}使用上游结构化回程报告；每个目标默认探测 3 次，再综合判断线路。${PLAIN}"
+
+    server_test_select_ip_mode || return
+    family=$(server_test_detect_family_mode)
+
+    case "$SERVER_TEST_IP_MODE:$family" in
+        4:both|4:ipv4) mode="4" ;;
+        4:*) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv4。${PLAIN}"; pause; return ;;
+        6:both|6:ipv6) mode="6"; include_v6=1 ;;
+        6:*) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv6。${PLAIN}"; pause; return ;;
+        0:both) mode="both"; include_v6=1 ;;
+        0:ipv4) mode="4" ;;
+        0:ipv6) mode="6"; include_v6=1 ;;
+        *) echo -e "${RED}[错误] 未检测到可用公网 IPv4 / IPv6。${PLAIN}"; pause; return ;;
+    esac
+
     asset=$(server_test_arch_asset "backtrace") || {
         echo -e "${RED}[错误] 当前 CPU 架构暂无 backtrace 测试资产。${PLAIN}"; pause; return
     }
-    get_public_ipv4 >/dev/null 2>&1 && has4=1 || true
-    get_public_ipv6 >/dev/null 2>&1 && has6=1 || true
-    [[ $has4 -eq 1 || $has6 -eq 1 ]] || { echo -e "${RED}[错误] 未检测到可用公网地址。${PLAIN}"; pause; return; }
     tmp=$(mktemp /tmp/ss2022-backtrace.XXXXXX) || { pause; return; }
+    report=$(mktemp /tmp/ss2022-backtrace-report.XXXXXX.json) || { rm -f "$tmp"; pause; return; }
+
     if server_test_download_release_asset "oneclickvirt/backtrace" "latest" "$asset" "$tmp"; then
-        if [[ $has4 -eq 1 ]]; then
-            echo -e "${CYAN}════════ IPv4 回程 ════════${PLAIN}"
-            "$tmp" -dns-mode auto || true
+        if [[ $include_v6 -eq 1 ]]; then
+            "$tmp" -route-json -ipv6 -route-attempts 3 -timeout 20s -dns-mode auto >"$report" 2>/dev/null || true
+        else
+            "$tmp" -route-json -route-attempts 3 -timeout 20s -dns-mode auto >"$report" 2>/dev/null || true
         fi
-        if [[ $has6 -eq 1 ]]; then
+
+        if jq -e '.schema_version == "backtrace.routes/v1" and (.targets | type == "array")' "$report" >/dev/null 2>&1; then
             echo ""
-            echo -e "${CYAN}════════ IPv6 回程 ════════${PLAIN}"
-            "$tmp" -ipv6 -dns-mode auto || true
+            case "$mode" in
+                4) server_test_render_route_json "$report" "v4" ;;
+                6) server_test_render_route_json "$report" "v6" ;;
+                both)
+                    server_test_render_route_json "$report" "v4"
+                    echo ""
+                    server_test_render_route_json "$report" "v6"
+                    ;;
+            esac
+            echo ""
+            echo -e "${YELLOW}说明: confirmed=确认，mixed=路径混合，证据不足表示未观察到足够骨干 ASN；结果仅供线路判断参考。${PLAIN}"
+        else
+            echo -e "${RED}[错误] backtrace 未返回有效结构化回程报告。${PLAIN}"
+            echo -e "${YELLOW}可稍后重试；不会修改服务器网络配置。${PLAIN}"
         fi
     fi
-    rm -f "$tmp"
+
+    rm -f "$tmp" "$report"
     echo ""
     pause
 }
+
 server_test_run_unlocktests() {
     local selection="$1" label="$2" mode="${3:-0}" selector="${4:-f}" asset tmp
     asset=$(server_test_arch_asset "ut") || {
