@@ -9783,7 +9783,8 @@ CURRENT_RX=0; CURRENT_TX=0; read -r CURRENT_RX CURRENT_TX < <(traffic_bytes)
 PERIOD="$(period_key)"
 LAST_RX=0; LAST_TX=0; TOTAL_RX=0; TOTAL_TX=0; STATE_PERIOD=""
 RX_WARN1=0; RX_WARN2=0; RX_CRITICAL=0; TX_WARN1=0; TX_WARN2=0; TX_CRITICAL=0
-if [[ -f "$STATE" ]]; then # shellcheck disable=SC1090
+if [[ -f "$STATE" ]]; then
+    # shellcheck disable=SC1090
     source "$STATE"
 fi
 if [[ "$STATE_PERIOD" != "$PERIOD" ]]; then
@@ -9801,11 +9802,19 @@ notify_threshold() {
     local direction="$1" percent="$2" used_gb="$3" limit="$4" warn1_var warn2_var critical_var
     if [[ "$direction" == "入站" ]]; then warn1_var="RX_WARN1"; warn2_var="RX_WARN2"; critical_var="RX_CRITICAL"; else warn1_var="TX_WARN1"; warn2_var="TX_WARN2"; critical_var="TX_CRITICAL"; fi
     [[ "$limit" =~ ^[0-9]+$ && "$limit" -gt 0 ]] || return 0
-    if [[ "$percent" -ge 100 && "${!critical_var}" -eq 0 ]]; then printf -v "$critical_var" 1; send_tg "🚨 ${HOST_LABEL}\n${direction}流量已达到 ${used_gb} GB / ${limit} GB（${percent}%）\n已达到流量上限。";
-    elif [[ "$percent" -ge "$WARN2_PERCENT" && "${!warn2_var}" -eq 0 ]]; then printf -v "$warn2_var" 1; send_tg "⚠️ ${HOST_LABEL}\n${direction}流量已达到 ${used_gb} GB / ${limit} GB（${percent}%）\n已达到第二预警线 ${WARN2_PERCENT}%。";
-    elif [[ "$percent" -ge "$WARN1_PERCENT" && "${!warn1_var}" -eq 0 ]]; then printf -v "$warn1_var" 1; send_tg "⚠️ ${HOST_LABEL}\n${direction}流量已达到 ${used_gb} GB / ${limit} GB（${percent}%）\n已达到第一预警线 ${WARN1_PERCENT}%。"; fi
+    if [[ "$percent" -ge 100 && "${!critical_var}" -eq 0 ]]; then
+        printf -v "$critical_var" 1
+        send_tg "🚨 ${HOST_LABEL}\n${direction}流量已达到 ${used_gb} GB / ${limit} GB（${percent}%）\n已达到流量上限。"
+    elif [[ "$percent" -ge "$WARN2_PERCENT" && "${!warn2_var}" -eq 0 ]]; then
+        printf -v "$warn2_var" 1
+        send_tg "⚠️ ${HOST_LABEL}\n${direction}流量已达到 ${used_gb} GB / ${limit} GB（${percent}%）\n已达到第二预警线 ${WARN2_PERCENT}%。"
+    elif [[ "$percent" -ge "$WARN1_PERCENT" && "${!warn1_var}" -eq 0 ]]; then
+        printf -v "$warn1_var" 1
+        send_tg "⚠️ ${HOST_LABEL}\n${direction}流量已达到 ${used_gb} GB / ${limit} GB（${percent}%）\n已达到第一预警线 ${WARN1_PERCENT}%。"
+    fi
 }
-notify_threshold "入站" "$rx_percent" "$rx_gb" "${RX_LIMIT_GB:-0}"; notify_threshold "出站" "$tx_percent" "$tx_gb" "${TX_LIMIT_GB:-0}"
+notify_threshold "入站" "$rx_percent" "$rx_gb" "${RX_LIMIT_GB:-0}"
+notify_threshold "出站" "$tx_percent" "$tx_gb" "${TX_LIMIT_GB:-0}"
 tmp="${STATE}.tmp.$$"; umask 077
 cat > "$tmp" <<EOF
 STATE_PERIOD='${STATE_PERIOD}'
@@ -9824,7 +9833,11 @@ mv -f "$tmp" "$STATE"; chmod 600 "$STATE"
 shutdown_needed=0
 if [[ "${RX_LIMIT_GB:-0}" =~ ^[0-9]+$ && "${RX_LIMIT_GB:-0}" -gt 0 && "$rx_percent" -ge "$SHUTDOWN_PERCENT" ]]; then shutdown_needed=1; fi
 if [[ "${TX_LIMIT_GB:-0}" =~ ^[0-9]+$ && "${TX_LIMIT_GB:-0}" -gt 0 && "$tx_percent" -ge "$SHUTDOWN_PERCENT" ]]; then shutdown_needed=1; fi
-if [[ "$shutdown_needed" -eq 1 && "$AUTO_SHUTDOWN" == "yes" ]]; then send_tg "⛔ ${HOST_LABEL}\n流量达到自动关机阈值 ${SHUTDOWN_PERCENT}%，服务器即将自动关机。"; sync; shutdown -h now; fi
+if [[ "$shutdown_needed" -eq 1 && "$AUTO_SHUTDOWN" == "yes" ]]; then
+    send_tg "⛔ ${HOST_LABEL}\n流量达到自动关机阈值 ${SHUTDOWN_PERCENT}%，服务器即将自动关机。"
+    sync
+    shutdown -h now
+fi
 TGWORKER
     chmod 700 "$TG_MONITOR_WORKER"
 
@@ -9834,6 +9847,7 @@ TGWORKER
 Description=ss2022 TG-BOT Traffic Monitor
 After=network-online.target
 Wants=network-online.target
+
 [Service]
 Type=oneshot
 ExecStart=${TG_MONITOR_WORKER}
@@ -9841,12 +9855,14 @@ EOF
         cat > "$TG_MONITOR_TIMER" <<'EOF'
 [Unit]
 Description=Run ss2022 TG-BOT Traffic Monitor Every Minute
+
 [Timer]
 OnBootSec=2min
 OnUnitActiveSec=60s
 AccuracySec=5s
 Persistent=true
 Unit=ss2022-tg-monitor.service
+
 [Install]
 WantedBy=timers.target
 EOF
@@ -9856,219 +9872,11 @@ EOF
         touch "$TG_MONITOR_CRON_FILE"
         sed -i "/ss2022-tg-monitor/d" "$TG_MONITOR_CRON_FILE"
         echo "* * * * * $TG_MONITOR_WORKER >/dev/null 2>&1 $TG_MONITOR_CRON_TAG" >> "$TG_MONITOR_CRON_FILE"
-        service_enable_now crond >/dev/null 2>&1 || { echo -e "${RED}[错误] OpenRC crond 启动失败。${PLAIN}"; return 1; }
-    fi
-}
-send_tg() {
-    local msg="$1"
-    [[ -n "${TG_BOT_TOKEN:-}" && -n "${TG_CHAT_ID:-}" ]] || return 0
-    curl -fsS --connect-timeout 5 --max-time 10 \
-        -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-        --data-urlencode "chat_id=${TG_CHAT_ID}" \
-        --data-urlencode "text=${msg}" >/dev/null 2>&1 || true
-}
-
-traffic_bytes() {
-    awk '
-    BEGIN { rx=0; tx=0 }
-    {
-        iface=$1
-        gsub(":","",iface)
-        if (iface ~ /^(eth|ens|enp|eno|venet|bond)[A-Za-z0-9_.-]*$/) {
-            rx += $2
-            tx += $10
+        service_enable_now crond >/dev/null 2>&1 || {
+            echo -e "${RED}[错误] OpenRC crond 启动失败。${PLAIN}"
+            return 1
         }
-    }
-    END { printf "%.0f %.0f\n", rx, tx }
-    ' /proc/net/dev
-}
-
-period_key() {
-    local day now_day current previous
-    day="${RESET_DAY:-1}"
-    now_day=$(date +%d | sed 's/^0//')
-    current=$(date +%Y-%m)
-
-    if [[ "$now_day" -ge "$day" ]]; then
-        printf '%s' "$current"
-    else
-        previous=$(date -d '1 month ago' +%Y-%m 2>/dev/null || date +%Y-%m)
-        printf '%s' "$previous"
     fi
-}
-
-human_gb() {
-    awk -v b="$1" 'BEGIN { printf "%.2f", b/1073741824 }'
-}
-
-percent_of() {
-    local bytes="$1" limit_gb="$2"
-    if [[ ! "$limit_gb" =~ ^[0-9]+$ ]] || [[ "$limit_gb" -le 0 ]]; then
-        echo 0
-        return
-    fi
-    awk -v b="$bytes" -v g="$limit_gb" 'BEGIN { printf "%.0f", (b/(g*1073741824))*100 }'
-}
-
-CURRENT_RX=0
-CURRENT_TX=0
-read -r CURRENT_RX CURRENT_TX < <(traffic_bytes)
-
-PERIOD="$(period_key)"
-LAST_RX=0
-LAST_TX=0
-TOTAL_RX=0
-TOTAL_TX=0
-STATE_PERIOD=""
-RX_WARN1=0
-RX_WARN2=0
-RX_CRITICAL=0
-TX_WARN1=0
-TX_WARN2=0
-TX_CRITICAL=0
-
-if [[ -f "$STATE" ]]; then
-    # 该状态文件由 root 管理且仅包含整数/周期字符串。
-    # shellcheck disable=SC1090
-    source "$STATE"
-fi
-
-if [[ "$STATE_PERIOD" != "$PERIOD" ]]; then
-    STATE_PERIOD="$PERIOD"
-    LAST_RX="$CURRENT_RX"
-    LAST_TX="$CURRENT_TX"
-    TOTAL_RX=0
-    TOTAL_TX=0
-    RX_WARN1=0
-    RX_WARN2=0
-    RX_CRITICAL=0
-    TX_WARN1=0
-    TX_WARN2=0
-    TX_CRITICAL=0
-else
-    if [[ "$CURRENT_RX" -ge "$LAST_RX" ]]; then
-        TOTAL_RX=$((TOTAL_RX + CURRENT_RX - LAST_RX))
-    else
-        # 网卡计数因 VPS 重启/网卡重置归零：保留历史累计，并把重启后的当前值作为新增量。
-        TOTAL_RX=$((TOTAL_RX + CURRENT_RX))
-    fi
-
-    if [[ "$CURRENT_TX" -ge "$LAST_TX" ]]; then
-        TOTAL_TX=$((TOTAL_TX + CURRENT_TX - LAST_TX))
-    else
-        TOTAL_TX=$((TOTAL_TX + CURRENT_TX))
-    fi
-
-    LAST_RX="$CURRENT_RX"
-    LAST_TX="$CURRENT_TX"
-fi
-
-HOST_LABEL="${HOST_LABEL:-$(hostname)}"
-WARN1_PERCENT="${WARN1_PERCENT:-80}"
-WARN2_PERCENT="${WARN2_PERCENT:-90}"
-AUTO_SHUTDOWN="${AUTO_SHUTDOWN:-no}"
-SHUTDOWN_PERCENT="${SHUTDOWN_PERCENT:-95}"
-
-rx_percent=$(percent_of "$TOTAL_RX" "${RX_LIMIT_GB:-0}")
-tx_percent=$(percent_of "$TOTAL_TX" "${TX_LIMIT_GB:-0}")
-rx_gb=$(human_gb "$TOTAL_RX")
-tx_gb=$(human_gb "$TOTAL_TX")
-
-notify_threshold() {
-    local direction="$1" percent="$2" used_gb="$3" limit="$4"
-    local warn1_var warn2_var critical_var
-    if [[ "$direction" == "入站" ]]; then
-        warn1_var="RX_WARN1"; warn2_var="RX_WARN2"; critical_var="RX_CRITICAL"
-    else
-        warn1_var="TX_WARN1"; warn2_var="TX_WARN2"; critical_var="TX_CRITICAL"
-    fi
-
-    [[ "$limit" =~ ^[0-9]+$ && "$limit" -gt 0 ]] || return 0
-
-    if [[ "$percent" -ge 100 && "${!critical_var}" -eq 0 ]]; then
-        printf -v "$critical_var" '%s' 1
-        send_tg "🚨 ${HOST_LABEL}
-${direction}流量已达到 ${used_gb} GB / ${limit} GB（${percent}%）
-已达到流量上限。"
-    elif [[ "$percent" -ge "$WARN2_PERCENT" && "${!warn2_var}" -eq 0 ]]; then
-        printf -v "$warn2_var" '%s' 1
-        send_tg "⚠️ ${HOST_LABEL}
-${direction}流量已达到 ${used_gb} GB / ${limit} GB（${percent}%）
-已达到第二预警线 ${WARN2_PERCENT}%。"
-    elif [[ "$percent" -ge "$WARN1_PERCENT" && "${!warn1_var}" -eq 0 ]]; then
-        printf -v "$warn1_var" '%s' 1
-        send_tg "⚠️ ${HOST_LABEL}
-${direction}流量已达到 ${used_gb} GB / ${limit} GB（${percent}%）
-已达到第一预警线 ${WARN1_PERCENT}%。"
-    fi
-}
-
-notify_threshold "入站" "$rx_percent" "$rx_gb" "${RX_LIMIT_GB:-0}"
-notify_threshold "出站" "$tx_percent" "$tx_gb" "${TX_LIMIT_GB:-0}"
-
-tmp="${STATE}.tmp.$$"
-umask 077
-cat > "$tmp" <<EOF
-STATE_PERIOD='${STATE_PERIOD}'
-LAST_RX=${LAST_RX}
-LAST_TX=${LAST_TX}
-TOTAL_RX=${TOTAL_RX}
-TOTAL_TX=${TOTAL_TX}
-RX_WARN1=${RX_WARN1}
-RX_WARN2=${RX_WARN2}
-RX_CRITICAL=${RX_CRITICAL}
-TX_WARN1=${TX_WARN1}
-TX_WARN2=${TX_WARN2}
-TX_CRITICAL=${TX_CRITICAL}
-EOF
-mv -f "$tmp" "$STATE"
-chmod 600 "$STATE"
-
-shutdown_needed=0
-if [[ "${RX_LIMIT_GB:-0}" =~ ^[0-9]+$ && "${RX_LIMIT_GB:-0}" -gt 0 && "$rx_percent" -ge "$SHUTDOWN_PERCENT" ]]; then
-    shutdown_needed=1
-fi
-if [[ "${TX_LIMIT_GB:-0}" =~ ^[0-9]+$ && "${TX_LIMIT_GB:-0}" -gt 0 && "$tx_percent" -ge "$SHUTDOWN_PERCENT" ]]; then
-    shutdown_needed=1
-fi
-
-if [[ "$shutdown_needed" -eq 1 && "$AUTO_SHUTDOWN" == "yes" ]]; then
-    send_tg "⛔ ${HOST_LABEL}
-流量达到自动关机阈值 ${SHUTDOWN_PERCENT}%，服务器即将自动关机。"
-    sync
-    shutdown -h now
-fi
-TGWORKER
-
-    chmod 700 "$TG_MONITOR_WORKER"
-
-    cat > "$TG_MONITOR_SERVICE" <<EOF
-[Unit]
-Description=ss2022 TG-BOT Traffic Monitor
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=${TG_MONITOR_WORKER}
-EOF
-
-    cat > "$TG_MONITOR_TIMER" <<'EOF'
-[Unit]
-Description=Run ss2022 TG-BOT Traffic Monitor Every Minute
-
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=60s
-AccuracySec=5s
-Persistent=true
-Unit=ss2022-tg-monitor.service
-
-[Install]
-WantedBy=timers.target
-EOF
-
-    systemctl daemon-reload || return 1
 }
 
 server_tool_tg_monitor_send_test() {
