@@ -173,6 +173,34 @@ jobs:
           grep -Fq 'singbox_managed' <<<"$full_body"
           grep -Fq '"$SINGBOX_MANAGED_MARKER"' <<<"$full_body"
 
+      - name: Guard Alpine Snell support boundary
+        shell: bash
+        run: |
+          export SS2022_LIB_ONLY=1
+          # shellcheck disable=SC1091
+          source ./ss2022.sh
+
+          install_body=$(declare -f install_snell_v5_core)
+          component_body=$(declare -f component_single_menu)
+          upgrade_body=$(declare -f upgrade_all_to_recommended)
+          protocol_body=$(declare -f protocol_management)
+
+          grep -Fq 'platform_is_alpine' <<<"$install_body"
+          grep -Fq 'return 1' <<<"$install_body"
+          grep -Fq '[[ "$c" == "snell" ]]' <<<"$component_body"
+          grep -Fq '[[ "$c" == "snell" ]]' <<<"$upgrade_body"
+          grep -Fq 'Snell v5                [Alpine 暂不支持]' <<<"$protocol_body"
+
+      - name: Guard current dev changelog uniqueness
+        shell: bash
+        run: |
+          version=$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' ss2022.sh | head -n1)
+          count=$(grep -Fc "# ${version}:" ss2022.sh)
+          if [[ "$count" -ne 1 ]]; then
+            echo "ERROR: changelog must contain exactly one current-version header: ${version}"
+            exit 1
+          fi
+
       - name: Summary
         run: |
           echo "CI passed."
