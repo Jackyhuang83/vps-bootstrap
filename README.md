@@ -418,15 +418,13 @@ SSH 端口修改采用安全方式：
 
 # 服务器测试管理
 
-当前服务器测试分为五类：
+当前服务器测试收敛为三个入口：
 
 | 测试 | 使用项目 / 方式 |
 |---|---|
 | IP 质量 / 风险测试 | oneclickvirt / securityCheck |
-| IPv4 / IPv6 回程路由 | nxtrace / NTrace-core（NextTrace 逐跳 traceroute） |
-| 流媒体 / 区域解锁测试 | 1-stream / RegionRestrictionCheck |
-| AI 工具解锁测试 | oneclickvirt / UnlockTests（AI-only） |
-| 通信软件网络可达性 | curl，按 IPv4 / IPv6 分别检测 |
+| IPv4 / IPv6 三网逐跳回程 | nxtrace / NTrace-core（NextTrace 逐跳 traceroute） |
+| 平台流媒体AI通信软件解锁测试 | 流媒体：1-stream / RegionRestrictionCheck；AI：oneclickvirt / UnlockTests；通信：curl 可达性检测 |
 
 ## IPv4 / IPv6 回程路由
 
@@ -450,6 +448,16 @@ SSH 端口修改采用安全方式：
 
 逐跳结果才是判断实际回程路径的主要依据。线路名称（例如 CN2、9929、CMIN2、4837、CMI）应结合路由中出现的 ASN 和实际 hop 判断，而不是只依赖自动汇总标签。
 
+
+## 平台流媒体AI通信软件解锁测试
+
+服务器测试菜单中的第 3 项为一键综合流程。只需要选择一次流媒体地区和一次地址族，脚本会依次执行：
+
+1. 流媒体解锁
+2. AI 工具解锁
+3. 通信软件可达性
+
+三部分仍使用各自最合适的实现，不为了“单一脚本”而降低检测质量。通信软件部分的“解锁”仅表示网络可达性，不代表账号区服或消息发送能力。
 
 ## 流媒体 / 区域解锁
 
