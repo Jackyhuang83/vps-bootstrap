@@ -37,7 +37,7 @@ jobs:
             -w /work \
             alpine:3.21 \
             sh -euxc '
-              apk add --no-cache bash curl unzip coreutils gcompat libstdc++ libgcc iproute2
+              apk add --no-cache bash openrc curl unzip coreutils gcompat libstdc++ libgcc iproute2
 
               bash <<'"'"'SNELL'"'"'
               set -euo pipefail
