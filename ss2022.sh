@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev33
+# 当前版本: v1.9.0-dev34
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,11 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev34:
+#   - Realm 单独卸载补齐 OpenRC PID / 日志清理
+#   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
+#   - 与完全卸载的服务账号 ownership 规则保持一致
 #
 # v1.9.0-dev33:
 #   - 增加 sing-box 安装 ownership 保护，拒绝覆盖服务器预先存在的非 vps-bootstrap sing-box
@@ -558,11 +563,12 @@
 #   v1.9.0-dev31 明确完全卸载系统设置保留边界
 #   v1.9.0-dev32 服务用户/组 ownership 保护
 #   v1.9.0-dev33 sing-box 安装 ownership 保护
+#   v1.9.0-dev34 Realm 单独卸载 ownership 收口
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev33"
+SCRIPT_VERSION="v1.9.0-dev34"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -7629,13 +7635,16 @@ uninstall_realm_forwarding() {
     read -rp "确认卸载 Realm 转发组件？[y/N]: " yes
     [[ "$yes" =~ ^[Yy]$ ]] || return
     service_disable_now "$REALM_SERVICE_NAME"
-    rm -f "$REALM_SERVICE" "$REALM_OPENRC_SERVICE" "$REALM_BIN" "$FORWARDING_FILE"
+    rm -f "$REALM_SERVICE" "$REALM_OPENRC_SERVICE" "$REALM_BIN" "$FORWARDING_FILE" "$REALM_OPENRC_PID" "$REALM_OPENRC_LOG"
     rm -rf /etc/ss2022-realm
     if [[ -f "$REALM_USER_MARKER" ]]; then
         delete_system_user "$REALM_USER"
         rm -f "$REALM_USER_MARKER"
     fi
-    delete_system_group "$REALM_GROUP"
+    if [[ -f "$REALM_GROUP_MARKER" ]]; then
+        delete_system_group "$REALM_GROUP"
+        rm -f "$REALM_GROUP_MARKER"
+    fi
     service_daemon_reload || true
     echo -e "${GREEN}✔ ss2022.sh Realm 转发组件已卸载。${PLAIN}"
     pause
