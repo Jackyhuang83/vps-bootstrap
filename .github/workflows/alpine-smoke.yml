@@ -7,6 +7,7 @@ on:
     paths:
       - "ss2022.sh"
       - ".github/workflows/alpine-smoke.yml"
+      - ".github/scripts/alpine-snell-runtime.sh"
 
   pull_request:
     branches:
@@ -32,86 +33,11 @@ jobs:
       - name: Verify official Snell runtime on Alpine
         shell: bash
         run: |
-          docker run --rm -i \
+          docker run --rm \
             -v "$PWD:/work" \
             -w /work \
             alpine:3.21 \
-            sh -s <<'ALPINE'
-          set -eux
-          apk add --no-cache bash openrc curl unzip coreutils gcompat libstdc++ libgcc iproute2
-
-          exec bash <<'SNELL'
-          set -euo pipefail
-          export SS2022_LIB_ONLY=1
-          # shellcheck disable=SC1091
-          source ./ss2022.sh
-
-          detect_platform
-          [[ "$PLATFORM_OS" == "alpine" ]]
-
-          arch=$(uname -m)
-          case "$arch" in
-              x86_64|amd64)
-                  asset_arch="amd64"
-                  expected="$SNELL_SHA256_AMD64"
-                  ;;
-              aarch64|arm64)
-                  asset_arch="aarch64"
-                  expected="$SNELL_SHA256_ARM64"
-                  ;;
-              *)
-                  echo "Unsupported CI architecture: $arch"
-                  exit 1
-                  ;;
-          esac
-
-          tmp=$(mktemp -d)
-          pid=""
-          cleanup() {
-              [[ -n "$pid" ]] && kill "$pid" >/dev/null 2>&1 || true
-              rm -rf "$tmp"
-          }
-          trap cleanup EXIT
-
-          zip="$tmp/snell.zip"
-          url="https://dl.nssurge.com/snell/snell-server-v${SNELL_VERSION}-linux-${asset_arch}.zip"
-
-          curl -fL --connect-timeout 20 --max-time 120 --retry 3 --retry-delay 2 -o "$zip" "$url"
-          actual=$(sha256sum "$zip" | awk '{print $1}')
-          [[ "$actual" == "$expected" ]]
-
-          unzip -oq "$zip" -d "$tmp"
-          chmod 755 "$tmp/snell-server"
-          snell_binary_works "$tmp/snell-server"
-
-          printf '%s\n' \
-            '[snell-server]' \
-            'listen = 127.0.0.1:63333' \
-            'psk = ci-runtime-test' \
-            'version = 5' \
-            'ipv6 = false' \
-            'obfs = off' > "$tmp/snell.conf"
-
-          "$tmp/snell-server" -c "$tmp/snell.conf" >"$tmp/snell.log" 2>&1 &
-          pid=$!
-          sleep 1
-
-          if ! kill -0 "$pid" 2>/dev/null; then
-              cat "$tmp/snell.log" >&2 || true
-              exit 1
-          fi
-          if ! ss -lnt | grep -Eq '127\.0\.0\.1:63333|0\.0\.0\.0:63333'; then
-              cat "$tmp/snell.log" >&2 || true
-              exit 1
-          fi
-
-          kill "$pid"
-          wait "$pid" 2>/dev/null || true
-          pid=""
-
-          echo "Official Snell runtime test passed on Alpine 3.21."
-          SNELL
-          ALPINE
+            sh -euxc 'apk add --no-cache bash openrc curl unzip coreutils gcompat libstdc++ libgcc iproute2 && bash .github/scripts/alpine-snell-runtime.sh'
 
   alpine-openrc:
     name: Alpine 3.21 / OpenRC
