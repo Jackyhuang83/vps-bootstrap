@@ -443,13 +443,38 @@ jobs:
             exit 1
           fi
 
-      - name: Guard current dev changelog uniqueness
+      - name: Guard current version consistency
         shell: bash
         run: |
           version=$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' ss2022.sh | head -n1)
-          count=$(grep -Fc "# ${version}:" ss2022.sh)
+          header=$(sed -n 's/^# 当前版本: \(.*\)$/\1/p' ss2022.sh | head -n1)
+
+          [[ "$header" == "$version" ]] || {
+            echo "ERROR: header/SCRIPT_VERSION mismatch: ${header} != ${version}"
+            exit 1
+          }
+
+          if [[ "$version" == *-dev* ]]; then
+            marker="# ${version}:"
+            grep -Fq "当前开发版本：**${version}**" README.md || {
+              echo "ERROR: README development version does not match ${version}"
+              exit 1
+            }
+          else
+            marker="# ${version} Release:"
+            grep -Fq "当前正式版本：**${version}**" README.md || {
+              echo "ERROR: README stable version does not match ${version}"
+              exit 1
+            }
+            if grep -Eq '^当前开发版本：\*\*v[0-9]+\.[0-9]+\.[0-9]+-dev[0-9]+\*\*' README.md; then
+              echo "ERROR: stable release README still exposes a current development version."
+              exit 1
+            fi
+          fi
+
+          count=$(grep -Fc "$marker" ss2022.sh)
           if [[ "$count" -ne 1 ]]; then
-            echo "ERROR: changelog must contain exactly one current-version header: ${version}"
+            echo "ERROR: changelog must contain exactly one current-version marker: ${marker}"
             exit 1
           fi
 
