@@ -108,6 +108,7 @@ jobs:
               touch /tmp/ss2022-ci-stale
               mkdir -p /tmp/ss2022-ci-stale-dir
               touch /tmp/ss2022-ci-stale-dir/file
+              touch "${SNELL_CANDIDATE_PREFIX}.4105"
 
               (
                   printf '"'"'DELETE\n'"'"' | full_uninstall
@@ -124,6 +125,7 @@ jobs:
               [[ ! -e /run/ss2022-tg-monitor.lockdir ]]
               [[ ! -e /tmp/ss2022-ci-stale ]]
               [[ ! -e /tmp/ss2022-ci-stale-dir ]]
+              [[ ! -e "${SNELL_CANDIDATE_PREFIX}.4105" ]]
 
               echo "Alpine/OpenRC smoke test passed."
               SMOKE
