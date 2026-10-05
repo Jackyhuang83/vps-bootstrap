@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev39
+# 当前版本: v1.9.0-dev40
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,10 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.9.0-dev40:
+#   - /usr/local/bin/proxy 快捷命令增加 ownership 保护，不再覆盖服务器已有同名文件/链接
+#   - 完全卸载仅删除确实指向本项目 /usr/local/bin/ss2022 的 proxy 链接
 #
 # v1.9.0-dev39:
 #   - systemd IPv6 Keepalive unit 改为 ss2022-ipv6-keepalive.service/timer，避免占用通用服务名
@@ -594,11 +598,12 @@
 #   v1.9.0-dev37 完全卸载临时/备份残留与 WARP 失败路径收口
 #   v1.9.0-dev38 Snell 候选文件与 SSH 事务备份残留收口
 #   v1.9.0-dev39 IPv6 Keepalive systemd ownership 收口
+#   v1.9.0-dev40 proxy 快捷命令 ownership 收口
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev39"
+SCRIPT_VERSION="v1.9.0-dev40"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -7863,9 +7868,10 @@ show_service_status() {
     ss -lntup 2>/dev/null | grep -E 'sing-box|xray|snell-server|ss2022-realm|realm' || echo "未检测到相关监听"
 }
 full_uninstall() {
-    local yes="" singbox_managed=0 snell_managed=0
+    local yes="" singbox_managed=0 snell_managed=0 proxy_link_managed=0
     singbox_is_project_managed && singbox_managed=1 || true
     snell_is_project_managed && snell_managed=1 || true
+    proxy_shortcut_is_project_managed && proxy_link_managed=1 || true
     echo -e "${RED}========== 完全卸载 ss2022.sh ==========${PLAIN}"
     echo ""
     echo -e "${RED}此操作会删除本脚本管理的协议核心、节点/分流/端口转发配置与服务。不会删除服务器原有 xray.service 或 realm.service。${PLAIN}"
@@ -7920,9 +7926,9 @@ full_uninstall() {
         rm -f "$SNELL_BIN" "$SNELL_SERVICE" "$SNELL_OPENRC_SERVICE" "$SNELL_MANAGED_MARKER"
     fi
 
+    [[ $proxy_link_managed -eq 1 ]] && rm -f "$SCRIPT_PROXY_LINK"
     rm -f \
-        /usr/local/bin/ss2022 \
-        /usr/local/bin/proxy \
+        "$SCRIPT_INSTALL_PATH" \
         "$SCRIPT_BACKUP_PATH" \
         "${SNELL_CANDIDATE_PREFIX}".* \
         "$XRAY_BIN" \
@@ -8275,6 +8281,24 @@ script_source_path() {
     readlink -f "$src" 2>/dev/null || printf '%s\n' "$src"
 }
 
+proxy_shortcut_is_project_managed() {
+    local target=""
+    [[ -L "$SCRIPT_PROXY_LINK" ]] || return 1
+    target=$(readlink "$SCRIPT_PROXY_LINK" 2>/dev/null || true)
+    [[ "$target" == "$SCRIPT_INSTALL_PATH" || "$target" == "${SCRIPT_INSTALL_PATH##*/}" ]]
+}
+
+ensure_proxy_shortcut() {
+    if [[ -e "$SCRIPT_PROXY_LINK" || -L "$SCRIPT_PROXY_LINK" ]]; then
+        if ! proxy_shortcut_is_project_managed; then
+            echo -e "${YELLOW}[提示] ${SCRIPT_PROXY_LINK} 已被其它文件或链接占用，保留原内容；仍可使用 ${SCRIPT_INSTALL_PATH}。${PLAIN}"
+            return 0
+        fi
+        rm -f "$SCRIPT_PROXY_LINK" || return 1
+    fi
+    ln -s "$SCRIPT_INSTALL_PATH" "$SCRIPT_PROXY_LINK"
+}
+
 compare_script_versions() {
     # 输出：
     #   equal         两版本相同
@@ -8484,7 +8508,7 @@ check_script_update() {
     echo "更新将："
     echo "  1. 备份当前系统安装脚本到 ${SCRIPT_BACKUP_PATH}"
     echo "  2. 安装 GitHub main 脚本到 ${SCRIPT_INSTALL_PATH}"
-    echo "  3. 保持 ${SCRIPT_PROXY_LINK} 快捷命令"
+    echo "  3. 若 ${SCRIPT_PROXY_LINK} 未被其它程序占用，则保持该快捷命令"
     echo "  4. 自动重新进入安装后的管理面板"
     echo ""
 
@@ -8522,7 +8546,7 @@ check_script_update() {
         return
     fi
 
-    ln -sf "$SCRIPT_INSTALL_PATH" "$SCRIPT_PROXY_LINK" || true
+    ensure_proxy_shortcut || echo -e "${YELLOW}[提示] proxy 快捷命令创建失败，不影响 ss2022 主命令。${PLAIN}"
     echo -e "${GREEN}✔ 脚本安装 / 更新完成：$(extract_script_version "$SCRIPT_INSTALL_PATH")${PLAIN}"
     echo "正在重新进入安装后的管理面板..."
     sleep 1
