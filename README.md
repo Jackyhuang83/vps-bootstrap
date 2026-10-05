@@ -2,13 +2,10 @@
 
 一体化 VPS 网络协议、服务端分流、端口转发与日常运维脚本。
 
-当前正式版本：**v1.8.1**  
-当前开发版本：**v1.9.0-dev43**
-
+当前正式版本：**v1.9.0**
 项目以单一交互式 Bash 脚本 `ss2022.sh` 为入口，整合 **SS2022、SS2022 + ShadowTLS v3、VLESS Reality、Snell v5**，并提供 WARP 出口、链式落地、规则分流、Realm L4 端口转发、组件管理、服务器工具、服务器测试与脚本自更新。
 
-> v1.8.1 为当前稳定正式版，正式支持 **Debian / Ubuntu + systemd**。  
-> v1.9.x 为当前开发线，已接入 **Alpine 3.21 + OpenRC**；核心 OpenRC 服务路径已通过 Alpine 3.21 CI smoke test。**Snell v5 官方二进制已确认无法在 Alpine 3.21 + gcompat 下正常启动，因此 Alpine 暂不开放 Snell；Cloudflare WARP 官方客户端也暂不在 Alpine 开放。**
+> v1.9.0 为当前稳定正式版。Debian / Ubuntu + systemd 正式支持；Alpine 3.21 + OpenRC 正式支持 SS2022、ShadowTLS v3、VLESS Reality、Realm 以及服务器管理/测试。Snell v5 与 Cloudflare WARP 在 Alpine 暂不开放。
 
 ---
 
@@ -31,8 +28,7 @@
 
 | 维度 | 当前支持 |
 |---|---|
-| **稳定正式版** | v1.8.1：Debian / Ubuntu + systemd |
-| **v1.9 开发版** | Debian / Ubuntu + systemd；Alpine 3.21 + OpenRC |
+| **稳定正式版** | v1.9.0：Debian / Ubuntu + systemd；Alpine 3.21 + OpenRC |
 | **CPU 架构** | x86_64 / amd64、aarch64 / arm64 |
 | **网络环境** | IPv4-only、IPv6-only、IPv4 + IPv6 双栈 |
 | **NAT VPS** | 可使用服务商映射端口部署节点 |
@@ -661,11 +657,11 @@ ss -lntup
 
 ---
 
-# 当前开发策略
+# 版本策略
 
 ## v1.8.x
 
-v1.8.1 为当前稳定正式版。
+v1.8.1 为上一稳定正式版。
 
 后续 v1.8.x 仅处理：
 
@@ -675,9 +671,9 @@ v1.8.1 为当前稳定正式版。
 
 原则上不再增加大型功能模块。
 
-## v1.9.x
+## v1.9.0
 
-当前开发版为 **v1.9.0-dev43**，重点是 Alpine / OpenRC 与卸载闭环收口：
+当前稳定正式版为 **v1.9.0**，本版本完成 Alpine / OpenRC 与卸载闭环收口：
 
 - SS2022、ShadowTLS v3、VLESS Reality、Realm 已接入 OpenRC
 - Snell v5 官方二进制已确认无法在 Alpine 3.21 + gcompat 下启动，因此 Alpine 暂不开放 Snell；Debian / Ubuntu 保持支持
@@ -694,7 +690,7 @@ v1.8.1 为当前稳定正式版。
 - IPv6-only 临时 DNS 使用 vps-bootstrap 专属备份路径；旧 /root/resolv.conf.orig 仅用于兼容历史版本恢复，不再由新版本创建
 - Debian / Ubuntu + systemd 路径继续保持兼容
 
-v1.9.x 在完成更充分的 Alpine 实机验证前仍属于开发线，不替代 v1.8.1 稳定版。
+v1.9.0 已完成发布前收口并成为当前稳定正式版；后续优先处理 Bug、稳定性和兼容性问题。
 
 ---
 

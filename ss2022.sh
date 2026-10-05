@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
-# 当前版本: v1.9.0-dev43
+# 当前版本: v1.9.0
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,16 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.9.0 Release:
+#   - 正式支持 Debian / Ubuntu + systemd，并将 Alpine 3.21 + OpenRC 纳入稳定支持范围
+#   - Alpine 正式支持 SS2022、SS2022 + ShadowTLS v3、VLESS Reality、Realm、服务器管理工具与服务器测试
+#   - Snell v5 在 Debian / Ubuntu 保持官方 snell-server v5；Alpine 因官方 glibc 二进制不兼容而明确关闭，不注入第三方 glibc
+#   - Cloudflare WARP 官方 Linux 客户端在 Debian / Ubuntu 保持支持；Alpine 暂不开放
+#   - 完成完全卸载闭环：systemd/OpenRC 服务、PID、日志、临时文件、候选/回滚文件、WARP 资产与脚本备份均按 ownership 清理
+#   - 完成 sing-box、Snell、proxy 快捷命令、IPv6 Keepalive、ForceIPv6、DNS 备份、WARP APT 仓库与共享配置目录 ownership 保护
+#   - 保留用户主动设置的 BBR、DNS、SSH 端口和 IPv4/IPv6 地址优先级，避免卸载时破坏系统网络可达性
+#   - GitHub Actions 覆盖 Bash 语法、ShellCheck、关键 ownership 回归保护、Alpine 3.21/OpenRC smoke test 与正式发布版本一致性校验
 #
 # v1.9.0-dev43:
 #   - 首页仅在 /usr/local/bin/proxy 确认属于本项目时显示 proxy 快捷命令
@@ -619,10 +629,10 @@
 #   v1.9.0-dev42 sing-box / Snell 配置目录 ownership 收口
 #   v1.9.0-dev43 proxy 展示与安装文档 ownership 一致性收口
 #
-# 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
+# 注意: v1.9.0 为稳定正式版；Alpine 3.21 上 Snell v5 与 Cloudflare WARP 仍受官方组件兼容性限制。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev43"
+SCRIPT_VERSION="v1.9.0"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -1015,7 +1025,7 @@ platform_feature_unavailable() {
     local feature="$1"
     echo ""
     echo "[提示] Alpine / OpenRC 当前不提供：$feature"
-    echo "v1.9 开发版已适配 SS2022、ShadowTLS v3、VLESS Reality、Realm、服务器工具与测试。"
+    echo "v1.9.0 正式版已适配 SS2022、ShadowTLS v3、VLESS Reality、Realm、服务器工具与测试。"
     echo "Snell v5 官方 Linux 二进制依赖 glibc，已确认无法在 Alpine 3.21 + gcompat 下正常启动；本脚本不注入第三方 glibc，也不替换非官方实现。"
     echo "Cloudflare WARP 官方 Linux 客户端当前未提供 Alpine 支持，因此本脚本也不在 Alpine 上强行安装。"
     return 1
@@ -11634,7 +11644,7 @@ main() {
     check_root
     detect_platform || exit 1
     if platform_is_alpine; then
-        echo "[v1.9 开发版] 已检测到 Alpine / OpenRC；核心协议、服务管理、服务器工具与测试已接入 OpenRC。"
+        echo "[v1.9.0] 已检测到 Alpine / OpenRC；核心协议、服务管理、服务器工具与测试已接入稳定支持范围。"
         echo "[提示] Snell v5 官方二进制与 Cloudflare WARP 官方客户端暂不在 Alpine 开放。"
     fi
 
