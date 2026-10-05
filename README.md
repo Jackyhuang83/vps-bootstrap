@@ -435,7 +435,7 @@ SSH 端口修改采用安全方式：
 流媒体测试会固定检测一组通用平台：
 
 - Netflix / Netflix CDN
-- YouTube Premium / YouTube CDN / YouTube Region
+- YouTube Region / YouTube CDN
 - Disney+
 - Amazon Prime Video
 - Google Search / Google Play Store
