@@ -125,6 +125,24 @@ jobs:
           grep -Fq '[[ -f "$WARP_MANAGED_MARKER" ]]' <<<"$menu_body"
           grep -Fq 'rm -f "$WARP_MANAGED_MARKER"' <<<"$menu_body"
 
+      - name: Guard WARP partial-install ownership
+        shell: bash
+        run: |
+          export SS2022_LIB_ONLY=1
+          # shellcheck disable=SC1091
+          source ./ss2022.sh
+          body=$(declare -f warp_install_client)
+
+          marker_line=$(grep -nF 'touch "$WARP_MANAGED_MARKER"' <<<"$body" | head -n1 | cut -d: -f1)
+          keyring_line=$(grep -nF 'cloudflare-warp-archive-keyring.gpg' <<<"$body" | head -n1 | cut -d: -f1)
+          source_line=$(grep -nF '/etc/apt/sources.list.d/cloudflare-client.list' <<<"$body" | head -n1 | cut -d: -f1)
+
+          [[ "$marker_line" =~ ^[0-9]+$ ]]
+          [[ "$keyring_line" =~ ^[0-9]+$ ]]
+          [[ "$source_line" =~ ^[0-9]+$ ]]
+          [[ "$marker_line" -lt "$keyring_line" ]]
+          [[ "$marker_line" -lt "$source_line" ]]
+
       - name: Guard uninstall runtime-file cleanup
         shell: bash
         run: |
@@ -139,6 +157,29 @@ jobs:
           grep -Fq '"$SNELL_OPENRC_PID"' <<<"$body"
           grep -Fq '"$REALM_OPENRC_PID"' <<<"$body"
           grep -Fq '/run/ss2022-tg-monitor.lockdir' <<<"$body"
+          grep -Fq 'rm -rf /tmp/ss2022-*' <<<"$body"
+
+      - name: Guard DNS backup ownership
+        shell: bash
+        run: |
+          export SS2022_LIB_ONLY=1
+          # shellcheck disable=SC1091
+          source ./ss2022.sh
+
+          [[ "$BACKUP_DNS" == "/root/.ss2022-resolv.conf.bak" ]]
+          [[ "$LEGACY_BACKUP_DNS" == "/root/resolv.conf.orig" ]]
+
+          prepare_body=$(declare -f prepare_ipv6_env)
+          restore_body=$(declare -f restore_ipv4_apt_and_dns_if_needed)
+          full_body=$(declare -f full_uninstall)
+
+          grep -Fq '"$BACKUP_DNS"' <<<"$prepare_body"
+          if grep -Fq '"$LEGACY_BACKUP_DNS"' <<<"$prepare_body"; then
+            echo "ERROR: prepare_ipv6_env must not create or reuse the legacy DNS backup path."
+            exit 1
+          fi
+          grep -Fq '"$LEGACY_BACKUP_DNS"' <<<"$restore_body"
+          grep -Fq 'restore_ipv4_apt_and_dns_if_needed' <<<"$full_body"
 
       - name: Guard service ownership markers
         shell: bash
