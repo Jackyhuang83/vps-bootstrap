@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022 / proxy
-# 当前版本: v1.9.0-dev32
+# 当前版本: v1.9.0-dev33
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -85,6 +85,11 @@
 #   - Shadowsocks 粘贴 ss:// 后按 method 自动识别 SS2022 / 标准 SS
 #   - 手动输入也统一在一个 Shadowsocks 菜单中选择算法
 #   - 内部仍保留真实 method/type，用于 Xray 直连或 sing-box Bridge 自动决策
+#
+# v1.9.0-dev33:
+#   - 增加 sing-box 安装 ownership 保护，拒绝覆盖服务器预先存在的非 vps-bootstrap sing-box
+#   - 旧版 vps-bootstrap 通过 legacy user marker / 状态 / Alpine runtime 自动认领迁移，不影响升级
+#   - 完全卸载只有确认 sing-box 属于本项目时才停止并删除通用 sing-box 二进制、配置和服务
 #
 # v1.9.0-dev32:
 #   - 修复服务账号 ownership：仅本脚本新建的 sing-box / Xray / Realm / Snell 用户与组才写 managed marker
@@ -552,11 +557,12 @@
 #   v1.9.0-dev30 完全卸载文件残留收口
 #   v1.9.0-dev31 明确完全卸载系统设置保留边界
 #   v1.9.0-dev32 服务用户/组 ownership 保护
+#   v1.9.0-dev33 sing-box 安装 ownership 保护
 #
 # 注意: 开发版请先在测试 VPS 验证，再作为正式 Release 使用。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0-dev32"
+SCRIPT_VERSION="v1.9.0-dev33"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -584,6 +590,7 @@ SINGBOX_USER="sing-box"
 SINGBOX_GROUP="sing-box"
 SINGBOX_USER_MARKER="/etc/ss2022-singbox-user-managed"
 SINGBOX_GROUP_MARKER="/etc/ss2022-singbox-group-managed"
+SINGBOX_MANAGED_MARKER="/etc/ss2022-singbox-install-managed"
 SINGBOX_ALPINE_PKG_MARKER="/etc/ss2022-singbox-apk-managed"
 SINGBOX_ALPINE_RUNTIME_DIR="/usr/local/lib/ss2022/sing-box-runtime"
 SINGBOX_ALPINE_RUNTIME_BIN="${SINGBOX_ALPINE_RUNTIME_DIR}/sing-box"
@@ -1780,6 +1787,46 @@ node_name_management() {
         esac
     done
 }
+singbox_is_project_managed() {
+    [[ -f "$SINGBOX_MANAGED_MARKER" ]] && return 0
+    # Legacy vps-bootstrap installations always created the service-user marker.
+    [[ -f "$SINGBOX_USER_MARKER" ]] && return 0
+    [[ -f "$SINGBOX_ALPINE_PKG_MARKER" ]] && return 0
+    [[ -d "$SINGBOX_ALPINE_RUNTIME_DIR" ]] && return 0
+
+    if [[ -f "$STATE_FILE" && -f "$SINGBOX_CONF" ]] && command -v jq >/dev/null 2>&1; then
+        jq -e '
+          any(.inbounds[]?;
+            ((.tag // "") == "ss-in") or
+            ((.tag // "") == "ss-shadowtls-in") or
+            ((.tag // "") == "ss-shadowtls-backend") or
+            ((.tag // "") == "ss-shadowtls-udp"))
+        ' "$SINGBOX_CONF" >/dev/null 2>&1 && return 0
+    fi
+    return 1
+}
+
+singbox_assert_safe_ownership() {
+    if singbox_is_project_managed; then
+        touch "$SINGBOX_MANAGED_MARKER" || return 1
+        chmod 600 "$SINGBOX_MANAGED_MARKER"
+        return 0
+    fi
+
+    if [[ -e "$SINGBOX_BIN" || -e "$SINGBOX_CONF" || -e "$SINGBOX_SERVICE" || -e "$SINGBOX_OPENRC_SERVICE" ]]; then
+        echo -e "${RED}[错误] 检测到服务器已有非 vps-bootstrap 管理的 sing-box。${PLAIN}"
+        echo -e "${YELLOW}为避免覆盖现有二进制、配置或服务，本脚本停止安装 sing-box。${PLAIN}"
+        echo -e "${YELLOW}请先自行迁移/移除现有 sing-box，或继续使用原服务。${PLAIN}"
+        return 1
+    fi
+    return 0
+}
+
+mark_singbox_project_managed() {
+    touch "$SINGBOX_MANAGED_MARKER" || return 1
+    chmod 600 "$SINGBOX_MANAGED_MARKER"
+}
+
 ensure_singbox_user() {
     ensure_managed_system_user "$SINGBOX_USER" "$SINGBOX_GROUP" "$SINGBOX_USER_MARKER" "$SINGBOX_GROUP_MARKER"
 }
@@ -1856,6 +1903,8 @@ SERVICE
 install_singbox_core() {
     local arch s_arch="" expected_sha256="" tar_file="" target_url="" curl_family=""
     local success=0 download_url="" actual_sha256="" runtime_tmp=""
+
+    singbox_assert_safe_ownership || return 1
 
     arch=$(uname -m)
     [[ "$NETWORK_MODE" == "ipv6" ]] && curl_family="-6" || curl_family="-4"
@@ -2006,6 +2055,7 @@ WRAPPER
 
         rm -rf /tmp/sb-temp "/tmp/${tar_file}"
         write_singbox_service || return 1
+        mark_singbox_project_managed || return 1
         echo -e "${GREEN}✔ sing-box ${SINGBOX_VERSION}（Alpine + gcompat）核心与 OpenRC 服务已就绪。${PLAIN}"
         return 0
     fi
@@ -2019,6 +2069,7 @@ WRAPPER
     }
 
     write_singbox_service || return 1
+    mark_singbox_project_managed || return 1
     echo -e "${GREEN}✔ sing-box ${SINGBOX_VERSION} 核心与服务管理已就绪。${PLAIN}"
     return 0
 }
@@ -7687,7 +7738,8 @@ show_service_status() {
     ss -lntup 2>/dev/null | grep -E 'sing-box|xray|snell-server|ss2022-realm|realm' || echo "未检测到相关监听"
 }
 full_uninstall() {
-    local yes=""
+    local yes="" singbox_managed=0
+    singbox_is_project_managed && singbox_managed=1 || true
     echo -e "${RED}========== 完全卸载 ss2022.sh ==========${PLAIN}"
     echo ""
     echo -e "${RED}此操作会删除本脚本管理的协议核心、节点/分流/端口转发配置与服务。不会删除服务器原有 xray.service 或 realm.service。${PLAIN}"
@@ -7698,11 +7750,12 @@ full_uninstall() {
     [[ "$yes" == "DELETE" ]] || { echo "已取消。"; sleep 1; return; }
 
     if [[ "$PLATFORM_INIT" == "systemd" ]]; then
-        systemctl disable --now sing-box "$XRAY_SERVICE_NAME" snell-v5 "$REALM_SERVICE_NAME" ipv6-keepalive.timer >/dev/null 2>&1 || true
+        [[ $singbox_managed -eq 1 ]] && systemctl disable --now sing-box >/dev/null 2>&1 || true
+        systemctl disable --now "$XRAY_SERVICE_NAME" snell-v5 "$REALM_SERVICE_NAME" ipv6-keepalive.timer >/dev/null 2>&1 || true
         systemctl disable --now "$IP_FAMILY_SERVICE_NAME" ss2022-tg-monitor.timer >/dev/null 2>&1 || true
         systemctl stop ipv6-keepalive.service ss2022-tg-monitor.service >/dev/null 2>&1 || true
     else
-        service_disable_now sing-box
+        [[ $singbox_managed -eq 1 ]] && service_disable_now sing-box
         service_disable_now "$XRAY_SERVICE_NAME"
         service_disable_now snell-v5
         service_disable_now "$REALM_SERVICE_NAME"
@@ -7712,7 +7765,7 @@ full_uninstall() {
 
     command -v nft >/dev/null 2>&1 && nft delete table inet ss2022_ip_family >/dev/null 2>&1 || true
 
-    if platform_is_alpine && [[ -f "$SINGBOX_ALPINE_PKG_MARKER" ]]; then
+    if [[ $singbox_managed -eq 1 ]] && platform_is_alpine && [[ -f "$SINGBOX_ALPINE_PKG_MARKER" ]]; then
         apk del sing-box >/dev/null 2>&1 || true
         rm -f "$SINGBOX_ALPINE_PKG_MARKER"
     fi
@@ -7729,21 +7782,23 @@ full_uninstall() {
         rm -f "$WARP_MANAGED_MARKER"
     fi
 
-    rm -rf /etc/sing-box /etc/snell /etc/ss2022-xray /etc/ss2022-realm "$STATE_DIR" /usr/local/lib/ss2022 /var/log/ss2022
+    [[ $singbox_managed -eq 1 ]] && rm -rf /etc/sing-box
+    rm -rf /etc/snell /etc/ss2022-xray /etc/ss2022-realm "$STATE_DIR" /usr/local/lib/ss2022 /var/log/ss2022
+    if [[ $singbox_managed -eq 1 ]]; then
+        rm -f "$SINGBOX_BIN" "$SINGBOX_SERVICE" "$SINGBOX_OPENRC_SERVICE" "$SINGBOX_MANAGED_MARKER"
+    fi
+
     rm -f \
         /usr/local/bin/ss2022 \
         /usr/local/bin/proxy \
         "$SCRIPT_BACKUP_PATH" \
-        "$SINGBOX_BIN" \
         "$XRAY_BIN" \
         "$SNELL_BIN" \
-        "$SINGBOX_SERVICE" \
         "$XRAY_SERVICE" \
         "$SNELL_SERVICE" \
         "$SNELL_OPENRC_SERVICE" \
         "$REALM_SERVICE" \
         "$IP_FAMILY_SERVICE" \
-        "$SINGBOX_OPENRC_SERVICE" \
         "$XRAY_OPENRC_SERVICE" \
         "$REALM_OPENRC_SERVICE" \
         "$IP_FAMILY_OPENRC_SERVICE" \
