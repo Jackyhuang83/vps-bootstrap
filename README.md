@@ -3,7 +3,7 @@
 一体化 VPS 网络协议、服务端分流、端口转发与日常运维脚本。
 
 当前正式版本：**v1.8.1**  
-当前开发版本：**v1.9.0-dev34**
+当前开发版本：**v1.9.0-dev35**
 
 项目以单一交互式 Bash 脚本 `ss2022.sh` 为入口，整合 **SS2022、SS2022 + ShadowTLS v3、VLESS Reality、Snell v5**，并提供 WARP 出口、链式落地、规则分流、Realm L4 端口转发、组件管理、服务器工具、服务器测试与脚本自更新。
 
@@ -21,9 +21,9 @@
 | **SS2022** | sing-box | Shadowsocks 2022 独立节点 |
 | **SS2022 + ShadowTLS v3** | sing-box | 在 SS2022 基础上增加 ShadowTLS v3 流量伪装 |
 | **VLESS Reality** | Xray-core | 独立 Xray 服务运行，不与 sing-box Reality 混用 |
-| **Snell v5** | 官方 snell-server | 使用 Surge 官方 Snell Server |
+| **Snell v5** | 官方 snell-server | Debian / Ubuntu 支持；Alpine 3.21 暂不支持 |
 
-四种协议可独立部署、更新参数、查看配置和删除。
+在 Debian / Ubuntu 上四种协议均可独立部署、更新参数、查看配置和删除；Alpine 3.21 当前支持前三种协议，Snell v5 因官方 glibc 二进制无法在 gcompat 下启动而关闭。
 
 ---
 
@@ -307,6 +307,8 @@ Realm 使用独立二进制、配置和独立服务；Debian/Ubuntu 使用 syste
 - Xray-core
 - Snell Server
 - Realm
+
+在 Alpine 3.21 上，Snell Server 会明确显示“暂不支持”，单独升级入口会被阻断，“全部升级”会自动跳过 Snell。Debian / Ubuntu 的 Snell v5 管理保持不变。
 
 核心下载会进行必要的来源与完整性校验，避免直接运行损坏或异常文件。
 
@@ -594,11 +596,23 @@ proxy
 
 ## 查看核心服务
 
+Debian / Ubuntu（systemd）示例：
+
 ```bash
 systemctl status sing-box
 systemctl status ss2022-xray
 systemctl status snell-v5
 ```
+
+Alpine / OpenRC 示例：
+
+```bash
+rc-service sing-box status
+rc-service ss2022-xray status
+rc-service ss2022-realm status
+```
+
+Alpine 当前不提供 Snell v5 服务。
 
 ## 查看监听端口
 
@@ -663,7 +677,7 @@ v1.8.1 为当前稳定正式版。
 
 ## v1.9.x
 
-当前开发版为 **v1.9.0-dev34**，重点是 Alpine / OpenRC 收口：
+当前开发版为 **v1.9.0-dev35**，重点是 Alpine / OpenRC 收口：
 
 - SS2022、ShadowTLS v3、VLESS Reality、Realm 已接入 OpenRC
 - Snell v5 官方二进制已确认无法在 Alpine 3.21 + gcompat 下启动，因此 Alpine 暂不开放 Snell；Debian / Ubuntu 保持支持
