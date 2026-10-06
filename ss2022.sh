@@ -7404,21 +7404,24 @@ app_egress_test() {
         fi
         echo "落地节点 : ${count} 个"
         echo "规则     : ${rules} 条"
+        echo "应用出口 : $(app_egress_status_text)"
         echo ""
         echo "  1. WARP 出口管理"
         echo "  2. 落地节点管理"
         echo "  3. 分流规则管理"
         echo "  4. 查看当前分流配置"
         echo "  5. 测试分流效果"
+        echo "  6. 本机 / Docker 应用出口"
         echo "  0. 返回"
         echo -e "${CYAN}══════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0-5]: " c
+        read -rp "请选择 [0-6]: " c
         case "$c" in
             1) warp_management ;;
             2) chain_management ;;
             3) routing_rule_management ;;
             4) routing_show_config; pause ;;
             5) routing_test_effect; pause ;;
+            6) app_egress_management ;;
             0) return ;;
             *) sleep 1 ;;
         esac
@@ -8416,8 +8419,11 @@ show_service_status() {
     echo -e "$YELLOW【Realm 端口转发】$PLAIN"
     service_status_output "$REALM_SERVICE_NAME" | head -n 15 || echo "未安装/未加载"
     echo ""
+    echo -e "$YELLOW【本机 / Docker 应用出口】$PLAIN"
+    service_status_output "$APP_EGRESS_SERVICE_NAME" | head -n 15 || echo "未安装/未加载"
+    echo ""
     echo -e "$YELLOW【监听端口】$PLAIN"
-    ss -lntup 2>/dev/null | grep -E 'sing-box|xray|snell-server|ss2022-realm|realm' || echo "未检测到相关监听"
+    ss -lntup 2>/dev/null | grep -E 'sing-box|xray|snell-server|ss2022-realm|ss2022-app-egress|realm' || echo "未检测到相关监听"
 }
 full_uninstall() {
     local yes="" singbox_managed=0 snell_managed=0 proxy_link_managed=0
@@ -8453,6 +8459,9 @@ full_uninstall() {
     fi
 
     command -v nft >/dev/null 2>&1 && nft delete table inet ss2022_ip_family >/dev/null 2>&1 || true
+
+    # 先移除独立应用出口，并解除 HomeSphere 的 TVB_PROXY_URL 关联。
+    app_egress_remove true || true
 
     if [[ $singbox_managed -eq 1 ]] && platform_is_alpine && [[ -f "$SINGBOX_ALPINE_PKG_MARKER" ]]; then
         apk del sing-box >/dev/null 2>&1 || true
@@ -8493,9 +8502,11 @@ full_uninstall() {
         "$XRAY_BIN" \
         "$XRAY_SERVICE" \
         "$REALM_SERVICE" \
+        "$APP_EGRESS_SERVICE" \
         "$IP_FAMILY_SERVICE" \
         "$XRAY_OPENRC_SERVICE" \
         "$REALM_OPENRC_SERVICE" \
+        "$APP_EGRESS_OPENRC_SERVICE" \
         "$IP_FAMILY_OPENRC_SERVICE" \
         "$IPV6_KEEPALIVE_OPENRC_SERVICE" \
         "$IPV6_KEEPALIVE_SYSTEMD_SERVICE" \
@@ -8524,7 +8535,7 @@ full_uninstall() {
     if [[ -f "$SNELL_GROUP_MARKER" ]]; then delete_system_group "$SNELL_GROUP"; rm -f "$SNELL_GROUP_MARKER"; fi
 
     [[ -f "$TG_MONITOR_CRON_FILE" ]] && sed -i "/ss2022-tg-monitor/d" "$TG_MONITOR_CRON_FILE" 2>/dev/null || true
-    rm -f "$SINGBOX_OPENRC_PID" "$XRAY_OPENRC_PID" "$SNELL_OPENRC_PID" "$REALM_OPENRC_PID"
+    rm -f "$SINGBOX_OPENRC_PID" "$XRAY_OPENRC_PID" "$SNELL_OPENRC_PID" "$REALM_OPENRC_PID" "$APP_EGRESS_OPENRC_PID"
     rm -rf /run/ss2022-tg-monitor.lockdir
     rm -rf /tmp/ss2022-* 2>/dev/null || true
     service_daemon_reload || true
