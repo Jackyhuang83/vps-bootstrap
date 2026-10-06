@@ -107,11 +107,11 @@ proxy
 - 自动识别标准 Shadowsocks / SS2022；
 - 拒绝 SIP003 plugin 节点；
 - 使用固定 sing-box 1.13.20 镜像先执行配置校验；
-- 创建 Docker 网络 `homesphere-egress`；
+- 创建 Docker 网络 `vps-app-egress`；
 - 创建 `ss2022-app-egress` 容器，在该 Docker 网络内提供 mixed HTTP/SOCKS；
 - **不映射宿主机端口，不向公网开放新的监听端口**；
 - 可一键测试最终出口 IP、TVB API、HLS-1 和 HLS-2；
-- 检测到 `/opt/homesphere` 时自动写入 `MYTVSUPER_PROXY_URL`，HomeSphere 支持共享网络后会自动重建服务接入该出口。
+- 检测到 `/opt/homesphere` 时自动写入 `TVB_PROXY_URL`，HomeSphere 支持共享网络后会自动重建服务接入该出口。
 
 敏感 SS 密码只保存在 VPS 本地 `/etc/ss2022/app-egress-singbox.json`，权限 600，不写入 GitHub、日志或 README。
 
