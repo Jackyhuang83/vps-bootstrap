@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
-# 当前版本: v1.9.0
+# 当前版本: v1.9.1-dev1
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,14 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.9.1-dev1:
+#   - 分流管理新增“本机 / Docker 应用出口”，可直接粘贴 ss:// 自动识别 SS2022 / 标准 Shadowsocks
+#   - 应用出口使用独立 ss2022-app-egress sing-box 服务，不改写现有 SS2022 / ShadowTLS / VLESS 入站
+#   - 监听地址只绑定专用 Docker bridge 网关，不开放宿主机公网端口；供 HomeSphere 等容器通过 HTTP CONNECT 使用
+#   - 自动创建 / 复用 vps-app-egress Docker 网络，并可自动写入 HomeSphere TVB_PROXY_URL 后安全重建 homesphere 容器
+#   - 应用出口测试增加出口 IP / Cloudflare 地区以及 TVB News HLS-1 / HLS-2 实测，便于确认香港落地真正生效
+#   - 完全卸载补齐 ss2022-app-egress 服务、配置与 HomeSphere 关联清理；共享 Docker 网络仅在无人使用时删除
 #
 # v1.9.0 Release:
 #   - 正式支持 Debian / Ubuntu + systemd，并将 Alpine 3.21 + OpenRC 纳入稳定支持范围
@@ -632,7 +640,7 @@
 # 注意: v1.9.0 为稳定正式版；Alpine 3.21 上 Snell v5 与 Cloudflare WARP 仍受官方组件兼容性限制。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0"
+SCRIPT_VERSION="v1.9.1-dev1"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -731,6 +739,17 @@ FORCE_IPV6_LEGACY_CONF="/etc/apt/apt.conf.d/99force-ipv6"
 STATE_DIR="/etc/ss2022"
 STATE_FILE="${STATE_DIR}/state.json"
 ROUTING_FILE="${STATE_DIR}/routing.json"
+# ----------------------------- 本机 / Docker 应用出口 --------------------------
+APP_EGRESS_CONF="${STATE_DIR}/app-egress.json"
+APP_EGRESS_STATE="${STATE_DIR}/app-egress-state.json"
+APP_EGRESS_SERVICE_NAME="ss2022-app-egress"
+APP_EGRESS_SERVICE="/etc/systemd/system/${APP_EGRESS_SERVICE_NAME}.service"
+APP_EGRESS_OPENRC_SERVICE="/etc/init.d/${APP_EGRESS_SERVICE_NAME}"
+APP_EGRESS_OPENRC_PID="/run/${APP_EGRESS_SERVICE_NAME}.pid"
+APP_EGRESS_OPENRC_LOG="/var/log/ss2022/${APP_EGRESS_SERVICE_NAME}.log"
+APP_EGRESS_DOCKER_NETWORK="vps-app-egress"
+APP_EGRESS_PORT=18080
+HOMESPHERE_DIR="/opt/homesphere"
 WARP_DEFAULT_PORT=40000
 WARP_MANAGED_MARKER="${STATE_DIR}/warp-package-managed"
 WARP_REPO_MANAGED_MARKER="${STATE_DIR}/warp-repo-managed"
