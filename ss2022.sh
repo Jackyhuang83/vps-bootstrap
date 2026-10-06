@@ -743,7 +743,7 @@ WARP_DEFAULT_PORT=40000
 APP_EGRESS_STATE="${STATE_DIR}/app-egress.json"
 APP_EGRESS_CONFIG="${STATE_DIR}/app-egress-singbox.json"
 APP_EGRESS_CONTAINER="ss2022-app-egress"
-APP_EGRESS_NETWORK="homesphere-egress"
+APP_EGRESS_NETWORK="vps-app-egress"
 APP_EGRESS_PORT=18080
 APP_EGRESS_IMAGE="ghcr.io/sagernet/sing-box:v${SINGBOX_VERSION}"
 HOMESPHERE_DIR="/opt/homesphere"
@@ -6997,17 +6997,24 @@ app_egress_set_homesphere_env() {
     [[ -d "$HOMESPHERE_DIR" && -f "$HOMESPHERE_ENV" ]] || return 0
     umask 077
     tmp=$(mktemp "${HOMESPHERE_DIR}/.env.app-egress.XXXXXX") || return 1
-    grep -v '^MYTVSUPER_PROXY_URL=' "$HOMESPHERE_ENV" > "$tmp" || true
+    grep -v '^TVB_PROXY_URL=' "$HOMESPHERE_ENV" > "$tmp" || true
     if [[ -n "$value" ]]; then
-        printf "MYTVSUPER_PROXY_URL='%s'\n" "$value" >> "$tmp"
+        printf "TVB_PROXY_URL='%s'\n" "$value" >> "$tmp"
     fi
     chmod 600 "$tmp"
     mv -f "$tmp" "$HOMESPHERE_ENV"
 }
 
 app_egress_sync_homesphere() {
-    local proxy_url="http://${APP_EGRESS_CONTAINER}:${APP_EGRESS_PORT}"
+    local proxy_ip proxy_url
     [[ -d "$HOMESPHERE_DIR" && -f "$HOMESPHERE_ENV" ]] || return 0
+
+    proxy_ip=$(docker inspect -f '{{with index .NetworkSettings.Networks "vps-app-egress"}}{{.IPAddress}}{{end}}' "$APP_EGRESS_CONTAINER" 2>/dev/null || true)
+    if [[ -z "$proxy_ip" ]]; then
+        echo -e "${YELLOW}[提示] 无法读取应用出口 Docker 私网地址；HomeSphere 尚未自动接入。${PLAIN}"
+        return 0
+    fi
+    proxy_url="http://${proxy_ip}:${APP_EGRESS_PORT}"
     app_egress_set_homesphere_env "$proxy_url" || {
         echo -e "${YELLOW}[提示] 应用出口已启动，但 HomeSphere .env 自动更新失败。${PLAIN}"
         return 0
