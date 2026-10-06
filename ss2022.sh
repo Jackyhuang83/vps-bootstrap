@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
-# 当前版本: v1.9.1-dev1
+# 当前版本: v1.9.0
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -629,18 +629,10 @@
 #   v1.9.0-dev42 sing-box / Snell 配置目录 ownership 收口
 #   v1.9.0-dev43 proxy 展示与安装文档 ownership 一致性收口
 #
-# v1.9.1-dev1:
-#   - 分流管理新增“本机应用出口”：粘贴一个 ss:// 节点即可建立仅 Docker 内网可见的 sing-box mixed 出口
-#   - 应用出口不发布宿主机端口；使用独立 homesphere-egress Docker 网络与 ss2022-app-egress 容器隔离
-#   - 自动识别标准 Shadowsocks / SS2022，拒绝 SIP003 plugin，并由 sing-box check 校验后再启动
-#   - 可一键测试最终出口 IP 与 TVB 无线新闻 HLS-1/HLS-2，便于确认香港落地是否真实生效
-#   - 检测到 /opt/homesphere 时自动写入 MYTVSUPER_PROXY_URL，并在 HomeSphere 已支持共享网络时重建服务
-#   - 删除应用出口会清理容器、敏感配置和 HomeSphere 环境变量；完全卸载同步清理本功能资产
-#
 # 注意: v1.9.0 为稳定正式版；Alpine 3.21 上 Snell v5 与 Cloudflare WARP 仍受官方组件兼容性限制。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.1-dev1"
+SCRIPT_VERSION="v1.9.0"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -740,14 +732,6 @@ STATE_DIR="/etc/ss2022"
 STATE_FILE="${STATE_DIR}/state.json"
 ROUTING_FILE="${STATE_DIR}/routing.json"
 WARP_DEFAULT_PORT=40000
-APP_EGRESS_STATE="${STATE_DIR}/app-egress.json"
-APP_EGRESS_CONFIG="${STATE_DIR}/app-egress-singbox.json"
-APP_EGRESS_CONTAINER="ss2022-app-egress"
-APP_EGRESS_NETWORK="vps-app-egress"
-APP_EGRESS_PORT=18080
-APP_EGRESS_IMAGE="ghcr.io/sagernet/sing-box:v${SINGBOX_VERSION}"
-HOMESPHERE_DIR="/opt/homesphere"
-HOMESPHERE_ENV="${HOMESPHERE_DIR}/.env"
 WARP_MANAGED_MARKER="${STATE_DIR}/warp-package-managed"
 WARP_REPO_MANAGED_MARKER="${STATE_DIR}/warp-repo-managed"
 WARP_OWNERSHIP_V2_MARKER="${STATE_DIR}/warp-ownership-v2"
@@ -6951,318 +6935,6 @@ routing_test_effect() {
     echo -e "${YELLOW}WARP Local Proxy 为应用层代理；当前实现不保证 QUIC/UDP 经 WARP 分流。${PLAIN}"
 }
 
-
-app_egress_require_docker() {
-    if ! command -v docker >/dev/null 2>&1; then
-        echo -e "${RED}[错误] 本机应用出口需要 Docker；当前未检测到 docker 命令。${PLAIN}"
-        return 1
-    fi
-    if ! docker info >/dev/null 2>&1; then
-        echo -e "${RED}[错误] Docker daemon 当前不可用。${PLAIN}"
-        return 1
-    fi
-    return 0
-}
-
-app_egress_running() {
-    command -v docker >/dev/null 2>&1 || return 1
-    [[ "$(docker inspect -f '{{.State.Running}}' "$APP_EGRESS_CONTAINER" 2>/dev/null || true)" == "true" ]]
-}
-
-app_egress_status_label() {
-    if app_egress_running; then
-        if [[ -f "$APP_EGRESS_STATE" ]]; then
-            printf 'Running / %s' "$(jq -r '.name // "Shadowsocks"' "$APP_EGRESS_STATE" 2>/dev/null)"
-        else
-            printf 'Running'
-        fi
-    elif [[ -f "$APP_EGRESS_CONFIG" ]]; then
-        printf '已配置但未运行'
-    else
-        printf '未配置'
-    fi
-}
-
-app_egress_ensure_network() {
-    app_egress_require_docker || return 1
-    if docker network inspect "$APP_EGRESS_NETWORK" >/dev/null 2>&1; then
-        return 0
-    fi
-    echo -e "${YELLOW}>> 创建 Docker 内部共享网络 ${APP_EGRESS_NETWORK}...${PLAIN}"
-    docker network create --driver bridge "$APP_EGRESS_NETWORK" >/dev/null || return 1
-}
-
-app_egress_set_homesphere_env() {
-    local value="$1" tmp
-    [[ -d "$HOMESPHERE_DIR" && -f "$HOMESPHERE_ENV" ]] || return 0
-    umask 077
-    tmp=$(mktemp "${HOMESPHERE_DIR}/.env.app-egress.XXXXXX") || return 1
-    grep -v '^TVB_PROXY_URL=' "$HOMESPHERE_ENV" > "$tmp" || true
-    if [[ -n "$value" ]]; then
-        printf "TVB_PROXY_URL='%s'\n" "$value" >> "$tmp"
-    fi
-    chmod 600 "$tmp"
-    mv -f "$tmp" "$HOMESPHERE_ENV"
-}
-
-app_egress_sync_homesphere() {
-    local proxy_ip proxy_url
-    [[ -d "$HOMESPHERE_DIR" && -f "$HOMESPHERE_ENV" ]] || return 0
-
-    proxy_ip=$(docker inspect -f '{{with index .NetworkSettings.Networks "vps-app-egress"}}{{.IPAddress}}{{end}}' "$APP_EGRESS_CONTAINER" 2>/dev/null || true)
-    if [[ -z "$proxy_ip" ]]; then
-        echo -e "${YELLOW}[提示] 无法读取应用出口 Docker 私网地址；HomeSphere 尚未自动接入。${PLAIN}"
-        return 0
-    fi
-    proxy_url="http://${proxy_ip}:${APP_EGRESS_PORT}"
-    app_egress_set_homesphere_env "$proxy_url" || {
-        echo -e "${YELLOW}[提示] 应用出口已启动，但 HomeSphere .env 自动更新失败。${PLAIN}"
-        return 0
-    }
-    if [[ -f "${HOMESPHERE_DIR}/docker-compose.yml" ]] &&
-       grep -Fq "$APP_EGRESS_NETWORK" "${HOMESPHERE_DIR}/docker-compose.yml"; then
-        echo -e "${YELLOW}>> 已检测到 HomeSphere，正在接入 TVB / myTV SUPER 香港出口...${PLAIN}"
-        (
-            cd "$HOMESPHERE_DIR" || exit 1
-            docker compose -f docker-compose.yml -f docker-compose.bridge.yml up -d --force-recreate homesphere
-        ) || {
-            echo -e "${YELLOW}[提示] HomeSphere 自动重建失败；应用出口本身仍保持运行。${PLAIN}"
-            return 0
-        }
-        echo -e "${GREEN}✔ HomeSphere 已接入应用出口。${PLAIN}"
-    else
-        echo -e "${YELLOW}[提示] 已写入 HomeSphere 出口变量；请先把 HomeSphere 更新到支持 ${APP_EGRESS_NETWORK} 的版本。${PLAIN}"
-    fi
-}
-
-app_egress_configure() {
-    local uri name method server port pass query tmp state_tmp
-    app_egress_require_docker || return 1
-    routing_init_state || return 1
-    echo -e "${CYAN}══════════════ 本机应用出口 / Shadowsocks ══════════════${PLAIN}"
-    echo "用途：让 HomeSphere 等本机 Docker 应用按需使用指定落地。"
-    echo "安全：不发布宿主机端口，只在 ${APP_EGRESS_NETWORK} Docker 网络内提供 mixed HTTP/SOCKS。"
-    echo ""
-    read -rp "出口名称 [默认: HomeSphere-HK]: " name
-    name=${name:-HomeSphere-HK}
-    read -rp "请粘贴 Shadowsocks ss:// URI: " uri
-    if ! parse_ss_uri "$uri"; then
-        echo -e "${RED}[错误] 无法解析该 ss:// URI。${PLAIN}"
-        return 1
-    fi
-    query="${CHAIN_SS_QUERY:-}"
-    if [[ "$query" == *"plugin="* ]]; then
-        echo -e "${RED}[错误] 本机应用出口暂不支持 SIP003 plugin。${PLAIN}"
-        return 1
-    fi
-    server="$CHAIN_SERVER"
-    port="$CHAIN_PORT"
-    method=$(normalize_standard_ss_method "$CHAIN_METHOD")
-    pass="$CHAIN_PASSWORD"
-    [[ -n "$pass" ]] || { echo -e "${RED}[错误] Shadowsocks 密码 / Key 为空。${PLAIN}"; return 1; }
-    case "$method" in
-        2022-blake3-aes-128-gcm|2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) ;;
-        *)
-            if ! singbox_supports_standard_ss_method "$method"; then
-                echo -e "${RED}[错误] 当前 sing-box 不支持算法 ${method}。${PLAIN}"
-                return 1
-            fi
-            ;;
-    esac
-
-    app_egress_ensure_network || return 1
-    echo -e "${YELLOW}>> 拉取 / 校验 sing-box ${SINGBOX_VERSION} 应用出口镜像...${PLAIN}"
-    docker pull "$APP_EGRESS_IMAGE" >/dev/null || {
-        echo -e "${RED}[错误] 无法获取 ${APP_EGRESS_IMAGE}。${PLAIN}"
-        return 1
-    }
-
-    umask 077
-    tmp=$(mktemp "${STATE_DIR}/.ss2022-app-egress.XXXXXX.json") || return 1
-    jq -n \
-        --arg server "$server" \
-        --argjson sport "$port" \
-        --arg method "$method" \
-        --arg password "$pass" \
-        --argjson lport "$APP_EGRESS_PORT" \
-        '{log:{level:"warn"},inbounds:[{type:"mixed",tag:"app-egress-in",listen:"0.0.0.0",listen_port:$lport}],outbounds:[{type:"shadowsocks",tag:"app-egress-out",server:$server,server_port:$sport,method:$method,password:$password}],route:{final:"app-egress-out"}}' > "$tmp" || {
-        rm -f "$tmp"
-        return 1
-    }
-
-    if ! docker run --rm -v "${tmp}:/etc/sing-box/config.json:ro" "$APP_EGRESS_IMAGE" check -c /etc/sing-box/config.json >/dev/null; then
-        echo -e "${RED}[错误] sing-box 拒绝该 Shadowsocks 配置；未修改现有应用出口。${PLAIN}"
-        rm -f "$tmp"
-        return 1
-    fi
-
-    mv -f "$tmp" "$APP_EGRESS_CONFIG"
-    chmod 600 "$APP_EGRESS_CONFIG"
-    state_tmp=$(mktemp "${STATE_DIR}/.ss2022-app-egress-state.XXXXXX.json") || return 1
-    jq -n --arg name "$name" --arg server "$server" --argjson port "$port" --arg method "$method" \
-        '{version:1,name:$name,type:"shadowsocks",server:$server,port:$port,method:$method}' > "$state_tmp" || {
-        rm -f "$state_tmp"
-        return 1
-    }
-    mv -f "$state_tmp" "$APP_EGRESS_STATE"
-    chmod 600 "$APP_EGRESS_STATE"
-
-    docker rm -f "$APP_EGRESS_CONTAINER" >/dev/null 2>&1 || true
-    if ! docker run -d \
-        --name "$APP_EGRESS_CONTAINER" \
-        --restart unless-stopped \
-        --network "$APP_EGRESS_NETWORK" \
-        --label "io.vps-bootstrap.managed=app-egress" \
-        -v "${APP_EGRESS_CONFIG}:/etc/sing-box/config.json:ro" \
-        "$APP_EGRESS_IMAGE" run -c /etc/sing-box/config.json >/dev/null; then
-        echo -e "${RED}[错误] 应用出口容器启动失败。${PLAIN}"
-        return 1
-    fi
-
-    sleep 1
-    if ! app_egress_running; then
-        echo -e "${RED}[错误] 应用出口容器启动后立即退出。${PLAIN}"
-        docker logs --tail 30 "$APP_EGRESS_CONTAINER" 2>/dev/null || true
-        return 1
-    fi
-
-    echo -e "${GREEN}✔ 本机应用出口已启动：${name}${PLAIN}"
-    echo "  Docker 服务: ${APP_EGRESS_CONTAINER}:${APP_EGRESS_PORT}"
-    echo "  Shadowsocks: ${server}:${port} / ${method}"
-    echo "  公网监听   : 无"
-    app_egress_sync_homesphere
-}
-
-app_egress_test() {
-    local proxy api hd master final variant variant_url hls2 exit_ip scheme_host
-    app_egress_require_docker || return 1
-    app_egress_running || {
-        echo -e "${RED}[错误] 本机应用出口未运行。${PLAIN}"
-        return 1
-    }
-    proxy="http://${APP_EGRESS_CONTAINER}:${APP_EGRESS_PORT}"
-    echo -e "${YELLOW}>> 测试应用出口公网 IP...${PLAIN}"
-    exit_ip=$(docker run --rm --network "$APP_EGRESS_NETWORK" curlimages/curl:8.10.1 \
-        -fsS --connect-timeout 8 --max-time 20 --proxy "$proxy" https://api.ipify.org 2>/dev/null || true)
-    if [[ -n "$exit_ip" ]]; then
-        echo -e "出口 IP : ${GREEN}${exit_ip}${PLAIN}"
-    else
-        echo -e "${RED}[错误] 无法通过应用出口访问公网。${PLAIN}"
-        return 1
-    fi
-
-    echo -e "${YELLOW}>> 测试 TVB 无线新闻官方 HLS...${PLAIN}"
-    api=$(docker run --rm --network "$APP_EGRESS_NETWORK" curlimages/curl:8.10.1 \
-        -fsS --connect-timeout 8 --max-time 20 --proxy "$proxy" \
-        -H 'Referer: https://news.tvb.com/' \
-        'https://inews-api.tvb.com/news/checkout/live/hd/ott_I-NEWS_h264?profile=safari' 2>/dev/null || true)
-    hd=$(jq -r '.content.url.hd // empty' <<<"$api" 2>/dev/null)
-    if [[ -z "$hd" ]]; then
-        echo -e "${RED}[错误] TVB API 未返回 HD 播放地址。${PLAIN}"
-        return 1
-    fi
-    echo -e "API    : ${GREEN}200 / success${PLAIN}"
-
-    final=$(docker run --rm --network "$APP_EGRESS_NETWORK" curlimages/curl:8.10.1 \
-        -sS -L --connect-timeout 8 --max-time 20 --proxy "$proxy" \
-        -H 'Referer: https://news.tvb.com/' \
-        -o /dev/null -w '%{http_code}\t%{url_effective}' "$hd" 2>/dev/null || true)
-    if [[ "${final%%$'\t'*}" != "200" ]]; then
-        echo -e "${RED}[错误] HLS-1 : ${final%%$'\t'*}${PLAIN}"
-        return 1
-    fi
-    echo -e "HLS-1  : ${GREEN}200${PLAIN}"
-
-    master=$(docker run --rm --network "$APP_EGRESS_NETWORK" curlimages/curl:8.10.1 \
-        -fsS -L --connect-timeout 8 --max-time 20 --proxy "$proxy" \
-        -H 'Referer: https://news.tvb.com/' "$hd" 2>/dev/null || true)
-    variant=$(awk 'NF && $0 !~ /^#/ {gsub(/\r/,""); print; exit}' <<<"$master")
-    [[ -n "$variant" ]] || {
-        echo -e "${RED}[错误] HLS-1 未发现二级播放清单。${PLAIN}"
-        return 1
-    }
-
-    final="${final#*$'\t'}"
-    case "$variant" in
-        https://*) variant_url="$variant" ;;
-        /*)
-            scheme_host="${final%%://*}://${final#*://}"
-            scheme_host="${scheme_host%%/*}"
-            variant_url="${scheme_host}${variant}"
-            ;;
-        *)
-            variant_url="${final%/*}/${variant}"
-            ;;
-    esac
-
-    hls2=$(docker run --rm --network "$APP_EGRESS_NETWORK" curlimages/curl:8.10.1 \
-        -sS -L --connect-timeout 8 --max-time 20 --proxy "$proxy" \
-        -H 'Referer: https://news.tvb.com/' \
-        -o /dev/null -w '%{http_code}' "$variant_url" 2>/dev/null || true)
-    if [[ "$hls2" == "200" ]]; then
-        echo -e "HLS-2  : ${GREEN}200${PLAIN}"
-        echo -e "${GREEN}✔ TVB 二级媒体清单已通过该 Shadowsocks 出口；可供 HomeSphere 使用。${PLAIN}"
-        return 0
-    fi
-    echo -e "HLS-2  : ${RED}${hls2:-失败}${PLAIN}"
-    echo -e "${RED}[错误] 当前 Shadowsocks 出口仍未通过 TVB 二级媒体清单限制。${PLAIN}"
-    return 1
-}
-
-app_egress_remove() {
-    local yes
-    echo -e "${YELLOW}当前状态: $(app_egress_status_label)${PLAIN}"
-    read -rp "确认删除本机应用出口？[y/N]: " yes
-    [[ "$yes" =~ ^[Yy]$ ]] || return 0
-    if command -v docker >/dev/null 2>&1; then
-        docker rm -f "$APP_EGRESS_CONTAINER" >/dev/null 2>&1 || true
-    fi
-    rm -f "$APP_EGRESS_CONFIG" "$APP_EGRESS_STATE"
-    app_egress_set_homesphere_env "" || true
-    if [[ -f "${HOMESPHERE_DIR}/docker-compose.yml" ]] &&
-       grep -Fq "$APP_EGRESS_NETWORK" "${HOMESPHERE_DIR}/docker-compose.yml" &&
-       command -v docker >/dev/null 2>&1; then
-        (
-            cd "$HOMESPHERE_DIR" || exit 1
-            docker compose -f docker-compose.yml -f docker-compose.bridge.yml up -d --force-recreate homesphere
-        ) >/dev/null 2>&1 || true
-    fi
-    echo -e "${GREEN}✔ 本机应用出口已删除；HomeSphere 已恢复默认出口。${PLAIN}"
-}
-
-app_egress_management() {
-    while true; do
-        clear
-        echo -e "${CYAN}════════════════ 本机应用出口 ════════════════${PLAIN}"
-        echo "当前状态 : $(app_egress_status_label)"
-        echo "Docker网络: ${APP_EGRESS_NETWORK}"
-        echo "用途      : HomeSphere / 其它本机 Docker 应用按需经指定 SS 落地"
-        echo "公网端口  : 不开放"
-        echo ""
-        echo "  1. 导入 / 更换 Shadowsocks ss:// 节点"
-        echo "  2. 测试出口与 TVB HLS"
-        echo "  3. 查看运行日志"
-        echo "  4. 删除本机应用出口"
-        echo "  0. 返回"
-        read -rp "请选择 [0-4]: " c
-        case "$c" in
-            1) app_egress_configure; pause ;;
-            2) app_egress_test; pause ;;
-            3)
-                if command -v docker >/dev/null 2>&1; then
-                    docker logs --tail 80 "$APP_EGRESS_CONTAINER" 2>&1 || true
-                else
-                    echo "Docker 未安装。"
-                fi
-                pause
-                ;;
-            4) app_egress_remove; pause ;;
-            0) return ;;
-            *) sleep 1 ;;
-        esac
-    done
-}
-
 routing_management() {
     while true; do
         clear
@@ -7290,19 +6962,17 @@ routing_management() {
         echo "  1. WARP 出口管理"
         echo "  2. 落地节点管理"
         echo "  3. 分流规则管理"
-        echo "  4. 本机应用出口（Docker / SS）"
-        echo "  5. 查看当前分流配置"
-        echo "  6. 测试分流效果"
+        echo "  4. 查看当前分流配置"
+        echo "  5. 测试分流效果"
         echo "  0. 返回"
         echo -e "${CYAN}══════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0-6]: " c
+        read -rp "请选择 [0-5]: " c
         case "$c" in
             1) warp_management ;;
             2) chain_management ;;
             3) routing_rule_management ;;
-            4) app_egress_management ;;
-            5) routing_show_config; pause ;;
-            6) routing_test_effect; pause ;;
+            4) routing_show_config; pause ;;
+            5) routing_test_effect; pause ;;
             0) return ;;
             *) sleep 1 ;;
         esac
@@ -8319,12 +7989,6 @@ full_uninstall() {
     echo ""
     read -rp "确认彻底卸载？请输入 DELETE: " yes
     [[ "$yes" == "DELETE" ]] || { echo "已取消。"; sleep 1; return; }
-
-    if command -v docker >/dev/null 2>&1; then
-        docker rm -f "$APP_EGRESS_CONTAINER" >/dev/null 2>&1 || true
-        docker network rm "$APP_EGRESS_NETWORK" >/dev/null 2>&1 || true
-    fi
-    app_egress_set_homesphere_env "" || true
 
     if [[ "$PLATFORM_INIT" == "systemd" ]]; then
         [[ $singbox_managed -eq 1 ]] && systemctl disable --now sing-box >/dev/null 2>&1 || true
