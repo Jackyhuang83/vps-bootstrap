@@ -4,6 +4,8 @@
 
 当前正式版本：**v1.9.0**
 
+当前开发版本：**v1.9.1-dev1**
+
 项目以单一交互式 Bash 脚本 `ss2022.sh` 为入口，整合 **SS2022、SS2022 + ShadowTLS v3、VLESS Reality、Snell v5**，并提供 WARP 出口、链式落地、规则分流、Realm L4 端口转发、组件管理、服务器工具、服务器测试与脚本自更新。
 
 > v1.9.0 为当前稳定正式版。Debian / Ubuntu + systemd 正式支持；Alpine 3.21 + OpenRC 正式支持 SS2022、ShadowTLS v3、VLESS Reality、Realm 以及服务器管理/测试。Snell v5 与 Cloudflare WARP 在 Alpine 暂不开放。
@@ -93,6 +95,25 @@ proxy
 10. 完全卸载脚本
 0. 退出管理面板
 ```
+
+---
+
+# 本机应用出口（v1.9.1-dev1）
+
+`分流管理 -> 本机应用出口（Docker / SS）` 用于让 HomeSphere 等同机 Docker 应用使用一个指定的 Shadowsocks 落地，而不改变整台 VPS 的默认出口。
+
+配置时只需要粘贴一个 `ss://` 节点。脚本会：
+
+- 自动识别标准 Shadowsocks / SS2022；
+- 拒绝 SIP003 plugin 节点；
+- 使用固定 sing-box 1.13.20 镜像先执行配置校验；
+- 创建 Docker 网络 `homesphere-egress`；
+- 创建 `ss2022-app-egress` 容器，在该 Docker 网络内提供 mixed HTTP/SOCKS；
+- **不映射宿主机端口，不向公网开放新的监听端口**；
+- 可一键测试最终出口 IP、TVB API、HLS-1 和 HLS-2；
+- 检测到 `/opt/homesphere` 时自动写入 `MYTVSUPER_PROXY_URL`，HomeSphere 支持共享网络后会自动重建服务接入该出口。
+
+敏感 SS 密码只保存在 VPS 本地 `/etc/ss2022/app-egress-singbox.json`，权限 600，不写入 GitHub、日志或 README。
 
 ---
 
