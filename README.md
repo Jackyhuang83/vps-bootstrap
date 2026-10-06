@@ -2,7 +2,7 @@
 
 一体化 VPS 网络协议、服务端分流、端口转发与日常运维脚本。
 
-当前正式版本：**v1.9.0**
+当前正式版本：**v1.9.0**；当前开发版本：**v1.9.1-dev1**
 
 项目以单一交互式 Bash 脚本 `ss2022.sh` 为入口，整合 **SS2022、SS2022 + ShadowTLS v3、VLESS Reality、Snell v5**，并提供 WARP 出口、链式落地、规则分流、Realm L4 端口转发、组件管理、服务器工具、服务器测试与脚本自更新。
 
@@ -225,6 +225,47 @@ Snell v5 保持官方 `snell-server` 架构，不参与 VPS 服务端分流。
 - SOCKS5
 
 可对落地节点进行查看、删除、测试，并设置为默认出口。
+
+### 本机 / Docker 应用出口（v1.9.1-dev1）
+
+用于“VPS 自己运行的应用”需要通过指定落地节点访问区域服务的场景。它与 SS2022 / ShadowTLS / VLESS 的客户端入站分流是两条独立链路。
+
+进入：
+
+```text
+ss2022
+→ 2. 分流管理
+→ 6. 本机 / Docker 应用出口
+→ 1. 导入 / 更换 Shadowsocks 节点
+```
+
+只需要粘贴一个标准 `ss://` URI。脚本会：
+
+- 自动解析服务器、端口、算法与密码 / Key；
+- 自动识别 SS2022 或标准 Shadowsocks；
+- 拒绝当前不支持的 SIP003 插件节点；
+- 生成独立 `ss2022-app-egress` sing-box 服务；
+- 创建 / 复用 `vps-app-egress` Docker bridge；
+- 只监听该 bridge 的私网网关和高位端口，不开放 VPS 公网端口；
+- 对配置执行 `sing-box check` 后才替换正式配置；
+- 自动测试落地后的 IPv4、Cloudflare 地区以及 TVB News HLS-1 / HLS-2；
+- 检测到 `/opt/homesphere` 时，可自动写入 `TVB_PROXY_URL` 并安全重建 HomeSphere 容器。
+
+HomeSphere 场景的链路为：
+
+```text
+HomeSphere 容器
+      ↓
+vps-app-egress Docker 私网
+      ↓ HTTP CONNECT
+ss2022-app-egress
+      ↓
+你粘贴的 Shadowsocks / SS2022 落地
+      ↓
+区域服务
+```
+
+该功能不会把整个 VPS 默认路由改成落地节点，也不会让 115、CCTV、系统更新等无关流量跟随该出口。HomeSphere 目前只把 TVB / myTV SUPER 的服务端取流、HLS 中继和 Widevine license 请求交给这个出口。
 
 ---
 
