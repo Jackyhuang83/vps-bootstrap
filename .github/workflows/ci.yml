@@ -42,6 +42,36 @@ jobs:
           shellcheck --version
           shellcheck --severity=error -x ss2022.sh
 
+      - name: Validate application egress sing-box image
+        shell: bash
+        run: |
+          cat > .ci-app-egress.json <<'JSON'
+          {
+            "log": {"level": "warn"},
+            "inbounds": [{
+              "type": "mixed",
+              "tag": "app-egress-in",
+              "listen": "0.0.0.0",
+              "listen_port": 18080
+            }],
+            "outbounds": [{
+              "type": "shadowsocks",
+              "tag": "app-egress-out",
+              "server": "127.0.0.1",
+              "server_port": 8388,
+              "method": "aes-128-gcm",
+              "password": "ci-test-password"
+            }],
+            "route": {"final": "app-egress-out"}
+          }
+          JSON
+          docker pull ghcr.io/sagernet/sing-box:v1.13.20
+          docker run --rm \
+            -v "$PWD/.ci-app-egress.json:/etc/sing-box/config.json:ro" \
+            ghcr.io/sagernet/sing-box:v1.13.20 \
+            check -c /etc/sing-box/config.json
+          rm -f .ci-app-egress.json
+
       - name: Check script version
         run: |
           if ! grep -Eq '^SCRIPT_VERSION="v[0-9]+\.[0-9]+\.[0-9]+(-dev[0-9]+)?"$' ss2022.sh; then
