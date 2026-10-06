@@ -6954,6 +6954,14811 @@ routing_test_effect() {
     echo -e "${YELLOW}WARP Local Proxy 为应用层代理；当前实现不保证 QUIC/UDP 经 WARP 分流。${PLAIN}"
 }
 
+
+app_egress_method_supported() {
+    local method="$1"
+    case "$method" in
+        2022-blake3-aes-128-gcm|2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) return 0 ;;
+    esac
+    singbox_supports_standard_ss_method "$method"
+}
+
+app_egress_ensure_network() {
+    command -v docker >/dev/null 2>&1 || {
+        echo -e "${RED}[错误] 本机 / Docker 应用出口需要 Docker；当前未检测到 docker 命令。${PLAIN}"
+        return 1
+    }
+    docker info >/dev/null 2>&1 || {
+        echo -e "${RED}[错误] Docker 服务当前不可用。${PLAIN}"
+        return 1
+    }
+    if ! docker network inspect "$APP_EGRESS_DOCKER_NETWORK" >/dev/null 2>&1; then
+        echo -e "${YELLOW}>> 创建隔离 Docker 网络 $APP_EGRESS_DOCKER_NETWORK...${PLAIN}"
+        docker network create --driver bridge \
+            --label com.vps-bootstrap.app-egress=true \
+            "$APP_EGRESS_DOCKER_NETWORK" >/dev/null || return 1
+    fi
+}
+
+app_egress_gateway() {
+    docker network inspect \
+        -f '{{(index .IPAM.Config 0).Gateway}}' \
+        "$APP_EGRESS_DOCKER_NETWORK" 2>/dev/null | head -n1
+}
+
+app_egress_proxy_url() {
+    local gateway
+    gateway=$(app_egress_gateway) || return 1
+    [[ -n "$gateway" ]] || return 1
+    printf 'http://%s:%s' "$gateway" "$APP_EGRESS_PORT"
+}
+
+write_app_egress_service() {
+    ensure_singbox_user || return 1
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        cat > "$APP_EGRESS_SERVICE" <<SERVICE
+[Unit]
+Description=vps-bootstrap local Docker application egress
+Documentation=https://github.com/Jackyhuang83/vps-bootstrap
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+User=$SINGBOX_USER
+Group=$SINGBOX_GROUP
+ExecStart=$SINGBOX_BIN run -c $APP_EGRESS_CONF
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=1048576
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+        service_daemon_reload || return 1
+        service_enable "$APP_EGRESS_SERVICE_NAME" || return 1
+        return 0
+    fi
+
+    mkdir -p /var/log/ss2022 || return 1
+    touch "$APP_EGRESS_OPENRC_LOG" || return 1
+    chown "$SINGBOX_USER:$SINGBOX_GROUP" "$APP_EGRESS_OPENRC_LOG" || return 1
+    chmod 640 "$APP_EGRESS_OPENRC_LOG"
+    cat > "$APP_EGRESS_OPENRC_SERVICE" <<SERVICE
+#!/sbin/openrc-run
+description="vps-bootstrap local Docker application egress"
+command="$SINGBOX_BIN"
+command_args="run -c $APP_EGRESS_CONF"
+command_user="$SINGBOX_USER:$SINGBOX_GROUP"
+supervisor="supervise-daemon"
+pidfile="$APP_EGRESS_OPENRC_PID"
+output_log="$APP_EGRESS_OPENRC_LOG"
+error_log="$APP_EGRESS_OPENRC_LOG"
+respawn_delay=3
+respawn_max=0
+umask=0077
+
+depend() {
+    need net
+    use docker
+    use dns
+}
+SERVICE
+    chmod 755 "$APP_EGRESS_OPENRC_SERVICE"
+    service_enable "$APP_EGRESS_SERVICE_NAME" || return 1
+}
+
+app_egress_homesphere_set_proxy() {
+    local proxy_url="$1" envfile="$HOMESPHERE_DIR/.env" tmp
+    local compose_args=(-f docker-compose.yml)
+    [[ -d "$HOMESPHERE_DIR" && -f "$envfile" ]] || {
+        echo -e "${YELLOW}[提示] 未检测到 $HOMESPHERE_DIR/.env；应用出口已就绪，但未自动关联 HomeSphere。${PLAIN}"
+        return 0
+    }
+
+    umask 077
+    tmp=$(mktemp "$HOMESPHERE_DIR/.env.app-egress.XXXXXX") || return 1
+    grep -v '^TVB_PROXY_URL=' "$envfile" > "$tmp" || true
+    printf "TVB_PROXY_URL='%s'\n" "$proxy_url" >> "$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$envfile"
+
+    if docker inspect homesphere >/dev/null 2>&1; then
+        if ! docker inspect -f '{{json .NetworkSettings.Networks}}' homesphere 2>/dev/null | grep -Fq "\"$APP_EGRESS_DOCKER_NETWORK\""; then
+            docker network connect "$APP_EGRESS_DOCKER_NETWORK" homesphere >/dev/null 2>&1 || true
+        fi
+    fi
+
+    if [[ -f "$HOMESPHERE_DIR/docker-compose.yml" ]] &&
+       grep -q 'TVB_PROXY_URL:' "$HOMESPHERE_DIR/docker-compose.yml"; then
+        (
+            cd "$HOMESPHERE_DIR" || exit 1
+            [[ -f docker-compose.bridge.yml ]] && compose_args+=(-f docker-compose.bridge.yml)
+            docker compose "${compose_args[@]}" up -d --force-recreate --no-deps homesphere
+        ) || {
+            echo -e "${YELLOW}[提示] TVB_PROXY_URL 已写入 HomeSphere，但自动重建容器失败；可稍后在 HomeSphere 菜单重启。${PLAIN}"
+            return 0
+        }
+        echo -e "${GREEN}✔ HomeSphere 已自动关联该应用出口。${PLAIN}"
+    else
+        echo -e "${YELLOW}[提示] HomeSphere 当前版本尚未识别 TVB_PROXY_URL；请先更新 HomeSphere，再重新选择“关联 HomeSphere”。${PLAIN}"
+    fi
+}
+
+app_egress_homesphere_clear_proxy() {
+    local envfile="$HOMESPHERE_DIR/.env" tmp
+    local compose_args=(-f docker-compose.yml)
+    [[ -f "$envfile" ]] || return 0
+    umask 077
+    tmp=$(mktemp "$HOMESPHERE_DIR/.env.app-egress.XXXXXX") || return 1
+    grep -v '^TVB_PROXY_URL=' "$envfile" > "$tmp" || true
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$envfile"
+
+    if [[ -f "$HOMESPHERE_DIR/docker-compose.yml" ]] &&
+       grep -q 'TVB_PROXY_URL:' "$HOMESPHERE_DIR/docker-compose.yml"; then
+        (
+            cd "$HOMESPHERE_DIR" || exit 1
+            [[ -f docker-compose.bridge.yml ]] && compose_args+=(-f docker-compose.bridge.yml)
+            docker compose "${compose_args[@]}" up -d --force-recreate --no-deps homesphere
+        ) >/dev/null 2>&1 || true
+    fi
+}
+
+app_egress_status_text() {
+    if [[ -f "$APP_EGRESS_CONF" ]] && service_is_active "$APP_EGRESS_SERVICE_NAME"; then
+        printf 'Running'
+    elif [[ -f "$APP_EGRESS_CONF" ]]; then
+        printf '已配置 / 未运行'
+    else
+        printf '未配置'
+    fi
+}
+
+app_egress_show_status() {
+    local gateway="" proxy="" server="" method="" region=""
+    echo -e "${CYAN}══════════════ 本机 / Docker 应用出口 ══════════════${PLAIN}"
+    echo "状态      : $(app_egress_status_text)"
+    if [[ -f "$APP_EGRESS_STATE" ]]; then
+        server=$(jq -r '.server // "-"' "$APP_EGRESS_STATE" 2>/dev/null || echo "-")
+        method=$(jq -r '.method // "-"' "$APP_EGRESS_STATE" 2>/dev/null || echo "-")
+        region=$(jq -r '.last_region // "-"' "$APP_EGRESS_STATE" 2>/dev/null || echo "-")
+        echo "落地服务器: $server"
+        echo "算法      : $method"
+        echo "最近地区  : $region"
+    fi
+    if command -v docker >/dev/null 2>&1 && docker network inspect "$APP_EGRESS_DOCKER_NETWORK" >/dev/null 2>&1; then
+        gateway=$(app_egress_gateway 2>/dev/null || true)
+        [[ -n "$gateway" ]] && proxy="http://$gateway:$APP_EGRESS_PORT"
+        echo "Docker网络: $APP_EGRESS_DOCKER_NETWORK"
+        echo "内部入口  : $proxy"
+        echo "公网端口  : 不开放"
+    fi
+    if [[ -f "$HOMESPHERE_DIR/.env" ]] && grep -q '^TVB_PROXY_URL=' "$HOMESPHERE_DIR/.env"; then
+        echo "HomeSphere: 已关联"
+    else
+        echo "HomeSphere: 未关联"
+    fi
+}
+
+app_egress_import_ss() {
+    local uri server port method pass gateway candidate backup="" state_tmp ss_kind="标准 Shadowsocks" proxy
+    routing_init_state || return 1
+
+    echo "只需要粘贴一个 Shadowsocks ss:// 节点。"
+    echo "脚本会自动识别 SS2022 / 标准 Shadowsocks，并只作为本机/Docker 应用出口使用。"
+    echo ""
+    read -rp "请粘贴 ss:// 节点: " uri
+    [[ -n "$uri" ]] || return 1
+
+    if ! parse_ss_uri "$uri"; then
+        echo -e "${RED}[错误] 无法解析该 ss:// URI。${PLAIN}"
+        return 1
+    fi
+    if [[ "${CHAIN_SS_QUERY:-}" == *"plugin="* ]]; then
+        echo -e "${RED}[错误] 应用出口暂不支持 SIP003 插件节点。${PLAIN}"
+        return 1
+    fi
+
+    server="$CHAIN_SERVER"
+    port="$CHAIN_PORT"
+    method=$(normalize_standard_ss_method "$CHAIN_METHOD")
+    pass="$CHAIN_PASSWORD"
+    [[ -n "$pass" ]] || {
+        echo -e "${RED}[错误] Shadowsocks 密码 / Key 为空。${PLAIN}"
+        return 1
+    }
+
+    app_egress_method_supported "$method" || {
+        echo -e "${RED}[错误] 当前 sing-box 不支持该 Shadowsocks 算法: $method${PLAIN}"
+        return 1
+    }
+    [[ "$method" == 2022-blake3-* ]] && ss_kind="SS2022"
+
+    echo ""
+    echo "检测结果："
+    echo "  服务器: $server"
+    echo "  端口  : $port"
+    echo "  算法  : $method"
+    echo "  类型  : $ss_kind"
+    echo "  密码  : 已解析（不会回显）"
+    echo ""
+
+    if [[ ! -x "$SINGBOX_BIN" ]]; then
+        echo -e "${YELLOW}>> 未安装 sing-box；应用出口需要 sing-box 核心。${PLAIN}"
+        NETWORK_MODE="${NETWORK_MODE:-ipv4}"
+        install_singbox_core || return 1
+        ensure_base_singbox_config || return 1
+    fi
+    ensure_singbox_user || return 1
+    app_egress_ensure_network || return 1
+    gateway=$(app_egress_gateway)
+    [[ -n "$gateway" ]] || {
+        echo -e "${RED}[错误] 无法获取 $APP_EGRESS_DOCKER_NETWORK 的 Docker 网关。${PLAIN}"
+        return 1
+    }
+
+    candidate=$(mktemp "$STATE_DIR/app-egress.XXXXXX.json") || return 1
+    jq -n \
+      --arg listen "$gateway" \
+      --argjson listen_port "$APP_EGRESS_PORT" \
+      --arg server "$server" \
+      --argjson server_port "$port" \
+      --arg method "$method" \
+      --arg password "$pass" \
+      '{
+        log:{level:"warn"},
+        dns:{servers:[{type:"local",tag:"local-dns",prefer_go:true}]},
+        inbounds:[{type:"mixed",tag:"app-in",listen:$listen,listen_port:$listen_port}],
+        outbounds:[{type:"shadowsocks",tag:"app-out",server:$server,server_port:$server_port,method:$method,password:$password}],
+        route:{final:"app-out"}
+      }' > "$candidate" || {
+        rm -f "$candidate"
+        return 1
+      }
+
+    chown root:"$SINGBOX_GROUP" "$candidate" 2>/dev/null || true
+    chmod 640 "$candidate"
+    if ! "$SINGBOX_BIN" check -c "$candidate"; then
+        echo -e "${RED}[错误] 应用出口 sing-box 配置校验失败，未修改现有配置。${PLAIN}"
+        rm -f "$candidate"
+        return 1
+    fi
+
+    if [[ -f "$APP_EGRESS_CONF" ]]; then
+        backup=$(mktemp "$STATE_DIR/app-egress.rollback.XXXXXX.json") || {
+            rm -f "$candidate"
+            return 1
+        }
+        cp -a "$APP_EGRESS_CONF" "$backup" || {
+            rm -f "$candidate" "$backup"
+            return 1
+        }
+    fi
+
+    mv -f "$candidate" "$APP_EGRESS_CONF" || {
+        rm -f "$candidate" "$backup"
+        return 1
+    }
+    chown root:"$SINGBOX_GROUP" "$APP_EGRESS_CONF"
+    chmod 640 "$APP_EGRESS_CONF"
+
+    write_app_egress_service || {
+        [[ -n "$backup" && -f "$backup" ]] && mv -f "$backup" "$APP_EGRESS_CONF"
+        return 1
+    }
+
+    if service_is_active "$APP_EGRESS_SERVICE_NAME"; then
+        service_restart "$APP_EGRESS_SERVICE_NAME" || true
+    else
+        service_enable_now "$APP_EGRESS_SERVICE_NAME" || true
+    fi
+
+    if ! service_is_active "$APP_EGRESS_SERVICE_NAME"; then
+        echo -e "${RED}[错误] $APP_EGRESS_SERVICE_NAME 启动失败，正在恢复上一版。${PLAIN}"
+        if [[ -n "$backup" && -f "$backup" ]]; then
+            mv -f "$backup" "$APP_EGRESS_CONF"
+            chown root:"$SINGBOX_GROUP" "$APP_EGRESS_CONF"
+            chmod 640 "$APP_EGRESS_CONF"
+            service_restart "$APP_EGRESS_SERVICE_NAME" >/dev/null 2>&1 || true
+        else
+            rm -f "$APP_EGRESS_CONF"
+            service_disable_now "$APP_EGRESS_SERVICE_NAME"
+        fi
+        service_log_tail "$APP_EGRESS_SERVICE_NAME" 30 || true
+        return 1
+    fi
+    rm -f "$backup"
+
+    state_tmp=$(mktemp "$STATE_DIR/app-egress-state.XXXXXX.json") || return 1
+    jq -n \
+      --arg server "$server" \
+      --argjson port "$port" \
+      --arg method "$method" \
+      --arg network "$APP_EGRESS_DOCKER_NETWORK" \
+      --arg gateway "$gateway" \
+      '{version:1,server:$server,port:$port,method:$method,network:$network,gateway:$gateway,last_region:null}' \
+      > "$state_tmp" || {
+        rm -f "$state_tmp"
+        return 1
+      }
+    mv -f "$state_tmp" "$APP_EGRESS_STATE"
+    chmod 600 "$APP_EGRESS_STATE"
+
+    proxy=$(app_egress_proxy_url) || return 1
+    echo -e "${GREEN}✔ 应用出口已启动：Docker 私网 $gateway:$APP_EGRESS_PORT → $server:$port${PLAIN}"
+    echo -e "${GREEN}✔ 未开放任何宿主机公网端口。${PLAIN}"
+
+    app_egress_homesphere_set_proxy "$proxy" || true
+    echo ""
+    echo -e "${YELLOW}>> 自动测试出口...${PLAIN}"
+    app_egress_test || true
+}
+
+app_egress_url_join() {
+    local base="$1" rel="$2" scheme host dir
+    if [[ "$rel" =~ ^https?:// ]]; then
+        printf '%s' "$rel"
+        return
+    fi
+    scheme=${base%%://*}
+    host=${base#*://}
+    host=${host%%/*}
+    if [[ "$rel" == /* ]]; then
+        printf '%s://%s%s' "$scheme" "$host" "$rel"
+        return
+    fi
+    dir=${base%/*}
+    printf '%s/%s' "$dir" "$rel"
+}
+
+app_egress_test() {
+    local proxy ip trace region api_file master_file variant_file meta hd result code1 eff1 variant url2 code2 tmp
+    proxy=$(app_egress_proxy_url 2>/dev/null || true)
+    [[ -n "$proxy" ]] || {
+        echo -e "${RED}[错误] 应用出口尚未配置。${PLAIN}"
+        return 1
+    }
+    service_is_active "$APP_EGRESS_SERVICE_NAME" || {
+        echo -e "${RED}[错误] $APP_EGRESS_SERVICE_NAME 未运行。${PLAIN}"
+        return 1
+    }
+
+    echo -e "${CYAN}应用出口: $proxy${PLAIN}"
+    ip=$(curl -fsS --proxy "$proxy" --connect-timeout 8 --max-time 15 https://api4.ipify.org 2>/dev/null || true)
+    trace=$(curl -fsS --proxy "$proxy" --connect-timeout 8 --max-time 15 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+    region=$(printf '%s\n' "$trace" | awk -F= '$1=="loc"{print $2; exit}')
+    echo "出口 IPv4: ${ip:-检测失败}"
+    echo "出口地区 : ${region:-未知}"
+    if [[ -f "$APP_EGRESS_STATE" && -n "$region" ]]; then
+        tmp=$(mktemp "$STATE_DIR/app-egress-state.XXXXXX.json" 2>/dev/null || true)
+        if [[ -n "$tmp" ]]; then
+            jq --arg r "$region" '.last_region=$r' "$APP_EGRESS_STATE" > "$tmp" 2>/dev/null &&
+              mv -f "$tmp" "$APP_EGRESS_STATE" || rm -f "$tmp"
+            chmod 600 "$APP_EGRESS_STATE" 2>/dev/null || true
+        fi
+    fi
+
+    api_file=$(mktemp /tmp/ss2022-app-egress-api.XXXXXX) || return 1
+    master_file=$(mktemp /tmp/ss2022-app-egress-master.XXXXXX) || {
+        rm -f "$api_file"
+        return 1
+    }
+    variant_file=$(mktemp /tmp/ss2022-app-egress-variant.XXXXXX) || {
+        rm -f "$api_file" "$master_file"
+        return 1
+    }
+
+    curl -fsS --proxy "$proxy" --connect-timeout 8 --max-time 20 \
+      -H 'Referer: https://news.tvb.com/' \
+      'https://inews-api.tvb.com/news/checkout/live/hd/ott_I-NEWS_h264?profile=safari' \
+      -o "$api_file" || {
+        echo -e "${RED}TVB API  : 失败${PLAIN}"
+        rm -f "$api_file" "$master_file" "$variant_file"
+        return 1
+      }
+
+    meta=$(jq -r '.meta.status // empty' "$api_file" 2>/dev/null)
+    hd=$(jq -r '.content.url.hd // empty' "$api_file" 2>/dev/null)
+    if [[ "$meta" != "success" || -z "$hd" ]]; then
+        echo -e "${RED}TVB API  : 返回异常${PLAIN}"
+        rm -f "$api_file" "$master_file" "$variant_file"
+        return 1
+    fi
+    echo -e "${GREEN}TVB API  : 200 / success${PLAIN}"
+
+    result=$(curl -sS -L --proxy "$proxy" --connect-timeout 8 --max-time 20 \
+      -H 'Referer: https://news.tvb.com/' \
+      -o "$master_file" -w '%{http_code}\t%{url_effective}' "$hd" 2>/dev/null || true)
+    code1=${result%%    while true; do
+        clear
+        routing_init_state || return
+        local def count rules warp_state="未连接"
+        def=$(jq -r '.default_outbound' "$ROUTING_FILE")
+        count=$(jq '.chain_nodes|length' "$ROUTING_FILE")
+        rules=$(jq '.rules|length' "$ROUTING_FILE")
+        warp_proxy_ready && warp_state="Running"
+        echo -e "${CYAN}════════════════════ 分流管理 ════════════════════${PLAIN}"
+        echo "服务端分流适用：SS2022 / SS2022+ShadowTLS / VLESS Reality"
+        echo "Snell v5：保持官方 snell-server，分流请使用 Surge Rules"
+        echo ""
+        echo "默认出口 : $(routing_outbound_label "$def")"
+        echo "地址族   : $(routing_ip_family_label "$(routing_global_ip_family)")"
+        if [[ "$warp_state" == "Running" ]]; then
+            warp_detect_direct_profile
+            echo "WARP     : ${warp_state} / $(warp_profile_label "$WARP_PROFILE")"
+        else
+            echo "WARP     : ${warp_state}"
+        fi
+        echo "落地节点 : ${count} 个"
+        echo "规则     : ${rules} 条"
+        echo ""
+        echo "  1. WARP 出口管理"
+        echo "  2. 落地节点管理"
+        echo "  3. 分流规则管理"
+        echo "  4. 查看当前分流配置"
+        echo "  5. 测试分流效果"
+        echo "  0. 返回"
+        echo -e "${CYAN}══════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-5]: " c
+        case "$c" in
+            1) warp_management ;;
+            2) chain_management ;;
+            3) routing_rule_management ;;
+            4) routing_show_config; pause ;;
+            5) routing_test_effect; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+# ==============================================================================
+# [10] Realm L4 端口转发
+# ==============================================================================
+
+ensure_realm_user() {
+    ensure_managed_system_user "$REALM_USER" "$REALM_GROUP" "$REALM_USER_MARKER" "$REALM_GROUP_MARKER"
+}
+write_realm_service() {
+    ensure_realm_user || return 1
+    mkdir -p "$(dirname "$REALM_CONF")" "$(dirname "$REALM_BIN")" || return 1
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        cat > "$REALM_SERVICE" <<SERVICE
+[Unit]
+Description=ss2022.sh managed Realm L4 forwarding service
+Documentation=https://github.com/zhboner/realm
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${REALM_USER}
+Group=${REALM_GROUP}
+ExecStart=${REALM_BIN} -c ${REALM_CONF}
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=1048576
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+        service_daemon_reload || return 1
+        return 0
+    fi
+    mkdir -p /var/log/ss2022 || return 1
+    touch "$REALM_OPENRC_LOG" || return 1
+    chown "$REALM_USER:$REALM_GROUP" "$REALM_OPENRC_LOG" || return 1
+    chmod 640 "$REALM_OPENRC_LOG"
+    cat > "$REALM_OPENRC_SERVICE" <<SERVICE
+#!/sbin/openrc-run
+description="vps-bootstrap Realm L4 forwarding"
+command="$REALM_BIN"
+command_args="-c $REALM_CONF"
+command_user="$REALM_USER:$REALM_GROUP"
+supervisor="supervise-daemon"
+pidfile="$REALM_OPENRC_PID"
+output_log="$REALM_OPENRC_LOG"
+error_log="$REALM_OPENRC_LOG"
+respawn_delay=3
+respawn_max=0
+umask=0077
+
+depend() {
+    need net
+    use dns
+}
+SERVICE
+    chmod 755 "$REALM_OPENRC_SERVICE"
+    return 0
+}
+forwarding_init_state() {
+    mkdir -p "$STATE_DIR" || return 1
+    chmod 700 "$STATE_DIR"
+    if [[ ! -f "$FORWARDING_FILE" ]]; then
+        cat > "$FORWARDING_FILE" <<'EOF'
+{
+  "version": 1,
+  "rules": []
+}
+EOF
+        chmod 600 "$FORWARDING_FILE"
+        return 0
+    fi
+
+    if ! jq -e 'type=="object" and ((.rules // [])|type=="array")' "$FORWARDING_FILE" >/dev/null 2>&1; then
+        echo -e "${RED}[错误] ${FORWARDING_FILE} 格式损坏，请先备份后修复。${PLAIN}"
+        return 1
+    fi
+
+    local tmp=""
+    tmp=$(mktemp "${STATE_DIR}/forwarding.json.tmp.XXXXXX") || return 1
+    if ! jq '.version=(.version // 1) | .rules=(.rules // [])' "$FORWARDING_FILE" > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    mv -f "$tmp" "$FORWARDING_FILE"
+    chmod 600 "$FORWARDING_FILE"
+}
+
+realm_asset_name() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo "realm-x86_64-unknown-linux-musl.tar.gz" ;;
+        aarch64|arm64) echo "realm-aarch64-unknown-linux-musl.tar.gz" ;;
+        *) return 1 ;;
+    esac
+}
+
+realm_fetch_asset_metadata() {
+    local asset="$1" api tmp expected url
+    api="https://api.github.com/repos/zhboner/realm/releases/tags/v${REALM_VERSION}"
+    tmp=$(mktemp /tmp/ss2022-realm-meta.XXXXXX) || return 1
+
+    if ! curl -fsSL --retry 2 --connect-timeout 10 --max-time 30 \
+        -H 'Accept: application/vnd.github+json' "$api" -o "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+
+    url=$(jq -r --arg a "$asset" '.assets[]? | select(.name==$a) | .browser_download_url // empty' "$tmp" | head -n1)
+    expected=$(jq -r --arg a "$asset" '.assets[]? | select(.name==$a) | .digest // empty' "$tmp" | head -n1)
+    rm -f "$tmp"
+
+    expected=${expected#sha256:}
+    [[ -n "$url" && "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || return 1
+    printf '%s\t%s\n' "$url" "$expected"
+}
+
+install_realm_core() {
+    install_dependencies || return 1
+
+    local asset="" metadata="" url="" expected="" archive="" actual="" tmpdir="" src="" download_url=""
+    asset=$(realm_asset_name) || {
+        echo -e "${RED}[错误] Realm 当前仅支持 x86_64 / aarch64 Linux。${PLAIN}"
+        return 1
+    }
+
+    echo -e "${YELLOW}>> 获取 Realm v${REALM_VERSION} 官方 Release 校验信息...${PLAIN}"
+    metadata=$(realm_fetch_asset_metadata "$asset") || {
+        echo -e "${RED}[错误] 无法从 GitHub 官方 Release 获取 ${asset} 的 SHA256 digest，拒绝不校验安装。${PLAIN}"
+        return 1
+    }
+    url=${metadata%%$'\t'*}
+    expected=${metadata#*$'\t'}
+
+    archive="/tmp/ss2022-${asset}"
+    rm -f "$archive"
+    local sources=(
+        "$url"
+        "https://ghproxy.net/${url}"
+        "https://gh-proxy.com/${url}"
+        "https://ghps.cc/${url}"
+    )
+
+    local ok=0
+    for download_url in "${sources[@]}"; do
+        echo -e "   尝试下载: ${CYAN}${download_url}${PLAIN}"
+        rm -f "$archive"
+        if ! curl -fL --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 120 "$download_url" -o "$archive"; then
+            echo -e "${YELLOW}   下载失败，尝试下一个源。${PLAIN}"
+            continue
+        fi
+        actual=$(sha256sum "$archive" | awk '{print $1}')
+        if [[ "${actual,,}" != "${expected,,}" ]]; then
+            echo -e "${RED}   SHA256 校验失败，拒绝安装。${PLAIN}"
+            echo "   期望: $expected"
+            echo "   实际: $actual"
+            continue
+        fi
+        if ! tar -tzf "$archive" >/dev/null 2>&1; then
+            echo -e "${RED}   Realm 压缩包结构无效。${PLAIN}"
+            continue
+        fi
+        if tar -tzf "$archive" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
+            echo -e "${RED}   Realm 压缩包包含不安全路径，拒绝解压。${PLAIN}"
+            continue
+        fi
+        ok=1
+        break
+    done
+    [[ $ok -eq 1 ]] || { rm -f "$archive"; return 1; }
+
+    tmpdir=$(mktemp -d /tmp/ss2022-realm-install.XXXXXX) || { rm -f "$archive"; return 1; }
+    tar -xzf "$archive" -C "$tmpdir" || { rm -rf "$tmpdir" "$archive"; return 1; }
+    src=$(find "$tmpdir" -type f -name realm -perm -u+x -print -quit 2>/dev/null || true)
+    if [[ -z "$src" ]]; then
+        src=$(find "$tmpdir" -type f -name realm -print -quit 2>/dev/null || true)
+    fi
+    [[ -n "$src" ]] || {
+        echo -e "${RED}[错误] Realm 压缩包中未找到二进制。${PLAIN}"
+        rm -rf "$tmpdir" "$archive"
+        return 1
+    }
+
+    mkdir -p "$(dirname "$REALM_BIN")"
+    install -m 0755 "$src" "$REALM_BIN" || { rm -rf "$tmpdir" "$archive"; return 1; }
+    rm -rf "$tmpdir" "$archive"
+
+    local installed_version=""
+    installed_version=$("$REALM_BIN" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)
+    if [[ "$installed_version" != "$REALM_VERSION" ]]; then
+        echo -e "${RED}[错误] Realm 安装后版本校验失败：期望 ${REALM_VERSION}，实际 ${installed_version:-未知}。${PLAIN}"
+        rm -f "$REALM_BIN"
+        return 1
+    fi
+
+    if platform_is_alpine; then
+        command -v setcap >/dev/null 2>&1 || { echo -e "${RED}[错误] Alpine 缺少 setcap。${PLAIN}"; return 1; }
+        setcap cap_net_bind_service=+ep "$REALM_BIN" || { echo -e "${RED}[错误] 无法为 Realm 设置低端口 capability。${PLAIN}"; return 1; }
+        "$REALM_BIN" --version >/dev/null 2>&1 || { echo -e "${RED}[错误] Realm 设置 capability 后无法执行。${PLAIN}"; return 1; }
+    fi
+    write_realm_service || return 1
+    echo -e "${GREEN}✔ Realm v${REALM_VERSION} 已安装并通过 SHA256/版本校验。${PLAIN}"
+}
+
+forwarding_format_host_port() {
+    local host="$1" port="$2"
+    host=${host#[}
+    host=${host%]}
+    if [[ "$host" == *:* ]]; then
+        printf '[%s]:%s' "$host" "$port"
+    else
+        printf '%s:%s' "$host" "$port"
+    fi
+}
+
+forwarding_network_json() {
+    local proto="$1" ipv6_only="${2:-false}"
+    case "$proto" in
+        tcp) jq -nc --argjson v6 "$ipv6_only" '{no_tcp:false,use_udp:false,ipv6_only:$v6}' ;;
+        udp) jq -nc --argjson v6 "$ipv6_only" '{no_tcp:true,use_udp:true,ipv6_only:$v6}' ;;
+        both) jq -nc --argjson v6 "$ipv6_only" '{no_tcp:false,use_udp:true,ipv6_only:$v6}' ;;
+        *) return 1 ;;
+    esac
+}
+
+realm_build_config_from_state() {
+    local state="$1" out="$2"
+    [[ -f "$state" ]] || return 1
+
+    local endpoints='[]' rule="" id="" type="" family="" proto="" host=""
+    local lport="" rport="" lstart="" lend="" rstart="" p="" rp=""
+    local remote="" network="" ep="" listen=""
+    while IFS= read -r rule; do
+        [[ -n "$rule" ]] || continue
+        id=$(jq -r '.id' <<<"$rule")
+        type=$(jq -r '.type' <<<"$rule")
+        family=$(jq -r '.listen_family' <<<"$rule")
+        proto=$(jq -r '.protocol' <<<"$rule")
+        host=$(jq -r '.remote_host' <<<"$rule")
+
+        if [[ "$type" == "single" ]]; then
+            lstart=$(jq -r '.listen_port' <<<"$rule")
+            lend="$lstart"
+            rstart=$(jq -r '.remote_port' <<<"$rule")
+        else
+            lstart=$(jq -r '.listen_start' <<<"$rule")
+            lend=$(jq -r '.listen_end' <<<"$rule")
+            rstart=$(jq -r '.remote_start' <<<"$rule")
+        fi
+
+        p="$lstart"
+        while [[ "$p" -le "$lend" ]]; do
+            rp=$((rstart + p - lstart))
+            remote=$(forwarding_format_host_port "$host" "$rp")
+
+            case "$family" in
+                ipv4)
+                    listen="0.0.0.0:${p}"
+                    network=$(forwarding_network_json "$proto" false) || return 1
+                    ep=$(jq -nc --arg l "$listen" --arg r "$remote" --argjson n "$network" --arg id "$id" \
+                        '{listen:$l,remote:$r,network:$n}')
+                    endpoints=$(jq -nc --argjson a "$endpoints" --argjson e "$ep" '$a + [$e]')
+                    ;;
+                ipv6)
+                    listen="[::]:${p}"
+                    network=$(forwarding_network_json "$proto" true) || return 1
+                    ep=$(jq -nc --arg l "$listen" --arg r "$remote" --argjson n "$network" --arg id "$id" \
+                        '{listen:$l,remote:$r,network:$n}')
+                    endpoints=$(jq -nc --argjson a "$endpoints" --argjson e "$ep" '$a + [$e]')
+                    ;;
+                dual)
+                    # Realm 官方语义：[::]:port + ipv6_only=false 会同时接受 IPv6 与 IPv4-mapped IPv6，
+                    # 因此双栈只生成一个 endpoint，避免同端口重复 bind。
+                    listen="[::]:${p}"
+                    network=$(forwarding_network_json "$proto" false) || return 1
+                    ep=$(jq -nc --arg l "$listen" --arg r "$remote" --argjson n "$network" --arg id "$id" \
+                        '{listen:$l,remote:$r,network:$n}')
+                    endpoints=$(jq -nc --argjson a "$endpoints" --argjson e "$ep" '$a + [$e]')
+                    ;;
+                *) return 1 ;;
+            esac
+            p=$((p+1))
+        done
+    done < <(jq -c '.rules[]?' "$state")
+
+    jq -n --argjson eps "$endpoints" '{
+      log:{level:"warn",output:"stdout"},
+      network:{
+        no_tcp:false,
+        use_udp:false,
+        tcp_timeout:5,
+        udp_timeout:30,
+        tcp_keepalive:15,
+        tcp_keepalive_probe:3
+      },
+      endpoints:$eps
+    }' > "$out"
+    jq -e '.endpoints|type=="array"' "$out" >/dev/null 2>&1
+}
+
+forwarding_rule_interval() {
+    local rule="$1"
+    if [[ "$(jq -r '.type' <<<"$rule")" == "single" ]]; then
+        printf '%s %s\n' "$(jq -r '.listen_port' <<<"$rule")" "$(jq -r '.listen_port' <<<"$rule")"
+    else
+        printf '%s %s\n' "$(jq -r '.listen_start' <<<"$rule")" "$(jq -r '.listen_end' <<<"$rule")"
+    fi
+}
+
+forwarding_state_port_conflict() {
+    local start="$1" end="$2" exclude_id="${3:-}" rule="" s="" e=""
+    while IFS= read -r rule; do
+        [[ -n "$rule" ]] || continue
+        [[ -n "$exclude_id" && "$(jq -r '.id' <<<"$rule")" == "$exclude_id" ]] && continue
+        read -r s e < <(forwarding_rule_interval "$rule")
+        if (( start <= e && end >= s )); then
+            return 0
+        fi
+    done < <(jq -c '.rules[]?' "$FORWARDING_FILE")
+    return 1
+}
+
+forwarding_os_port_conflict_range() {
+    local start="$1" end="$2" allowed_pid=""
+    allowed_pid=$(service_main_pid "$REALM_SERVICE_NAME" 2>/dev/null || true)
+    local p lines conflicts
+    lines=$(ss -H -lntup 2>/dev/null || true)
+    p="$start"
+    while [[ "$p" -le "$end" ]]; do
+        conflicts=$(printf '%s\n' "$lines" | awk -v p="$p" '
+          {
+            addr=$5; n=split(addr,a,":");
+            if (a[n] == p) print
+          }')
+        if [[ -n "$conflicts" && "$allowed_pid" =~ ^[0-9]+$ && "$allowed_pid" -gt 0 ]]; then
+            conflicts=$(printf '%s\n' "$conflicts" | grep -v "pid=${allowed_pid}," || true)
+        fi
+        if [[ -n "$conflicts" ]]; then
+            echo -e "${RED}[错误] 端口 ${p} 已被其他进程占用：${PLAIN}"
+            printf '%s\n' "$conflicts"
+            return 0
+        fi
+        p=$((p+1))
+    done
+    return 1
+}
+
+forwarding_apply_state_candidate() {
+    local candidate="$1" cfg_tmp="" state_backup="" cfg_backup="" old_count=0 new_count=0
+    [[ -f "$candidate" ]] || return 1
+    jq -e 'type=="object" and (.rules|type=="array")' "$candidate" >/dev/null 2>&1 || {
+        rm -f "$candidate"
+        return 1
+    }
+
+    new_count=$(jq '.rules|length' "$candidate")
+    if [[ "$new_count" -gt 0 && ! -x "$REALM_BIN" ]]; then
+        install_realm_core || { rm -f "$candidate"; return 1; }
+    fi
+    [[ "$new_count" -eq 0 ]] || write_realm_service || { rm -f "$candidate"; return 1; }
+
+    mkdir -p /etc/ss2022-realm || { rm -f "$candidate"; return 1; }
+    cfg_tmp=$(mktemp "/etc/ss2022-realm/config.json.tmp.XXXXXX") || { rm -f "$candidate"; return 1; }
+    if ! realm_build_config_from_state "$candidate" "$cfg_tmp"; then
+        rm -f "$candidate" "$cfg_tmp"
+        echo -e "${RED}[错误] Realm 配置生成失败。${PLAIN}"
+        return 1
+    fi
+
+    state_backup=$(mktemp "${STATE_DIR}/forwarding.rollback.XXXXXX") || { rm -f "$candidate" "$cfg_tmp"; return 1; }
+    cp -a "$FORWARDING_FILE" "$state_backup" || { rm -f "$candidate" "$cfg_tmp" "$state_backup"; return 1; }
+    old_count=$(jq '.rules|length' "$state_backup" 2>/dev/null || echo 0)
+
+    mkdir -p "$(dirname "$REALM_CONF")"
+    if [[ -f "$REALM_CONF" ]]; then
+        cfg_backup=$(mktemp "/etc/ss2022-realm/config.rollback.XXXXXX") || { rm -f "$candidate" "$cfg_tmp" "$state_backup"; return 1; }
+        cp -a "$REALM_CONF" "$cfg_backup"
+    fi
+
+    mv -f "$candidate" "$FORWARDING_FILE"
+    chmod 600 "$FORWARDING_FILE"
+    mv -f "$cfg_tmp" "$REALM_CONF"
+    chown root:"$REALM_GROUP" "$REALM_CONF"
+    chmod 640 "$REALM_CONF"
+
+    if [[ "$new_count" -eq 0 ]]; then
+        service_disable_now "$REALM_SERVICE_NAME"
+        rm -f "$state_backup" "$cfg_backup"
+        echo -e "${GREEN}✔ Realm 转发规则已清空，服务已停止。${PLAIN}"
+        return 0
+    fi
+
+    service_daemon_reload || true
+    service_enable "$REALM_SERVICE_NAME" >/dev/null 2>&1 || true
+    if service_restart "$REALM_SERVICE_NAME" && sleep 1 && service_is_active "$REALM_SERVICE_NAME"; then
+        rm -f "$state_backup" "$cfg_backup"
+        echo -e "${GREEN}✔ Realm 转发配置已应用。${PLAIN}"
+        return 0
+    fi
+
+    echo -e "${RED}[错误] Realm 新配置启动失败，正在恢复旧配置和旧规则...${PLAIN}"
+    mv -f "$state_backup" "$FORWARDING_FILE"
+    if [[ -n "$cfg_backup" && -f "$cfg_backup" ]]; then
+        mv -f "$cfg_backup" "$REALM_CONF"
+        chown root:"$REALM_GROUP" "$REALM_CONF" 2>/dev/null || true
+        chmod 640 "$REALM_CONF"
+    else
+        rm -f "$REALM_CONF"
+    fi
+    if [[ "$old_count" -gt 0 ]]; then
+        service_restart "$REALM_SERVICE_NAME" >/dev/null 2>&1 || true
+    else
+        service_disable_now "$REALM_SERVICE_NAME"
+    fi
+    service_log_tail "$REALM_SERVICE_NAME" 30 || true
+    return 1
+}
+
+forwarding_choose_family() {
+    local default="${1:-ipv4}" c=""
+    echo "请选择监听网络：" >&2
+    echo "  1. IPv4" >&2
+    echo "  2. IPv6" >&2
+    echo "  3. 双栈 IPv4 + IPv6" >&2
+    local d=1
+    [[ "$default" == "ipv6" ]] && d=2
+    [[ "$default" == "dual" ]] && d=3
+    read -rp "请选择 [1-3，默认 ${d}]: " c
+    c=${c:-$d}
+    case "$c" in
+        1) echo ipv4 ;;
+        2) echo ipv6 ;;
+        3) echo dual ;;
+        *) return 1 ;;
+    esac
+}
+
+forwarding_choose_protocol() {
+    local default="${1:-both}" c=""
+    echo "请选择转发协议：" >&2
+    echo "  1. TCP" >&2
+    echo "  2. UDP" >&2
+    echo "  3. TCP + UDP" >&2
+    local d=3
+    [[ "$default" == "tcp" ]] && d=1
+    [[ "$default" == "udp" ]] && d=2
+    read -rp "请选择 [1-3，默认 ${d}]: " c
+    c=${c:-$d}
+    case "$c" in
+        1) echo tcp ;;
+        2) echo udp ;;
+        3) echo both ;;
+        *) return 1 ;;
+    esac
+}
+
+forwarding_sanitize_host() {
+    local h="$1"
+    h=${h#[}
+    h=${h%]}
+    [[ -n "$h" && "$h" != *[[:space:]]* ]] || return 1
+    printf '%s' "$h"
+}
+
+forwarding_next_name() {
+    local base="$1" name="" n=2
+    name="$base"
+    while jq -e --arg n "$name" '.rules[]? | select(.name==$n)' "$FORWARDING_FILE" >/dev/null 2>&1; do
+        name="${base}-${n}"
+        n=$((n+1))
+    done
+    echo "$name"
+}
+
+forwarding_add_single() {
+    forwarding_init_state || return
+    local port="" rhost="" rport="" family="" proto="" name="" candidate="" id=""
+    while true; do
+        read -rp "本机监听端口: " port
+        validate_port_number "$port" && break
+        echo -e "${RED}端口必须为 1-65535。${PLAIN}"
+    done
+
+    if forwarding_state_port_conflict "$port" "$port"; then
+        echo -e "${RED}[错误] 端口 ${port} 已存在 Realm 转发规则。${PLAIN}"
+        pause; return
+    fi
+    if forwarding_os_port_conflict_range "$port" "$port"; then
+        pause; return
+    fi
+
+    family=$(forwarding_choose_family ipv4) || { echo "无效选择"; pause; return; }
+    proto=$(forwarding_choose_protocol both) || { echo "无效选择"; pause; return; }
+
+    while true; do
+        read -rp "目标服务器 IP/域名: " rhost
+        rhost=$(forwarding_sanitize_host "$rhost" 2>/dev/null || true)
+        [[ -n "$rhost" ]] && break
+        echo -e "${RED}目标地址不能为空或包含空格。${PLAIN}"
+    done
+    while true; do
+        read -rp "目标端口 [默认: ${port}]: " rport
+        rport=${rport:-$port}
+        validate_port_number "$rport" && break
+        echo -e "${RED}目标端口必须为 1-65535。${PLAIN}"
+    done
+
+    read -rp "规则备注 [默认: PF-${port}]: " name
+    name=${name:-"PF-${port}"}
+    name=$(forwarding_next_name "$name")
+    id="pf-$(date +%s)-${RANDOM}"
+
+    echo ""
+    echo "确认添加：${name}"
+    echo "  监听 : ${family} / ${port}"
+    echo "  目标 : ${rhost}:${rport}"
+    echo "  协议 : ${proto}"
+    local yes=""
+    read -rp "确认？[Y/n]: " yes
+    [[ ! "$yes" =~ ^[Nn]$ ]] || return
+
+    candidate=$(mktemp "${STATE_DIR}/forwarding.candidate.XXXXXX") || return
+    if ! jq \
+        --arg id "$id" --arg name "$name" --arg family "$family" --arg proto "$proto" \
+        --arg host "$rhost" --argjson lp "$port" --argjson rp "$rport" \
+        '.rules += [{id:$id,name:$name,type:"single",listen_family:$family,protocol:$proto,listen_port:$lp,remote_host:$host,remote_port:$rp}]' \
+        "$FORWARDING_FILE" > "$candidate"; then
+        rm -f "$candidate"; return
+    fi
+    forwarding_apply_state_candidate "$candidate"
+    pause
+}
+
+forwarding_add_range() {
+    forwarding_init_state || return
+    local start="" end="" rhost="" rstart="" rend="" family="" proto="" name="" candidate="" id="" count=""
+    while true; do
+        read -rp "本机起始端口: " start
+        validate_port_number "$start" && break
+        echo -e "${RED}端口必须为 1-65535。${PLAIN}"
+    done
+    while true; do
+        read -rp "本机结束端口: " end
+        if validate_port_number "$end" && [[ "$end" -ge "$start" ]]; then break; fi
+        echo -e "${RED}结束端口必须 >= 起始端口且 <= 65535。${PLAIN}"
+    done
+    count=$((end-start+1))
+    if [[ "$count" -gt "$REALM_MAX_RANGE_PORTS" ]]; then
+        echo -e "${RED}[错误] 单条端口段最多 ${REALM_MAX_RANGE_PORTS} 个端口。${PLAIN}"
+        pause; return
+    fi
+    if forwarding_state_port_conflict "$start" "$end"; then
+        echo -e "${RED}[错误] ${start}-${end} 与现有 Realm 转发规则端口重叠。${PLAIN}"
+        pause; return
+    fi
+    if forwarding_os_port_conflict_range "$start" "$end"; then
+        pause; return
+    fi
+
+    family=$(forwarding_choose_family ipv4) || { echo "无效选择"; pause; return; }
+    proto=$(forwarding_choose_protocol both) || { echo "无效选择"; pause; return; }
+
+    while true; do
+        read -rp "目标服务器 IP/域名: " rhost
+        rhost=$(forwarding_sanitize_host "$rhost" 2>/dev/null || true)
+        [[ -n "$rhost" ]] && break
+        echo -e "${RED}目标地址不能为空或包含空格。${PLAIN}"
+    done
+    while true; do
+        read -rp "目标起始端口 [默认: ${start}]: " rstart
+        rstart=${rstart:-$start}
+        if validate_port_number "$rstart"; then
+            rend=$((rstart+count-1))
+            [[ "$rend" -le 65535 ]] && break
+        fi
+        echo -e "${RED}目标端口段必须落在 1-65535。${PLAIN}"
+    done
+
+    read -rp "规则备注 [默认: PF-${start}-${end}]: " name
+    name=${name:-"PF-${start}-${end}"}
+    name=$(forwarding_next_name "$name")
+    id="pf-$(date +%s)-${RANDOM}"
+
+    echo ""
+    echo "确认添加：${name}"
+    echo "  监听 : ${family} / ${start}-${end}"
+    echo "  目标 : ${rhost}:${rstart}-${rend}"
+    echo "  协议 : ${proto}"
+    local yes=""
+    read -rp "确认？[Y/n]: " yes
+    [[ ! "$yes" =~ ^[Nn]$ ]] || return
+
+    candidate=$(mktemp "${STATE_DIR}/forwarding.candidate.XXXXXX") || return
+    if ! jq \
+        --arg id "$id" --arg name "$name" --arg family "$family" --arg proto "$proto" \
+        --arg host "$rhost" --argjson ls "$start" --argjson le "$end" --argjson rs "$rstart" \
+        '.rules += [{id:$id,name:$name,type:"range",listen_family:$family,protocol:$proto,listen_start:$ls,listen_end:$le,remote_host:$host,remote_start:$rs}]' \
+        "$FORWARDING_FILE" > "$candidate"; then
+        rm -f "$candidate"; return
+    fi
+    forwarding_apply_state_candidate "$candidate"
+    pause
+}
+
+forwarding_print_rules() {
+    forwarding_init_state || return 1
+    local count="" i=0 r="" type="" ports="" remote="" rstart="" rend="" lstart="" lend=""
+    count=$(jq '.rules|length' "$FORWARDING_FILE")
+    if [[ "$count" -eq 0 ]]; then
+        echo "暂无 Realm 转发规则。"
+        return 0
+    fi
+    printf "%-4s %-22s %-9s %-7s %-15s %s\n" "序号" "备注" "监听" "协议" "本机端口" "目标"
+    echo "------------------------------------------------------------------------------------------------"
+    while [[ "$i" -lt "$count" ]]; do
+        r=$(jq -c ".rules[$i]" "$FORWARDING_FILE")
+        type=$(jq -r '.type' <<<"$r")
+        if [[ "$type" == "single" ]]; then
+            ports=$(jq -r '.listen_port|tostring' <<<"$r")
+            remote="$(jq -r '.remote_host' <<<"$r"):$(jq -r '.remote_port' <<<"$r")"
+        else
+            lstart=$(jq -r '.listen_start' <<<"$r"); lend=$(jq -r '.listen_end' <<<"$r")
+            rstart=$(jq -r '.remote_start' <<<"$r"); rend=$((rstart+lend-lstart))
+            ports="${lstart}-${lend}"
+            remote="$(jq -r '.remote_host' <<<"$r"):${rstart}-${rend}"
+        fi
+        printf "%-4s %-22s %-9s %-7s %-15s %s\n" \
+            "$((i+1))" "$(jq -r '.name' <<<"$r")" "$(jq -r '.listen_family' <<<"$r")" \
+            "$(jq -r '.protocol' <<<"$r")" "$ports" "$remote"
+        i=$((i+1))
+    done
+}
+
+forwarding_select_rule_index() {
+    forwarding_print_rules >&2
+    local count="" c=""
+    count=$(jq '.rules|length' "$FORWARDING_FILE")
+    [[ "$count" -gt 0 ]] || return 1
+    read -rp "请选择规则序号 [1-${count}]: " c
+    [[ "$c" =~ ^[0-9]+$ && "$c" -ge 1 && "$c" -le "$count" ]] || return 1
+    echo $((c-1))
+}
+
+forwarding_edit_rule() {
+    forwarding_init_state || return
+    local idx="" rule="" id="" c="" candidate="" new="" old_start="" old_end="" start="" end="" rstart="" count="" rend=""
+    idx=$(forwarding_select_rule_index) || { echo "无效选择。"; pause; return; }
+    rule=$(jq -c ".rules[$idx]" "$FORWARDING_FILE")
+    id=$(jq -r '.id' <<<"$rule")
+
+    while true; do
+        clear
+        rule=$(jq -c --arg id "$id" '.rules[] | select(.id==$id)' "$FORWARDING_FILE")
+        [[ -n "$rule" ]] || return
+        echo -e "${CYAN}════════════════════ 修改转发规则 ════════════════════${PLAIN}"
+        echo "备注 : $(jq -r '.name' <<<"$rule")"
+        echo "监听 : $(jq -r '.listen_family' <<<"$rule")"
+        echo "协议 : $(jq -r '.protocol' <<<"$rule")"
+        if [[ "$(jq -r '.type' <<<"$rule")" == "single" ]]; then
+            echo "端口 : $(jq -r '.listen_port' <<<"$rule") → $(jq -r '.remote_host' <<<"$rule"):$(jq -r '.remote_port' <<<"$rule")"
+        else
+            old_start=$(jq -r '.listen_start' <<<"$rule"); old_end=$(jq -r '.listen_end' <<<"$rule")
+            rstart=$(jq -r '.remote_start' <<<"$rule"); rend=$((rstart+old_end-old_start))
+            echo "端口 : ${old_start}-${old_end} → $(jq -r '.remote_host' <<<"$rule"):${rstart}-${rend}"
+        fi
+        echo ""
+        echo "  1. 修改备注"
+        echo "  2. 修改监听网络"
+        echo "  3. 修改转发协议"
+        echo "  4. 修改目标服务器/目标端口"
+        echo "  5. 修改本机监听端口/端口段"
+        echo "  0. 返回"
+        read -rp "请选择 [0-5]: " c
+        [[ "$c" == "0" ]] && return
+
+        candidate=$(mktemp "${STATE_DIR}/forwarding.candidate.XXXXXX") || return
+        case "$c" in
+            1)
+                read -rp "新备注: " new
+                [[ -n "$new" ]] || { rm -f "$candidate"; continue; }
+                jq --arg id "$id" --arg v "$new" '(.rules[]|select(.id==$id)|.name)=$v' "$FORWARDING_FILE" > "$candidate"
+                ;;
+            2)
+                new=$(forwarding_choose_family "$(jq -r '.listen_family' <<<"$rule")") || { rm -f "$candidate"; continue; }
+                jq --arg id "$id" --arg v "$new" '(.rules[]|select(.id==$id)|.listen_family)=$v' "$FORWARDING_FILE" > "$candidate"
+                ;;
+            3)
+                new=$(forwarding_choose_protocol "$(jq -r '.protocol' <<<"$rule")") || { rm -f "$candidate"; continue; }
+                jq --arg id "$id" --arg v "$new" '(.rules[]|select(.id==$id)|.protocol)=$v' "$FORWARDING_FILE" > "$candidate"
+                ;;
+            4)
+                local nhost="" nr=""
+                read -rp "目标服务器 IP/域名 [当前: $(jq -r '.remote_host' <<<"$rule")]: " nhost
+                nhost=${nhost:-$(jq -r '.remote_host' <<<"$rule")}
+                nhost=$(forwarding_sanitize_host "$nhost" 2>/dev/null || true)
+                [[ -n "$nhost" ]] || { rm -f "$candidate"; continue; }
+                if [[ "$(jq -r '.type' <<<"$rule")" == "single" ]]; then
+                    nr=$(jq -r '.remote_port' <<<"$rule")
+                    read -rp "目标端口 [当前: ${nr}]: " new
+                    new=${new:-$nr}
+                    validate_port_number "$new" || { rm -f "$candidate"; continue; }
+                    jq --arg id "$id" --arg h "$nhost" --argjson p "$new" \
+                        '(.rules[]|select(.id==$id)|.remote_host)=$h | (.rules[]|select(.id==$id)|.remote_port)=$p' \
+                        "$FORWARDING_FILE" > "$candidate"
+                else
+                    nr=$(jq -r '.remote_start' <<<"$rule")
+                    count=$(( $(jq -r '.listen_end' <<<"$rule") - $(jq -r '.listen_start' <<<"$rule") + 1 ))
+                    read -rp "目标起始端口 [当前: ${nr}]: " new
+                    new=${new:-$nr}
+                    validate_port_number "$new" || { rm -f "$candidate"; continue; }
+                    [[ $((new+count-1)) -le 65535 ]] || { echo "目标端口段越界。"; rm -f "$candidate"; pause; continue; }
+                    jq --arg id "$id" --arg h "$nhost" --argjson p "$new" \
+                        '(.rules[]|select(.id==$id)|.remote_host)=$h | (.rules[]|select(.id==$id)|.remote_start)=$p' \
+                        "$FORWARDING_FILE" > "$candidate"
+                fi
+                ;;
+            5)
+                read -r old_start old_end < <(forwarding_rule_interval "$rule")
+                if [[ "$(jq -r '.type' <<<"$rule")" == "single" ]]; then
+                    read -rp "新监听端口 [当前: ${old_start}]: " start
+                    start=${start:-$old_start}
+                    validate_port_number "$start" || { rm -f "$candidate"; continue; }
+                    end="$start"
+                else
+                    read -rp "新起始端口 [当前: ${old_start}]: " start
+                    start=${start:-$old_start}
+                    read -rp "新结束端口 [当前: ${old_end}]: " end
+                    end=${end:-$old_end}
+                    if ! validate_port_number "$start" || ! validate_port_number "$end" || [[ "$end" -lt "$start" ]]; then
+                        rm -f "$candidate"; continue
+                    fi
+                    count=$((end-start+1))
+                    [[ "$count" -le "$REALM_MAX_RANGE_PORTS" ]] || { echo "端口段过大。"; rm -f "$candidate"; pause; continue; }
+                fi
+                if forwarding_state_port_conflict "$start" "$end" "$id"; then
+                    echo "与其他 Realm 转发规则端口重叠。"; rm -f "$candidate"; pause; continue
+                fi
+                if [[ "$start" != "$old_start" || "$end" != "$old_end" ]] && forwarding_os_port_conflict_range "$start" "$end"; then
+                    rm -f "$candidate"; pause; continue
+                fi
+                if [[ "$(jq -r '.type' <<<"$rule")" == "single" ]]; then
+                    jq --arg id "$id" --argjson p "$start" '(.rules[]|select(.id==$id)|.listen_port)=$p' "$FORWARDING_FILE" > "$candidate"
+                else
+                    rstart=$(jq -r '.remote_start' <<<"$rule")
+                    count=$((end-start+1))
+                    [[ $((rstart+count-1)) -le 65535 ]] || { echo "目标端口段会越界，请先修改目标起始端口。"; rm -f "$candidate"; pause; continue; }
+                    jq --arg id "$id" --argjson s "$start" --argjson e "$end" \
+                        '(.rules[]|select(.id==$id)|.listen_start)=$s | (.rules[]|select(.id==$id)|.listen_end)=$e' \
+                        "$FORWARDING_FILE" > "$candidate"
+                fi
+                ;;
+            *) rm -f "$candidate"; continue ;;
+        esac
+
+        if forwarding_apply_state_candidate "$candidate"; then
+            echo -e "${GREEN}✔ 规则已更新。${PLAIN}"
+        fi
+        pause
+    done
+}
+
+forwarding_delete_rule() {
+    forwarding_init_state || return
+    local idx="" rule="" id="" candidate="" yes=""
+    idx=$(forwarding_select_rule_index) || { echo "无效选择。"; pause; return; }
+    rule=$(jq -c ".rules[$idx]" "$FORWARDING_FILE")
+    id=$(jq -r '.id' <<<"$rule")
+    read -rp "确认删除“$(jq -r '.name' <<<"$rule")”？[y/N]: " yes
+    [[ "$yes" =~ ^[Yy]$ ]] || return
+    candidate=$(mktemp "${STATE_DIR}/forwarding.candidate.XXXXXX") || return
+    jq --arg id "$id" '.rules |= map(select(.id != $id))' "$FORWARDING_FILE" > "$candidate" || { rm -f "$candidate"; return; }
+    forwarding_apply_state_candidate "$candidate"
+    pause
+}
+
+forwarding_test_tcp_target() {
+    local host="$1" port="$2" hp=""
+    hp=$(forwarding_format_host_port "$host" "$port")
+    local out=""
+    out=$(curl -v --connect-timeout 3 --max-time 3 "telnet://${hp}" </dev/null 2>&1 || true)
+    if grep -qE 'Connected to .* port|Connected to ' <<<"$out"; then
+        return 0
+    fi
+    return 1
+}
+
+forwarding_test_rule() {
+    forwarding_init_state || return
+    local idx="" rule="" type="" proto="" family="" host="" lp="" rp="" ls="" le="" rs="" re="" tcp_test_port=""
+    idx=$(forwarding_select_rule_index) || { echo "无效选择。"; pause; return; }
+    rule=$(jq -c ".rules[$idx]" "$FORWARDING_FILE")
+    type=$(jq -r '.type' <<<"$rule")
+    proto=$(jq -r '.protocol' <<<"$rule")
+    family=$(jq -r '.listen_family' <<<"$rule")
+    host=$(jq -r '.remote_host' <<<"$rule")
+    if [[ "$type" == "single" ]]; then
+        lp=$(jq -r '.listen_port' <<<"$rule")
+        rp=$(jq -r '.remote_port' <<<"$rule")
+        echo "规则：$(jq -r '.name' <<<"$rule")  ${lp} → ${host}:${rp} (${proto}/${family})"
+        tcp_test_port="$rp"
+    else
+        ls=$(jq -r '.listen_start' <<<"$rule"); le=$(jq -r '.listen_end' <<<"$rule")
+        rs=$(jq -r '.remote_start' <<<"$rule"); re=$((rs+le-ls))
+        echo "规则：$(jq -r '.name' <<<"$rule")  ${ls}-${le} → ${host}:${rs}-${re} (${proto}/${family})"
+        lp="$ls"; tcp_test_port="$rs"
+    fi
+
+    echo ""
+    echo "【服务状态】"
+    if service_is_active "$REALM_SERVICE_NAME"; then
+        echo -e "  Realm : ${GREEN}Running${PLAIN}"
+    else
+        echo -e "  Realm : ${RED}Stopped${PLAIN}"
+    fi
+
+    echo "【监听检查】"
+    if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
+        if ss -H -lntp 2>/dev/null | awk -v p="$lp" '{a=$4; n=split(a,x,":"); if(x[n]==p) ok=1} END{exit !ok}'; then
+            echo -e "  TCP ${lp}: ${GREEN}✓ 已监听${PLAIN}"
+        else
+            echo -e "  TCP ${lp}: ${RED}✗ 未监听${PLAIN}"
+        fi
+    fi
+    if [[ "$proto" == "udp" || "$proto" == "both" ]]; then
+        if ss -H -lnup 2>/dev/null | awk -v p="$lp" '{a=$4; n=split(a,x,":"); if(x[n]==p) ok=1} END{exit !ok}'; then
+            echo -e "  UDP ${lp}: ${GREEN}✓ 已监听${PLAIN}"
+        else
+            echo -e "  UDP ${lp}: ${RED}✗ 未监听${PLAIN}"
+        fi
+    fi
+
+    if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
+        echo "【目标 TCP 连通性】"
+        if forwarding_test_tcp_target "$host" "$tcp_test_port"; then
+            echo -e "  ${host}:${tcp_test_port}: ${GREEN}✓ TCP 可连接${PLAIN}"
+        else
+            echo -e "  ${host}:${tcp_test_port}: ${YELLOW}未能建立 TCP 连接（目标服务可能拒绝探测；请结合实际客户端验证）${PLAIN}"
+        fi
+    fi
+    if [[ "$proto" == "udp" || "$proto" == "both" ]]; then
+        echo -e "${YELLOW}[说明] UDP 没有通用握手，脚本只验证监听状态；最终以真实 UDP 应用流量为准。${PLAIN}"
+    fi
+    pause
+}
+
+forwarding_show_config() {
+    forwarding_init_state || return
+    forwarding_print_rules
+    echo ""
+    echo "Realm 二进制 : ${REALM_BIN}"
+    if [[ -x "$REALM_BIN" ]]; then
+        echo "Realm 版本   : $("$REALM_BIN" --version 2>/dev/null | head -n1)"
+    else
+        echo "Realm 版本   : 未安装"
+    fi
+    echo "Realm 配置   : ${REALM_CONF}"
+    echo "规则状态文件 : ${FORWARDING_FILE}"
+    case "$PLATFORM_INIT" in
+        systemd) echo "服务管理     : systemd (${REALM_SERVICE_NAME}.service)" ;;
+        openrc) echo "服务管理     : OpenRC (${REALM_OPENRC_SERVICE})" ;;
+        *) echo "服务管理     : 未知" ;;
+    esac
+}
+
+uninstall_realm_forwarding() {
+    local yes=""
+    echo -e "${YELLOW}此操作只删除 ss2022.sh 管理的 Realm 转发组件和 forwarding.json；不会删除服务器已有 realm.service 或 /usr/local/bin/realm。${PLAIN}"
+    read -rp "确认卸载 Realm 转发组件？[y/N]: " yes
+    [[ "$yes" =~ ^[Yy]$ ]] || return
+    service_disable_now "$REALM_SERVICE_NAME"
+    rm -f "$REALM_SERVICE" "$REALM_OPENRC_SERVICE" "$REALM_BIN" "$FORWARDING_FILE" "$REALM_OPENRC_PID" "$REALM_OPENRC_LOG"
+    rm -rf /etc/ss2022-realm
+    if [[ -f "$REALM_USER_MARKER" ]]; then
+        delete_system_user "$REALM_USER"
+        rm -f "$REALM_USER_MARKER"
+    fi
+    if [[ -f "$REALM_GROUP_MARKER" ]]; then
+        delete_system_group "$REALM_GROUP"
+        rm -f "$REALM_GROUP_MARKER"
+    fi
+    service_daemon_reload || true
+    echo -e "${GREEN}✔ ss2022.sh Realm 转发组件已卸载。${PLAIN}"
+    pause
+}
+realm_service_management() {
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ Realm 服务管理 ════════════════════${PLAIN}"
+        echo "  1. 安装 / 重新安装固定版本 Realm v${REALM_VERSION}"
+        echo "  2. 查看服务状态"
+        echo "  3. 查看实时日志"
+        echo "  4. 重启服务"
+        echo "  5. 停止服务"
+        echo "  6. 启动服务"
+        echo "  7. 卸载 Realm 转发组件"
+        echo "  0. 返回"
+        read -rp "请选择 [0-7]: " c
+        case "$c" in
+            1)
+                if install_realm_core; then
+                    forwarding_init_state || true
+                    if [[ $(jq '.rules|length' "$FORWARDING_FILE" 2>/dev/null || echo 0) -gt 0 ]]; then
+                        local tmp=""
+                        tmp=$(mktemp "${STATE_DIR}/forwarding.candidate.XXXXXX") || { pause; continue; }
+                        cp -a "$FORWARDING_FILE" "$tmp"
+                        forwarding_apply_state_candidate "$tmp" || true
+                    fi
+                fi
+                pause
+                ;;
+            2) service_status_output "$REALM_SERVICE_NAME" || echo "未运行"; pause ;;
+            3) service_log_follow "$REALM_SERVICE_NAME" ;;
+            4) service_restart "$REALM_SERVICE_NAME" && echo "已重启" || service_log_tail "$REALM_SERVICE_NAME" 30; pause ;;
+            5) service_stop "$REALM_SERVICE_NAME" && echo "已停止"; pause ;;
+            6) service_start "$REALM_SERVICE_NAME" && echo "已启动" || service_log_tail "$REALM_SERVICE_NAME" 30; pause ;;
+            7) uninstall_realm_forwarding ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+forwarding_management() {
+    forwarding_init_state || { pause; return; }
+    while true; do
+        clear
+        forwarding_init_state || return
+        local count="" state="未安装"
+        count=$(jq '.rules|length' "$FORWARDING_FILE")
+        if [[ -x "$REALM_BIN" ]]; then
+            if service_is_active "$REALM_SERVICE_NAME"; then state="Running"; else state="Stopped"; fi
+        fi
+        echo -e "${CYAN}════════════════════ Realm 端口转发 ════════════════════${PLAIN}"
+        echo "Realm     : ${state}"
+        echo "版本      : v${REALM_VERSION}"
+        echo "转发规则  : ${count} 条"
+        echo ""
+        echo "  1. 添加单端口转发"
+        echo "  2. 添加端口段转发"
+        echo "  3. 查看转发规则"
+        echo "  4. 修改转发规则"
+        echo "  5. 删除转发规则"
+        echo "  6. 测试转发规则"
+        echo "  7. Realm 服务管理"
+        echo "  0. 返回"
+        echo -e "${CYAN}═════════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-7]: " c
+        case "$c" in
+            1) forwarding_add_single ;;
+            2) forwarding_add_range ;;
+            3) clear; forwarding_show_config; pause ;;
+            4) forwarding_edit_rule ;;
+            5) forwarding_delete_rule ;;
+            6) forwarding_test_rule ;;
+            7) realm_service_management ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+# ==============================================================================
+# [11] 服务运维与彻底卸载
+# ==============================================================================
+
+show_service_status() {
+    echo ""
+    echo -e "$YELLOW【sing-box】$PLAIN"
+    service_status_output sing-box | head -n 15 || echo "未安装/未加载"
+    echo ""
+    echo -e "$YELLOW【ss2022-xray / VLESS Reality】$PLAIN"
+    service_status_output "$XRAY_SERVICE_NAME" | head -n 15 || echo "未安装/未加载"
+    echo ""
+    echo -e "$YELLOW【Snell v5】$PLAIN"
+    service_status_output snell-v5 | head -n 15 || echo "未安装/未加载"
+    echo ""
+    echo -e "$YELLOW【Realm 端口转发】$PLAIN"
+    service_status_output "$REALM_SERVICE_NAME" | head -n 15 || echo "未安装/未加载"
+    echo ""
+    echo -e "$YELLOW【监听端口】$PLAIN"
+    ss -lntup 2>/dev/null | grep -E 'sing-box|xray|snell-server|ss2022-realm|realm' || echo "未检测到相关监听"
+}
+full_uninstall() {
+    local yes="" singbox_managed=0 snell_managed=0 proxy_link_managed=0
+    local warp_package_managed=0 warp_repo_managed=0
+    singbox_is_project_managed && singbox_managed=1 || true
+    snell_is_project_managed && snell_managed=1 || true
+    proxy_shortcut_is_project_managed && proxy_link_managed=1 || true
+    warp_package_is_project_managed && warp_package_managed=1 || true
+    warp_repo_is_project_managed && warp_repo_managed=1 || true
+    echo -e "${RED}========== 完全卸载 ss2022.sh ==========${PLAIN}"
+    echo ""
+    echo -e "${RED}此操作会删除本脚本管理的协议核心、节点/分流/端口转发配置与服务。不会删除服务器原有 xray.service 或 realm.service。${PLAIN}"
+    echo -e "${YELLOW}[保留] 服务器工具中由你主动设置的 BBR、DNS、SSH 端口和 IPv4/IPv6 地址优先级不会自动回滚。${PLAIN}"
+    echo -e "${YELLOW}[说明] 这些属于服务器系统设置；自动恢复可能改变网络或 SSH 可达性，需要时请在卸载前通过对应菜单手动恢复。${PLAIN}"
+    echo ""
+    read -rp "确认彻底卸载？请输入 DELETE: " yes
+    [[ "$yes" == "DELETE" ]] || { echo "已取消。"; sleep 1; return; }
+
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        [[ $singbox_managed -eq 1 ]] && systemctl disable --now sing-box >/dev/null 2>&1 || true
+        [[ $snell_managed -eq 1 ]] && systemctl disable --now snell-v5 >/dev/null 2>&1 || true
+        systemctl disable --now "$XRAY_SERVICE_NAME" "$REALM_SERVICE_NAME" "${IPV6_KEEPALIVE_SYSTEMD_SERVICE_NAME}.timer" >/dev/null 2>&1 || true
+        systemctl disable --now "$IP_FAMILY_SERVICE_NAME" ss2022-tg-monitor.timer >/dev/null 2>&1 || true
+        systemctl stop "${IPV6_KEEPALIVE_SYSTEMD_SERVICE_NAME}.service" ss2022-tg-monitor.service >/dev/null 2>&1 || true
+        cleanup_legacy_ipv6_keepalive_if_managed
+    else
+        [[ $singbox_managed -eq 1 ]] && service_disable_now sing-box
+        service_disable_now "$XRAY_SERVICE_NAME"
+        [[ $snell_managed -eq 1 ]] && service_disable_now snell-v5
+        service_disable_now "$REALM_SERVICE_NAME"
+        service_disable_now "$IP_FAMILY_SERVICE_NAME"
+        service_disable_now ss2022-ipv6-keepalive
+    fi
+
+    command -v nft >/dev/null 2>&1 && nft delete table inet ss2022_ip_family >/dev/null 2>&1 || true
+
+    if [[ $singbox_managed -eq 1 ]] && platform_is_alpine && [[ -f "$SINGBOX_ALPINE_PKG_MARKER" ]]; then
+        apk del sing-box >/dev/null 2>&1 || true
+        rm -f "$SINGBOX_ALPINE_PKG_MARKER"
+    fi
+
+    if [[ $warp_package_managed -eq 1 || $warp_repo_managed -eq 1 ]]; then
+        if command -v warp-cli >/dev/null 2>&1; then
+            warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
+            [[ $warp_package_managed -eq 1 ]] && warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
+        fi
+        warp_remove_managed_install_assets
+    fi
+
+    if [[ $singbox_managed -eq 1 ]]; then
+        rm -f "$SINGBOX_CONF" "${SINGBOX_CONF_DIR}"/.ss2022-*
+        rm -f "$SINGBOX_BIN" "$SINGBOX_SERVICE" "$SINGBOX_OPENRC_SERVICE" "$SINGBOX_MANAGED_MARKER"
+        if [[ -f "$SINGBOX_DIR_MARKER" ]]; then
+            rmdir "$SINGBOX_CONF_DIR" 2>/dev/null || true
+            rm -f "$SINGBOX_DIR_MARKER"
+        fi
+    fi
+    if [[ $snell_managed -eq 1 ]]; then
+        rm -f "$SNELL_CONF" "${SNELL_CONF_DIR}"/.ss2022-*
+        rm -f "$SNELL_BIN" "$SNELL_SERVICE" "$SNELL_OPENRC_SERVICE" "$SNELL_MANAGED_MARKER"
+        if [[ -f "$SNELL_DIR_MARKER" ]]; then
+            rmdir "$SNELL_CONF_DIR" 2>/dev/null || true
+            rm -f "$SNELL_DIR_MARKER"
+        fi
+    fi
+    rm -rf /etc/ss2022-xray /etc/ss2022-realm "$STATE_DIR" /usr/local/lib/ss2022 /var/log/ss2022
+
+    [[ $proxy_link_managed -eq 1 ]] && rm -f "$SCRIPT_PROXY_LINK"
+    rm -f \
+        "$SCRIPT_INSTALL_PATH" \
+        "$SCRIPT_BACKUP_PATH" \
+        "${SNELL_CANDIDATE_PREFIX}".* \
+        "$XRAY_BIN" \
+        "$XRAY_SERVICE" \
+        "$REALM_SERVICE" \
+        "$IP_FAMILY_SERVICE" \
+        "$XRAY_OPENRC_SERVICE" \
+        "$REALM_OPENRC_SERVICE" \
+        "$IP_FAMILY_OPENRC_SERVICE" \
+        "$IPV6_KEEPALIVE_OPENRC_SERVICE" \
+        "$IPV6_KEEPALIVE_SYSTEMD_SERVICE" \
+        "$IPV6_KEEPALIVE_SYSTEMD_TIMER" \
+        "$TG_MONITOR_SERVICE" \
+        "$TG_MONITOR_TIMER" \
+        "$FORCE_IPV6_CONF"
+
+    if [[ -f "$DNS_MARKER" || -f "$BACKUP_DNS" ]]; then
+        if ! restore_ipv4_apt_and_dns_if_needed; then
+            echo -e "${YELLOW}[提示] IPv6-only 临时 DNS 未能自动恢复；脚本专属备份会保留供手动恢复。${PLAIN}"
+        fi
+    fi
+    rm -f "$DNS_MARKER"
+
+    if [[ -f "$SINGBOX_USER_MARKER" ]]; then delete_system_user "$SINGBOX_USER"; rm -f "$SINGBOX_USER_MARKER"; fi
+    if [[ -f "$SINGBOX_GROUP_MARKER" ]]; then delete_system_group "$SINGBOX_GROUP"; rm -f "$SINGBOX_GROUP_MARKER"; fi
+
+    if [[ -f "$XRAY_USER_MARKER" ]]; then delete_system_user "$XRAY_USER"; rm -f "$XRAY_USER_MARKER"; fi
+    if [[ -f "$XRAY_GROUP_MARKER" ]]; then delete_system_group "$XRAY_GROUP"; rm -f "$XRAY_GROUP_MARKER"; fi
+
+    if [[ -f "$REALM_USER_MARKER" ]]; then delete_system_user "$REALM_USER"; rm -f "$REALM_USER_MARKER"; fi
+    if [[ -f "$REALM_GROUP_MARKER" ]]; then delete_system_group "$REALM_GROUP"; rm -f "$REALM_GROUP_MARKER"; fi
+
+    if [[ -f "$SNELL_USER_MARKER" ]]; then delete_system_user "$SNELL_USER"; rm -f "$SNELL_USER_MARKER"; fi
+    if [[ -f "$SNELL_GROUP_MARKER" ]]; then delete_system_group "$SNELL_GROUP"; rm -f "$SNELL_GROUP_MARKER"; fi
+
+    [[ -f "$TG_MONITOR_CRON_FILE" ]] && sed -i "/ss2022-tg-monitor/d" "$TG_MONITOR_CRON_FILE" 2>/dev/null || true
+    rm -f "$SINGBOX_OPENRC_PID" "$XRAY_OPENRC_PID" "$SNELL_OPENRC_PID" "$REALM_OPENRC_PID"
+    rm -rf /run/ss2022-tg-monitor.lockdir
+    rm -rf /tmp/ss2022-* 2>/dev/null || true
+    service_daemon_reload || true
+    echo -e "${GREEN}✔ vps-bootstrap 协议核心、服务与运行文件已清理完成。${PLAIN}"
+    echo -e "${YELLOW}[保留] BBR / DNS / SSH 端口 / IPv4-IPv6 地址优先级等用户主动系统设置保持当前状态。${PLAIN}"
+    exit 0
+}
+get_singbox_version_raw() {
+    if [[ -x "$SINGBOX_BIN" ]]; then
+        "$SINGBOX_BIN" version 2>/dev/null | head -n1 | awk '{print $3}'
+    fi
+}
+
+get_xray_version_raw() {
+    if [[ -x "$XRAY_BIN" ]]; then
+        "$XRAY_BIN" version 2>/dev/null | head -n1 | awk '{print $2}'
+    fi
+}
+
+get_snell_version_raw() {
+    [[ -x "$SNELL_BIN" ]] && printf '%s\n' "$SNELL_VERSION" || true
+}
+
+get_realm_version_raw() {
+    if [[ -x "$REALM_BIN" ]]; then
+        "$REALM_BIN" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1
+    fi
+}
+
+component_current_version() {
+    case "$1" in
+        singbox) get_singbox_version_raw ;;
+        xray) get_xray_version_raw ;;
+        snell) get_snell_version_raw ;;
+        realm) get_realm_version_raw ;;
+    esac
+}
+
+component_recommended_version() {
+    case "$1" in
+        singbox) echo "$SINGBOX_VERSION" ;;
+        xray) echo "$XRAY_VERSION" ;;
+        snell) echo "$SNELL_VERSION" ;;
+        realm) echo "$REALM_VERSION" ;;
+    esac
+}
+
+component_label() {
+    case "$1" in
+        singbox) echo "sing-box" ;;
+        xray) echo "Xray-core" ;;
+        snell) echo "Snell Server" ;;
+        realm) echo "Realm" ;;
+    esac
+}
+
+component_bin_path() {
+    case "$1" in
+        singbox) echo "$SINGBOX_BIN" ;;
+        xray) echo "$XRAY_BIN" ;;
+        snell) echo "$SNELL_BIN" ;;
+        realm) echo "$REALM_BIN" ;;
+    esac
+}
+
+component_service_name() {
+    case "$1" in
+        singbox) echo "sing-box" ;;
+        xray) echo "$XRAY_SERVICE_NAME" ;;
+        snell) echo "snell-v5" ;;
+        realm) echo "$REALM_SERVICE_NAME" ;;
+    esac
+}
+
+component_config_exists() {
+    case "$1" in
+        singbox) [[ -f "$SINGBOX_CONF" ]] ;;
+        xray) [[ -f "$XRAY_CONF" ]] ;;
+        snell) [[ -f "$SNELL_CONF" ]] ;;
+        realm) [[ -f "$REALM_CONF" ]] ;;
+    esac
+}
+
+component_validate_existing_config() {
+    local c="$1"
+    case "$c" in
+        singbox)
+            [[ -f "$SINGBOX_CONF" ]] || return 0
+            "$SINGBOX_BIN" check -c "$SINGBOX_CONF"
+            ;;
+        xray)
+            [[ -f "$XRAY_CONF" ]] || return 0
+            "$XRAY_BIN" run -test -format json -config "$XRAY_CONF"
+            ;;
+        snell)
+            [[ -f "$SNELL_CONF" ]] || return 0
+            snell_binary_works "$SNELL_BIN"
+            ;;
+        realm)
+            [[ -f "$REALM_CONF" ]] || return 0
+            "$REALM_BIN" --version >/dev/null 2>&1
+            ;;
+    esac
+}
+
+component_install_recommended() {
+    local c="$1" label bin svc tmp old_active=0 had_bin=0 ok=0
+    label=$(component_label "$c")
+    bin=$(component_bin_path "$c")
+    svc=$(component_service_name "$c")
+    tmp=$(mktemp -d /tmp/ss2022-core-upgrade.XXXXXX) || return 1
+
+    if [[ -x "$bin" ]]; then
+        cp -a "$bin" "$tmp/old.bin" || { rm -rf "$tmp"; return 1; }
+        had_bin=1
+    fi
+    service_is_active "$svc" && old_active=1 || true
+
+    echo -e "${YELLOW}>> ${label}: 安装/修复到脚本推荐版本 $(component_recommended_version "$c")...${PLAIN}"
+    case "$c" in
+        singbox) install_singbox_core && ok=1 ;;
+        xray) install_xray_core && ok=1 ;;
+        snell) install_snell_v5_core && write_snell_service && ok=1 ;;
+        realm) install_realm_core && ok=1 ;;
+    esac
+
+    if [[ $ok -eq 1 ]] && ! component_validate_existing_config "$c"; then
+        echo -e "${RED}[错误] 新 ${label} 无法兼容当前配置，开始恢复旧二进制。${PLAIN}"
+        ok=0
+    fi
+
+    if [[ $ok -eq 1 ]] && component_config_exists "$c"; then
+        service_daemon_reload >/dev/null 2>&1 || true
+        if ! service_restart "$svc" >/dev/null 2>&1; then
+            echo -e "${RED}[错误] ${label} 新版本启动失败，开始回滚。${PLAIN}"
+            ok=0
+        else
+            sleep 1
+            service_is_active "$svc" || ok=0
+        fi
+    fi
+
+    if [[ $ok -ne 1 ]]; then
+        if [[ $had_bin -eq 1 && -f "$tmp/old.bin" ]]; then
+            install -m 755 "$tmp/old.bin" "$bin" || true
+        elif [[ $had_bin -eq 0 ]]; then
+            rm -f "$bin"
+        fi
+        service_daemon_reload >/dev/null 2>&1 || true
+        [[ $old_active -eq 1 ]] && service_restart "$svc" >/dev/null 2>&1 || true
+        rm -rf "$tmp"
+        echo -e "${RED}[错误] ${label} 升级/修复失败，已尽力恢复原核心。${PLAIN}"
+        return 1
+    fi
+
+    rm -rf "$tmp"
+    echo -e "${GREEN}✔ ${label} 当前版本: $(component_current_version "$c")${PLAIN}"
+    return 0
+}
+
+fetch_github_latest_tag() {
+    local repo="$1"
+    curl -fsSL --retry 1 --connect-timeout 5 --max-time 12 \
+      -H 'Accept: application/vnd.github+json' \
+      "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null \
+      | jq -r '.tag_name // empty' 2>/dev/null | sed 's/^v//'
+}
+
+show_component_versions() {
+    local sb xr sn re
+    sb=$(get_singbox_version_raw); sb=${sb:-未安装}
+    xr=$(get_xray_version_raw); xr=${xr:-未安装}
+    sn=$(get_snell_version_raw); sn=${sn:-未安装}
+    re=$(get_realm_version_raw); re=${re:-未安装}
+    clear
+    echo -e "${CYAN}════════════════════ 组件版本管理 ════════════════════${PLAIN}"
+    echo "【协议核心】"
+    printf '  sing-box      已安装: %-12s 推荐: %s\n' "$sb" "$SINGBOX_VERSION"
+    printf '  Xray-core     已安装: %-12s 推荐: %s\n' "$xr" "$XRAY_VERSION"
+    if platform_is_alpine; then
+        printf '  Snell Server  已安装: %-12s 推荐: %s  [Alpine 暂不支持]\n' "$sn" "$SNELL_VERSION"
+    else
+        printf '  Snell Server  已安装: %-12s 推荐: %s\n' "$sn" "$SNELL_VERSION"
+    fi
+    echo ""
+    echo "【网络组件】"
+    printf '  Realm         已安装: %-12s 推荐: %s\n' "$re" "$REALM_VERSION"
+    if command -v warp-cli >/dev/null 2>&1; then
+        echo "  Cloudflare WARP: 已安装（版本由 Cloudflare 客户端自身管理）"
+    else
+        echo "  Cloudflare WARP: 未安装"
+    fi
+}
+
+check_upstream_versions() {
+    clear
+    echo -e "${CYAN}════════════════════ 上游版本检查 ════════════════════${PLAIN}"
+    echo "说明：仅查询并提示，不会自动安装官方 Latest。"
+    echo ""
+    local latest current
+    current=$(get_singbox_version_raw); current=${current:-未安装}
+    latest=$(fetch_github_latest_tag 'SagerNet/sing-box'); latest=${latest:-查询失败}
+    printf 'sing-box      当前 %-12s 推荐 %-12s 上游 %s\n' "$current" "$SINGBOX_VERSION" "$latest"
+    current=$(get_xray_version_raw); current=${current:-未安装}
+    latest=$(fetch_github_latest_tag 'XTLS/Xray-core'); latest=${latest:-查询失败}
+    printf 'Xray-core     当前 %-12s 推荐 %-12s 上游 %s\n' "$current" "$XRAY_VERSION" "$latest"
+    current=$(get_snell_version_raw); current=${current:-未安装}
+    printf 'Snell Server  当前 %-12s 推荐 %-12s 上游 %s\n' "$current" "$SNELL_VERSION" "请以 Surge 官方发布为准"
+    current=$(get_realm_version_raw); current=${current:-未安装}
+    latest=$(fetch_github_latest_tag 'zhboner/realm'); latest=${latest:-查询失败}
+    printf 'Realm         当前 %-12s 推荐 %-12s 上游 %s\n' "$current" "$REALM_VERSION" "$latest"
+    echo ""
+    echo -e "${YELLOW}上游 Latest 不代表本脚本已验证。请优先使用脚本推荐版本。${PLAIN}"
+    pause
+}
+
+component_single_menu() {
+    local c="$1" label current recommended choice
+    if platform_is_alpine && [[ "$c" == "snell" ]]; then
+        platform_feature_unavailable "Snell v5（Surge 官方 snell-server）"
+        pause
+        return
+    fi
+    label=$(component_label "$c")
+    while true; do
+        clear
+        current=$(component_current_version "$c"); current=${current:-未安装}
+        recommended=$(component_recommended_version "$c")
+        echo -e "${CYAN}════════════════════ ${label} ════════════════════${PLAIN}"
+        echo "当前版本 : $current"
+        echo "推荐版本 : $recommended"
+        echo ""
+        echo "  1. 升级 / 重装到推荐版本"
+        echo "  2. 查看当前版本"
+        echo "  0. 返回"
+        read -rp "请选择 [0-2]: " choice
+        case "$choice" in
+            1) component_install_recommended "$c"; pause ;;
+            2) current=$(component_current_version "$c"); echo "${label}: ${current:-未安装}"; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+upgrade_all_to_recommended() {
+    local c current target failed=0
+    for c in singbox xray snell realm; do
+        if platform_is_alpine && [[ "$c" == "snell" ]]; then
+            echo -e "${YELLOW}○ Snell Server：Alpine 3.21 暂不支持官方 snell-server，跳过。${PLAIN}"
+            continue
+        fi
+        current=$(component_current_version "$c")
+        target=$(component_recommended_version "$c")
+        if [[ -z "$current" ]]; then
+            case "$c" in
+                singbox) [[ -f "$SINGBOX_CONF" ]] || continue ;;
+                xray) [[ -f "$XRAY_CONF" ]] || continue ;;
+                snell) [[ -f "$SNELL_CONF" ]] || continue ;;
+                realm) [[ -f "$REALM_CONF" || -f "$FORWARDING_FILE" ]] || continue ;;
+            esac
+        fi
+        if [[ "$current" == "$target" ]]; then
+            echo -e "${GREEN}✔ $(component_label "$c") 已是推荐版本 $target${PLAIN}"
+            continue
+        fi
+        component_install_recommended "$c" || failed=1
+    done
+    [[ $failed -eq 0 ]]
+}
+
+component_version_management() {
+    while true; do
+        show_component_versions
+        echo ""
+        echo "  1. sing-box"
+        echo "  2. Xray-core"
+        if platform_is_alpine; then
+            echo "  3. Snell Server            [Alpine 暂不支持]"
+        else
+            echo "  3. Snell Server"
+        fi
+        echo "  4. Realm"
+        echo "  5. 检查官方上游版本（仅提示）"
+        echo "  6. 全部升级到脚本推荐版本"
+        echo "  0. 返回"
+        echo -e "${CYAN}═════════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-6]: " c
+        case "$c" in
+            1) component_single_menu singbox ;;
+            2) component_single_menu xray ;;
+            3) component_single_menu snell ;;
+            4) component_single_menu realm ;;
+            5) check_upstream_versions ;;
+            6) upgrade_all_to_recommended; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+# ==============================================================================
+# [13] 脚本自更新
+# ==============================================================================
+
+extract_script_version() {
+    local file="$1"
+    sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' "$file" 2>/dev/null | head -n1
+}
+
+script_source_path() {
+    local src="${BASH_SOURCE[0]}"
+    readlink -f "$src" 2>/dev/null || printf '%s\n' "$src"
+}
+
+proxy_shortcut_is_project_managed() {
+    local target=""
+    [[ -L "$SCRIPT_PROXY_LINK" ]] || return 1
+    target=$(readlink "$SCRIPT_PROXY_LINK" 2>/dev/null || true)
+    [[ "$target" == "$SCRIPT_INSTALL_PATH" || "$target" == "${SCRIPT_INSTALL_PATH##*/}" ]]
+}
+
+ensure_proxy_shortcut() {
+    if [[ -e "$SCRIPT_PROXY_LINK" || -L "$SCRIPT_PROXY_LINK" ]]; then
+        if ! proxy_shortcut_is_project_managed; then
+            echo -e "${YELLOW}[提示] ${SCRIPT_PROXY_LINK} 已被其它文件或链接占用，保留原内容；仍可使用 ${SCRIPT_INSTALL_PATH}。${PLAIN}"
+            return 0
+        fi
+        rm -f "$SCRIPT_PROXY_LINK" || return 1
+    fi
+    ln -s "$SCRIPT_INSTALL_PATH" "$SCRIPT_PROXY_LINK"
+}
+
+compare_script_versions() {
+    # 输出：
+    #   equal         两版本相同
+    #   remote_newer  第二个版本更新
+    #   remote_older  第二个版本更旧
+    #   unknown       无法按 vX.Y.Z[-devN] 规则比较
+    local current="$1"
+    local remote="$2"
+    local c_major c_minor c_patch c_dev r_major r_minor r_patch r_dev
+    local c_is_dev=0 r_is_dev=0
+
+    if [[ "$current" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)(-dev([0-9]+))?$ ]]; then
+        c_major="${BASH_REMATCH[1]}"
+        c_minor="${BASH_REMATCH[2]}"
+        c_patch="${BASH_REMATCH[3]}"
+        if [[ -n "${BASH_REMATCH[4]:-}" ]]; then
+            c_is_dev=1
+            c_dev="${BASH_REMATCH[5]}"
+        else
+            c_dev=0
+        fi
+    else
+        echo "unknown"
+        return
+    fi
+
+    if [[ "$remote" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)(-dev([0-9]+))?$ ]]; then
+        r_major="${BASH_REMATCH[1]}"
+        r_minor="${BASH_REMATCH[2]}"
+        r_patch="${BASH_REMATCH[3]}"
+        if [[ -n "${BASH_REMATCH[4]:-}" ]]; then
+            r_is_dev=1
+            r_dev="${BASH_REMATCH[5]}"
+        else
+            r_dev=0
+        fi
+    else
+        echo "unknown"
+        return
+    fi
+
+    local c r
+    for c_r in major minor patch; do
+        case "$c_r" in
+            major) c="$c_major"; r="$r_major" ;;
+            minor) c="$c_minor"; r="$r_minor" ;;
+            patch) c="$c_patch"; r="$r_patch" ;;
+        esac
+        if (( 10#$r > 10#$c )); then
+            echo "remote_newer"
+            return
+        elif (( 10#$r < 10#$c )); then
+            echo "remote_older"
+            return
+        fi
+    done
+
+    # 同一正式版本号下：正式版 > dev 版。
+    if (( c_is_dev == 1 && r_is_dev == 0 )); then
+        echo "remote_newer"
+        return
+    elif (( c_is_dev == 0 && r_is_dev == 1 )); then
+        echo "remote_older"
+        return
+    elif (( c_is_dev == 0 && r_is_dev == 0 )); then
+        echo "equal"
+        return
+    fi
+
+    if (( 10#$r_dev > 10#$c_dev )); then
+        echo "remote_newer"
+    elif (( 10#$r_dev < 10#$c_dev )); then
+        echo "remote_older"
+    else
+        echo "equal"
+    fi
+}
+
+check_script_update() {
+    clear
+    echo -e "${CYAN}════════════════════ 检查脚本更新 ════════════════════${PLAIN}"
+    echo "更新源 : ${SCRIPT_UPDATE_URL}"
+    echo ""
+
+    command -v curl >/dev/null 2>&1 || {
+        echo -e "${RED}[错误] 未检测到 curl，无法检查更新。${PLAIN}"
+        pause
+        return
+    }
+
+    local tmp remote_version running_file running_version installed_version
+    local running_hash installed_hash remote_hash cache_bust relation
+    local install_reason=""
+    local ans
+
+    running_file=$(script_source_path)
+    running_version=$(extract_script_version "$running_file")
+    [[ -n "$running_version" ]] || running_version="$SCRIPT_VERSION"
+
+    if [[ -f "$SCRIPT_INSTALL_PATH" ]]; then
+        installed_version=$(extract_script_version "$SCRIPT_INSTALL_PATH")
+        installed_hash=$(sha256sum "$SCRIPT_INSTALL_PATH" 2>/dev/null | awk '{print $1}')
+    else
+        installed_version="未安装"
+        installed_hash=""
+    fi
+
+    running_hash=$(sha256sum "$running_file" 2>/dev/null | awk '{print $1}')
+
+    tmp=$(mktemp /tmp/ss2022-update.XXXXXX.sh) || {
+        echo -e "${RED}[错误] 无法创建临时文件。${PLAIN}"
+        pause
+        return
+    }
+    cache_bust=$(date +%s)
+
+    echo -e "${YELLOW}>> 正在从 GitHub main 获取最新脚本...${PLAIN}"
+    if ! curl -fsSL --retry 2 --retry-delay 1 --connect-timeout 8 --max-time 60 \
+        -H 'Cache-Control: no-cache' \
+        "${SCRIPT_UPDATE_URL}?t=${cache_bust}" -o "$tmp"; then
+        rm -f "$tmp"
+        echo -e "${RED}[错误] 下载 GitHub 最新脚本失败。${PLAIN}"
+        pause
+        return
+    fi
+
+    # 只接受本项目脚本，避免 URL / CDN 异常返回 HTML 或其它内容后被直接执行。
+    if ! grep -q '^# 项目名称: vps-bootstrap / ss2022.sh$' "$tmp"; then
+        rm -f "$tmp"
+        echo -e "${RED}[错误] 下载内容不是有效的 vps-bootstrap/ss2022.sh，已拒绝更新。${PLAIN}"
+        pause
+        return
+    fi
+    if ! bash -n "$tmp"; then
+        rm -f "$tmp"
+        echo -e "${RED}[错误] GitHub 脚本未通过 Bash 语法检查，已拒绝更新。${PLAIN}"
+        pause
+        return
+    fi
+
+    remote_version=$(extract_script_version "$tmp")
+    if [[ -z "$remote_version" ]]; then
+        rm -f "$tmp"
+        echo -e "${RED}[错误] 无法读取远程 SCRIPT_VERSION，已拒绝更新。${PLAIN}"
+        pause
+        return
+    fi
+
+    remote_hash=$(sha256sum "$tmp" | awk '{print $1}')
+    relation=$(compare_script_versions "$running_version" "$remote_version")
+
+    echo "当前运行 : ${running_version}"
+    echo "系统安装 : ${installed_version}"
+    echo "GitHub main: ${remote_version}"
+    echo ""
+    echo "运行 SHA : ${running_hash:-无法读取}"
+    echo "安装 SHA : ${installed_hash:-未安装}"
+    echo "远程 SHA : ${remote_hash}"
+    echo ""
+
+    # 情况 1：当前正在运行的文件与 GitHub main 完全一致。
+    if [[ -n "$running_hash" && "$running_hash" == "$remote_hash" ]]; then
+        if [[ -n "$installed_hash" && "$installed_hash" == "$remote_hash" ]]; then
+            rm -f "$tmp"
+            echo -e "${GREEN}✔ 当前运行脚本、系统安装脚本与 GitHub main 完全一致。${PLAIN}"
+            pause
+            return
+        fi
+
+        echo -e "${YELLOW}当前运行脚本已与 GitHub main 一致，但系统安装版本仍不一致。${PLAIN}"
+        echo "可以把当前 GitHub main 版本同步安装到：${SCRIPT_INSTALL_PATH}"
+        install_reason="sync_install"
+    else
+        case "$relation" in
+            remote_newer)
+                echo -e "${GREEN}检测到脚本更新：${running_version} → ${remote_version}${PLAIN}"
+                install_reason="remote_newer"
+                ;;
+            remote_older)
+                rm -f "$tmp"
+                echo -e "${YELLOW}GitHub main 版本比当前运行版本更旧：${remote_version} < ${running_version}${PLAIN}"
+                echo "为避免误降级，本工具不会自动覆盖当前版本。"
+                echo ""
+                echo "如果你刚从测试文件运行了新版，请先把新版 ss2022.sh 提交到 GitHub main，"
+                echo "之后再使用“检查脚本更新”。"
+                pause
+                return
+                ;;
+            equal)
+                echo -e "${YELLOW}检测到同版本号内容变化：${running_version}${PLAIN}"
+                echo "版本号相同，但当前运行文件与 GitHub main 的 SHA256 不同。"
+                install_reason="same_version_changed"
+                ;;
+            *)
+                echo -e "${YELLOW}检测到脚本内容不同，但无法可靠判断版本新旧。${PLAIN}"
+                echo "当前运行：${running_version}"
+                echo "GitHub main：${remote_version}"
+                echo "为避免误降级，默认不自动覆盖。"
+                rm -f "$tmp"
+                pause
+                return
+                ;;
+        esac
+    fi
+
+    echo ""
+    echo "更新将："
+    echo "  1. 备份当前系统安装脚本到 ${SCRIPT_BACKUP_PATH}"
+    echo "  2. 安装 GitHub main 脚本到 ${SCRIPT_INSTALL_PATH}"
+    echo "  3. 若 ${SCRIPT_PROXY_LINK} 未被其它程序占用，则保持该快捷命令"
+    echo "  4. 自动重新进入安装后的管理面板"
+    echo ""
+
+    read -rp "确认安装 / 更新？[y/N]: " ans
+    if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+        rm -f "$tmp"
+        echo "已取消更新。"
+        pause
+        return
+    fi
+
+    # 覆盖前保存最近一个系统安装版本。安装失败时立即恢复。
+    if [[ -f "$SCRIPT_INSTALL_PATH" ]]; then
+        cp -a "$SCRIPT_INSTALL_PATH" "$SCRIPT_BACKUP_PATH" || {
+            rm -f "$tmp"
+            echo -e "${RED}[错误] 无法备份当前脚本，已取消更新。${PLAIN}"
+            pause
+            return
+        }
+    fi
+
+    if ! install -m 0755 "$tmp" "$SCRIPT_INSTALL_PATH"; then
+        [[ -f "$SCRIPT_BACKUP_PATH" ]] && install -m 0755 "$SCRIPT_BACKUP_PATH" "$SCRIPT_INSTALL_PATH" 2>/dev/null || true
+        rm -f "$tmp"
+        echo -e "${RED}[错误] 新脚本安装失败，已尝试恢复旧版本。${PLAIN}"
+        pause
+        return
+    fi
+    rm -f "$tmp"
+
+    if ! bash -n "$SCRIPT_INSTALL_PATH"; then
+        echo -e "${RED}[错误] 安装后的脚本语法校验失败，正在恢复旧版本。${PLAIN}"
+        [[ -f "$SCRIPT_BACKUP_PATH" ]] && install -m 0755 "$SCRIPT_BACKUP_PATH" "$SCRIPT_INSTALL_PATH" 2>/dev/null || true
+        pause
+        return
+    fi
+
+    ensure_proxy_shortcut || echo -e "${YELLOW}[提示] proxy 快捷命令创建失败，不影响 ss2022 主命令。${PLAIN}"
+    echo -e "${GREEN}✔ 脚本安装 / 更新完成：$(extract_script_version "$SCRIPT_INSTALL_PATH")${PLAIN}"
+    echo "正在重新进入安装后的管理面板..."
+    sleep 1
+    exec "$SCRIPT_INSTALL_PATH"
+}
+
+# ==============================================================================
+# [14] 菜单与程序入口
+# ==============================================================================
+
+protocol_management() {
+    while true; do
+        clear
+        echo -e "$CYAN════════════════════ 协议管理 ════════════════════$PLAIN"
+        echo "  1. SS2022"
+        echo "  2. SS2022 + ShadowTLS v3（增强伪装）"
+        echo "  3. VLESS Reality"
+        if platform_is_alpine; then
+            echo "  4. Snell v5                [Alpine 暂不支持]"
+        else
+            echo "  4. Snell v5"
+        fi
+        echo "  0. 返回"
+        echo -e "$CYAN═══════════════════════════════════════════════════$PLAIN"
+        read -rp "请选择 [0-4]: " c
+        case "$c" in
+            1) protocol_action_menu "SS2022" deploy_ss2022 update_ss2022 delete_ss2022 ;;
+            2) protocol_action_menu "SS2022 + ShadowTLS v3" deploy_shadowtls update_shadowtls delete_shadowtls ;;
+            3) protocol_action_menu "VLESS Reality" deploy_vless_reality update_vless_reality delete_vless_reality ;;
+            4)
+                if platform_is_alpine; then
+                    platform_feature_unavailable "Snell v5（Surge 官方 snell-server）"
+                    pause
+                else
+                    protocol_action_menu "Snell v5" deploy_snell_v5 update_snell_v5 delete_snell_v5
+                fi
+                ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+follow_service_log() {
+    local service="$1"
+    service_log_follow "$service"
+}
+restart_service_safe() {
+    local service="$1" label="$2"
+    if service_restart "$service"; then
+        echo -e "$GREEN✔ $label 已重启。$PLAIN"
+    else
+        service_log_tail "$service" 30 || true
+        return 1
+    fi
+}
+server_tool_pkg_manager() {
+    if command -v apt-get >/dev/null 2>&1; then
+        echo "apt"
+    elif command -v dnf >/dev/null 2>&1; then
+        echo "dnf"
+    elif command -v yum >/dev/null 2>&1; then
+        echo "yum"
+    elif command -v apk >/dev/null 2>&1; then
+        echo "apk"
+    else
+        echo "unknown"
+    fi
+}
+
+server_tool_get_ip_profile() {
+    local ipv4="$1" ipv6="$2" target meta hosting proxy mobile org asn isp country region city location
+    local scam_html score risk_label
+
+    SERVER_INFO_IPV4="$ipv4"
+    SERVER_INFO_IPV6="$ipv6"
+    SERVER_INFO_IP_TYPE="未知"
+    SERVER_INFO_IP_RISK="未获取"
+    SERVER_INFO_ISP="未知"
+    SERVER_INFO_ASN="未知"
+    SERVER_INFO_LOCATION="未知"
+
+    target="$ipv4"
+    [[ -n "$target" ]] || target="$ipv6"
+    [[ -n "$target" ]] || return 0
+
+    # ip-api 免费接口用于轻量判定 hosting / proxy / mobile；查询失败时保持“未知”。
+    meta=$(curl -fsS --connect-timeout 3 --max-time 5 \
+        "http://ip-api.com/json/${target}?fields=status,message,country,regionName,city,isp,org,as,hosting,proxy,mobile,query" \
+        2>/dev/null || true)
+
+    if [[ -n "$meta" ]] && jq -e '.status=="success"' >/dev/null 2>&1 <<<"$meta"; then
+        hosting=$(jq -r '.hosting // false' <<<"$meta")
+        proxy=$(jq -r '.proxy // false' <<<"$meta")
+        mobile=$(jq -r '.mobile // false' <<<"$meta")
+        org=$(jq -r '.org // empty' <<<"$meta")
+        isp=$(jq -r '.isp // empty' <<<"$meta")
+        asn=$(jq -r '.as // empty' <<<"$meta")
+        country=$(jq -r '.country // empty' <<<"$meta")
+        region=$(jq -r '.regionName // empty' <<<"$meta")
+        city=$(jq -r '.city // empty' <<<"$meta")
+
+        SERVER_INFO_ISP="${isp:-${org:-未知}}"
+        SERVER_INFO_ASN="${asn:-未知}"
+
+        location=""
+        [[ -n "$country" ]] && location="$country"
+        [[ -n "$region" ]] && location="${location:+${location} / }${region}"
+        [[ -n "$city" ]] && location="${location:+${location} / }${city}"
+        SERVER_INFO_LOCATION="${location:-未知}"
+
+        if [[ "$hosting" == "true" ]]; then
+            SERVER_INFO_IP_TYPE="数据中心"
+        elif [[ "$mobile" == "true" ]]; then
+            SERVER_INFO_IP_TYPE="移动网络"
+        elif [[ "$proxy" == "true" ]]; then
+            SERVER_INFO_IP_TYPE="代理/VPN"
+        else
+            SERVER_INFO_IP_TYPE="宽带/其他"
+        fi
+    fi
+
+    # Scamalytics 网页公开查询结果中包含 Fraud Score；失败时不影响系统信息展示。
+    scam_html=$(curl -A "Mozilla/5.0" -fsSL --connect-timeout 3 --max-time 6 \
+        "https://scamalytics.com/ip/${target}" 2>/dev/null || true)
+
+    if [[ -n "$scam_html" ]]; then
+        score=$(printf '%s' "$scam_html" \
+            | tr '\n' ' ' \
+            | grep -oE '"score"[[:space:]]*:[[:space:]]*"?[0-9]{1,3}"?' \
+            | head -n1 \
+            | grep -oE '[0-9]{1,3}' || true)
+
+        if [[ -z "$score" ]]; then
+            score=$(printf '%s' "$scam_html" \
+                | tr '\n' ' ' \
+                | sed -nE 's/.*Fraud Score:[[:space:]]*([0-9]{1,3}).*/\1/p' \
+                | head -n1 || true)
+        fi
+
+        if [[ "$score" =~ ^[0-9]+$ ]] && [[ "$score" -le 100 ]]; then
+            if [[ "$score" -le 19 ]]; then
+                risk_label="低风险"
+            elif [[ "$score" -le 59 ]]; then
+                risk_label="中等风险"
+            elif [[ "$score" -le 89 ]]; then
+                risk_label="高风险"
+            else
+                risk_label="极高风险"
+            fi
+            SERVER_INFO_IP_RISK="${score}/100（${risk_label}）"
+        fi
+    fi
+}
+
+server_tool_format_bytes() {
+    local bytes="${1:-0}"
+    awk -v b="$bytes" 'BEGIN {
+        if (b >= 1099511627776) printf "%.2f TB", b/1099511627776;
+        else if (b >= 1073741824) printf "%.2f GB", b/1073741824;
+        else if (b >= 1048576) printf "%.2f MB", b/1048576;
+        else if (b >= 1024) printf "%.2f KB", b/1024;
+        else printf "%.0f B", b;
+    }'
+}
+
+server_tool_public_traffic_bytes() {
+    local iface4 iface6 iface path rx tx
+    local total_rx=0 total_tx=0
+    local -A seen=()
+
+    iface4=$(ip -4 route show default 2>/dev/null | awk '
+        {
+            for (i=1;i<=NF;i++) if ($i=="dev" && (i+1)<=NF) {print $(i+1); exit}
+        }')
+    iface6=$(ip -6 route show default 2>/dev/null | awk '
+        {
+            for (i=1;i<=NF;i++) if ($i=="dev" && (i+1)<=NF) {print $(i+1); exit}
+        }')
+
+    for iface in "$iface4" "$iface6"; do
+        [[ -n "$iface" ]] || continue
+        [[ -n "${seen[$iface]:-}" ]] && continue
+        seen[$iface]=1
+        path="/sys/class/net/${iface}/statistics"
+        [[ -r "${path}/rx_bytes" && -r "${path}/tx_bytes" ]] || continue
+        rx=$(cat "${path}/rx_bytes" 2>/dev/null || echo 0)
+        tx=$(cat "${path}/tx_bytes" 2>/dev/null || echo 0)
+        [[ "$rx" =~ ^[0-9]+$ ]] || rx=0
+        [[ "$tx" =~ ^[0-9]+$ ]] || tx=0
+        total_rx=$((total_rx + rx))
+        total_tx=$((total_tx + tx))
+    done
+
+    # 极少数环境没有默认路由设备时，回退到常见公网接口。
+    if [[ ${#seen[@]} -eq 0 ]]; then
+        for path in /sys/class/net/*; do
+            [[ -d "$path/statistics" ]] || continue
+            iface=${path##*/}
+            case "$iface" in
+                lo|docker*|br-*|veth*|tun*|tap*|wg*|warp*|tailscale*) continue ;;
+            esac
+            [[ "$iface" =~ ^(eth|ens|enp|eno|venet|bond) ]] || continue
+            rx=$(cat "$path/statistics/rx_bytes" 2>/dev/null || echo 0)
+            tx=$(cat "$path/statistics/tx_bytes" 2>/dev/null || echo 0)
+            [[ "$rx" =~ ^[0-9]+$ ]] || rx=0
+            [[ "$tx" =~ ^[0-9]+$ ]] || tx=0
+            total_rx=$((total_rx + rx))
+            total_tx=$((total_tx + tx))
+        done
+    fi
+
+    printf '%s %s\n' "$total_rx" "$total_tx"
+}
+
+server_tool_monthly_traffic_bytes() {
+    local raw current_rx current_tx month
+    local state_month="" last_rx=0 last_tx=0 total_rx=0 total_tx=0
+    local tmp
+
+    mkdir -p "$STATE_DIR" || {
+        echo "0 0"
+        return
+    }
+    chmod 700 "$STATE_DIR"
+
+    raw=$(server_tool_public_traffic_bytes)
+    current_rx=$(awk '{print $1}' <<<"$raw")
+    current_tx=$(awk '{print $2}' <<<"$raw")
+    [[ "$current_rx" =~ ^[0-9]+$ ]] || current_rx=0
+    [[ "$current_tx" =~ ^[0-9]+$ ]] || current_tx=0
+
+    month=$(date +%Y-%m)
+
+    if [[ -f "$SYSTEM_INFO_TRAFFIC_STATE" ]]; then
+        state_month=$(awk -F= '$1=="MONTH" {gsub(/\047/,"",$2); print $2}' "$SYSTEM_INFO_TRAFFIC_STATE" 2>/dev/null)
+        last_rx=$(awk -F= '$1=="LAST_RX" {print $2}' "$SYSTEM_INFO_TRAFFIC_STATE" 2>/dev/null)
+        last_tx=$(awk -F= '$1=="LAST_TX" {print $2}' "$SYSTEM_INFO_TRAFFIC_STATE" 2>/dev/null)
+        total_rx=$(awk -F= '$1=="TOTAL_RX" {print $2}' "$SYSTEM_INFO_TRAFFIC_STATE" 2>/dev/null)
+        total_tx=$(awk -F= '$1=="TOTAL_TX" {print $2}' "$SYSTEM_INFO_TRAFFIC_STATE" 2>/dev/null)
+    fi
+
+    [[ "$last_rx" =~ ^[0-9]+$ ]] || last_rx=0
+    [[ "$last_tx" =~ ^[0-9]+$ ]] || last_tx=0
+    [[ "$total_rx" =~ ^[0-9]+$ ]] || total_rx=0
+    [[ "$total_tx" =~ ^[0-9]+$ ]] || total_tx=0
+
+    if [[ "$state_month" != "$month" ]]; then
+        # 新月份从当前时刻重新开始累计。
+        state_month="$month"
+        last_rx="$current_rx"
+        last_tx="$current_tx"
+        total_rx=0
+        total_tx=0
+    else
+        if [[ "$current_rx" -ge "$last_rx" ]]; then
+            total_rx=$((total_rx + current_rx - last_rx))
+        else
+            # VPS 重启或网卡计数归零：保留当月累计，并把当前值作为重启后的新增量。
+            total_rx=$((total_rx + current_rx))
+        fi
+
+        if [[ "$current_tx" -ge "$last_tx" ]]; then
+            total_tx=$((total_tx + current_tx - last_tx))
+        else
+            total_tx=$((total_tx + current_tx))
+        fi
+
+        last_rx="$current_rx"
+        last_tx="$current_tx"
+    fi
+
+    tmp="${SYSTEM_INFO_TRAFFIC_STATE}.tmp.$$"
+    umask 077
+    cat > "$tmp" <<EOF
+MONTH='${state_month}'
+LAST_RX=${last_rx}
+LAST_TX=${last_tx}
+TOTAL_RX=${total_rx}
+TOTAL_TX=${total_tx}
+EOF
+    mv -f "$tmp" "$SYSTEM_INFO_TRAFFIC_STATE"
+    chmod 600 "$SYSTEM_INFO_TRAFFIC_STATE"
+
+    printf '%s %s\n' "$total_rx" "$total_tx"
+}
+
+server_tool_system_info() {
+    local cpu cores mem_total mem_used swap_total swap_used disk_used disk_total
+    local uptime_days timezone dns congestion qdisc os_info ipv4 ipv6 hostname_text
+    local cpu_mhz cpu_ghz traffic_rx traffic_tx traffic_pair
+    local warp_ipv6="" ipv6_display=""
+
+    clear
+    os_info=$(get_sys_info)
+    cpu=$(awk -F: '/model name|Hardware|Processor/ {gsub(/^[ \t]+/,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null)
+    cpu=${cpu:-$(uname -m)}
+    cores=$(nproc 2>/dev/null || echo "?")
+
+    cpu_mhz=$(awk -F: '/cpu MHz/ {gsub(/^[ \t]+/,"",$2); sum+=$2; n++} END {if (n>0) printf "%.0f", sum/n}' /proc/cpuinfo 2>/dev/null)
+    if [[ "$cpu_mhz" =~ ^[0-9]+$ ]] && [[ "$cpu_mhz" -gt 0 ]]; then
+        cpu_ghz=$(awk -v mhz="$cpu_mhz" 'BEGIN {printf "%.2f", mhz/1000}')
+    else
+        cpu_ghz=""
+    fi
+
+    mem_total=$(free -h 2>/dev/null | awk '/^Mem:/ {print $2}')
+    mem_used=$(free -h 2>/dev/null | awk '/^Mem:/ {print $3}')
+    swap_total=$(free -h 2>/dev/null | awk '/^Swap:/ {print $2}')
+    swap_used=$(free -h 2>/dev/null | awk '/^Swap:/ {print $3}')
+    mem_total=${mem_total//Gi/G}
+    mem_total=${mem_total//Mi/M}
+    mem_total=${mem_total//Ki/K}
+    mem_total=${mem_total//Ti/T}
+    mem_used=${mem_used//Gi/G}
+    mem_used=${mem_used//Mi/M}
+    mem_used=${mem_used//Ki/K}
+    mem_used=${mem_used//Ti/T}
+    swap_total=${swap_total//Gi/G}
+    swap_total=${swap_total//Mi/M}
+    swap_total=${swap_total//Ki/K}
+    swap_total=${swap_total//Ti/T}
+    swap_used=${swap_used//Gi/G}
+    swap_used=${swap_used//Mi/M}
+    swap_used=${swap_used//Ki/K}
+    swap_used=${swap_used//Ti/T}
+    disk_used=$(df -h / 2>/dev/null | awk 'NR==2 {print $3}')
+    disk_total=$(df -h / 2>/dev/null | awk 'NR==2 {print $2}')
+
+    uptime_days=$(awk '{printf "%d", $1/86400}' /proc/uptime 2>/dev/null)
+    [[ "$uptime_days" =~ ^[0-9]+$ ]] || uptime_days=0
+
+    timezone=$(timedatectl show -p Timezone --value 2>/dev/null || date +%Z)
+    dns=$(awk '/^[[:space:]]*nameserver[[:space:]]+/ {print $2}' /etc/resolv.conf 2>/dev/null | paste -sd ',' -)
+    congestion=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
+    hostname_text=$(hostname 2>/dev/null || echo "未知")
+
+    traffic_pair=$(server_tool_monthly_traffic_bytes)
+    traffic_rx=$(awk '{print $1}' <<<"$traffic_pair")
+    traffic_tx=$(awk '{print $2}' <<<"$traffic_pair")
+
+    ipv4=$(curl -4fsS --connect-timeout 2 --max-time 4 https://api4.ipify.org 2>/dev/null || true)
+    ipv6=$(curl -6fsS --connect-timeout 2 --max-time 4 https://api6.ipify.org 2>/dev/null || true)
+
+    # WARP 使用 Local Proxy，不会把 Cloudflare IPv6 写入 VPS 本机网络栈。
+    # 因此原生 IPv6 不存在时，需要通过 WARP SOCKS 出口单独查询。
+    if [[ -n "$ipv6" ]]; then
+        ipv6_display="$ipv6"
+    elif warp_proxy_ready 2>/dev/null && warp_family_allowed ipv6 2>/dev/null; then
+        warp_ipv6=$(warp_test_family ipv6 2>/dev/null || true)
+        if [[ -n "$warp_ipv6" ]]; then
+            ipv6_display="${warp_ipv6}（WARP）"
+        else
+            ipv6_display="无 IPv6"
+        fi
+    else
+        ipv6_display="无 IPv6"
+    fi
+
+    # IP 属性继续以 VPS 原生公网地址为准，不使用 WARP 出口覆盖机房/IP 属性。
+    server_tool_get_ip_profile "$ipv4" "$ipv6"
+
+    echo -e "${CYAN}════════════════════ 系统信息 ════════════════════${PLAIN}"
+    echo "  主机名     : ${hostname_text}"
+    echo "  系统       : ${os_info}"
+    echo "  CPU        : ${cpu}"
+    echo "  CPU 核心   : ${cores}$([[ -n "$cpu_ghz" ]] && printf " 核 @ %s GHz" "$cpu_ghz" || printf " 核")"
+    echo "  内存       : ${mem_used:-?} / ${mem_total:-?}"
+    echo "  虚拟内存   : ${swap_used:-?} / ${swap_total:-?}"
+    echo "  硬盘占用   : ${disk_used:-?} / ${disk_total:-?}"
+    echo "  运行时间   : ${uptime_days} 天"
+    echo "  入站流量   : $(server_tool_format_bytes "${traffic_rx:-0}")（本月）"
+    echo "  出站流量   : $(server_tool_format_bytes "${traffic_tx:-0}")（本月）"
+    echo "  时区       : ${timezone:-未知}"
+    echo "  IPv4 地址  : ${ipv4:-无 IPv4}"
+    echo "  IPv6 地址  : ${ipv6_display}"
+    echo "  地理位置   : ${SERVER_INFO_LOCATION}"
+    echo "  ISP / ASN  : ${SERVER_INFO_ISP} / ${SERVER_INFO_ASN}"
+    echo "  IP 性质    : ${SERVER_INFO_IP_TYPE}"
+    echo "  IP 危险性  : ${SERVER_INFO_IP_RISK}"
+    echo "  DNS        : ${dns:-未检测到}"
+    echo "  网络算法   : ${congestion} ${qdisc}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════${PLAIN}"
+}
+
+server_tool_system_update() {
+    local pm action
+    pm=$(server_tool_pkg_manager)
+
+    clear
+    echo -e "${CYAN}════════════════ 系统更新 / 清理 ════════════════${PLAIN}"
+    echo "  1. 更新系统软件包"
+    echo "  2. 清理无用软件包与缓存"
+    echo "  3. 更新 + 清理"
+    echo "  0. 返回"
+    read -rp "请选择 [0-3]: " action
+
+    [[ "$action" == "0" ]] && return
+
+    if [[ "$pm" == "unknown" ]]; then
+        echo -e "${RED}[错误] 未识别当前系统包管理器。${PLAIN}"
+        pause
+        return
+    fi
+
+    if [[ "$action" == "1" || "$action" == "3" ]]; then
+        echo -e "${YELLOW}>> 正在更新系统软件包...${PLAIN}"
+        case "$pm" in
+            apt)
+                DEBIAN_FRONTEND=noninteractive apt-get update -y &&
+                DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y
+                ;;
+            dnf) dnf upgrade -y ;;
+            yum) yum update -y ;;
+            apk) apk update && apk upgrade ;;
+        esac
+    fi
+
+    if [[ "$action" == "2" || "$action" == "3" ]]; then
+        echo -e "${YELLOW}>> 正在清理无用软件包与包管理器缓存...${PLAIN}"
+        case "$pm" in
+            apt)
+                DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y
+                apt-get clean
+                apt-get autoclean
+                ;;
+            dnf)
+                dnf autoremove -y || true
+                dnf clean all
+                ;;
+            yum)
+                yum autoremove -y || true
+                yum clean all
+                ;;
+            apk)
+                apk cache clean
+                ;;
+        esac
+    fi
+
+    echo -e "${GREEN}✔ 操作完成。${PLAIN}"
+    pause
+}
+
+server_tool_swap_status() {
+    echo -e "${YELLOW}当前内存 / Swap:${PLAIN}"
+    free -h 2>/dev/null || true
+    echo ""
+    swapon --show 2>/dev/null || true
+}
+
+server_tool_swap_create() {
+    local size_mb="$1"
+
+    if ! [[ "$size_mb" =~ ^[0-9]+$ ]] || [[ "$size_mb" -lt 256 ]] || [[ "$size_mb" -gt 32768 ]]; then
+        echo -e "${RED}[错误] Swap 大小必须在 256-32768 MB。${PLAIN}"
+        return 1
+    fi
+
+    if platform_is_alpine; then
+        ensure_test_dependency mkswap util-linux-misc || {
+            echo -e "${RED}[错误] Alpine 无法安装 util-linux-misc，不能安全管理 Swap。${PLAIN}"
+            return 1
+        }
+    fi
+    for cmd in mkswap swapon swapoff; do
+        command -v "$cmd" >/dev/null 2>&1 || {
+            echo -e "${RED}[错误] 缺少 $cmd，无法管理 Swap。${PLAIN}"
+            return 1
+        }
+    done
+
+    if swapon --show=NAME --noheadings 2>/dev/null | grep -qx '/swapfile'; then
+        swapoff /swapfile || return 1
+    fi
+    rm -f /swapfile
+    echo -e "${YELLOW}>> 创建 ${size_mb} MB /swapfile...${PLAIN}"
+    if command -v fallocate >/dev/null 2>&1; then
+        fallocate -l "${size_mb}M" /swapfile || return 1
+    else
+        dd if=/dev/zero of=/swapfile bs=1M count="$size_mb" status=progress || return 1
+    fi
+    chmod 600 /swapfile
+    mkswap /swapfile >/dev/null || { rm -f /swapfile; return 1; }
+    swapon /swapfile || { rm -f /swapfile; return 1; }
+    sed -i '\|^/swapfile[[:space:]]|d' /etc/fstab
+    echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    echo -e "${GREEN}✔ /swapfile 已启用。${PLAIN}"
+}
+server_tool_swap_remove() {
+    local ans=""
+    if [[ ! -f /swapfile ]] && ! grep -qE '^/swapfile[[:space:]]' /etc/fstab 2>/dev/null; then
+        echo -e "${YELLOW}未检测到由本工具管理的 /swapfile。${PLAIN}"
+        return 0
+    fi
+
+    read -rp "确认删除 /swapfile？不会影响其他 Swap。[y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || return 0
+
+    swapoff /swapfile >/dev/null 2>&1 || true
+    sed -i '\|^/swapfile[[:space:]]|d' /etc/fstab
+    rm -f /swapfile
+    echo -e "${GREEN}✔ /swapfile 已删除。${PLAIN}"
+}
+
+server_tool_swap_management() {
+    local c custom
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ Swap 管理 ════════════════════${PLAIN}"
+        server_tool_swap_status
+        echo ""
+        echo "  1. 设置 512 MB"
+        echo "  2. 设置 1 GB"
+        echo "  3. 设置 2 GB"
+        echo "  4. 设置 4 GB"
+        echo "  5. 自定义大小"
+        echo "  6. 删除 /swapfile"
+        echo "  0. 返回"
+        read -rp "请选择 [0-6]: " c
+        case "$c" in
+            1) server_tool_swap_create 512; pause ;;
+            2) server_tool_swap_create 1024; pause ;;
+            3) server_tool_swap_create 2048; pause ;;
+            4) server_tool_swap_create 4096; pause ;;
+            5)
+                read -rp "请输入 Swap 大小（MB，256-32768）: " custom
+                server_tool_swap_create "$custom"
+                pause
+                ;;
+            6) server_tool_swap_remove; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+server_tool_bbr_status() {
+    local available current qdisc
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+    current=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || true)
+    echo "当前算法 : ${current:-未知}"
+    echo "可用算法 : ${available:-未知}"
+    echo "当前 qdisc: ${qdisc:-未知}"
+}
+
+server_tool_bbr_enable() {
+    local available
+    modprobe tcp_bbr >/dev/null 2>&1 || true
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+
+    if ! grep -qw bbr <<<"$available"; then
+        echo -e "${RED}[错误] 当前内核没有提供 BBR。${PLAIN}"
+        echo -e "${YELLOW}本脚本不会为了 BBR 自动替换 VPS 内核。${PLAIN}"
+        return 1
+    fi
+
+    mkdir -p /etc/sysctl.d
+    cat > /etc/sysctl.d/99-ss2022-bbr.conf <<'EOF'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+
+    sysctl -p /etc/sysctl.d/99-ss2022-bbr.conf >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1 || return 1
+
+    if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]]; then
+        echo -e "${GREEN}✔ BBR 已启用。${PLAIN}"
+        return 0
+    fi
+
+    echo -e "${RED}[错误] BBR 参数写入后未生效。${PLAIN}"
+    return 1
+}
+
+server_tool_bbr_disable() {
+    local available fallback="cubic"
+    rm -f /etc/sysctl.d/99-ss2022-bbr.conf
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+    grep -qw cubic <<<"$available" || fallback=$(awk '{print $1}' <<<"$available")
+    [[ -n "$fallback" ]] || fallback="reno"
+
+    sysctl -w "net.ipv4.tcp_congestion_control=${fallback}" >/dev/null 2>&1 || true
+    if grep -qw fq_codel <<<"$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"; then
+        :
+    else
+        sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1 || true
+    fi
+    echo -e "${GREEN}✔ 已移除本脚本 BBR 持久化配置；当前算法: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 未知)${PLAIN}"
+}
+
+server_tool_bbr_management() {
+    local c
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ BBR 管理 ════════════════════${PLAIN}"
+        server_tool_bbr_status
+        echo ""
+        echo "  1. 启用当前内核原生 BBR"
+        echo "  2. 移除本脚本 BBR 配置"
+        echo "  0. 返回"
+        read -rp "请选择 [0-2]: " c
+        case "$c" in
+            1) server_tool_bbr_enable; pause ;;
+            2) server_tool_bbr_disable; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+server_tool_dns_show() {
+    echo -e "${YELLOW}当前 /etc/resolv.conf:${PLAIN}"
+    cat /etc/resolv.conf 2>/dev/null || true
+}
+
+server_tool_dns_apply() {
+    local dns_list="$1"
+    local resolved_dropin="/etc/systemd/resolved.conf.d/99-ss2022-dns.conf"
+    local backup="${STATE_DIR}/resolv.conf.server-tools.bak"
+    local dns="" valid_list=""
+
+    for dns in $dns_list; do
+        dns=${dns//,/}
+        [[ -n "$dns" ]] || continue
+
+        if [[ "$dns" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            local IFS=.
+            read -r a b c d <<<"$dns"
+            if (( a <= 255 && b <= 255 && c <= 255 && d <= 255 )); then
+                valid_list+="${dns} "
+            else
+                echo -e "${RED}[错误] 无效 IPv4 DNS: ${dns}${PLAIN}"
+                return 1
+            fi
+        elif [[ "$dns" =~ ^[0-9A-Fa-f:]+$ && "$dns" == *:* ]]; then
+            valid_list+="${dns} "
+        else
+            echo -e "${RED}[错误] 无效 DNS 地址: ${dns}${PLAIN}"
+            return 1
+        fi
+    done
+
+    valid_list=${valid_list% }
+    [[ -n "$valid_list" ]] || {
+        echo -e "${RED}[错误] 未提供有效 DNS 地址。${PLAIN}"
+        return 1
+    }
+
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+
+    if [[ -L /etc/resolv.conf ]] && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        mkdir -p /etc/systemd/resolved.conf.d
+        cat > "$resolved_dropin" <<EOF
+[Resolve]
+DNS=${valid_list}
+FallbackDNS=
+EOF
+        if ! systemctl restart systemd-resolved; then
+            rm -f "$resolved_dropin"
+            systemctl restart systemd-resolved >/dev/null 2>&1 || true
+            return 1
+        fi
+        echo -e "${GREEN}✔ DNS 已通过 systemd-resolved 更新：${valid_list}${PLAIN}"
+        return 0
+    fi
+
+    if [[ -L /etc/resolv.conf ]]; then
+        echo -e "${RED}[错误] /etc/resolv.conf 是符号链接，但未检测到可管理的 systemd-resolved。${PLAIN}"
+        echo -e "${YELLOW}为避免破坏 NetworkManager 或其他网络管理器，本工具不会强制覆盖。${PLAIN}"
+        return 1
+    fi
+
+    if [[ ! -f "$backup" && -f /etc/resolv.conf ]]; then
+        cp -a /etc/resolv.conf "$backup" || return 1
+        chmod 600 "$backup"
+    fi
+
+    : > /etc/resolv.conf
+    for dns in $valid_list; do
+        printf 'nameserver %s\n' "$dns" >> /etc/resolv.conf
+    done
+    printf '%s\n' 'options timeout:2 attempts:2' >> /etc/resolv.conf
+
+    echo -e "${GREEN}✔ DNS 已更新：${valid_list}${PLAIN}"
+}
+
+server_tool_dns_restore() {
+    local resolved_dropin="/etc/systemd/resolved.conf.d/99-ss2022-dns.conf"
+    local backup="${STATE_DIR}/resolv.conf.server-tools.bak"
+
+    if [[ -f "$resolved_dropin" ]]; then
+        rm -f "$resolved_dropin"
+        systemctl restart systemd-resolved >/dev/null 2>&1 || true
+        echo -e "${GREEN}✔ 已移除本脚本的 systemd-resolved DNS 配置。${PLAIN}"
+        return 0
+    fi
+
+    if [[ -f "$backup" && ! -L /etc/resolv.conf ]]; then
+        cp -af "$backup" /etc/resolv.conf
+        rm -f "$backup"
+        echo -e "${GREEN}✔ 已恢复修改前的 DNS 配置。${PLAIN}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}没有找到本工具可恢复的 DNS 备份。${PLAIN}"
+}
+
+server_tool_dns_management() {
+    local c custom_dns
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ DNS 管理 ════════════════════${PLAIN}"
+        server_tool_dns_show
+        echo ""
+        echo "  1. Cloudflare + Google"
+        echo "     1.1.1.1 / 8.8.8.8 / 2606:4700:4700::1111 / 2001:4860:4860::8888"
+        echo "  2. Quad9 + Cloudflare"
+        echo "     9.9.9.9 / 1.1.1.1 / 2620:fe::fe / 2606:4700:4700::1111"
+        echo "  3. 阿里 DNS + DNSPod"
+        echo "     223.5.5.5 / 119.29.29.29 / 2400:3200::1 / 2402:4e00::"
+        echo "  4. 自定义 DNS（支持解锁 DNS）"
+        echo "  5. 恢复修改前 DNS"
+        echo "  0. 返回"
+        read -rp "请选择 [0-5]: " c
+        case "$c" in
+            1)
+                server_tool_dns_apply "1.1.1.1 8.8.8.8 2606:4700:4700::1111 2001:4860:4860::8888"
+                pause
+                ;;
+            2)
+                server_tool_dns_apply "9.9.9.9 1.1.1.1 2620:fe::fe 2606:4700:4700::1111"
+                pause
+                ;;
+            3)
+                server_tool_dns_apply "223.5.5.5 119.29.29.29 2400:3200::1 2402:4e00::"
+                pause
+                ;;
+            4)
+                echo ""
+                echo "请输入厂商提供的 DNS IP。"
+                echo "支持 IPv4 / IPv6；多个地址使用空格分隔。"
+                echo "示例: 1.2.3.4 5.6.7.8"
+                read -rp "自定义 DNS: " custom_dns
+                [[ -n "$custom_dns" ]] && server_tool_dns_apply "$custom_dns"
+                pause
+                ;;
+            5)
+                server_tool_dns_restore
+                pause
+                ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+server_tool_ip_priority_status() {
+    if platform_is_alpine; then
+        echo "Alpine/musl：不使用 gai.conf"
+        return
+    fi
+    if grep -q '^precedence ::ffff:0:0/96[[:space:]]\+100[[:space:]]*# ss2022-prefer-ipv4$' /etc/gai.conf 2>/dev/null; then
+        echo "IPv4 优先"
+    else
+        echo "系统默认（通常 IPv6 优先）"
+    fi
+}
+server_tool_ip_priority_management() {
+    local c
+    if platform_is_alpine; then
+        clear
+        echo -e "${CYAN}════════════ IPv4 / IPv6 地址优先级 ════════════${PLAIN}"
+        echo -e "${YELLOW}Alpine 使用 musl libc，/etc/gai.conf 的 glibc precedence 规则不会生效。${PLAIN}"
+        echo "因此这里不写入无效配置。"
+        echo "vps-bootstrap 业务流量请使用“全局业务出口地址族 / 应用地址族分流”；"
+        echo "需要彻底关闭某地址族时使用下方 IPv4 / IPv6 协议族管理。"
+        pause
+        return
+    fi
+    while true; do
+        clear
+        echo -e "${CYAN}════════════ IPv4 / IPv6 优先级 ════════════${PLAIN}"
+        echo "当前模式: $(server_tool_ip_priority_status)"
+        echo ""
+        echo "  1. 设置 IPv4 优先"
+        echo "  2. 恢复系统默认优先级"
+        echo "  0. 返回"
+        read -rp "请选择 [0-2]: " c
+        case "$c" in
+            1)
+                touch /etc/gai.conf
+                sed -i '/# ss2022-prefer-ipv4$/d' /etc/gai.conf
+                echo 'precedence ::ffff:0:0/96  100 # ss2022-prefer-ipv4' >> /etc/gai.conf
+                echo -e "${GREEN}✔ 已设置 IPv4 优先。${PLAIN}"; pause ;;
+            2)
+                [[ -f /etc/gai.conf ]] && sed -i '/# ss2022-prefer-ipv4$/d' /etc/gai.conf
+                echo -e "${GREEN}✔ 已恢复系统默认地址优先级。${PLAIN}"; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+server_tool_ip_family_mode() {
+    local mode="dual"
+    if [[ -f "$IP_FAMILY_MODE_FILE" ]]; then
+        mode=$(tr -d '[:space:]' < "$IP_FAMILY_MODE_FILE" 2>/dev/null)
+    fi
+    case "$mode" in
+        dual|ipv4-only|ipv6-only) echo "$mode" ;;
+        *) echo "dual" ;;
+    esac
+}
+
+server_tool_ip_family_mode_label() {
+    case "${1:-dual}" in
+        ipv4-only) echo "仅 IPv4（IPv6 已关闭）" ;;
+        ipv6-only) echo "仅 IPv6（IPv4 已关闭）" ;;
+        *) echo "IPv4 + IPv6 双栈" ;;
+    esac
+}
+
+server_tool_ip_family_mode_allows() {
+    local family="${1:-default}" mode
+    [[ "$family" == "default" ]] && return 0
+    mode=$(server_tool_ip_family_mode)
+    case "$mode:$family" in
+        dual:ipv4|dual:ipv6|ipv4-only:ipv4|ipv6-only:ipv6) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+server_tool_current_ssh_family() {
+    local peer=""
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then
+        peer=${SSH_CONNECTION%% *}
+    elif [[ -n "${SSH_CLIENT:-}" ]]; then
+        peer=${SSH_CLIENT%% *}
+    fi
+    [[ -n "$peer" ]] || { echo "unknown"; return; }
+    if [[ "$peer" == *:* ]]; then echo "ipv6"; else echo "ipv4"; fi
+}
+
+server_tool_native_family_ready() {
+    local family="$1"
+    case "$family" in
+        ipv4)
+            ip -4 addr show scope global 2>/dev/null | grep -q 'inet ' || return 1
+            ip -4 route show default 2>/dev/null | grep -q '^default ' || return 1
+            curl -4fsS --connect-timeout 4 --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q '^ip='
+            ;;
+        ipv6)
+            ip -6 addr show scope global 2>/dev/null | grep -q 'inet6 ' || return 1
+            ip -6 route show default 2>/dev/null | grep -q '^default ' || return 1
+            curl -6fsS --connect-timeout 4 --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q '^ip='
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+server_tool_ip_family_policy_conflict() {
+    local mode="$1" blocked="" global default_ref effective count i r ref fam name found=0
+    [[ "$mode" == "ipv4-only" ]] && blocked="ipv6"
+    [[ "$mode" == "ipv6-only" ]] && blocked="ipv4"
+    [[ -n "$blocked" ]] || return 1
+
+    routing_init_state || return 1
+    global=$(routing_global_ip_family)
+    default_ref=$(jq -r '.default_outbound // "direct"' "$ROUTING_FILE")
+    effective=$(routing_effective_family "$global" "$default_ref")
+    if [[ "$effective" == "$blocked" ]]; then
+        echo -e "${RED}[冲突] 全局默认出口当前固定为 $(routing_ip_family_label "$blocked")。${PLAIN}"
+        found=1
+    fi
+
+    count=$(jq '.rules|length' "$ROUTING_FILE")
+    i=0
+    while [[ $i -lt $count ]]; do
+        r=$(jq -c ".rules[$i]" "$ROUTING_FILE")
+        ref=$(jq -r '.outbound // "default"' <<<"$r")
+        fam=$(routing_effective_family "$(jq -r '.ip_family // "default"' <<<"$r")" "$ref")
+        if [[ "$fam" == "$blocked" ]]; then
+            name=$(jq -r '.name // "未命名规则"' <<<"$r")
+            echo -e "${RED}[冲突] 规则 ${name} 当前固定为 $(routing_ip_family_label "$blocked")。${PLAIN}"
+            found=1
+        fi
+        i=$((i+1))
+    done
+
+    [[ $found -eq 1 ]]
+}
+
+server_tool_install_ip_family_guard() {
+    ensure_test_dependency nft nftables || {
+        echo -e "${RED}[错误] nftables 不可用，无法安全管理 IPv4 / IPv6 关闭状态。${PLAIN}"
+        return 1
+    }
+    mkdir -p "$STATE_DIR" /usr/local/lib/ss2022 || return 1
+    chmod 700 "$STATE_DIR"
+    cat > "$IP_FAMILY_APPLY_HELPER" <<'EOF'
+#!/bin/bash
+set -u
+STATE_FILE="/etc/ss2022/ip-family-mode"
+TABLE="ss2022_ip_family"
+mode="dual"
+[[ -f "$STATE_FILE" ]] && mode=$(tr -d '[:space:]' < "$STATE_FILE" 2>/dev/null)
+command -v nft >/dev/null 2>&1 || exit 1
+nft delete table inet "$TABLE" >/dev/null 2>&1 || true
+case "$mode" in
+  dual) exit 0 ;;
+  ipv4-only|ipv6-only) ;;
+  *) exit 1 ;;
+esac
+nft add table inet "$TABLE"
+nft 'add chain inet ss2022_ip_family input { type filter hook input priority -20; policy accept; }'
+nft 'add chain inet ss2022_ip_family output { type filter hook output priority -20; policy accept; }'
+if [[ "$mode" == "ipv4-only" ]]; then
+    nft 'add rule inet ss2022_ip_family input meta nfproto ipv6 iifname != "lo" drop'
+    nft 'add rule inet ss2022_ip_family output meta nfproto ipv6 oifname != "lo" drop'
+else
+    nft 'add rule inet ss2022_ip_family input meta nfproto ipv4 iifname != "lo" drop'
+    nft 'add rule inet ss2022_ip_family output meta nfproto ipv4 oifname != "lo" drop'
+fi
+EOF
+    chmod 700 "$IP_FAMILY_APPLY_HELPER"
+
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        cat > "$IP_FAMILY_SERVICE" <<EOF
+[Unit]
+Description=vps-bootstrap IPv4/IPv6 family guard
+After=network-online.target
+Wants=network-online.target
+Before=sing-box.service ${XRAY_SERVICE_NAME}.service ${REALM_SERVICE_NAME}.service
+
+[Service]
+Type=oneshot
+ExecStart=${IP_FAMILY_APPLY_HELPER}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        chmod 644 "$IP_FAMILY_SERVICE"
+        service_daemon_reload || return 1
+    else
+        cat > "$IP_FAMILY_OPENRC_SERVICE" <<EOF
+#!/sbin/openrc-run
+description="vps-bootstrap IPv4/IPv6 family guard"
+depend() {
+    need net
+    before sing-box ${XRAY_SERVICE_NAME} ${REALM_SERVICE_NAME}
+}
+start() {
+    ebegin "Applying vps-bootstrap IP family guard"
+    ${IP_FAMILY_APPLY_HELPER}
+    eend $?
+}
+stop() {
+    return 0
+}
+EOF
+        chmod 755 "$IP_FAMILY_OPENRC_SERVICE"
+    fi
+    service_enable "$IP_FAMILY_SERVICE_NAME" || return 1
+}
+server_tool_set_ip_family_mode() {
+    local new_mode="$1" old_mode ssh_family keep_family label
+    old_mode=$(server_tool_ip_family_mode)
+    [[ "$new_mode" != "$old_mode" ]] || {
+        echo -e "${GREEN}当前已经是：$(server_tool_ip_family_mode_label "$new_mode")。${PLAIN}"
+        return 0
+    }
+
+    if [[ "$old_mode" != "dual" && "$new_mode" != "dual" ]]; then
+        echo -e "${YELLOW}[提示] 请先恢复 IPv4 + IPv6 双栈，再切换到另一单地址族模式。${PLAIN}"
+        return 1
+    fi
+
+    case "$new_mode" in
+        ipv4-only) keep_family="ipv4" ;;
+        ipv6-only) keep_family="ipv6" ;;
+        dual) keep_family="" ;;
+        *) return 1 ;;
+    esac
+
+    if [[ -n "$keep_family" ]]; then
+        ssh_family=$(server_tool_current_ssh_family)
+        if [[ "$ssh_family" != "unknown" && "$ssh_family" != "$keep_family" ]]; then
+            echo -e "${RED}[拒绝] 当前 SSH 会话正在使用 ${ssh_family^^}，不能关闭该地址族。${PLAIN}"
+            echo "请先用 ${keep_family^^} 地址重新建立 SSH 会话后再操作。"
+            return 1
+        fi
+
+        if ! server_tool_native_family_ready "$keep_family"; then
+            echo -e "${RED}[拒绝] 未确认 ${keep_family^^} 原生公网连接可用，不能关闭另一地址族。${PLAIN}"
+            return 1
+        fi
+
+        if server_tool_ip_family_policy_conflict "$new_mode"; then
+            echo -e "${RED}[拒绝] 请先调整上面的全局/应用地址族规则，再关闭协议族。${PLAIN}"
+            return 1
+        fi
+    fi
+
+    server_tool_install_ip_family_guard || return 1
+    printf '%s
+' "$new_mode" > "$IP_FAMILY_MODE_FILE" || return 1
+    chmod 600 "$IP_FAMILY_MODE_FILE"
+
+    if ! service_restart "$IP_FAMILY_SERVICE_NAME"; then
+        echo -e "${RED}[错误] 新协议族策略应用失败，正在恢复。${PLAIN}"
+        printf '%s
+' "$old_mode" > "$IP_FAMILY_MODE_FILE"
+        service_restart "$IP_FAMILY_SERVICE_NAME" >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    label=$(server_tool_ip_family_mode_label "$new_mode")
+    echo -e "${GREEN}✔ 已切换为：${label}。${PLAIN}"
+    if [[ "$new_mode" != "dual" ]]; then
+        echo -e "${YELLOW}说明: IP 地址本身不会被删除；本脚本通过独立 nftables 表阻断已关闭地址族的公网收发，因此可以安全恢复。${PLAIN}"
+    fi
+}
+
+server_tool_ip_family_status() {
+    local v4="无" v6="无" mode global
+    v4=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | head -n1)
+    v6=$(ip -6 -o addr show scope global 2>/dev/null | awk '{print $4}' | head -n1)
+    v4=${v4:-无}
+    v6=${v6:-无}
+    mode=$(server_tool_ip_family_mode)
+    global=$(routing_global_ip_family)
+    echo "  IPv4 地址     : $v4"
+    echo "  IPv6 地址     : $v6"
+    echo "  系统协议族状态 : $(server_tool_ip_family_mode_label "$mode")"
+    echo "  业务出口地址族 : $(routing_ip_family_label "$global")"
+    echo "  地址优先级     : $(server_tool_ip_priority_status)"
+}
+
+server_tool_ip_family_management() {
+    local c
+    while true; do
+        clear
+        routing_init_state >/dev/null 2>&1 || true
+        echo -e "${CYAN}════════════ IPv4 / IPv6 管理 ════════════${PLAIN}"
+        server_tool_ip_family_status
+        echo ""
+        echo "  1. IPv4 / IPv6 地址优先级"
+        echo "  2. 全局业务出口地址族（双栈 / 仅 IPv4 / 仅 IPv6）"
+        echo "  3. 应用地址族分流（YouTube / ChatGPT / MyTVSuper 等）"
+        echo "  ------------------------------------------"
+        echo "  4. 关闭 IPv4（仅保留 IPv6 公网通信）"
+        echo "  5. 关闭 IPv6（仅保留 IPv4 公网通信）"
+        echo "  6. 恢复 IPv4 + IPv6 双栈公网通信"
+        echo "  0. 返回"
+        read -rp "请选择 [0-6]: " c
+        case "$c" in
+            1) server_tool_ip_priority_management ;;
+            2) routing_global_ip_family_management ;;
+            3) routing_app_family_management ;;
+            4) server_tool_set_ip_family_mode ipv6-only; pause ;;
+            5) server_tool_set_ip_family_mode ipv4-only; pause ;;
+            6) server_tool_set_ip_family_mode dual; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+server_tool_port_usage_show_all() {
+    echo -e "${YELLOW}当前 TCP / UDP 监听端口:${PLAIN}"
+    if command -v ss >/dev/null 2>&1; then
+        ss -H -lntup 2>/dev/null | awk '
+        {
+            proto=$1
+            local_addr=$5
+            proc=""
+            for (i=6;i<=NF;i++) proc=proc $i " "
+            printf "  %-5s %-30s %s\n", proto, local_addr, proc
+        }'
+    else
+        echo "  未找到 ss 命令。"
+    fi
+
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        echo ""
+        echo -e "${YELLOW}Docker 容器端口映射:${PLAIN}"
+        docker ps --format '  {{.Names}}\t{{.Ports}}' 2>/dev/null || true
+    fi
+}
+
+server_tool_port_usage_detail() {
+    local port="$1" found=0
+
+    echo -e "${CYAN}══════════════ 端口 ${port} 占用详情 ══════════════${PLAIN}"
+
+    if command -v ss >/dev/null 2>&1; then
+        local lines
+        lines=$(ss -H -lntup 2>/dev/null | awk -v p="$port" '
+        {
+            addr=$5
+            n=split(addr,a,":")
+            if (a[n] == p) print
+        }')
+        if [[ -n "$lines" ]]; then
+            found=1
+            printf '%s\n' "$lines"
+        fi
+    fi
+
+    if command -v lsof >/dev/null 2>&1; then
+        local lsof_out
+        lsof_out=$(lsof -nP -i ":${port}" 2>/dev/null || true)
+        if [[ -n "$lsof_out" ]]; then
+            found=1
+            echo ""
+            echo -e "${YELLOW}进程详情:${PLAIN}"
+            printf '%s\n' "$lsof_out"
+        fi
+    fi
+
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        local docker_out
+        docker_out=$(docker ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null \
+            | awk -F'\t' -v p="$port" '$2 ~ ("[:]" p "->") || $2 ~ ("0\\.0\\.0\\.0:" p "->") || $2 ~ ("\\[::\\]:" p "->") {print}')
+        if [[ -n "$docker_out" ]]; then
+            found=1
+            echo ""
+            echo -e "${YELLOW}Docker 容器:${PLAIN}"
+            printf '  %s\n' "$docker_out"
+        fi
+    fi
+
+    if [[ $found -eq 0 ]]; then
+        echo -e "${GREEN}未发现端口 ${port} 被监听占用。${PLAIN}"
+    fi
+}
+
+server_tool_port_listener_lines() {
+    local port="$1"
+
+    command -v ss >/dev/null 2>&1 || return 1
+    ss -H -lntup 2>/dev/null | awk -v p="$port" '
+    {
+        addr=$5
+        n=split(addr,a,":")
+        if (a[n] == p) print
+    }'
+}
+
+server_tool_port_listener_pids() {
+    local port="$1"
+    local lines
+
+    lines=$(server_tool_port_listener_lines "$port" 2>/dev/null || true)
+    [[ -n "$lines" ]] || return 0
+
+    printf '%s\n' "$lines" \
+        | grep -oE 'pid=[0-9]+' 2>/dev/null \
+        | cut -d= -f2 \
+        | sort -nu
+}
+
+server_tool_pid_systemd_unit() {
+    local pid="$1" unit="" pf="" pf_pid="" svc=""
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        if [[ -r "/proc/${pid}/cgroup" ]]; then
+            unit=$(sed -nE 's#.*[/]([^/]+\.service)(/.*)?$#\1#p' "/proc/${pid}/cgroup" 2>/dev/null | head -n1)
+        fi
+        if [[ -z "$unit" ]]; then
+            unit=$(systemctl status "$pid" --no-pager 2>/dev/null | sed -nE 's/^[[:space:]]*●[[:space:]]+([^[:space:]]+\.service).*/\1/p' | head -n1)
+        fi
+        [[ -n "$unit" ]] && printf '%s\n' "$unit"
+        return
+    fi
+
+    # OpenRC 没有 systemd cgroup unit 映射；优先从常见 pidfile 反查 init.d 服务。
+    for pf in /run/*.pid /run/*/*.pid /var/run/*.pid /var/run/*/*.pid; do
+        [[ -r "$pf" ]] || continue
+        pf_pid=$(head -n1 "$pf" 2>/dev/null | tr -dc '0-9')
+        [[ "$pf_pid" == "$pid" ]] || continue
+        svc=${pf##*/}; svc=${svc%.pid}
+        [[ -x "/etc/init.d/$svc" ]] || continue
+        printf '%s\n' "$svc"
+        return 0
+    done
+
+    for svc in sing-box "$XRAY_SERVICE_NAME" "$REALM_SERVICE_NAME" sshd chronyd ntpd crond; do
+        [[ -x "/etc/init.d/$svc" ]] || continue
+        [[ "$(service_main_pid "$svc" 2>/dev/null || true)" == "$pid" ]] || continue
+        printf '%s\n' "$svc"
+        return 0
+    done
+    return 1
+}
+server_tool_port_docker_containers() {
+    local port="$1"
+
+    command -v docker >/dev/null 2>&1 || return 0
+    docker info >/dev/null 2>&1 || return 0
+
+    docker ps --format '{{.ID}}\t{{.Names}}\t{{.Ports}}' 2>/dev/null \
+        | awk -F'\t' -v p="$port" '
+          $3 ~ ("0\\.0\\.0\\.0:" p "->") ||
+          $3 ~ ("\\[::\\]:" p "->") ||
+          $3 ~ ("127\\.0\\.0\\.1:" p "->") {
+              print
+          }'
+}
+
+server_tool_port_is_current_ssh() {
+    local port="$1"
+    local ssh_port=""
+
+    [[ -n "${SSH_CONNECTION:-}" ]] || return 1
+    ssh_port=$(awk '{print $4}' <<<"$SSH_CONNECTION")
+    [[ "$ssh_port" == "$port" ]]
+}
+
+server_tool_port_release_show_targets() {
+    local port="$1"
+    local pids pid comm args unit docker_lines lines
+
+    echo -e "${CYAN}══════════════ 端口 ${port} 当前占用 ══════════════${PLAIN}"
+
+    lines=$(server_tool_port_listener_lines "$port" 2>/dev/null || true)
+    if [[ -z "$lines" ]]; then
+        echo -e "${GREEN}当前没有发现监听进程，端口 ${port} 已经空闲。${PLAIN}"
+        return 1
+    fi
+
+    printf '%s\n' "$lines"
+    echo ""
+
+    pids=$(server_tool_port_listener_pids "$port" 2>/dev/null || true)
+    if [[ -n "$pids" ]]; then
+        echo -e "${YELLOW}监听进程:${PLAIN}"
+        while read -r pid; do
+            [[ -n "$pid" ]] || continue
+            comm=$(ps -p "$pid" -o comm= 2>/dev/null | xargs || true)
+            args=$(ps -p "$pid" -o args= 2>/dev/null | xargs || true)
+            unit=$(server_tool_pid_systemd_unit "$pid" 2>/dev/null || true)
+
+            echo "  PID     : ${pid}"
+            echo "  进程    : ${comm:-未知}"
+            [[ -n "$unit" ]] && echo "  服务    : ${unit}"
+            echo "  命令    : ${args:-未知}"
+            echo ""
+        done <<<"$pids"
+    else
+        echo -e "${YELLOW}[提示] ss 没有返回可识别 PID，可能是权限、内核或容器网络限制。${PLAIN}"
+        echo ""
+    fi
+
+    docker_lines=$(server_tool_port_docker_containers "$port" 2>/dev/null || true)
+    if [[ -n "$docker_lines" ]]; then
+        echo -e "${YELLOW}Docker 容器端口映射:${PLAIN}"
+        while IFS=$'\t' read -r cid cname cports; do
+            echo "  容器    : ${cname} (${cid})"
+            echo "  映射    : ${cports}"
+        done <<<"$docker_lines"
+        echo ""
+    fi
+
+    return 0
+}
+
+server_tool_port_stop_systemd_units() {
+    local port="$1" disable="${2:-no}" pids pid unit svc
+    local -A seen_units=()
+    local found=0 failed=0
+
+    pids=$(server_tool_port_listener_pids "$port" 2>/dev/null || true)
+    [[ -n "$pids" ]] || { echo -e "${YELLOW}没有发现可识别的监听 PID。${PLAIN}"; return 1; }
+
+    while read -r pid; do
+        [[ -n "$pid" ]] || continue
+        unit=$(server_tool_pid_systemd_unit "$pid" 2>/dev/null || true)
+        [[ -n "$unit" ]] || continue
+        [[ -n "${seen_units[$unit]:-}" ]] && continue
+        seen_units["$unit"]=1
+        found=1
+        svc=${unit%.service}
+        case "$svc" in
+            ssh|sshd)
+                echo -e "${RED}[拒绝] 不允许通过端口释放工具停止 SSH 服务：${svc}${PLAIN}"
+                failed=1; continue ;;
+        esac
+        echo -e "${YELLOW}>> 处理服务 ${svc}...${PLAIN}"
+        if [[ "$disable" == "yes" ]]; then
+            service_disable_now "$svc"
+            if service_is_active "$svc"; then
+                echo -e "${RED}[错误] ${svc} 停止/禁用失败。${PLAIN}"; failed=1
+            else
+                echo -e "${GREEN}✔ ${svc} 已停止并移除开机自启。${PLAIN}"
+            fi
+        else
+            if service_stop "$svc"; then
+                echo -e "${GREEN}✔ ${svc} 已停止。${PLAIN}"
+            else
+                echo -e "${RED}[错误] ${svc} 停止失败。${PLAIN}"; failed=1
+            fi
+        fi
+    done <<<"$pids"
+
+    [[ $found -eq 1 ]] || { echo -e "${YELLOW}没有检测到对应的系统服务。${PLAIN}"; return 1; }
+    sleep 1
+    [[ -z "$(server_tool_port_listener_lines "$port" 2>/dev/null || true)" ]] || {
+        echo -e "${YELLOW}[提示] 端口 ${port} 仍有监听进程，请重新查看占用详情。${PLAIN}"
+        return 1
+    }
+    [[ $failed -eq 0 ]]
+}
+server_tool_port_stop_docker() {
+    local port="$1"
+    local docker_lines cid cname cports
+    local found=0 failed=0
+
+    docker_lines=$(server_tool_port_docker_containers "$port" 2>/dev/null || true)
+    [[ -n "$docker_lines" ]] || {
+        echo -e "${YELLOW}没有发现映射端口 ${port} 的 Docker 容器。${PLAIN}"
+        return 1
+    }
+
+    while IFS=$'\t' read -r cid cname cports; do
+        [[ -n "$cid" ]] || continue
+        found=1
+        echo -e "${YELLOW}>> 停止 Docker 容器 ${cname} (${cid})...${PLAIN}"
+        if docker stop "$cid"; then
+            echo -e "${GREEN}✔ 容器 ${cname} 已停止。${PLAIN}"
+        else
+            echo -e "${RED}[错误] 容器 ${cname} 停止失败。${PLAIN}"
+            failed=1
+        fi
+    done <<<"$docker_lines"
+
+    sleep 1
+    if [[ -n "$(server_tool_port_listener_lines "$port" 2>/dev/null || true)" ]]; then
+        echo -e "${YELLOW}[提示] 端口 ${port} 仍有监听进程。${PLAIN}"
+        return 1
+    fi
+
+    [[ $found -eq 1 && $failed -eq 0 ]]
+}
+
+server_tool_port_terminate_processes() {
+    local port="$1"
+    local pids pid comm confirm
+    local -a targets=()
+    local -a remaining=()
+
+    pids=$(server_tool_port_listener_pids "$port" 2>/dev/null || true)
+    [[ -n "$pids" ]] || {
+        echo -e "${YELLOW}没有发现可结束的监听 PID。${PLAIN}"
+        return 1
+    }
+
+    while read -r pid; do
+        [[ -n "$pid" ]] || continue
+
+        if [[ "$pid" == "1" || "$pid" == "$$" || "$pid" == "$PPID" ]]; then
+            echo -e "${RED}[拒绝] PID ${pid} 属于关键/当前进程，不允许结束。${PLAIN}"
+            continue
+        fi
+
+        comm=$(ps -p "$pid" -o comm= 2>/dev/null | xargs || true)
+        case "$comm" in
+            sshd|systemd|init)
+                echo -e "${RED}[拒绝] 不允许直接结束关键进程 ${comm} (PID ${pid})。${PLAIN}"
+                continue
+                ;;
+        esac
+
+        targets+=("$pid")
+    done <<<"$pids"
+
+    [[ ${#targets[@]} -gt 0 ]] || {
+        echo -e "${RED}[错误] 没有安全可结束的监听进程。${PLAIN}"
+        return 1
+    }
+
+    echo ""
+    echo -e "${YELLOW}[警告] 将直接结束以下 PID：${targets[*]}${PLAIN}"
+    echo "优先发送 SIGTERM。"
+    read -rp "确认直接结束进程？请输入 RELEASE: " confirm
+    [[ "$confirm" == "RELEASE" ]] || {
+        echo "已取消。"
+        return 0
+    }
+
+    for pid in "${targets[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+
+    sleep 2
+
+    for pid in "${targets[@]}"; do
+        kill -0 "$pid" 2>/dev/null && remaining+=("$pid")
+    done
+
+    if [[ ${#remaining[@]} -gt 0 ]]; then
+        echo -e "${YELLOW}[提示] PID ${remaining[*]} 在 SIGTERM 后仍未退出。${PLAIN}"
+        read -rp "如确认强制结束，请输入 KILL: " confirm
+        if [[ "$confirm" == "KILL" ]]; then
+            for pid in "${remaining[@]}"; do
+                kill -9 "$pid" 2>/dev/null || true
+            done
+            sleep 1
+        else
+            echo "已取消强制结束。"
+        fi
+    fi
+
+    if [[ -z "$(server_tool_port_listener_lines "$port" 2>/dev/null || true)" ]]; then
+        echo -e "${GREEN}✔ 端口 ${port} 已释放。${PLAIN}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}[提示] 端口 ${port} 仍被占用。若进程自动重启，通常说明背后还有 systemd / OpenRC / Docker / Supervisor 等守护机制。${PLAIN}"
+    return 1
+}
+
+server_tool_port_release() {
+    local port c
+    local docker_lines pids pid unit has_unit=0
+
+    clear
+    echo -e "${CYAN}════════════════ 当前全部监听端口 ════════════════${PLAIN}"
+    server_tool_port_usage_show_all
+    echo ""
+    echo -e "${YELLOW}请输入需要释放的端口号；输入 0 返回。${PLAIN}"
+    read -rp "端口号 [0=返回]: " port
+
+    [[ "$port" == "0" ]] && return
+
+    if ! validate_port_number "$port"; then
+        echo -e "${RED}端口无效。${PLAIN}"
+        pause
+        return
+    fi
+
+    if server_tool_port_is_current_ssh "$port"; then
+        echo -e "${RED}════════════════ 安全保护 ════════════════${PLAIN}"
+        echo -e "${RED}[拒绝] 端口 ${port} 正是当前 SSH 会话使用的服务器端口。${PLAIN}"
+        echo -e "${YELLOW}为了避免把当前远程连接直接断开，本工具不会释放该端口。${PLAIN}"
+        pause
+        return
+    fi
+
+    clear
+    if ! server_tool_port_release_show_targets "$port"; then
+        pause
+        return
+    fi
+
+    pids=$(server_tool_port_listener_pids "$port" 2>/dev/null || true)
+    while read -r pid; do
+        [[ -n "$pid" ]] || continue
+        unit=$(server_tool_pid_systemd_unit "$pid" 2>/dev/null || true)
+        if [[ -n "$unit" && "$unit" != "ssh.service" && "$unit" != "sshd.service" ]]; then
+            has_unit=1
+            break
+        fi
+    done <<<"$pids"
+
+    docker_lines=$(server_tool_port_docker_containers "$port" 2>/dev/null || true)
+
+    echo "请选择释放方式："
+    if [[ $has_unit -eq 1 ]]; then
+        echo "  1. 停止对应系统服务"
+        echo "  2. 停止并禁用对应系统服务"
+    else
+        echo "  1. 停止对应系统服务（未检测到）"
+        echo "  2. 停止并禁用对应系统服务（未检测到）"
+    fi
+
+    if [[ -n "$docker_lines" ]]; then
+        echo "  3. 停止对应 Docker 容器"
+    else
+        echo "  3. 停止对应 Docker 容器（未检测到）"
+    fi
+
+    echo "  4. 直接结束监听进程"
+    echo "  0. 取消"
+    read -rp "请选择 [0-4]: " c
+
+    case "$c" in
+        1)
+            server_tool_port_stop_systemd_units "$port" "no"
+            ;;
+        2)
+            echo -e "${YELLOW}[注意] 该操作会同时取消对应服务的开机自启。${PLAIN}"
+            read -rp "确认继续？请输入 DISABLE: " c
+            [[ "$c" == "DISABLE" ]] && server_tool_port_stop_systemd_units "$port" "yes"
+            ;;
+        3)
+            server_tool_port_stop_docker "$port"
+            ;;
+        4)
+            server_tool_port_terminate_processes "$port"
+            ;;
+        0)
+            return
+            ;;
+        *)
+            echo -e "${RED}输入无效。${PLAIN}"
+            ;;
+    esac
+
+    echo ""
+    if [[ -n "$(server_tool_port_listener_lines "$port" 2>/dev/null || true)" ]]; then
+        echo -e "${YELLOW}端口 ${port} 当前仍有监听：${PLAIN}"
+        server_tool_port_listener_lines "$port"
+    else
+        echo -e "${GREEN}✔ 端口 ${port} 当前已空闲。${PLAIN}"
+    fi
+    pause
+}
+
+server_tool_port_usage() {
+    local c port
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ 端口占用 ════════════════════${PLAIN}"
+        echo "  1. 查看全部监听端口"
+        echo "  2. 查询指定端口"
+        echo "  3. 释放指定端口"
+        echo "  0. 返回"
+        echo -e "${CYAN}═══════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-3]: " c
+        case "$c" in
+            1)
+                clear
+                server_tool_port_usage_show_all
+                pause
+                ;;
+            2)
+                read -rp "请输入端口号: " port
+                if ! validate_port_number "$port"; then
+                    echo -e "${RED}端口无效。${PLAIN}"
+                    pause
+                    continue
+                fi
+                clear
+                server_tool_port_usage_detail "$port"
+                pause
+                ;;
+            3)
+                server_tool_port_release
+                ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+server_tool_timezone_management() {
+    local c zone
+    if platform_is_alpine && [[ ! -e /usr/share/zoneinfo/UTC ]]; then
+        pkg_install tzdata || { echo -e "${RED}[错误] tzdata 安装失败。${PLAIN}"; pause; return; }
+    fi
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ 时区管理 ════════════════════${PLAIN}"
+        echo "当前时区: $(timedatectl show -p Timezone --value 2>/dev/null || date +%Z)"
+        echo ""
+        echo "  1. UTC"
+        echo "  2. Asia/Shanghai"
+        echo "  3. Asia/Tokyo"
+        echo "  4. America/Los_Angeles"
+        echo "  5. Europe/London"
+        echo "  6. 自定义 IANA 时区"
+        echo "  0. 返回"
+        read -rp "请选择 [0-6]: " c
+        case "$c" in
+            1) zone="UTC" ;;
+            2) zone="Asia/Shanghai" ;;
+            3) zone="Asia/Tokyo" ;;
+            4) zone="America/Los_Angeles" ;;
+            5) zone="Europe/London" ;;
+            6)
+                read -rp "请输入时区，例如 Asia/Singapore: " zone
+                ;;
+            0) return ;;
+            *) sleep 1; continue ;;
+        esac
+
+        if command -v timedatectl >/dev/null 2>&1 && timedatectl list-timezones 2>/dev/null | grep -Fxq "$zone"; then
+            timedatectl set-timezone "$zone" &&
+                echo -e "${GREEN}✔ 时区已设置为 ${zone}。${PLAIN}"
+        elif [[ -e "/usr/share/zoneinfo/${zone}" ]]; then
+            ln -sf "/usr/share/zoneinfo/${zone}" /etc/localtime
+            echo "$zone" > /etc/timezone 2>/dev/null || true
+            echo -e "${GREEN}✔ 时区已设置为 ${zone}。${PLAIN}"
+        else
+            echo -e "${RED}[错误] 无效时区: ${zone}${PLAIN}"
+        fi
+        pause
+    done
+}
+
+server_tool_ssh_ports() {
+    if command -v sshd >/dev/null 2>&1; then
+        sshd -T 2>/dev/null | awk '$1=="port" {print $2}' | sort -nu
+    fi
+}
+
+server_tool_ssh_add_port() {
+    local new_port old_ports target_conf service_name backup ans tmp_main use_dropin="no"
+    local include_dir="/etc/ssh/sshd_config.d"
+    local dropin="${include_dir}/99-ss2022-port.conf"
+    local main_conf="/etc/ssh/sshd_config"
+
+    command -v sshd >/dev/null 2>&1 || { echo -e "${RED}[错误] 未找到 sshd。${PLAIN}"; return 1; }
+    old_ports=$(server_tool_ssh_ports)
+    echo "当前 SSH 端口: $(tr '\n' ' ' <<<"$old_ports")"
+    read -rp "请输入要新增的 SSH 端口: " new_port
+    validate_port_number "$new_port" || { echo -e "${RED}[错误] 端口无效。${PLAIN}"; return 1; }
+    if grep -qx "$new_port" <<<"$old_ports"; then
+        echo -e "${YELLOW}该端口已经是 SSH 监听端口。${PLAIN}"; return 0
+    fi
+    if port_in_use_by_other_process "$new_port" "" >/tmp/ss2022-ssh-port.$$ 2>/dev/null; then
+        echo -e "${RED}[错误] 端口 ${new_port} 已被其他进程占用。${PLAIN}"
+        cat /tmp/ss2022-ssh-port.$$ 2>/dev/null || true; rm -f /tmp/ss2022-ssh-port.$$; return 1
+    fi
+    rm -f /tmp/ss2022-ssh-port.$$ 2>/dev/null || true
+    echo -e "${YELLOW}[安全策略] 新端口会与现有 SSH 端口同时保留，不会删除旧端口。${PLAIN}"
+    echo -e "${YELLOW}还需确认云厂商安全组/防火墙已放行 ${new_port}/TCP。${PLAIN}"
+    read -rp "确认新增？[y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || return 0
+
+    if grep -Eiq '^[[:space:]]*Include[[:space:]]+.*sshd_config\.d' "$main_conf" 2>/dev/null; then
+        use_dropin="yes"
+        mkdir -p "$include_dir"
+        target_conf="$dropin"
+        backup="${dropin}.bak.$(date +%Y%m%d-%H%M%S)"
+        [[ -f "$dropin" ]] && cp -a "$dropin" "$backup"
+        {
+            echo "# Managed by ss2022.sh - preserve existing SSH ports"
+            while read -r p; do [[ -n "$p" ]] && echo "Port $p"; done <<<"$old_ports"
+            echo "Port $new_port"
+        } > "$dropin"
+    else
+        target_conf="$main_conf"
+        backup="${STATE_DIR}/sshd_config.bak.$(date +%Y%m%d-%H%M%S)"
+        mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
+        cp -a "$main_conf" "$backup" || return 1
+        tmp_main=$(mktemp /tmp/ss2022-sshd.XXXXXX) || return 1
+        awk '
+          $0=="# BEGIN ss2022 managed ports" {skip=1; next}
+          $0=="# END ss2022 managed ports" {skip=0; next}
+          !skip {print}
+        ' "$main_conf" > "$tmp_main"
+        {
+            cat "$tmp_main"
+            echo "# BEGIN ss2022 managed ports"
+            while read -r p; do [[ -n "$p" ]] && echo "Port $p"; done <<<"$old_ports"
+            echo "Port $new_port"
+            echo "# END ss2022 managed ports"
+        } > "$main_conf"
+        rm -f "$tmp_main"
+    fi
+
+    if ! sshd -t; then
+        echo -e "${RED}[错误] sshd 配置校验失败，正在回滚。${PLAIN}"
+        if [[ "$use_dropin" == "yes" ]]; then
+            [[ -f "$backup" ]] && mv -f "$backup" "$dropin" || rm -f "$dropin"
+        else
+            cp -af "$backup" "$main_conf"
+        fi
+        sshd -t >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    if service_exists ssh; then service_name="ssh"; else service_name="sshd"; fi
+    if ! service_reload "$service_name" 2>/dev/null; then
+        echo -e "${RED}[错误] SSH reload 失败，正在回滚。${PLAIN}"
+        if [[ "$use_dropin" == "yes" ]]; then
+            [[ -f "$backup" ]] && mv -f "$backup" "$dropin" || rm -f "$dropin"
+        else
+            cp -af "$backup" "$main_conf"
+        fi
+        service_reload "$service_name" >/dev/null 2>&1 || true
+        return 1
+    fi
+    sleep 1
+    if ss -H -lnt 2>/dev/null | awk -v p="$new_port" '{addr=$4; n=split(addr,a,":"); if (a[n]==p) found=1} END {exit !found}'; then
+        rm -f "$backup"
+        echo -e "${GREEN}✔ SSH 已新增端口 ${new_port}，旧端口继续保留。${PLAIN}"
+        echo -e "${YELLOW}请先新开一个 SSH 会话验证 ${new_port} 可登录，再考虑手工移除旧端口。${PLAIN}"
+        return 0
+    fi
+    echo -e "${YELLOW}[警告] sshd 配置已通过，但暂未检测到 ${new_port} 正在监听。请不要关闭当前 SSH 会话。${PLAIN}"
+    return 1
+}
+server_tool_ssh_management() {
+    local c
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ SSH 端口 ════════════════════${PLAIN}"
+        echo "当前端口:"
+        server_tool_ssh_ports | sed 's/^/  - /'
+        echo ""
+        echo "  1. 安全新增 SSH 端口（保留旧端口）"
+        echo "  0. 返回"
+        read -rp "请选择 [0-1]: " c
+        case "$c" in
+            1) server_tool_ssh_add_port; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+server_tool_tg_monitor_ensure_worker() {
+    install -d -m 755 /usr/local/lib/ss2022 || return 1
+    mkdir -p "$STATE_DIR" || return 1
+    chmod 700 "$STATE_DIR"
+    cat > "$TG_MONITOR_WORKER" <<'TGWORKER'
+#!/bin/bash
+set -u
+CONF="/etc/ss2022/tg-monitor.conf"
+STATE="/etc/ss2022/tg-monitor.state"
+LOCKDIR="/run/ss2022-tg-monitor.lockdir"
+[[ -f "$CONF" ]] || exit 0
+# shellcheck disable=SC1090
+source "$CONF"
+if ! mkdir "$LOCKDIR" 2>/dev/null; then exit 0; fi
+trap 'rmdir "$LOCKDIR" >/dev/null 2>&1 || true' EXIT INT TERM
+
+send_tg() {
+    local msg="$1"
+    [[ -n "${TG_BOT_TOKEN:-}" && -n "${TG_CHAT_ID:-}" ]] || return 0
+    curl -fsS --connect-timeout 5 --max-time 10 -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" --data-urlencode "chat_id=${TG_CHAT_ID}" --data-urlencode "text=${msg}" >/dev/null 2>&1 || true
+}
+traffic_bytes() {
+    awk 'BEGIN {rx=0;tx=0} {iface=$1;gsub(":","",iface); if (iface ~ /^(eth|ens|enp|eno|venet|bond)[A-Za-z0-9_.-]*$/) {rx+=$2;tx+=$10}} END {printf "%.0f %.0f\n",rx,tx}' /proc/net/dev
+}
+period_key() {
+    local day now_day year month prev_year prev_month
+    day="${RESET_DAY:-1}"; now_day=$(date +%d | sed 's/^0//'); year=$(date +%Y); month=$(date +%m | sed 's/^0//')
+    if [[ "$now_day" -ge "$day" ]]; then printf "%04d-%02d" "$year" "$month"; return; fi
+    if [[ "$month" -eq 1 ]]; then prev_year=$((year-1)); prev_month=12; else prev_year=$year; prev_month=$((month-1)); fi
+    printf "%04d-%02d" "$prev_year" "$prev_month"
+}
+human_gb() { awk -v b="$1" 'BEGIN {printf "%.2f",b/1073741824}'; }
+percent_of() { local bytes="$1" limit_gb="$2"; if [[ ! "$limit_gb" =~ ^[0-9]+$ || "$limit_gb" -le 0 ]]; then echo 0; else awk -v b="$bytes" -v g="$limit_gb" 'BEGIN {printf "%.0f",(b/(g*1073741824))*100}'; fi; }
+CURRENT_RX=0; CURRENT_TX=0; read -r CURRENT_RX CURRENT_TX < <(traffic_bytes)
+PERIOD="$(period_key)"
+LAST_RX=0; LAST_TX=0; TOTAL_RX=0; TOTAL_TX=0; STATE_PERIOD=""
+RX_WARN1=0; RX_WARN2=0; RX_CRITICAL=0; TX_WARN1=0; TX_WARN2=0; TX_CRITICAL=0
+if [[ -f "$STATE" ]]; then
+    # shellcheck disable=SC1090
+    source "$STATE"
+fi
+if [[ "$STATE_PERIOD" != "$PERIOD" ]]; then
+    STATE_PERIOD="$PERIOD"; LAST_RX="$CURRENT_RX"; LAST_TX="$CURRENT_TX"; TOTAL_RX=0; TOTAL_TX=0
+    RX_WARN1=0; RX_WARN2=0; RX_CRITICAL=0; TX_WARN1=0; TX_WARN2=0; TX_CRITICAL=0
+else
+    if [[ "$CURRENT_RX" -ge "$LAST_RX" ]]; then TOTAL_RX=$((TOTAL_RX+CURRENT_RX-LAST_RX)); else TOTAL_RX=$((TOTAL_RX+CURRENT_RX)); fi
+    if [[ "$CURRENT_TX" -ge "$LAST_TX" ]]; then TOTAL_TX=$((TOTAL_TX+CURRENT_TX-LAST_TX)); else TOTAL_TX=$((TOTAL_TX+CURRENT_TX)); fi
+    LAST_RX="$CURRENT_RX"; LAST_TX="$CURRENT_TX"
+fi
+HOST_LABEL="${HOST_LABEL:-$(hostname)}"; WARN1_PERCENT="${WARN1_PERCENT:-80}"; WARN2_PERCENT="${WARN2_PERCENT:-90}"; AUTO_SHUTDOWN="${AUTO_SHUTDOWN:-no}"; SHUTDOWN_PERCENT="${SHUTDOWN_PERCENT:-95}"
+rx_percent=$(percent_of "$TOTAL_RX" "${RX_LIMIT_GB:-0}"); tx_percent=$(percent_of "$TOTAL_TX" "${TX_LIMIT_GB:-0}")
+rx_gb=$(human_gb "$TOTAL_RX"); tx_gb=$(human_gb "$TOTAL_TX")
+notify_threshold() {
+    local direction="$1" percent="$2" used_gb="$3" limit="$4" warn1_var warn2_var critical_var
+    if [[ "$direction" == "入站" ]]; then warn1_var="RX_WARN1"; warn2_var="RX_WARN2"; critical_var="RX_CRITICAL"; else warn1_var="TX_WARN1"; warn2_var="TX_WARN2"; critical_var="TX_CRITICAL"; fi
+    [[ "$limit" =~ ^[0-9]+$ && "$limit" -gt 0 ]] || return 0
+    if [[ "$percent" -ge 100 && "${!critical_var}" -eq 0 ]]; then
+        printf -v "$critical_var" 1
+        send_tg "🚨 ${HOST_LABEL}\n${direction}流量已达到 ${used_gb} GB / ${limit} GB（${percent}%）\n已达到流量上限。"
+    elif [[ "$percent" -ge "$WARN2_PERCENT" && "${!warn2_var}" -eq 0 ]]; then
+        printf -v "$warn2_var" 1
+        send_tg "⚠️ ${HOST_LABEL}\n${direction}流量已达到 ${used_gb} GB / ${limit} GB（${percent}%）\n已达到第二预警线 ${WARN2_PERCENT}%。"
+    elif [[ "$percent" -ge "$WARN1_PERCENT" && "${!warn1_var}" -eq 0 ]]; then
+        printf -v "$warn1_var" 1
+        send_tg "⚠️ ${HOST_LABEL}\n${direction}流量已达到 ${used_gb} GB / ${limit} GB（${percent}%）\n已达到第一预警线 ${WARN1_PERCENT}%。"
+    fi
+}
+notify_threshold "入站" "$rx_percent" "$rx_gb" "${RX_LIMIT_GB:-0}"
+notify_threshold "出站" "$tx_percent" "$tx_gb" "${TX_LIMIT_GB:-0}"
+tmp="${STATE}.tmp.$$"; umask 077
+cat > "$tmp" <<EOF
+STATE_PERIOD='${STATE_PERIOD}'
+LAST_RX=${LAST_RX}
+LAST_TX=${LAST_TX}
+TOTAL_RX=${TOTAL_RX}
+TOTAL_TX=${TOTAL_TX}
+RX_WARN1=${RX_WARN1}
+RX_WARN2=${RX_WARN2}
+RX_CRITICAL=${RX_CRITICAL}
+TX_WARN1=${TX_WARN1}
+TX_WARN2=${TX_WARN2}
+TX_CRITICAL=${TX_CRITICAL}
+EOF
+mv -f "$tmp" "$STATE"; chmod 600 "$STATE"
+shutdown_needed=0
+if [[ "${RX_LIMIT_GB:-0}" =~ ^[0-9]+$ && "${RX_LIMIT_GB:-0}" -gt 0 && "$rx_percent" -ge "$SHUTDOWN_PERCENT" ]]; then shutdown_needed=1; fi
+if [[ "${TX_LIMIT_GB:-0}" =~ ^[0-9]+$ && "${TX_LIMIT_GB:-0}" -gt 0 && "$tx_percent" -ge "$SHUTDOWN_PERCENT" ]]; then shutdown_needed=1; fi
+if [[ "$shutdown_needed" -eq 1 && "$AUTO_SHUTDOWN" == "yes" ]]; then
+    send_tg "⛔ ${HOST_LABEL}\n流量达到自动关机阈值 ${SHUTDOWN_PERCENT}%，服务器即将自动关机。"
+    sync
+    shutdown -h now
+fi
+TGWORKER
+    chmod 700 "$TG_MONITOR_WORKER"
+
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        cat > "$TG_MONITOR_SERVICE" <<EOF
+[Unit]
+Description=ss2022 TG-BOT Traffic Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${TG_MONITOR_WORKER}
+EOF
+        cat > "$TG_MONITOR_TIMER" <<'EOF'
+[Unit]
+Description=Run ss2022 TG-BOT Traffic Monitor Every Minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=5s
+Persistent=true
+Unit=ss2022-tg-monitor.service
+
+[Install]
+WantedBy=timers.target
+EOF
+        service_daemon_reload || return 1
+    else
+        mkdir -p "$(dirname "$TG_MONITOR_CRON_FILE")"
+        touch "$TG_MONITOR_CRON_FILE"
+        sed -i "/ss2022-tg-monitor/d" "$TG_MONITOR_CRON_FILE"
+        echo "* * * * * $TG_MONITOR_WORKER >/dev/null 2>&1 $TG_MONITOR_CRON_TAG" >> "$TG_MONITOR_CRON_FILE"
+        service_enable_now crond >/dev/null 2>&1 || {
+            echo -e "${RED}[错误] OpenRC crond 启动失败。${PLAIN}"
+            return 1
+        }
+    fi
+}
+
+server_tool_tg_monitor_send_test() {
+    local token chat_id host
+    [[ -f "$TG_MONITOR_CONF" ]] || {
+        echo -e "${YELLOW}尚未配置 TG-BOT 流量监控。${PLAIN}"
+        return 1
+    }
+
+    # shellcheck disable=SC1090
+    source "$TG_MONITOR_CONF"
+    token="${TG_BOT_TOKEN:-}"
+    chat_id="${TG_CHAT_ID:-}"
+    host="${HOST_LABEL:-$(hostname)}"
+
+    if curl -fsS --connect-timeout 5 --max-time 10 \
+        -X POST "https://api.telegram.org/bot${token}/sendMessage" \
+        --data-urlencode "chat_id=${chat_id}" \
+        --data-urlencode "text=✅ ${host}：ss2022 TG-BOT 流量监控测试消息发送成功。" \
+        >/dev/null 2>&1; then
+        echo -e "${GREEN}✔ Telegram 测试消息已发送。${PLAIN}"
+        return 0
+    fi
+
+    echo -e "${RED}[错误] Telegram 消息发送失败，请检查 Bot Token、Chat ID 和服务器网络。${PLAIN}"
+    return 1
+}
+
+server_tool_tg_monitor_configure() {
+    local token chat_id rx_limit tx_limit reset_day warn1 warn2 shutdown_percent auto_shutdown host_label
+    local current_token="" current_chat="" ans
+
+    if [[ -f "$TG_MONITOR_CONF" ]]; then
+        # shellcheck disable=SC1090
+        source "$TG_MONITOR_CONF"
+        current_token="${TG_BOT_TOKEN:-}"
+        current_chat="${TG_CHAT_ID:-}"
+    fi
+
+    clear
+    echo -e "${CYAN}════════════ TG-BOT 流量监控配置 ════════════${PLAIN}"
+    echo "说明："
+    echo "  - 每分钟累计公网网卡收发流量；累计状态写入磁盘，重启 VPS 后不会清零。"
+    echo "  - 默认在 80% / 90% / 100% 三个阶段发送 Telegram 预警。"
+    echo "  - 自动关机阈值独立配置，默认 95%。"
+    echo "  - 新启用时从当前流量计数作为起点，只统计启用后的流量。"
+    echo ""
+
+    if [[ -n "$current_token" ]]; then
+        read -rp "Telegram Bot Token [回车保持现有 Token]: " token
+        token=${token:-$current_token}
+    else
+        read -rp "Telegram Bot Token: " token
+    fi
+
+    if [[ ! "$token" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then
+        echo -e "${RED}[错误] Bot Token 格式不正确。${PLAIN}"
+        pause
+        return
+    fi
+
+    if [[ -n "$current_chat" ]]; then
+        read -rp "Telegram Chat ID [回车保持: ${current_chat}]: " chat_id
+        chat_id=${chat_id:-$current_chat}
+    else
+        read -rp "Telegram Chat ID: " chat_id
+    fi
+
+    if [[ ! "$chat_id" =~ ^-?[0-9]+$ ]]; then
+        echo -e "${RED}[错误] Chat ID 应为数字，可为负数（群组）。${PLAIN}"
+        pause
+        return
+    fi
+
+    read -rp "每月入站流量上限 GB [默认 1000，0=不限制]: " rx_limit
+    rx_limit=${rx_limit:-1000}
+    read -rp "每月出站流量上限 GB [默认 1000，0=不限制]: " tx_limit
+    tx_limit=${tx_limit:-1000}
+    read -rp "每月流量重置日 [默认 1，范围 1-28]: " reset_day
+    reset_day=${reset_day:-1}
+    read -rp "第一预警百分比 [默认 80]: " warn1
+    warn1=${warn1:-80}
+    read -rp "第二预警百分比 [默认 90]: " warn2
+    warn2=${warn2:-90}
+    read -rp "自动关机阈值百分比 [默认 95]: " shutdown_percent
+    shutdown_percent=${shutdown_percent:-95}
+
+    for n in "$rx_limit" "$tx_limit" "$reset_day" "$warn1" "$warn2" "$shutdown_percent"; do
+        [[ "$n" =~ ^[0-9]+$ ]] || {
+            echo -e "${RED}[错误] 阈值必须为整数。${PLAIN}"
+            pause
+            return
+        }
+    done
+
+    if [[ "$reset_day" -lt 1 || "$reset_day" -gt 28 ]]; then
+        echo -e "${RED}[错误] 重置日必须为 1-28。${PLAIN}"
+        pause
+        return
+    fi
+
+    if [[ "$warn1" -lt 1 || "$warn1" -ge "$warn2" || "$warn2" -ge 100 ]]; then
+        echo -e "${RED}[错误] 预警比例必须满足 1 <= 第一预警 < 第二预警 < 100。${PLAIN}"
+        pause
+        return
+    fi
+
+    if [[ "$shutdown_percent" -lt 1 || "$shutdown_percent" -gt 100 ]]; then
+        echo -e "${RED}[错误] 自动关机阈值必须在 1-100%。${PLAIN}"
+        pause
+        return
+    fi
+
+    read -rp "达到 ${shutdown_percent}% 后自动关机？[y/N]: " ans
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+        auto_shutdown="yes"
+        echo -e "${YELLOW}[警告] 自动关机启用后，任一启用方向达到 ${shutdown_percent}% 会执行 shutdown -h now。${PLAIN}"
+        read -rp "再次确认启用自动关机？[y/N]: " ans
+        [[ "$ans" =~ ^[Yy]$ ]] || auto_shutdown="no"
+    else
+        auto_shutdown="no"
+    fi
+
+    host_label=$(hostname 2>/dev/null || echo "VPS")
+
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+    umask 077
+    cat > "$TG_MONITOR_CONF" <<EOF
+TG_BOT_TOKEN='${token}'
+TG_CHAT_ID='${chat_id}'
+HOST_LABEL='${host_label}'
+RX_LIMIT_GB=${rx_limit}
+TX_LIMIT_GB=${tx_limit}
+RESET_DAY=${reset_day}
+WARN1_PERCENT=${warn1}
+WARN2_PERCENT=${warn2}
+SHUTDOWN_PERCENT=${shutdown_percent}
+AUTO_SHUTDOWN='${auto_shutdown}'
+EOF
+    chmod 600 "$TG_MONITOR_CONF"
+
+    server_tool_tg_monitor_ensure_worker || {
+        echo -e "${RED}[错误] TG-BOT 监控服务生成失败。${PLAIN}"
+        pause
+        return
+    }
+
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        systemctl enable --now ss2022-tg-monitor.timer >/dev/null 2>&1 || {
+            echo -e "${RED}[错误] TG-BOT 监控 timer 启动失败。${PLAIN}"; pause; return
+        }
+    fi
+    # 立即运行一次，建立初始状态。OpenRC 后续由 crond 每分钟执行。
+    "$TG_MONITOR_WORKER" >/dev/null 2>&1 || true
+
+    echo -e "${GREEN}✔ TG-BOT 流量监控已启用。${PLAIN}"
+    server_tool_tg_monitor_send_test
+    pause
+}
+
+server_tool_tg_monitor_status() {
+    local enabled="未启用" rx_limit="-" tx_limit="-" reset_day="-" warn1="-" warn2="-" shutdown_percent="95" auto="-"
+    local total_rx=0 total_tx=0 period="-" rx_gb tx_gb token_masked="-"
+    [[ -f "$TG_MONITOR_CONF" ]] && {
+        # shellcheck disable=SC1090
+        source "$TG_MONITOR_CONF"
+        rx_limit="${RX_LIMIT_GB:-0}"; tx_limit="${TX_LIMIT_GB:-0}"; reset_day="${RESET_DAY:-1}"
+        warn1="${WARN1_PERCENT:-80}"; warn2="${WARN2_PERCENT:-90}"; shutdown_percent="${SHUTDOWN_PERCENT:-95}"; auto="${AUTO_SHUTDOWN:-no}"
+        [[ -n "${TG_BOT_TOKEN:-}" ]] && token_masked="${TG_BOT_TOKEN:0:6}******"
+    }
+    [[ -f "$TG_MONITOR_STATE" ]] && {
+        # shellcheck disable=SC1090
+        source "$TG_MONITOR_STATE"
+        total_rx="${TOTAL_RX:-0}"; total_tx="${TOTAL_TX:-0}"; period="${STATE_PERIOD:--}"
+    }
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        if systemctl is-active --quiet ss2022-tg-monitor.timer 2>/dev/null; then enabled="运行中"; elif systemctl is-enabled --quiet ss2022-tg-monitor.timer 2>/dev/null; then enabled="已启用但未运行"; fi
+    else
+        if grep -q "ss2022-tg-monitor" "$TG_MONITOR_CRON_FILE" 2>/dev/null && service_is_active crond; then enabled="运行中（OpenRC crond）"; elif grep -q "ss2022-tg-monitor" "$TG_MONITOR_CRON_FILE" 2>/dev/null; then enabled="已配置但 crond 未运行"; fi
+    fi
+    rx_gb=$(awk -v b="$total_rx" 'BEGIN {printf "%.2f",b/1073741824}'); tx_gb=$(awk -v b="$total_tx" 'BEGIN {printf "%.2f",b/1073741824}')
+    clear
+    echo -e "${CYAN}════════════ TG-BOT 流量监控状态 ════════════${PLAIN}"
+    echo "  状态         : ${enabled}"
+    echo "  统计周期     : ${period} / 每月 ${reset_day} 日重置"
+    echo "  当前入站累计 : ${rx_gb} GB / ${rx_limit} GB"
+    echo "  当前出站累计 : ${tx_gb} GB / ${tx_limit} GB"
+    echo "  TG Token     : ${token_masked}"
+    echo "  Chat ID      : ${TG_CHAT_ID:--}"
+    echo "  预警线       : ${warn1}% / ${warn2}% / 100%"
+    echo "  关机阈值     : ${shutdown_percent}%"
+    echo "  自动关机     : $([[ "$auto" == "yes" ]] && echo "开启" || echo "关闭")"
+    echo -e "${CYAN}═══════════════════════════════════════════════${PLAIN}"
+}
+server_tool_tg_monitor_disable() {
+    local ans
+    read -rp "确认停用 TG-BOT 流量监控？配置和累计数据会保留。[y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || return 0
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        systemctl disable --now ss2022-tg-monitor.timer >/dev/null 2>&1 || true
+    else
+        [[ -f "$TG_MONITOR_CRON_FILE" ]] && sed -i "/ss2022-tg-monitor/d" "$TG_MONITOR_CRON_FILE"
+    fi
+    echo -e "${GREEN}✔ TG-BOT 流量监控已停用。${PLAIN}"
+}
+server_tool_tg_monitor_reset() {
+    local ans
+    read -rp "确认清零当前累计流量和预警状态？[y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || return 0
+    rm -f "$TG_MONITOR_STATE"
+    [[ -x "$TG_MONITOR_WORKER" ]] && "$TG_MONITOR_WORKER" >/dev/null 2>&1 || true
+    echo -e "${GREEN}✔ 流量累计已重新从当前时刻开始统计。${PLAIN}"
+}
+server_tool_tg_monitor_remove() {
+    local ans
+    read -rp "确认彻底删除 TG-BOT 流量监控配置、Token 和累计数据？[y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || return 0
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        systemctl disable --now ss2022-tg-monitor.timer >/dev/null 2>&1 || true
+    else
+        [[ -f "$TG_MONITOR_CRON_FILE" ]] && sed -i "/ss2022-tg-monitor/d" "$TG_MONITOR_CRON_FILE"
+    fi
+    rm -f "$TG_MONITOR_TIMER" "$TG_MONITOR_SERVICE" "$TG_MONITOR_WORKER" "$TG_MONITOR_CONF" "$TG_MONITOR_STATE"
+    service_daemon_reload >/dev/null 2>&1 || true
+    echo -e "${GREEN}✔ TG-BOT 流量监控已彻底删除。${PLAIN}"
+}
+server_tool_tg_monitor_management() {
+    local c
+    while true; do
+        server_tool_tg_monitor_status
+        echo ""
+        echo "  1. 配置 / 启用监控"
+        echo "  2. 发送 TG 测试消息"
+        echo "  3. 清零流量累计"
+        echo "  4. 停用监控（保留配置）"
+        echo "  5. 删除监控配置"
+        echo "  0. 返回"
+        read -rp "请选择 [0-5]: " c
+        case "$c" in
+            1) server_tool_tg_monitor_configure ;;
+            2) server_tool_tg_monitor_send_test; pause ;;
+            3) server_tool_tg_monitor_reset; pause ;;
+            4) server_tool_tg_monitor_disable; pause ;;
+            5) server_tool_tg_monitor_remove; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+server_tool_reboot() {
+    local ans
+    clear
+    echo -e "${RED}════════════════════ 重启服务器 ════════════════════${PLAIN}"
+    echo -e "${YELLOW}[警告] 重启会立即中断当前 SSH 会话和正在运行的任务。${PLAIN}"
+    echo ""
+    echo "为避免误触，请完整输入：REBOOT"
+    read -rp "确认字符: " ans
+    [[ "$ans" == "REBOOT" ]] || {
+        echo "已取消重启。"
+        pause
+        return
+    }
+    sync
+    reboot
+}
+
+server_management_tools() {
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ 服务器管理工具 ════════════════════${PLAIN}"
+        echo "  1. 系统信息"
+        echo "  2. 查看端口占用"
+        echo "  3. TG-BOT 流量监控 / 预警 / 自动关机"
+        echo "  4. 系统更新 / 清理"
+        echo "  5. Swap 虚拟内存"
+        echo "  6. BBR 加速"
+        echo "  7. DNS 管理"
+        echo "  8. IPv4 / IPv6 管理"
+        echo "  9. 系统时区"
+        echo " 10. SSH 端口管理"
+        echo " 11. 重启服务器"
+        echo "  0. 返回"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-11]: " c
+        case "$c" in
+            1) server_tool_system_info; pause ;;
+            2) server_tool_port_usage ;;
+            3) server_tool_tg_monitor_management ;;
+            4) server_tool_system_update ;;
+            5) server_tool_swap_management ;;
+            6) server_tool_bbr_management ;;
+            7) server_tool_dns_management ;;
+            8) server_tool_ip_family_management ;;
+            9) server_tool_timezone_management ;;
+            10) server_tool_ssh_management ;;
+            11) server_tool_reboot ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+ensure_test_dependency() {
+    local cmd="$1"
+    local pkg="${2:-$1}"
+
+    command -v "$cmd" >/dev/null 2>&1 && return 0
+
+    echo -e "${YELLOW}>> 缺少 ${cmd}，正在安装 ${pkg}...${PLAIN}"
+
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -y >/dev/null 2>&1 || return 1
+        apt-get install -y "$pkg" >/dev/null 2>&1 || return 1
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y "$pkg" >/dev/null 2>&1 || return 1
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y "$pkg" >/dev/null 2>&1 || return 1
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache "$pkg" >/dev/null 2>&1 || return 1
+    else
+        echo -e "${RED}[错误] 未识别包管理器，请手动安装 ${pkg}。${PLAIN}"
+        return 1
+    fi
+
+    command -v "$cmd" >/dev/null 2>&1
+}
+
+show_external_test_source() {
+    local name="$1"
+    local source="$2"
+    echo ""
+    echo -e "${CYAN}════════════════════ ${name} ════════════════════${PLAIN}"
+    echo -e "${YELLOW}测试来源: ${source}${PLAIN}"
+    echo -e "${YELLOW}说明: 测试组件仅用于检测；临时下载到 /tmp，校验来源完整性后执行，用完删除，不修改协议或分流配置。${PLAIN}"
+    echo ""
+}
+server_test_download_release_asset() {
+    local repo="$1" tag="$2" asset="$3" out="$4"
+    local api meta url digest expected actual source ok=0
+
+    ensure_test_dependency curl curl || return 1
+    ensure_test_dependency jq jq || return 1
+    command -v sha256sum >/dev/null 2>&1 || ensure_test_dependency sha256sum coreutils || return 1
+
+    if [[ "$tag" == "latest" ]]; then
+        api="https://api.github.com/repos/${repo}/releases/latest"
+    else
+        api="https://api.github.com/repos/${repo}/releases/tags/${tag}"
+    fi
+    meta=$(mktemp /tmp/ss2022-test-release.XXXXXX.json) || return 1
+    if ! curl -fsSL --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 30 -H "Accept: application/vnd.github+json" "$api" -o "$meta"; then
+        rm -f "$meta"
+        echo -e "${RED}[错误] 无法获取 ${repo} Release 元数据。${PLAIN}"
+        return 1
+    fi
+    url=$(jq -r --arg a "$asset" '.assets[]? | select(.name==$a) | .browser_download_url // empty' "$meta" | head -n1)
+    digest=$(jq -r --arg a "$asset" '.assets[]? | select(.name==$a) | .digest // empty' "$meta" | head -n1)
+    rm -f "$meta"
+    expected=${digest#sha256:}
+    if [[ -z "$url" || ! "$expected" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        echo -e "${RED}[错误] Release 中未找到 ${asset} 或缺少官方 SHA256 digest。${PLAIN}"
+        return 1
+    fi
+
+    local sources=("$url" "https://ghproxy.net/${url}" "https://gh-proxy.com/${url}")
+    for source in "${sources[@]}"; do
+        rm -f "$out"
+        echo -e "${YELLOW}>> 下载并校验 ${asset}...${PLAIN}"
+        if ! curl -fL --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 120 "$source" -o "$out"; then
+            continue
+        fi
+        actual=$(sha256sum "$out" | awk '{print $1}')
+        if [[ "${actual,,}" == "${expected,,}" ]]; then
+            ok=1
+            break
+        fi
+        echo -e "${RED}[警告] SHA256 不匹配，拒绝执行当前下载结果。${PLAIN}"
+    done
+    [[ $ok -eq 1 ]] || { rm -f "$out"; echo -e "${RED}[错误] ${asset} 下载失败或 SHA256 校验失败。${PLAIN}"; return 1; }
+    chmod 700 "$out"
+    return 0
+}
+
+server_test_arch_asset() {
+    local prefix="$1"
+    case "$(uname -m)" in
+        x86_64|amd64) printf "%s-linux-amd64" "$prefix" ;;
+        aarch64|arm64) printf "%s-linux-arm64" "$prefix" ;;
+        i386|i686) printf "%s-linux-386" "$prefix" ;;
+        armv7l|armv7*) printf "%s-linux-arm" "$prefix" ;;
+        *) return 1 ;;
+    esac
+}
+
+server_test_detect_family_mode() {
+    local has4=0 has6=0
+    get_public_ipv4 >/dev/null 2>&1 && has4=1 || true
+    get_public_ipv6 >/dev/null 2>&1 && has6=1 || true
+    if [[ $has4 -eq 1 && $has6 -eq 1 ]]; then echo "both"
+    elif [[ $has4 -eq 1 ]]; then echo "ipv4"
+    elif [[ $has6 -eq 1 ]]; then echo "ipv6"
+    else echo "none"; fi
+}
+
+run_external_curl_test() {
+    local label="$1"
+    local url="$2"
+    shift 2
+
+    local tmp=""
+    tmp=$(mktemp /tmp/ss2022-external-test.XXXXXX.sh) || {
+        echo -e "${RED}[错误] 无法创建临时测试文件。${PLAIN}"
+        return 1
+    }
+
+    if ! curl -fLsS --retry 2 --retry-delay 1 \
+        --connect-timeout 10 --max-time 60 \
+        "$url" -o "$tmp"; then
+        rm -f "$tmp"
+        echo -e "${RED}[错误] ${label}脚本下载失败。${PLAIN}"
+        return 1
+    fi
+
+    if [[ ! -s "$tmp" ]]; then
+        rm -f "$tmp"
+        echo -e "${RED}[错误] ${label}脚本下载结果为空。${PLAIN}"
+        return 1
+    fi
+
+    chmod 700 "$tmp"
+
+    # 第三方检测脚本可能用非 0 返回码表达内部检测状态。
+    # 这里不把它二次解释成“脚本执行失败”；实际检测结果以第三方输出为准。
+    bash "$tmp" "$@" || true
+
+    rm -f "$tmp"
+    return 0
+}
+
+test_ip_quality() {
+    local asset tmp family check_mode
+    clear
+    show_external_test_source "IP 质量测试" "oneclickvirt/securityCheck"
+    asset=$(server_test_arch_asset "securityCheck") || {
+        echo -e "${RED}[错误] 当前 CPU 架构暂无 securityCheck 测试资产。${PLAIN}"; pause; return
+    }
+    family=$(server_test_detect_family_mode)
+    case "$family" in
+        both) check_mode="both" ;;
+        ipv4) check_mode="ipv4" ;;
+        ipv6) check_mode="ipv6" ;;
+        *) echo -e "${RED}[错误] 未检测到可用公网 IPv4 / IPv6。${PLAIN}"; pause; return ;;
+    esac
+    tmp=$(mktemp /tmp/ss2022-securitycheck.XXXXXX) || { pause; return; }
+    if server_test_download_release_asset "oneclickvirt/securityCheck" "output" "$asset" "$tmp"; then
+        echo -e "${CYAN}检测地址族: ${check_mode}${PLAIN}"
+        "$tmp" -l zh -c "$check_mode" -e yes || true
+    fi
+    rm -f "$tmp"
+    echo ""
+    pause
+}
+server_test_nexttrace_asset() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo "nexttrace-tiny_linux_amd64" ;;
+        aarch64|arm64) echo "nexttrace-tiny_linux_arm64" ;;
+        i386|i686) echo "nexttrace-tiny_linux_386" ;;
+        armv7l|armv7*) echo "nexttrace-tiny_linux_armv7" ;;
+        *) return 1 ;;
+    esac
+}
+
+server_test_write_return_targets() {
+    local family="$1" out="$2"
+    case "$family" in
+        4)
+            cat >"$out" <<'EOF'
+ipv4.pek-4134.endpoint.nxtrace.org 北京电信
+ipv4.pek-4837.endpoint.nxtrace.org 北京联通
+ipv4.pek-9808.endpoint.nxtrace.org 北京移动
+ipv4.sha-4134.endpoint.nxtrace.org 上海电信
+ipv4.sha-4837.endpoint.nxtrace.org 上海联通
+ipv4.sha-9808.endpoint.nxtrace.org 上海移动
+ipv4.can-4134.endpoint.nxtrace.org 广州电信
+ipv4.can-4837.endpoint.nxtrace.org 广州联通
+ipv4.can-9808.endpoint.nxtrace.org 广州移动
+EOF
+            ;;
+        6)
+            cat >"$out" <<'EOF'
+ipv6.pek-4134.endpoint.nxtrace.org 北京电信
+ipv6.pek-4837.endpoint.nxtrace.org 北京联通
+ipv6.pek-9808.endpoint.nxtrace.org 北京移动
+ipv6.sha-4134.endpoint.nxtrace.org 上海电信
+ipv6.sha-4837.endpoint.nxtrace.org 上海联通
+ipv6.sha-9808.endpoint.nxtrace.org 上海移动
+ipv6.can-4134.endpoint.nxtrace.org 广州电信
+ipv6.can-4837.endpoint.nxtrace.org 广州联通
+ipv6.can-9808.endpoint.nxtrace.org 广州移动
+EOF
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+server_test_run_nexttrace_family() {
+    local bin="$1" family="$2" targets title
+    targets=$(mktemp /tmp/ss2022-nexttrace-targets.XXXXXX) || return 1
+    server_test_write_return_targets "$family" "$targets" || {
+        rm -f "$targets"
+        return 1
+    }
+
+    [[ "$family" == "6" ]] && title="IPv6" || title="IPv4"
+    echo ""
+    echo -e "${CYAN}════════ ${title} 三网逐跳回程 ════════${PLAIN}"
+    echo -e "${YELLOW}目标: 北京 / 上海 / 广州 × 电信 / 联通 / 移动；TCP 80；每一跳显示 IP / ASN / 地区 / 延迟。${PLAIN}"
+    echo ""
+
+    "$bin" --traceroute --file "$targets"         --tcp --port 80         --queries 1 --max-hops 30 --timeout 2000         --language cn --no-color -M || true
+
+    rm -f "$targets"
+}
+
+test_return_route() {
+    local asset tmp family
+    clear
+    show_external_test_source "IPv4 / IPv6 三网逐跳回程" "nxtrace/NTrace-core"
+    echo -e "${YELLOW}本项显示完整 traceroute，每个目标会逐跳列出经过的 IP、ASN、地区与延迟。${PLAIN}"
+    echo -e "${CYAN}检测目标: 北京 / 上海 / 广州 × 电信 / 联通 / 移动，共 9 条/地址族。${PLAIN}"
+
+    server_test_select_ip_mode || return
+    family=$(server_test_detect_family_mode)
+
+    asset=$(server_test_nexttrace_asset) || {
+        echo -e "${RED}[错误] 当前 CPU 架构暂无 NextTrace 测试资产。${PLAIN}"
+        pause
+        return
+    }
+
+    tmp=$(mktemp /tmp/ss2022-nexttrace.XXXXXX) || { pause; return; }
+    if ! server_test_download_release_asset "nxtrace/NTrace-core" "latest" "$asset" "$tmp"; then
+        rm -f "$tmp"
+        pause
+        return
+    fi
+
+    case "$SERVER_TEST_IP_MODE:$family" in
+        4:both|4:ipv4)
+            server_test_run_nexttrace_family "$tmp" 4
+            ;;
+        4:*)
+            echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv4。${PLAIN}"
+            ;;
+        6:both|6:ipv6)
+            server_test_run_nexttrace_family "$tmp" 6
+            ;;
+        6:*)
+            echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv6。${PLAIN}"
+            ;;
+        0:both)
+            server_test_run_nexttrace_family "$tmp" 4
+            server_test_run_nexttrace_family "$tmp" 6
+            ;;
+        0:ipv4)
+            server_test_run_nexttrace_family "$tmp" 4
+            ;;
+        0:ipv6)
+            server_test_run_nexttrace_family "$tmp" 6
+            ;;
+        *)
+            echo -e "${RED}[错误] 未检测到可用公网 IPv4 / IPv6。${PLAIN}"
+            ;;
+    esac
+
+    rm -f "$tmp"
+    echo ""
+    pause
+}
+
+server_test_run_unlocktests() {
+    local selection="$1" label="$2" mode="${3:-0}" selector="${4:-f}" asset tmp
+    asset=$(server_test_arch_asset "ut") || {
+        echo -e "${RED}[错误] 当前 CPU 架构暂无 UnlockTests 测试资产。${PLAIN}"
+        return 1
+    }
+    tmp=$(mktemp /tmp/ss2022-unlocktests.XXXXXX) || return 1
+    if ! server_test_download_release_asset "oneclickvirt/UnlockTests" "output" "$asset" "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    echo -e "${CYAN}${label}${PLAIN}"
+    case "$selector" in
+        region) "$tmp" -L zh -m "$mode" -region "$selection" -b=false -cache || true ;;
+        test) "$tmp" -L zh -m "$mode" -test "$selection" -b=false -cache || true ;;
+        *) "$tmp" -L zh -m "$mode" -f "$selection" -b=false -cache || true ;;
+    esac
+    rm -f "$tmp"
+}
+server_test_select_ip_mode() {
+    local c
+    SERVER_TEST_IP_MODE="0"
+    while true; do
+        echo ""
+        echo "请选择测试地址族："
+        echo "  1. IPv4 + IPv6（按 VPS 实际可用性）"
+        echo "  2. 仅 IPv4"
+        echo "  3. 仅 IPv6"
+        echo "  0. 返回"
+        read -rp "请选择 [0-3，默认 1]: " c
+        c=${c:-1}
+        case "$c" in
+            1) SERVER_TEST_IP_MODE="0"; return 0 ;;
+            2) SERVER_TEST_IP_MODE="4"; return 0 ;;
+            3) SERVER_TEST_IP_MODE="6"; return 0 ;;
+            0) return 1 ;;
+            *) echo -e "${RED}输入无效。${PLAIN}" ;;
+        esac
+    done
+}
+
+server_test_region_map_local_choice() {
+    case "$1" in
+        2) echo "TW_UnlockTest" ;;
+        3) echo "HK_UnlockTest" ;;
+        4) echo "JP_UnlockTest" ;;
+        5) echo "KR_UnlockTest" ;;
+        6) echo "NA_UnlockTest" ;;
+        7) echo "SA_UnlockTest" ;;
+        8) echo "EU_UnlockTest" ;;
+        9) echo "AF_UnlockTest" ;;
+        10) echo "SEA_UnlockTest" ;;
+        11) echo "OA_UnlockTest" ;;
+        12) echo "Sport_UnlockTest" ;;
+        *) return 1 ;;
+    esac
+}
+
+server_test_select_streaming_region() {
+    local c raw token mapped result="" label=""
+    SERVER_TEST_REGION_SELECTION=""
+    SERVER_TEST_REGION_LABEL="通用流媒体"
+    while true; do
+        echo ""
+        echo "请选择流媒体 / 区域检测范围："
+        echo "  1. 通用流媒体（Netflix / YouTube Premium / Disney+ / Prime Video / Google 等）"
+        echo "  2. 台湾"
+        echo "  3. 香港"
+        echo "  4. 日本"
+        echo "  5. 韩国"
+        echo "  6. 北美"
+        echo "  7. 南美"
+        echo "  8. 欧洲"
+        echo "  9. 非洲"
+        echo " 10. 东南亚"
+        echo " 11. 大洋洲"
+        echo " 12. 体育平台"
+        echo " 13. 全部流媒体平台（不含 AI）"
+        echo " 14. 自定义多地区组合"
+        echo "  0. 返回"
+        read -rp "请选择 [0-14，默认 1]: " c
+        c=${c:-1}
+        case "$c" in
+            1) SERVER_TEST_REGION_SELECTION=""; SERVER_TEST_REGION_LABEL="通用流媒体"; return 0 ;;
+            2) SERVER_TEST_REGION_SELECTION="TW_UnlockTest"; SERVER_TEST_REGION_LABEL="台湾平台"; return 0 ;;
+            3) SERVER_TEST_REGION_SELECTION="HK_UnlockTest"; SERVER_TEST_REGION_LABEL="香港平台"; return 0 ;;
+            4) SERVER_TEST_REGION_SELECTION="JP_UnlockTest"; SERVER_TEST_REGION_LABEL="日本平台"; return 0 ;;
+            5) SERVER_TEST_REGION_SELECTION="KR_UnlockTest"; SERVER_TEST_REGION_LABEL="韩国平台"; return 0 ;;
+            6) SERVER_TEST_REGION_SELECTION="NA_UnlockTest"; SERVER_TEST_REGION_LABEL="北美平台"; return 0 ;;
+            7) SERVER_TEST_REGION_SELECTION="SA_UnlockTest"; SERVER_TEST_REGION_LABEL="南美平台"; return 0 ;;
+            8) SERVER_TEST_REGION_SELECTION="EU_UnlockTest"; SERVER_TEST_REGION_LABEL="欧洲平台"; return 0 ;;
+            9) SERVER_TEST_REGION_SELECTION="AF_UnlockTest"; SERVER_TEST_REGION_LABEL="非洲平台"; return 0 ;;
+            10) SERVER_TEST_REGION_SELECTION="SEA_UnlockTest"; SERVER_TEST_REGION_LABEL="东南亚平台"; return 0 ;;
+            11) SERVER_TEST_REGION_SELECTION="OA_UnlockTest"; SERVER_TEST_REGION_LABEL="大洋洲平台"; return 0 ;;
+            12) SERVER_TEST_REGION_SELECTION="Sport_UnlockTest"; SERVER_TEST_REGION_LABEL="体育平台"; return 0 ;;
+            13)
+                SERVER_TEST_REGION_SELECTION="TW_UnlockTest,HK_UnlockTest,JP_UnlockTest,KR_UnlockTest,NA_UnlockTest,SA_UnlockTest,EU_UnlockTest,AF_UnlockTest,SEA_UnlockTest,OA_UnlockTest,Sport_UnlockTest"
+                SERVER_TEST_REGION_LABEL="全部地区平台"
+                return 0
+                ;;
+            14)
+                echo ""
+                echo "输入上面地区编号，可选多个，以空格分隔。"
+                echo "示例：3 4 10 = 香港 + 日本 + 东南亚"
+                echo "可组合 2-12；通用流媒体固定只检测一次。"
+                read -rp "地区编号: " raw
+                result=""; label=""
+                for token in $raw; do
+                    [[ "$token" =~ ^([2-9]|1[0-2])$ ]] || {
+                        echo -e "${RED}[错误] 无效地区编号: ${token}${PLAIN}"; result=""; break
+                    }
+                    mapped=$(server_test_region_map_local_choice "$token") || { result=""; break; }
+                    if [[ ",${result}," != *",${mapped},"* ]]; then
+                        result="${result:+${result},}${mapped}"
+                        case "$token" in
+                            2) label="${label:+${label} + }台湾" ;;
+                            3) label="${label:+${label} + }香港" ;;
+                            4) label="${label:+${label} + }日本" ;;
+                            5) label="${label:+${label} + }韩国" ;;
+                            6) label="${label:+${label} + }北美" ;;
+                            7) label="${label:+${label} + }南美" ;;
+                            8) label="${label:+${label} + }欧洲" ;;
+                            9) label="${label:+${label} + }非洲" ;;
+                            10) label="${label:+${label} + }东南亚" ;;
+                            11) label="${label:+${label} + }大洋洲" ;;
+                            12) label="${label:+${label} + }体育" ;;
+                        esac
+                    fi
+                done
+                [[ -n "$result" ]] || { echo -e "${RED}[错误] 未选择有效地区。${PLAIN}"; continue; }
+                SERVER_TEST_REGION_SELECTION="$result"
+                SERVER_TEST_REGION_LABEL="$label"
+                return 0
+                ;;
+            0) return 1 ;;
+            *) echo -e "${RED}输入无效。${PLAIN}" ;;
+        esac
+    done
+}
+
+server_test_show_exit_info_for_mode() {
+    local mode="${1:-0}" family
+    family=$(server_test_detect_family_mode)
+    case "$mode" in
+        4)
+            case "$family" in
+                both|ipv4)
+                    echo "===========[ IPV4 流媒体出口 ]============"
+                    server_test_exit_info "ipv4"
+                    ;;
+                *) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv4。${PLAIN}" ;;
+            esac
+            ;;
+        6)
+            case "$family" in
+                both|ipv6)
+                    echo "===========[ IPV6 流媒体出口 ]============"
+                    server_test_exit_info "ipv6"
+                    ;;
+                *) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv6。${PLAIN}" ;;
+            esac
+            ;;
+        *)
+            case "$family" in
+                both)
+                    echo "===========[ IPV4 流媒体出口 ]============"
+                    server_test_exit_info "ipv4"
+                    echo ""
+                    echo "===========[ IPV6 流媒体出口 ]============"
+                    server_test_exit_info "ipv6"
+                    ;;
+                ipv4)
+                    echo "===========[ IPV4 流媒体出口 ]============"
+                    server_test_exit_info "ipv4"
+                    ;;
+                ipv6)
+                    echo "===========[ IPV6 流媒体出口 ]============"
+                    server_test_exit_info "ipv6"
+                    ;;
+                *) echo -e "${RED}[错误] 未检测到可用公网 IPv4 / IPv6。${PLAIN}" ;;
+            esac
+            ;;
+    esac
+}
+
+server_test_download_rrc_source() {
+    local out="$1"
+    local commit="ab6829eb07c4c592c1f8f3dac736d675667d1a08"
+    local blob="9cd4e7fd81f49acfa4336ee48322114f8d88a6ad"
+    local raw="https://raw.githubusercontent.com/1-stream/RegionRestrictionCheck/${commit}/check.sh"
+    local source size actual ok=0
+
+    ensure_test_dependency curl curl || return 1
+    command -v sha1sum >/dev/null 2>&1 || ensure_test_dependency sha1sum coreutils || return 1
+
+    for source in "$raw" "https://ghproxy.net/$raw" "https://gh-proxy.com/$raw"; do
+        rm -f "$out"
+        echo -e "${YELLOW}>> 下载并校验 RegionRestrictionCheck...${PLAIN}"
+        if ! curl -fL --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 90 "$source" -o "$out"; then
+            continue
+        fi
+        size=$(wc -c <"$out" | tr -d '[:space:]')
+        actual=$(
+            {
+                printf 'blob %s\0' "$size"
+                cat "$out"
+            } | sha1sum | awk '{print $1}'
+        )
+        if [[ "${actual,,}" == "${blob,,}" ]]; then
+            ok=1
+            break
+        fi
+        echo -e "${RED}[警告] Git blob 校验失败，拒绝执行当前下载结果。${PLAIN}"
+    done
+
+    [[ $ok -eq 1 ]] || {
+        rm -f "$out"
+        echo -e "${RED}[错误] RegionRestrictionCheck 下载失败或来源完整性校验失败。${PLAIN}"
+        return 1
+    }
+    chmod 700 "$out"
+    return 0
+}
+
+server_test_run_region_restriction_check() {
+    local selection="$1" mode="${2:-0}"
+    local source runner family run_mode
+    source=$(mktemp /tmp/ss2022-rrc-source.XXXXXX.sh) || return 1
+    runner=$(mktemp /tmp/ss2022-rrc-runner.XXXXXX.sh) || { rm -f "$source"; return 1; }
+
+    ensure_test_dependency jq jq || { rm -f "$source" "$runner"; return 1; }
+    ensure_test_dependency python3 python3 || { rm -f "$source" "$runner"; return 1; }
+    ensure_test_dependency grep grep || { rm -f "$source" "$runner"; return 1; }
+    ensure_test_dependency openssl openssl || { rm -f "$source" "$runner"; return 1; }
+
+    if ! server_test_download_rrc_source "$source"; then
+        rm -f "$source" "$runner"
+        return 1
+    fi
+
+    if ! grep -q '^function ScriptTitle()' "$source" ||
+       ! grep -q '^function Global_UnlockTest()' "$source"; then
+        echo -e "${RED}[错误] 上游脚本结构发生变化，已停止执行以避免误调用。${PLAIN}"
+        rm -f "$source" "$runner"
+        return 1
+    fi
+
+    sed '/^function ScriptTitle()/,$d' "$source" >"$runner"
+    cat >>"$runner" <<'RRC_RUNNER'
+
+ss2022_rrc_run_family() {
+    local fam="$1" fn
+    echo ""
+    echo "===========[ IPV$fam 通用流媒体 ]============"
+    Global_UnlockTest "$fam"
+
+    if [[ -n "$SS2022_RRC_REGIONS" ]]; then
+        IFS=',' read -r -a ss2022_rrc_funcs <<<"$SS2022_RRC_REGIONS"
+        for fn in "${ss2022_rrc_funcs[@]}"; do
+            case "$fn" in
+                TW_UnlockTest|HK_UnlockTest|JP_UnlockTest|KR_UnlockTest|NA_UnlockTest|SA_UnlockTest|EU_UnlockTest|AF_UnlockTest|SEA_UnlockTest|OA_UnlockTest|Sport_UnlockTest)
+                    "$fn" "$fam"
+                    ;;
+            esac
+        done
+    fi
+}
+
+case "$SS2022_RRC_MODE" in
+    4) ss2022_rrc_run_family 4 ;;
+    6) ss2022_rrc_run_family 6 ;;
+    *)
+        ss2022_rrc_run_family 4
+        ss2022_rrc_run_family 6
+        ;;
+esac
+RRC_RUNNER
+    chmod 700 "$runner"
+
+    family=$(server_test_detect_family_mode)
+    run_mode="$mode"
+    case "$mode:$family" in
+        4:both|4:ipv4) run_mode=4 ;;
+        4:*) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv4，跳过流媒体 IPv4 检测。${PLAIN}"; rm -f "$source" "$runner"; return 0 ;;
+        6:both|6:ipv6) run_mode=6 ;;
+        6:*) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv6，跳过流媒体 IPv6 检测。${PLAIN}"; rm -f "$source" "$runner"; return 0 ;;
+        0:both) run_mode=0 ;;
+        0:ipv4) run_mode=4 ;;
+        0:ipv6) run_mode=6 ;;
+        0:*) echo -e "${RED}[错误] 未检测到可用公网 IPv4 / IPv6。${PLAIN}"; rm -f "$source" "$runner"; return 1 ;;
+    esac
+
+    SS2022_RRC_REGIONS="$selection" SS2022_RRC_MODE="$run_mode" bash "$runner" || true
+    rm -f "$source" "$runner"
+    return 0
+}
+
+test_streaming_unlock() {
+    clear
+    show_external_test_source "流媒体 / 区域解锁测试" "1-stream/RegionRestrictionCheck"
+    echo -e "${YELLOW}通用流媒体固定检测；地区平台按选择追加。AI 平台不会在本项执行。${PLAIN}"
+    echo -e "${CYAN}通用项目包含 Netflix / YouTube Premium / Disney+ / Prime Video / Spotify / Google 等。${PLAIN}"
+    server_test_select_streaming_region || return
+    server_test_select_ip_mode || return
+    echo ""
+    echo -e "${CYAN}检测范围: 通用流媒体${SERVER_TEST_REGION_SELECTION:+ + ${SERVER_TEST_REGION_LABEL}}${PLAIN}"
+    case "$SERVER_TEST_IP_MODE" in
+        4) echo -e "${CYAN}地址族: 仅 IPv4${PLAIN}" ;;
+        6) echo -e "${CYAN}地址族: 仅 IPv6${PLAIN}" ;;
+        *) echo -e "${CYAN}地址族: IPv4 + IPv6${PLAIN}" ;;
+    esac
+    echo ""
+    server_test_show_exit_info_for_mode "$SERVER_TEST_IP_MODE"
+    echo ""
+    server_test_run_region_restriction_check "$SERVER_TEST_REGION_SELECTION" "$SERVER_TEST_IP_MODE" || true
+    echo ""
+    pause
+}
+
+test_ai_unlock() {
+    clear
+    show_external_test_source "AI 工具测试" "oneclickvirt/UnlockTests"
+    echo -e "${CYAN}检测模式: AI-only（ChatGPT / Gemini / Claude / Copilot / Grok / Perplexity / Poe 等）${PLAIN}"
+    echo -e "${YELLOW}结果区分 YES / NO / Restricted / Banned / TIMEOUT / DNS失败等状态。${PLAIN}"
+    server_test_select_ip_mode || return
+    echo ""
+    case "$SERVER_TEST_IP_MODE" in
+        4) echo -e "${CYAN}地址族: 仅 IPv4${PLAIN}" ;;
+        6) echo -e "${CYAN}地址族: 仅 IPv6${PLAIN}" ;;
+        *) echo -e "${CYAN}地址族: IPv4 + IPv6${PLAIN}" ;;
+    esac
+    echo ""
+    server_test_run_unlocktests "21" "AI 平台检测" "$SERVER_TEST_IP_MODE" "region" || true
+    echo ""
+    pause
+}
+
+server_test_communication_probe() {
+    local family="$1" name="$2" url="$3" family_flag errfile http_code rc status
+    [[ "$family" == "ipv6" ]] && family_flag="-6" || family_flag="-4"
+    errfile=$(mktemp /tmp/ss2022-comm.XXXXXX) || return 1
+    http_code=$(curl "$family_flag" -sS -o /dev/null -w '%{http_code}' \
+        --connect-timeout 6 --max-time 12 "$url" 2>"$errfile")
+    rc=$?
+    rm -f "$errfile"
+    case "$rc" in
+        0) status="YES${http_code:+ (HTTP ${http_code})}" ;;
+        6) status="N/A (DNS Resolve Failed)" ;;
+        7) status="NO (Connect Failed)" ;;
+        28) status="TIMEOUT" ;;
+        35|60) status="NO (TLS Failed)" ;;
+        *) status="NO (curl ${rc})" ;;
+    esac
+    printf " %-25s %s\n" "$name" "$status"
+}
+
+server_test_exit_info() {
+    local family="$1" family_flag ip trace country
+    [[ "$family" == "ipv6" ]] && family_flag="-6" || family_flag="-4"
+
+    if [[ "$family" == "ipv6" ]]; then
+        ip=$(get_public_ipv6 2>/dev/null || true)
+    else
+        ip=$(get_public_ipv4 2>/dev/null || true)
+    fi
+
+    trace=$(curl "$family_flag" -fsS --connect-timeout 5 --max-time 8 \
+        "https://www.cloudflare.com/cdn-cgi/trace" 2>/dev/null || true)
+    country=$(awk -F= '$1=="loc" {print $2; exit}' <<<"$trace")
+    [[ "$country" =~ ^[A-Z]{2}$ ]] || country="未知"
+
+    printf " %-25s %s\n" "出口 IP" "${ip:-未知}"
+    printf " %-25s %s\n" "出口地区" "$country"
+}
+
+server_test_run_communication_family() {
+    local family="$1" title
+    [[ "$family" == "ipv6" ]] && title="IPV6" || title="IPV4"
+    echo "===========[ ${title} 通信软件 ]============"
+    server_test_exit_info "$family"
+    server_test_communication_probe "$family" "Telegram" "https://web.telegram.org/"
+    server_test_communication_probe "$family" "WhatsApp" "https://web.whatsapp.com/"
+    server_test_communication_probe "$family" "Signal" "https://signal.org/"
+    server_test_communication_probe "$family" "Discord" "https://discord.com/api/v10/gateway"
+}
+
+test_communication_access() {
+    local family
+    clear
+    echo -e "${CYAN}════════════════════ 通信软件网络可达性测试 ════════════════════${PLAIN}"
+    echo -e "${YELLOW}检测 DNS / TCP / TLS / HTTPS 可达性，不登录账号，也不代表消息发送功能。${PLAIN}"
+    server_test_select_ip_mode || return
+    family=$(server_test_detect_family_mode)
+    echo ""
+    case "$SERVER_TEST_IP_MODE" in
+        4)
+            case "$family" in
+                both|ipv4) server_test_run_communication_family "ipv4" ;;
+                *) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv4。${PLAIN}" ;;
+            esac
+            ;;
+        6)
+            case "$family" in
+                both|ipv6) server_test_run_communication_family "ipv6" ;;
+                *) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv6。${PLAIN}" ;;
+            esac
+            ;;
+        *)
+            case "$family" in
+                both)
+                    server_test_run_communication_family "ipv4"
+                    echo ""
+                    server_test_run_communication_family "ipv6"
+                    ;;
+                ipv4) server_test_run_communication_family "ipv4" ;;
+                ipv6) server_test_run_communication_family "ipv6" ;;
+                *) echo -e "${RED}[错误] 未检测到可用公网 IPv4 / IPv6。${PLAIN}" ;;
+            esac
+            ;;
+    esac
+    echo ""
+    pause
+}
+
+test_platform_media_ai_communication_unlock() {
+    local family
+    clear
+    echo -e "${CYAN}════════════ 平台流媒体AI通信软件解锁测试 ════════════${PLAIN}"
+    echo -e "${YELLOW}一次选择地址族后，依次执行流媒体、AI、通信软件检测。${PLAIN}"
+    echo -e "${YELLOW}通信软件部分检测网络可达性，不登录账号，也不代表消息发送功能。${PLAIN}"
+
+    server_test_select_streaming_region || return
+    server_test_select_ip_mode || return
+    family=$(server_test_detect_family_mode)
+
+    echo ""
+    echo -e "${CYAN}════════════ 1/3 流媒体解锁 ════════════${PLAIN}"
+    show_external_test_source "流媒体 / 区域解锁测试" "1-stream/RegionRestrictionCheck"
+    echo -e "${CYAN}检测范围: 通用流媒体${SERVER_TEST_REGION_SELECTION:+ + ${SERVER_TEST_REGION_LABEL}}${PLAIN}"
+    case "$SERVER_TEST_IP_MODE" in
+        4) echo -e "${CYAN}地址族: 仅 IPv4${PLAIN}" ;;
+        6) echo -e "${CYAN}地址族: 仅 IPv6${PLAIN}" ;;
+        *) echo -e "${CYAN}地址族: IPv4 + IPv6${PLAIN}" ;;
+    esac
+    echo ""
+    server_test_show_exit_info_for_mode "$SERVER_TEST_IP_MODE"
+    echo ""
+    server_test_run_region_restriction_check "$SERVER_TEST_REGION_SELECTION" "$SERVER_TEST_IP_MODE" || true
+
+    echo ""
+    echo -e "${CYAN}════════════ 2/3 AI 工具解锁 ════════════${PLAIN}"
+    show_external_test_source "AI 工具测试" "oneclickvirt/UnlockTests"
+    server_test_run_unlocktests "21" "AI 平台检测" "$SERVER_TEST_IP_MODE" "region" || true
+
+    echo ""
+    echo -e "${CYAN}════════════ 3/3 通信软件解锁 ════════════${PLAIN}"
+    echo -e "${YELLOW}此处“解锁”表示网络可达性检测，不代表账号区服或消息发送能力。${PLAIN}"
+    case "$SERVER_TEST_IP_MODE" in
+        4)
+            case "$family" in
+                both|ipv4) server_test_run_communication_family "ipv4" ;;
+                *) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv4。${PLAIN}" ;;
+            esac
+            ;;
+        6)
+            case "$family" in
+                both|ipv6) server_test_run_communication_family "ipv6" ;;
+                *) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv6。${PLAIN}" ;;
+            esac
+            ;;
+        *)
+            case "$family" in
+                both)
+                    server_test_run_communication_family "ipv4"
+                    echo ""
+                    server_test_run_communication_family "ipv6"
+                    ;;
+                ipv4) server_test_run_communication_family "ipv4" ;;
+                ipv6) server_test_run_communication_family "ipv6" ;;
+                *) echo -e "${RED}[错误] 未检测到可用公网 IPv4 / IPv6。${PLAIN}" ;;
+            esac
+            ;;
+    esac
+
+    echo ""
+    pause
+}
+
+server_test_management() {
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ 服务器测试管理 ════════════════════${PLAIN}"
+        echo "  1. IP 质量 / 风险测试"
+        echo "  2. IPv4 / IPv6 三网逐跳回程"
+        echo "  3. 平台流媒体AI通信软件解锁测试"
+        echo "  0. 返回"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-3]: " c
+        case "$c" in
+            1) test_ip_quality ;;
+            2) test_return_route ;;
+            3) test_platform_media_ai_communication_unlock ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+protocol_operations_management() {
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ 协议运维管理 ════════════════════${PLAIN}"
+        echo "  1. 查看全部服务状态与监听端口"
+        echo "  2. 查看 sing-box 实时日志"
+        echo "  3. 查看 ss2022-xray 实时日志"
+        echo "  4. 查看 Snell v5 实时日志"
+        echo "  5. 查看 Realm 转发实时日志"
+        echo "  6. 重启 sing-box"
+        echo "  7. 重启 ss2022-xray"
+        echo "  8. 重启 Snell v5"
+        echo "  9. 重启 Realm 转发"
+        echo " 10. 查看 IPv6 Keepalive 状态"
+        echo "  0. 返回"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-10]: " c
+        case "$c" in
+            1) show_service_status; pause ;;
+            2) follow_service_log sing-box ;;
+            3) follow_service_log "$XRAY_SERVICE_NAME" ;;
+            4) follow_service_log snell-v5 ;;
+            5) follow_service_log "$REALM_SERVICE_NAME" ;;
+            6) restart_service_safe sing-box "sing-box"; pause ;;
+            7) restart_service_safe "$XRAY_SERVICE_NAME" "ss2022-xray"; pause ;;
+            8) restart_service_safe snell-v5 "Snell v5"; pause ;;
+            9) restart_service_safe "$REALM_SERVICE_NAME" "Realm 转发"; pause ;;
+            10)
+                if service_is_active "$(keepalive_service_name)"; then
+                    echo "IPv6 Keepalive: Running"
+                    service_status_output "$(keepalive_service_name)" 2>/dev/null || true
+                else
+                    echo "IPv6 Keepalive: 未运行"
+                fi
+                pause
+                ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+main() {
+    check_root
+    detect_platform || exit 1
+    if platform_is_alpine; then
+        echo "[v1.9.0] 已检测到 Alpine / OpenRC；核心协议、服务管理、服务器工具与测试已接入稳定支持范围。"
+        echo "[提示] Snell v5 官方二进制与 Cloudflare WARP 官方客户端暂不在 Alpine 开放。"
+    fi
+
+    # 兼容旧安装：已有 local-dns 缺少 prefer_go:true 时执行一次安全迁移。
+    # 失败不会覆盖旧配置，也不会阻断管理面板。
+    migrate_singbox_local_dns_prefer_go || true
+
+    while true; do
+        show_dashboard
+        echo "  1. 协议管理"
+        echo "  2. 分流管理"
+        echo "  3. 端口转发（Realm）"
+        echo "  4. 查看当前节点参数与客户端配置"
+        echo "  5. 协议运维管理"
+        echo "  6. 组件版本管理"
+        echo "  - - - - - - - - - - - - - - - -"
+        echo "  7. 服务器管理工具"
+        echo "  8. 服务器测试管理"
+        echo "  - - - - - - - - - - - - - - - -"
+        echo "  9. 检查脚本更新"
+        echo -e "${RED} 10. 完全卸载脚本${PLAIN}"
+        echo "  0. 退出管理面板"
+        echo -e "${CYAN}═════════════════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请输入选项编号 [0-10]: " choice
+
+        case "$choice" in
+            1) protocol_management ;;
+            2) routing_management ;;
+            3) forwarding_management ;;
+            4) view_config_menu ;;
+            5) protocol_operations_management ;;
+            6) component_version_management ;;
+            7) server_management_tools ;;
+            8) server_test_management ;;
+            9) check_script_update ;;
+            10) full_uninstall ;;
+            0)
+                echo "已安全退出。随时输入 ss2022 唤出！"
+                exit 0
+                ;;
+            *)
+                echo -e "${RED}请输入有效编号！${PLAIN}"
+                sleep 1
+                ;;
+        esac
+    done
+} 
+
+# CI / smoke test can load the function library without entering the interactive UI.
+# Normal users never need to set this variable.
+if [[ "${SS2022_LIB_ONLY:-0}" != "1" ]]; then
+    main
+fi
+\t'*}
+    eff1=${result#*    while true; do
+        clear
+        routing_init_state || return
+        local def count rules warp_state="未连接"
+        def=$(jq -r '.default_outbound' "$ROUTING_FILE")
+        count=$(jq '.chain_nodes|length' "$ROUTING_FILE")
+        rules=$(jq '.rules|length' "$ROUTING_FILE")
+        warp_proxy_ready && warp_state="Running"
+        echo -e "${CYAN}════════════════════ 分流管理 ════════════════════${PLAIN}"
+        echo "服务端分流适用：SS2022 / SS2022+ShadowTLS / VLESS Reality"
+        echo "Snell v5：保持官方 snell-server，分流请使用 Surge Rules"
+        echo ""
+        echo "默认出口 : $(routing_outbound_label "$def")"
+        echo "地址族   : $(routing_ip_family_label "$(routing_global_ip_family)")"
+        if [[ "$warp_state" == "Running" ]]; then
+            warp_detect_direct_profile
+            echo "WARP     : ${warp_state} / $(warp_profile_label "$WARP_PROFILE")"
+        else
+            echo "WARP     : ${warp_state}"
+        fi
+        echo "落地节点 : ${count} 个"
+        echo "规则     : ${rules} 条"
+        echo ""
+        echo "  1. WARP 出口管理"
+        echo "  2. 落地节点管理"
+        echo "  3. 分流规则管理"
+        echo "  4. 查看当前分流配置"
+        echo "  5. 测试分流效果"
+        echo "  0. 返回"
+        echo -e "${CYAN}══════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-5]: " c
+        case "$c" in
+            1) warp_management ;;
+            2) chain_management ;;
+            3) routing_rule_management ;;
+            4) routing_show_config; pause ;;
+            5) routing_test_effect; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+# ==============================================================================
+# [10] Realm L4 端口转发
+# ==============================================================================
+
+ensure_realm_user() {
+    ensure_managed_system_user "$REALM_USER" "$REALM_GROUP" "$REALM_USER_MARKER" "$REALM_GROUP_MARKER"
+}
+write_realm_service() {
+    ensure_realm_user || return 1
+    mkdir -p "$(dirname "$REALM_CONF")" "$(dirname "$REALM_BIN")" || return 1
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        cat > "$REALM_SERVICE" <<SERVICE
+[Unit]
+Description=ss2022.sh managed Realm L4 forwarding service
+Documentation=https://github.com/zhboner/realm
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${REALM_USER}
+Group=${REALM_GROUP}
+ExecStart=${REALM_BIN} -c ${REALM_CONF}
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=1048576
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+        service_daemon_reload || return 1
+        return 0
+    fi
+    mkdir -p /var/log/ss2022 || return 1
+    touch "$REALM_OPENRC_LOG" || return 1
+    chown "$REALM_USER:$REALM_GROUP" "$REALM_OPENRC_LOG" || return 1
+    chmod 640 "$REALM_OPENRC_LOG"
+    cat > "$REALM_OPENRC_SERVICE" <<SERVICE
+#!/sbin/openrc-run
+description="vps-bootstrap Realm L4 forwarding"
+command="$REALM_BIN"
+command_args="-c $REALM_CONF"
+command_user="$REALM_USER:$REALM_GROUP"
+supervisor="supervise-daemon"
+pidfile="$REALM_OPENRC_PID"
+output_log="$REALM_OPENRC_LOG"
+error_log="$REALM_OPENRC_LOG"
+respawn_delay=3
+respawn_max=0
+umask=0077
+
+depend() {
+    need net
+    use dns
+}
+SERVICE
+    chmod 755 "$REALM_OPENRC_SERVICE"
+    return 0
+}
+forwarding_init_state() {
+    mkdir -p "$STATE_DIR" || return 1
+    chmod 700 "$STATE_DIR"
+    if [[ ! -f "$FORWARDING_FILE" ]]; then
+        cat > "$FORWARDING_FILE" <<'EOF'
+{
+  "version": 1,
+  "rules": []
+}
+EOF
+        chmod 600 "$FORWARDING_FILE"
+        return 0
+    fi
+
+    if ! jq -e 'type=="object" and ((.rules // [])|type=="array")' "$FORWARDING_FILE" >/dev/null 2>&1; then
+        echo -e "${RED}[错误] ${FORWARDING_FILE} 格式损坏，请先备份后修复。${PLAIN}"
+        return 1
+    fi
+
+    local tmp=""
+    tmp=$(mktemp "${STATE_DIR}/forwarding.json.tmp.XXXXXX") || return 1
+    if ! jq '.version=(.version // 1) | .rules=(.rules // [])' "$FORWARDING_FILE" > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    mv -f "$tmp" "$FORWARDING_FILE"
+    chmod 600 "$FORWARDING_FILE"
+}
+
+realm_asset_name() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo "realm-x86_64-unknown-linux-musl.tar.gz" ;;
+        aarch64|arm64) echo "realm-aarch64-unknown-linux-musl.tar.gz" ;;
+        *) return 1 ;;
+    esac
+}
+
+realm_fetch_asset_metadata() {
+    local asset="$1" api tmp expected url
+    api="https://api.github.com/repos/zhboner/realm/releases/tags/v${REALM_VERSION}"
+    tmp=$(mktemp /tmp/ss2022-realm-meta.XXXXXX) || return 1
+
+    if ! curl -fsSL --retry 2 --connect-timeout 10 --max-time 30 \
+        -H 'Accept: application/vnd.github+json' "$api" -o "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+
+    url=$(jq -r --arg a "$asset" '.assets[]? | select(.name==$a) | .browser_download_url // empty' "$tmp" | head -n1)
+    expected=$(jq -r --arg a "$asset" '.assets[]? | select(.name==$a) | .digest // empty' "$tmp" | head -n1)
+    rm -f "$tmp"
+
+    expected=${expected#sha256:}
+    [[ -n "$url" && "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || return 1
+    printf '%s\t%s\n' "$url" "$expected"
+}
+
+install_realm_core() {
+    install_dependencies || return 1
+
+    local asset="" metadata="" url="" expected="" archive="" actual="" tmpdir="" src="" download_url=""
+    asset=$(realm_asset_name) || {
+        echo -e "${RED}[错误] Realm 当前仅支持 x86_64 / aarch64 Linux。${PLAIN}"
+        return 1
+    }
+
+    echo -e "${YELLOW}>> 获取 Realm v${REALM_VERSION} 官方 Release 校验信息...${PLAIN}"
+    metadata=$(realm_fetch_asset_metadata "$asset") || {
+        echo -e "${RED}[错误] 无法从 GitHub 官方 Release 获取 ${asset} 的 SHA256 digest，拒绝不校验安装。${PLAIN}"
+        return 1
+    }
+    url=${metadata%%$'\t'*}
+    expected=${metadata#*$'\t'}
+
+    archive="/tmp/ss2022-${asset}"
+    rm -f "$archive"
+    local sources=(
+        "$url"
+        "https://ghproxy.net/${url}"
+        "https://gh-proxy.com/${url}"
+        "https://ghps.cc/${url}"
+    )
+
+    local ok=0
+    for download_url in "${sources[@]}"; do
+        echo -e "   尝试下载: ${CYAN}${download_url}${PLAIN}"
+        rm -f "$archive"
+        if ! curl -fL --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 120 "$download_url" -o "$archive"; then
+            echo -e "${YELLOW}   下载失败，尝试下一个源。${PLAIN}"
+            continue
+        fi
+        actual=$(sha256sum "$archive" | awk '{print $1}')
+        if [[ "${actual,,}" != "${expected,,}" ]]; then
+            echo -e "${RED}   SHA256 校验失败，拒绝安装。${PLAIN}"
+            echo "   期望: $expected"
+            echo "   实际: $actual"
+            continue
+        fi
+        if ! tar -tzf "$archive" >/dev/null 2>&1; then
+            echo -e "${RED}   Realm 压缩包结构无效。${PLAIN}"
+            continue
+        fi
+        if tar -tzf "$archive" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
+            echo -e "${RED}   Realm 压缩包包含不安全路径，拒绝解压。${PLAIN}"
+            continue
+        fi
+        ok=1
+        break
+    done
+    [[ $ok -eq 1 ]] || { rm -f "$archive"; return 1; }
+
+    tmpdir=$(mktemp -d /tmp/ss2022-realm-install.XXXXXX) || { rm -f "$archive"; return 1; }
+    tar -xzf "$archive" -C "$tmpdir" || { rm -rf "$tmpdir" "$archive"; return 1; }
+    src=$(find "$tmpdir" -type f -name realm -perm -u+x -print -quit 2>/dev/null || true)
+    if [[ -z "$src" ]]; then
+        src=$(find "$tmpdir" -type f -name realm -print -quit 2>/dev/null || true)
+    fi
+    [[ -n "$src" ]] || {
+        echo -e "${RED}[错误] Realm 压缩包中未找到二进制。${PLAIN}"
+        rm -rf "$tmpdir" "$archive"
+        return 1
+    }
+
+    mkdir -p "$(dirname "$REALM_BIN")"
+    install -m 0755 "$src" "$REALM_BIN" || { rm -rf "$tmpdir" "$archive"; return 1; }
+    rm -rf "$tmpdir" "$archive"
+
+    local installed_version=""
+    installed_version=$("$REALM_BIN" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)
+    if [[ "$installed_version" != "$REALM_VERSION" ]]; then
+        echo -e "${RED}[错误] Realm 安装后版本校验失败：期望 ${REALM_VERSION}，实际 ${installed_version:-未知}。${PLAIN}"
+        rm -f "$REALM_BIN"
+        return 1
+    fi
+
+    if platform_is_alpine; then
+        command -v setcap >/dev/null 2>&1 || { echo -e "${RED}[错误] Alpine 缺少 setcap。${PLAIN}"; return 1; }
+        setcap cap_net_bind_service=+ep "$REALM_BIN" || { echo -e "${RED}[错误] 无法为 Realm 设置低端口 capability。${PLAIN}"; return 1; }
+        "$REALM_BIN" --version >/dev/null 2>&1 || { echo -e "${RED}[错误] Realm 设置 capability 后无法执行。${PLAIN}"; return 1; }
+    fi
+    write_realm_service || return 1
+    echo -e "${GREEN}✔ Realm v${REALM_VERSION} 已安装并通过 SHA256/版本校验。${PLAIN}"
+}
+
+forwarding_format_host_port() {
+    local host="$1" port="$2"
+    host=${host#[}
+    host=${host%]}
+    if [[ "$host" == *:* ]]; then
+        printf '[%s]:%s' "$host" "$port"
+    else
+        printf '%s:%s' "$host" "$port"
+    fi
+}
+
+forwarding_network_json() {
+    local proto="$1" ipv6_only="${2:-false}"
+    case "$proto" in
+        tcp) jq -nc --argjson v6 "$ipv6_only" '{no_tcp:false,use_udp:false,ipv6_only:$v6}' ;;
+        udp) jq -nc --argjson v6 "$ipv6_only" '{no_tcp:true,use_udp:true,ipv6_only:$v6}' ;;
+        both) jq -nc --argjson v6 "$ipv6_only" '{no_tcp:false,use_udp:true,ipv6_only:$v6}' ;;
+        *) return 1 ;;
+    esac
+}
+
+realm_build_config_from_state() {
+    local state="$1" out="$2"
+    [[ -f "$state" ]] || return 1
+
+    local endpoints='[]' rule="" id="" type="" family="" proto="" host=""
+    local lport="" rport="" lstart="" lend="" rstart="" p="" rp=""
+    local remote="" network="" ep="" listen=""
+    while IFS= read -r rule; do
+        [[ -n "$rule" ]] || continue
+        id=$(jq -r '.id' <<<"$rule")
+        type=$(jq -r '.type' <<<"$rule")
+        family=$(jq -r '.listen_family' <<<"$rule")
+        proto=$(jq -r '.protocol' <<<"$rule")
+        host=$(jq -r '.remote_host' <<<"$rule")
+
+        if [[ "$type" == "single" ]]; then
+            lstart=$(jq -r '.listen_port' <<<"$rule")
+            lend="$lstart"
+            rstart=$(jq -r '.remote_port' <<<"$rule")
+        else
+            lstart=$(jq -r '.listen_start' <<<"$rule")
+            lend=$(jq -r '.listen_end' <<<"$rule")
+            rstart=$(jq -r '.remote_start' <<<"$rule")
+        fi
+
+        p="$lstart"
+        while [[ "$p" -le "$lend" ]]; do
+            rp=$((rstart + p - lstart))
+            remote=$(forwarding_format_host_port "$host" "$rp")
+
+            case "$family" in
+                ipv4)
+                    listen="0.0.0.0:${p}"
+                    network=$(forwarding_network_json "$proto" false) || return 1
+                    ep=$(jq -nc --arg l "$listen" --arg r "$remote" --argjson n "$network" --arg id "$id" \
+                        '{listen:$l,remote:$r,network:$n}')
+                    endpoints=$(jq -nc --argjson a "$endpoints" --argjson e "$ep" '$a + [$e]')
+                    ;;
+                ipv6)
+                    listen="[::]:${p}"
+                    network=$(forwarding_network_json "$proto" true) || return 1
+                    ep=$(jq -nc --arg l "$listen" --arg r "$remote" --argjson n "$network" --arg id "$id" \
+                        '{listen:$l,remote:$r,network:$n}')
+                    endpoints=$(jq -nc --argjson a "$endpoints" --argjson e "$ep" '$a + [$e]')
+                    ;;
+                dual)
+                    # Realm 官方语义：[::]:port + ipv6_only=false 会同时接受 IPv6 与 IPv4-mapped IPv6，
+                    # 因此双栈只生成一个 endpoint，避免同端口重复 bind。
+                    listen="[::]:${p}"
+                    network=$(forwarding_network_json "$proto" false) || return 1
+                    ep=$(jq -nc --arg l "$listen" --arg r "$remote" --argjson n "$network" --arg id "$id" \
+                        '{listen:$l,remote:$r,network:$n}')
+                    endpoints=$(jq -nc --argjson a "$endpoints" --argjson e "$ep" '$a + [$e]')
+                    ;;
+                *) return 1 ;;
+            esac
+            p=$((p+1))
+        done
+    done < <(jq -c '.rules[]?' "$state")
+
+    jq -n --argjson eps "$endpoints" '{
+      log:{level:"warn",output:"stdout"},
+      network:{
+        no_tcp:false,
+        use_udp:false,
+        tcp_timeout:5,
+        udp_timeout:30,
+        tcp_keepalive:15,
+        tcp_keepalive_probe:3
+      },
+      endpoints:$eps
+    }' > "$out"
+    jq -e '.endpoints|type=="array"' "$out" >/dev/null 2>&1
+}
+
+forwarding_rule_interval() {
+    local rule="$1"
+    if [[ "$(jq -r '.type' <<<"$rule")" == "single" ]]; then
+        printf '%s %s\n' "$(jq -r '.listen_port' <<<"$rule")" "$(jq -r '.listen_port' <<<"$rule")"
+    else
+        printf '%s %s\n' "$(jq -r '.listen_start' <<<"$rule")" "$(jq -r '.listen_end' <<<"$rule")"
+    fi
+}
+
+forwarding_state_port_conflict() {
+    local start="$1" end="$2" exclude_id="${3:-}" rule="" s="" e=""
+    while IFS= read -r rule; do
+        [[ -n "$rule" ]] || continue
+        [[ -n "$exclude_id" && "$(jq -r '.id' <<<"$rule")" == "$exclude_id" ]] && continue
+        read -r s e < <(forwarding_rule_interval "$rule")
+        if (( start <= e && end >= s )); then
+            return 0
+        fi
+    done < <(jq -c '.rules[]?' "$FORWARDING_FILE")
+    return 1
+}
+
+forwarding_os_port_conflict_range() {
+    local start="$1" end="$2" allowed_pid=""
+    allowed_pid=$(service_main_pid "$REALM_SERVICE_NAME" 2>/dev/null || true)
+    local p lines conflicts
+    lines=$(ss -H -lntup 2>/dev/null || true)
+    p="$start"
+    while [[ "$p" -le "$end" ]]; do
+        conflicts=$(printf '%s\n' "$lines" | awk -v p="$p" '
+          {
+            addr=$5; n=split(addr,a,":");
+            if (a[n] == p) print
+          }')
+        if [[ -n "$conflicts" && "$allowed_pid" =~ ^[0-9]+$ && "$allowed_pid" -gt 0 ]]; then
+            conflicts=$(printf '%s\n' "$conflicts" | grep -v "pid=${allowed_pid}," || true)
+        fi
+        if [[ -n "$conflicts" ]]; then
+            echo -e "${RED}[错误] 端口 ${p} 已被其他进程占用：${PLAIN}"
+            printf '%s\n' "$conflicts"
+            return 0
+        fi
+        p=$((p+1))
+    done
+    return 1
+}
+
+forwarding_apply_state_candidate() {
+    local candidate="$1" cfg_tmp="" state_backup="" cfg_backup="" old_count=0 new_count=0
+    [[ -f "$candidate" ]] || return 1
+    jq -e 'type=="object" and (.rules|type=="array")' "$candidate" >/dev/null 2>&1 || {
+        rm -f "$candidate"
+        return 1
+    }
+
+    new_count=$(jq '.rules|length' "$candidate")
+    if [[ "$new_count" -gt 0 && ! -x "$REALM_BIN" ]]; then
+        install_realm_core || { rm -f "$candidate"; return 1; }
+    fi
+    [[ "$new_count" -eq 0 ]] || write_realm_service || { rm -f "$candidate"; return 1; }
+
+    mkdir -p /etc/ss2022-realm || { rm -f "$candidate"; return 1; }
+    cfg_tmp=$(mktemp "/etc/ss2022-realm/config.json.tmp.XXXXXX") || { rm -f "$candidate"; return 1; }
+    if ! realm_build_config_from_state "$candidate" "$cfg_tmp"; then
+        rm -f "$candidate" "$cfg_tmp"
+        echo -e "${RED}[错误] Realm 配置生成失败。${PLAIN}"
+        return 1
+    fi
+
+    state_backup=$(mktemp "${STATE_DIR}/forwarding.rollback.XXXXXX") || { rm -f "$candidate" "$cfg_tmp"; return 1; }
+    cp -a "$FORWARDING_FILE" "$state_backup" || { rm -f "$candidate" "$cfg_tmp" "$state_backup"; return 1; }
+    old_count=$(jq '.rules|length' "$state_backup" 2>/dev/null || echo 0)
+
+    mkdir -p "$(dirname "$REALM_CONF")"
+    if [[ -f "$REALM_CONF" ]]; then
+        cfg_backup=$(mktemp "/etc/ss2022-realm/config.rollback.XXXXXX") || { rm -f "$candidate" "$cfg_tmp" "$state_backup"; return 1; }
+        cp -a "$REALM_CONF" "$cfg_backup"
+    fi
+
+    mv -f "$candidate" "$FORWARDING_FILE"
+    chmod 600 "$FORWARDING_FILE"
+    mv -f "$cfg_tmp" "$REALM_CONF"
+    chown root:"$REALM_GROUP" "$REALM_CONF"
+    chmod 640 "$REALM_CONF"
+
+    if [[ "$new_count" -eq 0 ]]; then
+        service_disable_now "$REALM_SERVICE_NAME"
+        rm -f "$state_backup" "$cfg_backup"
+        echo -e "${GREEN}✔ Realm 转发规则已清空，服务已停止。${PLAIN}"
+        return 0
+    fi
+
+    service_daemon_reload || true
+    service_enable "$REALM_SERVICE_NAME" >/dev/null 2>&1 || true
+    if service_restart "$REALM_SERVICE_NAME" && sleep 1 && service_is_active "$REALM_SERVICE_NAME"; then
+        rm -f "$state_backup" "$cfg_backup"
+        echo -e "${GREEN}✔ Realm 转发配置已应用。${PLAIN}"
+        return 0
+    fi
+
+    echo -e "${RED}[错误] Realm 新配置启动失败，正在恢复旧配置和旧规则...${PLAIN}"
+    mv -f "$state_backup" "$FORWARDING_FILE"
+    if [[ -n "$cfg_backup" && -f "$cfg_backup" ]]; then
+        mv -f "$cfg_backup" "$REALM_CONF"
+        chown root:"$REALM_GROUP" "$REALM_CONF" 2>/dev/null || true
+        chmod 640 "$REALM_CONF"
+    else
+        rm -f "$REALM_CONF"
+    fi
+    if [[ "$old_count" -gt 0 ]]; then
+        service_restart "$REALM_SERVICE_NAME" >/dev/null 2>&1 || true
+    else
+        service_disable_now "$REALM_SERVICE_NAME"
+    fi
+    service_log_tail "$REALM_SERVICE_NAME" 30 || true
+    return 1
+}
+
+forwarding_choose_family() {
+    local default="${1:-ipv4}" c=""
+    echo "请选择监听网络：" >&2
+    echo "  1. IPv4" >&2
+    echo "  2. IPv6" >&2
+    echo "  3. 双栈 IPv4 + IPv6" >&2
+    local d=1
+    [[ "$default" == "ipv6" ]] && d=2
+    [[ "$default" == "dual" ]] && d=3
+    read -rp "请选择 [1-3，默认 ${d}]: " c
+    c=${c:-$d}
+    case "$c" in
+        1) echo ipv4 ;;
+        2) echo ipv6 ;;
+        3) echo dual ;;
+        *) return 1 ;;
+    esac
+}
+
+forwarding_choose_protocol() {
+    local default="${1:-both}" c=""
+    echo "请选择转发协议：" >&2
+    echo "  1. TCP" >&2
+    echo "  2. UDP" >&2
+    echo "  3. TCP + UDP" >&2
+    local d=3
+    [[ "$default" == "tcp" ]] && d=1
+    [[ "$default" == "udp" ]] && d=2
+    read -rp "请选择 [1-3，默认 ${d}]: " c
+    c=${c:-$d}
+    case "$c" in
+        1) echo tcp ;;
+        2) echo udp ;;
+        3) echo both ;;
+        *) return 1 ;;
+    esac
+}
+
+forwarding_sanitize_host() {
+    local h="$1"
+    h=${h#[}
+    h=${h%]}
+    [[ -n "$h" && "$h" != *[[:space:]]* ]] || return 1
+    printf '%s' "$h"
+}
+
+forwarding_next_name() {
+    local base="$1" name="" n=2
+    name="$base"
+    while jq -e --arg n "$name" '.rules[]? | select(.name==$n)' "$FORWARDING_FILE" >/dev/null 2>&1; do
+        name="${base}-${n}"
+        n=$((n+1))
+    done
+    echo "$name"
+}
+
+forwarding_add_single() {
+    forwarding_init_state || return
+    local port="" rhost="" rport="" family="" proto="" name="" candidate="" id=""
+    while true; do
+        read -rp "本机监听端口: " port
+        validate_port_number "$port" && break
+        echo -e "${RED}端口必须为 1-65535。${PLAIN}"
+    done
+
+    if forwarding_state_port_conflict "$port" "$port"; then
+        echo -e "${RED}[错误] 端口 ${port} 已存在 Realm 转发规则。${PLAIN}"
+        pause; return
+    fi
+    if forwarding_os_port_conflict_range "$port" "$port"; then
+        pause; return
+    fi
+
+    family=$(forwarding_choose_family ipv4) || { echo "无效选择"; pause; return; }
+    proto=$(forwarding_choose_protocol both) || { echo "无效选择"; pause; return; }
+
+    while true; do
+        read -rp "目标服务器 IP/域名: " rhost
+        rhost=$(forwarding_sanitize_host "$rhost" 2>/dev/null || true)
+        [[ -n "$rhost" ]] && break
+        echo -e "${RED}目标地址不能为空或包含空格。${PLAIN}"
+    done
+    while true; do
+        read -rp "目标端口 [默认: ${port}]: " rport
+        rport=${rport:-$port}
+        validate_port_number "$rport" && break
+        echo -e "${RED}目标端口必须为 1-65535。${PLAIN}"
+    done
+
+    read -rp "规则备注 [默认: PF-${port}]: " name
+    name=${name:-"PF-${port}"}
+    name=$(forwarding_next_name "$name")
+    id="pf-$(date +%s)-${RANDOM}"
+
+    echo ""
+    echo "确认添加：${name}"
+    echo "  监听 : ${family} / ${port}"
+    echo "  目标 : ${rhost}:${rport}"
+    echo "  协议 : ${proto}"
+    local yes=""
+    read -rp "确认？[Y/n]: " yes
+    [[ ! "$yes" =~ ^[Nn]$ ]] || return
+
+    candidate=$(mktemp "${STATE_DIR}/forwarding.candidate.XXXXXX") || return
+    if ! jq \
+        --arg id "$id" --arg name "$name" --arg family "$family" --arg proto "$proto" \
+        --arg host "$rhost" --argjson lp "$port" --argjson rp "$rport" \
+        '.rules += [{id:$id,name:$name,type:"single",listen_family:$family,protocol:$proto,listen_port:$lp,remote_host:$host,remote_port:$rp}]' \
+        "$FORWARDING_FILE" > "$candidate"; then
+        rm -f "$candidate"; return
+    fi
+    forwarding_apply_state_candidate "$candidate"
+    pause
+}
+
+forwarding_add_range() {
+    forwarding_init_state || return
+    local start="" end="" rhost="" rstart="" rend="" family="" proto="" name="" candidate="" id="" count=""
+    while true; do
+        read -rp "本机起始端口: " start
+        validate_port_number "$start" && break
+        echo -e "${RED}端口必须为 1-65535。${PLAIN}"
+    done
+    while true; do
+        read -rp "本机结束端口: " end
+        if validate_port_number "$end" && [[ "$end" -ge "$start" ]]; then break; fi
+        echo -e "${RED}结束端口必须 >= 起始端口且 <= 65535。${PLAIN}"
+    done
+    count=$((end-start+1))
+    if [[ "$count" -gt "$REALM_MAX_RANGE_PORTS" ]]; then
+        echo -e "${RED}[错误] 单条端口段最多 ${REALM_MAX_RANGE_PORTS} 个端口。${PLAIN}"
+        pause; return
+    fi
+    if forwarding_state_port_conflict "$start" "$end"; then
+        echo -e "${RED}[错误] ${start}-${end} 与现有 Realm 转发规则端口重叠。${PLAIN}"
+        pause; return
+    fi
+    if forwarding_os_port_conflict_range "$start" "$end"; then
+        pause; return
+    fi
+
+    family=$(forwarding_choose_family ipv4) || { echo "无效选择"; pause; return; }
+    proto=$(forwarding_choose_protocol both) || { echo "无效选择"; pause; return; }
+
+    while true; do
+        read -rp "目标服务器 IP/域名: " rhost
+        rhost=$(forwarding_sanitize_host "$rhost" 2>/dev/null || true)
+        [[ -n "$rhost" ]] && break
+        echo -e "${RED}目标地址不能为空或包含空格。${PLAIN}"
+    done
+    while true; do
+        read -rp "目标起始端口 [默认: ${start}]: " rstart
+        rstart=${rstart:-$start}
+        if validate_port_number "$rstart"; then
+            rend=$((rstart+count-1))
+            [[ "$rend" -le 65535 ]] && break
+        fi
+        echo -e "${RED}目标端口段必须落在 1-65535。${PLAIN}"
+    done
+
+    read -rp "规则备注 [默认: PF-${start}-${end}]: " name
+    name=${name:-"PF-${start}-${end}"}
+    name=$(forwarding_next_name "$name")
+    id="pf-$(date +%s)-${RANDOM}"
+
+    echo ""
+    echo "确认添加：${name}"
+    echo "  监听 : ${family} / ${start}-${end}"
+    echo "  目标 : ${rhost}:${rstart}-${rend}"
+    echo "  协议 : ${proto}"
+    local yes=""
+    read -rp "确认？[Y/n]: " yes
+    [[ ! "$yes" =~ ^[Nn]$ ]] || return
+
+    candidate=$(mktemp "${STATE_DIR}/forwarding.candidate.XXXXXX") || return
+    if ! jq \
+        --arg id "$id" --arg name "$name" --arg family "$family" --arg proto "$proto" \
+        --arg host "$rhost" --argjson ls "$start" --argjson le "$end" --argjson rs "$rstart" \
+        '.rules += [{id:$id,name:$name,type:"range",listen_family:$family,protocol:$proto,listen_start:$ls,listen_end:$le,remote_host:$host,remote_start:$rs}]' \
+        "$FORWARDING_FILE" > "$candidate"; then
+        rm -f "$candidate"; return
+    fi
+    forwarding_apply_state_candidate "$candidate"
+    pause
+}
+
+forwarding_print_rules() {
+    forwarding_init_state || return 1
+    local count="" i=0 r="" type="" ports="" remote="" rstart="" rend="" lstart="" lend=""
+    count=$(jq '.rules|length' "$FORWARDING_FILE")
+    if [[ "$count" -eq 0 ]]; then
+        echo "暂无 Realm 转发规则。"
+        return 0
+    fi
+    printf "%-4s %-22s %-9s %-7s %-15s %s\n" "序号" "备注" "监听" "协议" "本机端口" "目标"
+    echo "------------------------------------------------------------------------------------------------"
+    while [[ "$i" -lt "$count" ]]; do
+        r=$(jq -c ".rules[$i]" "$FORWARDING_FILE")
+        type=$(jq -r '.type' <<<"$r")
+        if [[ "$type" == "single" ]]; then
+            ports=$(jq -r '.listen_port|tostring' <<<"$r")
+            remote="$(jq -r '.remote_host' <<<"$r"):$(jq -r '.remote_port' <<<"$r")"
+        else
+            lstart=$(jq -r '.listen_start' <<<"$r"); lend=$(jq -r '.listen_end' <<<"$r")
+            rstart=$(jq -r '.remote_start' <<<"$r"); rend=$((rstart+lend-lstart))
+            ports="${lstart}-${lend}"
+            remote="$(jq -r '.remote_host' <<<"$r"):${rstart}-${rend}"
+        fi
+        printf "%-4s %-22s %-9s %-7s %-15s %s\n" \
+            "$((i+1))" "$(jq -r '.name' <<<"$r")" "$(jq -r '.listen_family' <<<"$r")" \
+            "$(jq -r '.protocol' <<<"$r")" "$ports" "$remote"
+        i=$((i+1))
+    done
+}
+
+forwarding_select_rule_index() {
+    forwarding_print_rules >&2
+    local count="" c=""
+    count=$(jq '.rules|length' "$FORWARDING_FILE")
+    [[ "$count" -gt 0 ]] || return 1
+    read -rp "请选择规则序号 [1-${count}]: " c
+    [[ "$c" =~ ^[0-9]+$ && "$c" -ge 1 && "$c" -le "$count" ]] || return 1
+    echo $((c-1))
+}
+
+forwarding_edit_rule() {
+    forwarding_init_state || return
+    local idx="" rule="" id="" c="" candidate="" new="" old_start="" old_end="" start="" end="" rstart="" count="" rend=""
+    idx=$(forwarding_select_rule_index) || { echo "无效选择。"; pause; return; }
+    rule=$(jq -c ".rules[$idx]" "$FORWARDING_FILE")
+    id=$(jq -r '.id' <<<"$rule")
+
+    while true; do
+        clear
+        rule=$(jq -c --arg id "$id" '.rules[] | select(.id==$id)' "$FORWARDING_FILE")
+        [[ -n "$rule" ]] || return
+        echo -e "${CYAN}════════════════════ 修改转发规则 ════════════════════${PLAIN}"
+        echo "备注 : $(jq -r '.name' <<<"$rule")"
+        echo "监听 : $(jq -r '.listen_family' <<<"$rule")"
+        echo "协议 : $(jq -r '.protocol' <<<"$rule")"
+        if [[ "$(jq -r '.type' <<<"$rule")" == "single" ]]; then
+            echo "端口 : $(jq -r '.listen_port' <<<"$rule") → $(jq -r '.remote_host' <<<"$rule"):$(jq -r '.remote_port' <<<"$rule")"
+        else
+            old_start=$(jq -r '.listen_start' <<<"$rule"); old_end=$(jq -r '.listen_end' <<<"$rule")
+            rstart=$(jq -r '.remote_start' <<<"$rule"); rend=$((rstart+old_end-old_start))
+            echo "端口 : ${old_start}-${old_end} → $(jq -r '.remote_host' <<<"$rule"):${rstart}-${rend}"
+        fi
+        echo ""
+        echo "  1. 修改备注"
+        echo "  2. 修改监听网络"
+        echo "  3. 修改转发协议"
+        echo "  4. 修改目标服务器/目标端口"
+        echo "  5. 修改本机监听端口/端口段"
+        echo "  0. 返回"
+        read -rp "请选择 [0-5]: " c
+        [[ "$c" == "0" ]] && return
+
+        candidate=$(mktemp "${STATE_DIR}/forwarding.candidate.XXXXXX") || return
+        case "$c" in
+            1)
+                read -rp "新备注: " new
+                [[ -n "$new" ]] || { rm -f "$candidate"; continue; }
+                jq --arg id "$id" --arg v "$new" '(.rules[]|select(.id==$id)|.name)=$v' "$FORWARDING_FILE" > "$candidate"
+                ;;
+            2)
+                new=$(forwarding_choose_family "$(jq -r '.listen_family' <<<"$rule")") || { rm -f "$candidate"; continue; }
+                jq --arg id "$id" --arg v "$new" '(.rules[]|select(.id==$id)|.listen_family)=$v' "$FORWARDING_FILE" > "$candidate"
+                ;;
+            3)
+                new=$(forwarding_choose_protocol "$(jq -r '.protocol' <<<"$rule")") || { rm -f "$candidate"; continue; }
+                jq --arg id "$id" --arg v "$new" '(.rules[]|select(.id==$id)|.protocol)=$v' "$FORWARDING_FILE" > "$candidate"
+                ;;
+            4)
+                local nhost="" nr=""
+                read -rp "目标服务器 IP/域名 [当前: $(jq -r '.remote_host' <<<"$rule")]: " nhost
+                nhost=${nhost:-$(jq -r '.remote_host' <<<"$rule")}
+                nhost=$(forwarding_sanitize_host "$nhost" 2>/dev/null || true)
+                [[ -n "$nhost" ]] || { rm -f "$candidate"; continue; }
+                if [[ "$(jq -r '.type' <<<"$rule")" == "single" ]]; then
+                    nr=$(jq -r '.remote_port' <<<"$rule")
+                    read -rp "目标端口 [当前: ${nr}]: " new
+                    new=${new:-$nr}
+                    validate_port_number "$new" || { rm -f "$candidate"; continue; }
+                    jq --arg id "$id" --arg h "$nhost" --argjson p "$new" \
+                        '(.rules[]|select(.id==$id)|.remote_host)=$h | (.rules[]|select(.id==$id)|.remote_port)=$p' \
+                        "$FORWARDING_FILE" > "$candidate"
+                else
+                    nr=$(jq -r '.remote_start' <<<"$rule")
+                    count=$(( $(jq -r '.listen_end' <<<"$rule") - $(jq -r '.listen_start' <<<"$rule") + 1 ))
+                    read -rp "目标起始端口 [当前: ${nr}]: " new
+                    new=${new:-$nr}
+                    validate_port_number "$new" || { rm -f "$candidate"; continue; }
+                    [[ $((new+count-1)) -le 65535 ]] || { echo "目标端口段越界。"; rm -f "$candidate"; pause; continue; }
+                    jq --arg id "$id" --arg h "$nhost" --argjson p "$new" \
+                        '(.rules[]|select(.id==$id)|.remote_host)=$h | (.rules[]|select(.id==$id)|.remote_start)=$p' \
+                        "$FORWARDING_FILE" > "$candidate"
+                fi
+                ;;
+            5)
+                read -r old_start old_end < <(forwarding_rule_interval "$rule")
+                if [[ "$(jq -r '.type' <<<"$rule")" == "single" ]]; then
+                    read -rp "新监听端口 [当前: ${old_start}]: " start
+                    start=${start:-$old_start}
+                    validate_port_number "$start" || { rm -f "$candidate"; continue; }
+                    end="$start"
+                else
+                    read -rp "新起始端口 [当前: ${old_start}]: " start
+                    start=${start:-$old_start}
+                    read -rp "新结束端口 [当前: ${old_end}]: " end
+                    end=${end:-$old_end}
+                    if ! validate_port_number "$start" || ! validate_port_number "$end" || [[ "$end" -lt "$start" ]]; then
+                        rm -f "$candidate"; continue
+                    fi
+                    count=$((end-start+1))
+                    [[ "$count" -le "$REALM_MAX_RANGE_PORTS" ]] || { echo "端口段过大。"; rm -f "$candidate"; pause; continue; }
+                fi
+                if forwarding_state_port_conflict "$start" "$end" "$id"; then
+                    echo "与其他 Realm 转发规则端口重叠。"; rm -f "$candidate"; pause; continue
+                fi
+                if [[ "$start" != "$old_start" || "$end" != "$old_end" ]] && forwarding_os_port_conflict_range "$start" "$end"; then
+                    rm -f "$candidate"; pause; continue
+                fi
+                if [[ "$(jq -r '.type' <<<"$rule")" == "single" ]]; then
+                    jq --arg id "$id" --argjson p "$start" '(.rules[]|select(.id==$id)|.listen_port)=$p' "$FORWARDING_FILE" > "$candidate"
+                else
+                    rstart=$(jq -r '.remote_start' <<<"$rule")
+                    count=$((end-start+1))
+                    [[ $((rstart+count-1)) -le 65535 ]] || { echo "目标端口段会越界，请先修改目标起始端口。"; rm -f "$candidate"; pause; continue; }
+                    jq --arg id "$id" --argjson s "$start" --argjson e "$end" \
+                        '(.rules[]|select(.id==$id)|.listen_start)=$s | (.rules[]|select(.id==$id)|.listen_end)=$e' \
+                        "$FORWARDING_FILE" > "$candidate"
+                fi
+                ;;
+            *) rm -f "$candidate"; continue ;;
+        esac
+
+        if forwarding_apply_state_candidate "$candidate"; then
+            echo -e "${GREEN}✔ 规则已更新。${PLAIN}"
+        fi
+        pause
+    done
+}
+
+forwarding_delete_rule() {
+    forwarding_init_state || return
+    local idx="" rule="" id="" candidate="" yes=""
+    idx=$(forwarding_select_rule_index) || { echo "无效选择。"; pause; return; }
+    rule=$(jq -c ".rules[$idx]" "$FORWARDING_FILE")
+    id=$(jq -r '.id' <<<"$rule")
+    read -rp "确认删除“$(jq -r '.name' <<<"$rule")”？[y/N]: " yes
+    [[ "$yes" =~ ^[Yy]$ ]] || return
+    candidate=$(mktemp "${STATE_DIR}/forwarding.candidate.XXXXXX") || return
+    jq --arg id "$id" '.rules |= map(select(.id != $id))' "$FORWARDING_FILE" > "$candidate" || { rm -f "$candidate"; return; }
+    forwarding_apply_state_candidate "$candidate"
+    pause
+}
+
+forwarding_test_tcp_target() {
+    local host="$1" port="$2" hp=""
+    hp=$(forwarding_format_host_port "$host" "$port")
+    local out=""
+    out=$(curl -v --connect-timeout 3 --max-time 3 "telnet://${hp}" </dev/null 2>&1 || true)
+    if grep -qE 'Connected to .* port|Connected to ' <<<"$out"; then
+        return 0
+    fi
+    return 1
+}
+
+forwarding_test_rule() {
+    forwarding_init_state || return
+    local idx="" rule="" type="" proto="" family="" host="" lp="" rp="" ls="" le="" rs="" re="" tcp_test_port=""
+    idx=$(forwarding_select_rule_index) || { echo "无效选择。"; pause; return; }
+    rule=$(jq -c ".rules[$idx]" "$FORWARDING_FILE")
+    type=$(jq -r '.type' <<<"$rule")
+    proto=$(jq -r '.protocol' <<<"$rule")
+    family=$(jq -r '.listen_family' <<<"$rule")
+    host=$(jq -r '.remote_host' <<<"$rule")
+    if [[ "$type" == "single" ]]; then
+        lp=$(jq -r '.listen_port' <<<"$rule")
+        rp=$(jq -r '.remote_port' <<<"$rule")
+        echo "规则：$(jq -r '.name' <<<"$rule")  ${lp} → ${host}:${rp} (${proto}/${family})"
+        tcp_test_port="$rp"
+    else
+        ls=$(jq -r '.listen_start' <<<"$rule"); le=$(jq -r '.listen_end' <<<"$rule")
+        rs=$(jq -r '.remote_start' <<<"$rule"); re=$((rs+le-ls))
+        echo "规则：$(jq -r '.name' <<<"$rule")  ${ls}-${le} → ${host}:${rs}-${re} (${proto}/${family})"
+        lp="$ls"; tcp_test_port="$rs"
+    fi
+
+    echo ""
+    echo "【服务状态】"
+    if service_is_active "$REALM_SERVICE_NAME"; then
+        echo -e "  Realm : ${GREEN}Running${PLAIN}"
+    else
+        echo -e "  Realm : ${RED}Stopped${PLAIN}"
+    fi
+
+    echo "【监听检查】"
+    if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
+        if ss -H -lntp 2>/dev/null | awk -v p="$lp" '{a=$4; n=split(a,x,":"); if(x[n]==p) ok=1} END{exit !ok}'; then
+            echo -e "  TCP ${lp}: ${GREEN}✓ 已监听${PLAIN}"
+        else
+            echo -e "  TCP ${lp}: ${RED}✗ 未监听${PLAIN}"
+        fi
+    fi
+    if [[ "$proto" == "udp" || "$proto" == "both" ]]; then
+        if ss -H -lnup 2>/dev/null | awk -v p="$lp" '{a=$4; n=split(a,x,":"); if(x[n]==p) ok=1} END{exit !ok}'; then
+            echo -e "  UDP ${lp}: ${GREEN}✓ 已监听${PLAIN}"
+        else
+            echo -e "  UDP ${lp}: ${RED}✗ 未监听${PLAIN}"
+        fi
+    fi
+
+    if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
+        echo "【目标 TCP 连通性】"
+        if forwarding_test_tcp_target "$host" "$tcp_test_port"; then
+            echo -e "  ${host}:${tcp_test_port}: ${GREEN}✓ TCP 可连接${PLAIN}"
+        else
+            echo -e "  ${host}:${tcp_test_port}: ${YELLOW}未能建立 TCP 连接（目标服务可能拒绝探测；请结合实际客户端验证）${PLAIN}"
+        fi
+    fi
+    if [[ "$proto" == "udp" || "$proto" == "both" ]]; then
+        echo -e "${YELLOW}[说明] UDP 没有通用握手，脚本只验证监听状态；最终以真实 UDP 应用流量为准。${PLAIN}"
+    fi
+    pause
+}
+
+forwarding_show_config() {
+    forwarding_init_state || return
+    forwarding_print_rules
+    echo ""
+    echo "Realm 二进制 : ${REALM_BIN}"
+    if [[ -x "$REALM_BIN" ]]; then
+        echo "Realm 版本   : $("$REALM_BIN" --version 2>/dev/null | head -n1)"
+    else
+        echo "Realm 版本   : 未安装"
+    fi
+    echo "Realm 配置   : ${REALM_CONF}"
+    echo "规则状态文件 : ${FORWARDING_FILE}"
+    case "$PLATFORM_INIT" in
+        systemd) echo "服务管理     : systemd (${REALM_SERVICE_NAME}.service)" ;;
+        openrc) echo "服务管理     : OpenRC (${REALM_OPENRC_SERVICE})" ;;
+        *) echo "服务管理     : 未知" ;;
+    esac
+}
+
+uninstall_realm_forwarding() {
+    local yes=""
+    echo -e "${YELLOW}此操作只删除 ss2022.sh 管理的 Realm 转发组件和 forwarding.json；不会删除服务器已有 realm.service 或 /usr/local/bin/realm。${PLAIN}"
+    read -rp "确认卸载 Realm 转发组件？[y/N]: " yes
+    [[ "$yes" =~ ^[Yy]$ ]] || return
+    service_disable_now "$REALM_SERVICE_NAME"
+    rm -f "$REALM_SERVICE" "$REALM_OPENRC_SERVICE" "$REALM_BIN" "$FORWARDING_FILE" "$REALM_OPENRC_PID" "$REALM_OPENRC_LOG"
+    rm -rf /etc/ss2022-realm
+    if [[ -f "$REALM_USER_MARKER" ]]; then
+        delete_system_user "$REALM_USER"
+        rm -f "$REALM_USER_MARKER"
+    fi
+    if [[ -f "$REALM_GROUP_MARKER" ]]; then
+        delete_system_group "$REALM_GROUP"
+        rm -f "$REALM_GROUP_MARKER"
+    fi
+    service_daemon_reload || true
+    echo -e "${GREEN}✔ ss2022.sh Realm 转发组件已卸载。${PLAIN}"
+    pause
+}
+realm_service_management() {
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ Realm 服务管理 ════════════════════${PLAIN}"
+        echo "  1. 安装 / 重新安装固定版本 Realm v${REALM_VERSION}"
+        echo "  2. 查看服务状态"
+        echo "  3. 查看实时日志"
+        echo "  4. 重启服务"
+        echo "  5. 停止服务"
+        echo "  6. 启动服务"
+        echo "  7. 卸载 Realm 转发组件"
+        echo "  0. 返回"
+        read -rp "请选择 [0-7]: " c
+        case "$c" in
+            1)
+                if install_realm_core; then
+                    forwarding_init_state || true
+                    if [[ $(jq '.rules|length' "$FORWARDING_FILE" 2>/dev/null || echo 0) -gt 0 ]]; then
+                        local tmp=""
+                        tmp=$(mktemp "${STATE_DIR}/forwarding.candidate.XXXXXX") || { pause; continue; }
+                        cp -a "$FORWARDING_FILE" "$tmp"
+                        forwarding_apply_state_candidate "$tmp" || true
+                    fi
+                fi
+                pause
+                ;;
+            2) service_status_output "$REALM_SERVICE_NAME" || echo "未运行"; pause ;;
+            3) service_log_follow "$REALM_SERVICE_NAME" ;;
+            4) service_restart "$REALM_SERVICE_NAME" && echo "已重启" || service_log_tail "$REALM_SERVICE_NAME" 30; pause ;;
+            5) service_stop "$REALM_SERVICE_NAME" && echo "已停止"; pause ;;
+            6) service_start "$REALM_SERVICE_NAME" && echo "已启动" || service_log_tail "$REALM_SERVICE_NAME" 30; pause ;;
+            7) uninstall_realm_forwarding ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+forwarding_management() {
+    forwarding_init_state || { pause; return; }
+    while true; do
+        clear
+        forwarding_init_state || return
+        local count="" state="未安装"
+        count=$(jq '.rules|length' "$FORWARDING_FILE")
+        if [[ -x "$REALM_BIN" ]]; then
+            if service_is_active "$REALM_SERVICE_NAME"; then state="Running"; else state="Stopped"; fi
+        fi
+        echo -e "${CYAN}════════════════════ Realm 端口转发 ════════════════════${PLAIN}"
+        echo "Realm     : ${state}"
+        echo "版本      : v${REALM_VERSION}"
+        echo "转发规则  : ${count} 条"
+        echo ""
+        echo "  1. 添加单端口转发"
+        echo "  2. 添加端口段转发"
+        echo "  3. 查看转发规则"
+        echo "  4. 修改转发规则"
+        echo "  5. 删除转发规则"
+        echo "  6. 测试转发规则"
+        echo "  7. Realm 服务管理"
+        echo "  0. 返回"
+        echo -e "${CYAN}═════════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-7]: " c
+        case "$c" in
+            1) forwarding_add_single ;;
+            2) forwarding_add_range ;;
+            3) clear; forwarding_show_config; pause ;;
+            4) forwarding_edit_rule ;;
+            5) forwarding_delete_rule ;;
+            6) forwarding_test_rule ;;
+            7) realm_service_management ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+# ==============================================================================
+# [11] 服务运维与彻底卸载
+# ==============================================================================
+
+show_service_status() {
+    echo ""
+    echo -e "$YELLOW【sing-box】$PLAIN"
+    service_status_output sing-box | head -n 15 || echo "未安装/未加载"
+    echo ""
+    echo -e "$YELLOW【ss2022-xray / VLESS Reality】$PLAIN"
+    service_status_output "$XRAY_SERVICE_NAME" | head -n 15 || echo "未安装/未加载"
+    echo ""
+    echo -e "$YELLOW【Snell v5】$PLAIN"
+    service_status_output snell-v5 | head -n 15 || echo "未安装/未加载"
+    echo ""
+    echo -e "$YELLOW【Realm 端口转发】$PLAIN"
+    service_status_output "$REALM_SERVICE_NAME" | head -n 15 || echo "未安装/未加载"
+    echo ""
+    echo -e "$YELLOW【监听端口】$PLAIN"
+    ss -lntup 2>/dev/null | grep -E 'sing-box|xray|snell-server|ss2022-realm|realm' || echo "未检测到相关监听"
+}
+full_uninstall() {
+    local yes="" singbox_managed=0 snell_managed=0 proxy_link_managed=0
+    local warp_package_managed=0 warp_repo_managed=0
+    singbox_is_project_managed && singbox_managed=1 || true
+    snell_is_project_managed && snell_managed=1 || true
+    proxy_shortcut_is_project_managed && proxy_link_managed=1 || true
+    warp_package_is_project_managed && warp_package_managed=1 || true
+    warp_repo_is_project_managed && warp_repo_managed=1 || true
+    echo -e "${RED}========== 完全卸载 ss2022.sh ==========${PLAIN}"
+    echo ""
+    echo -e "${RED}此操作会删除本脚本管理的协议核心、节点/分流/端口转发配置与服务。不会删除服务器原有 xray.service 或 realm.service。${PLAIN}"
+    echo -e "${YELLOW}[保留] 服务器工具中由你主动设置的 BBR、DNS、SSH 端口和 IPv4/IPv6 地址优先级不会自动回滚。${PLAIN}"
+    echo -e "${YELLOW}[说明] 这些属于服务器系统设置；自动恢复可能改变网络或 SSH 可达性，需要时请在卸载前通过对应菜单手动恢复。${PLAIN}"
+    echo ""
+    read -rp "确认彻底卸载？请输入 DELETE: " yes
+    [[ "$yes" == "DELETE" ]] || { echo "已取消。"; sleep 1; return; }
+
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        [[ $singbox_managed -eq 1 ]] && systemctl disable --now sing-box >/dev/null 2>&1 || true
+        [[ $snell_managed -eq 1 ]] && systemctl disable --now snell-v5 >/dev/null 2>&1 || true
+        systemctl disable --now "$XRAY_SERVICE_NAME" "$REALM_SERVICE_NAME" "${IPV6_KEEPALIVE_SYSTEMD_SERVICE_NAME}.timer" >/dev/null 2>&1 || true
+        systemctl disable --now "$IP_FAMILY_SERVICE_NAME" ss2022-tg-monitor.timer >/dev/null 2>&1 || true
+        systemctl stop "${IPV6_KEEPALIVE_SYSTEMD_SERVICE_NAME}.service" ss2022-tg-monitor.service >/dev/null 2>&1 || true
+        cleanup_legacy_ipv6_keepalive_if_managed
+    else
+        [[ $singbox_managed -eq 1 ]] && service_disable_now sing-box
+        service_disable_now "$XRAY_SERVICE_NAME"
+        [[ $snell_managed -eq 1 ]] && service_disable_now snell-v5
+        service_disable_now "$REALM_SERVICE_NAME"
+        service_disable_now "$IP_FAMILY_SERVICE_NAME"
+        service_disable_now ss2022-ipv6-keepalive
+    fi
+
+    command -v nft >/dev/null 2>&1 && nft delete table inet ss2022_ip_family >/dev/null 2>&1 || true
+
+    if [[ $singbox_managed -eq 1 ]] && platform_is_alpine && [[ -f "$SINGBOX_ALPINE_PKG_MARKER" ]]; then
+        apk del sing-box >/dev/null 2>&1 || true
+        rm -f "$SINGBOX_ALPINE_PKG_MARKER"
+    fi
+
+    if [[ $warp_package_managed -eq 1 || $warp_repo_managed -eq 1 ]]; then
+        if command -v warp-cli >/dev/null 2>&1; then
+            warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
+            [[ $warp_package_managed -eq 1 ]] && warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
+        fi
+        warp_remove_managed_install_assets
+    fi
+
+    if [[ $singbox_managed -eq 1 ]]; then
+        rm -f "$SINGBOX_CONF" "${SINGBOX_CONF_DIR}"/.ss2022-*
+        rm -f "$SINGBOX_BIN" "$SINGBOX_SERVICE" "$SINGBOX_OPENRC_SERVICE" "$SINGBOX_MANAGED_MARKER"
+        if [[ -f "$SINGBOX_DIR_MARKER" ]]; then
+            rmdir "$SINGBOX_CONF_DIR" 2>/dev/null || true
+            rm -f "$SINGBOX_DIR_MARKER"
+        fi
+    fi
+    if [[ $snell_managed -eq 1 ]]; then
+        rm -f "$SNELL_CONF" "${SNELL_CONF_DIR}"/.ss2022-*
+        rm -f "$SNELL_BIN" "$SNELL_SERVICE" "$SNELL_OPENRC_SERVICE" "$SNELL_MANAGED_MARKER"
+        if [[ -f "$SNELL_DIR_MARKER" ]]; then
+            rmdir "$SNELL_CONF_DIR" 2>/dev/null || true
+            rm -f "$SNELL_DIR_MARKER"
+        fi
+    fi
+    rm -rf /etc/ss2022-xray /etc/ss2022-realm "$STATE_DIR" /usr/local/lib/ss2022 /var/log/ss2022
+
+    [[ $proxy_link_managed -eq 1 ]] && rm -f "$SCRIPT_PROXY_LINK"
+    rm -f \
+        "$SCRIPT_INSTALL_PATH" \
+        "$SCRIPT_BACKUP_PATH" \
+        "${SNELL_CANDIDATE_PREFIX}".* \
+        "$XRAY_BIN" \
+        "$XRAY_SERVICE" \
+        "$REALM_SERVICE" \
+        "$IP_FAMILY_SERVICE" \
+        "$XRAY_OPENRC_SERVICE" \
+        "$REALM_OPENRC_SERVICE" \
+        "$IP_FAMILY_OPENRC_SERVICE" \
+        "$IPV6_KEEPALIVE_OPENRC_SERVICE" \
+        "$IPV6_KEEPALIVE_SYSTEMD_SERVICE" \
+        "$IPV6_KEEPALIVE_SYSTEMD_TIMER" \
+        "$TG_MONITOR_SERVICE" \
+        "$TG_MONITOR_TIMER" \
+        "$FORCE_IPV6_CONF"
+
+    if [[ -f "$DNS_MARKER" || -f "$BACKUP_DNS" ]]; then
+        if ! restore_ipv4_apt_and_dns_if_needed; then
+            echo -e "${YELLOW}[提示] IPv6-only 临时 DNS 未能自动恢复；脚本专属备份会保留供手动恢复。${PLAIN}"
+        fi
+    fi
+    rm -f "$DNS_MARKER"
+
+    if [[ -f "$SINGBOX_USER_MARKER" ]]; then delete_system_user "$SINGBOX_USER"; rm -f "$SINGBOX_USER_MARKER"; fi
+    if [[ -f "$SINGBOX_GROUP_MARKER" ]]; then delete_system_group "$SINGBOX_GROUP"; rm -f "$SINGBOX_GROUP_MARKER"; fi
+
+    if [[ -f "$XRAY_USER_MARKER" ]]; then delete_system_user "$XRAY_USER"; rm -f "$XRAY_USER_MARKER"; fi
+    if [[ -f "$XRAY_GROUP_MARKER" ]]; then delete_system_group "$XRAY_GROUP"; rm -f "$XRAY_GROUP_MARKER"; fi
+
+    if [[ -f "$REALM_USER_MARKER" ]]; then delete_system_user "$REALM_USER"; rm -f "$REALM_USER_MARKER"; fi
+    if [[ -f "$REALM_GROUP_MARKER" ]]; then delete_system_group "$REALM_GROUP"; rm -f "$REALM_GROUP_MARKER"; fi
+
+    if [[ -f "$SNELL_USER_MARKER" ]]; then delete_system_user "$SNELL_USER"; rm -f "$SNELL_USER_MARKER"; fi
+    if [[ -f "$SNELL_GROUP_MARKER" ]]; then delete_system_group "$SNELL_GROUP"; rm -f "$SNELL_GROUP_MARKER"; fi
+
+    [[ -f "$TG_MONITOR_CRON_FILE" ]] && sed -i "/ss2022-tg-monitor/d" "$TG_MONITOR_CRON_FILE" 2>/dev/null || true
+    rm -f "$SINGBOX_OPENRC_PID" "$XRAY_OPENRC_PID" "$SNELL_OPENRC_PID" "$REALM_OPENRC_PID"
+    rm -rf /run/ss2022-tg-monitor.lockdir
+    rm -rf /tmp/ss2022-* 2>/dev/null || true
+    service_daemon_reload || true
+    echo -e "${GREEN}✔ vps-bootstrap 协议核心、服务与运行文件已清理完成。${PLAIN}"
+    echo -e "${YELLOW}[保留] BBR / DNS / SSH 端口 / IPv4-IPv6 地址优先级等用户主动系统设置保持当前状态。${PLAIN}"
+    exit 0
+}
+get_singbox_version_raw() {
+    if [[ -x "$SINGBOX_BIN" ]]; then
+        "$SINGBOX_BIN" version 2>/dev/null | head -n1 | awk '{print $3}'
+    fi
+}
+
+get_xray_version_raw() {
+    if [[ -x "$XRAY_BIN" ]]; then
+        "$XRAY_BIN" version 2>/dev/null | head -n1 | awk '{print $2}'
+    fi
+}
+
+get_snell_version_raw() {
+    [[ -x "$SNELL_BIN" ]] && printf '%s\n' "$SNELL_VERSION" || true
+}
+
+get_realm_version_raw() {
+    if [[ -x "$REALM_BIN" ]]; then
+        "$REALM_BIN" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1
+    fi
+}
+
+component_current_version() {
+    case "$1" in
+        singbox) get_singbox_version_raw ;;
+        xray) get_xray_version_raw ;;
+        snell) get_snell_version_raw ;;
+        realm) get_realm_version_raw ;;
+    esac
+}
+
+component_recommended_version() {
+    case "$1" in
+        singbox) echo "$SINGBOX_VERSION" ;;
+        xray) echo "$XRAY_VERSION" ;;
+        snell) echo "$SNELL_VERSION" ;;
+        realm) echo "$REALM_VERSION" ;;
+    esac
+}
+
+component_label() {
+    case "$1" in
+        singbox) echo "sing-box" ;;
+        xray) echo "Xray-core" ;;
+        snell) echo "Snell Server" ;;
+        realm) echo "Realm" ;;
+    esac
+}
+
+component_bin_path() {
+    case "$1" in
+        singbox) echo "$SINGBOX_BIN" ;;
+        xray) echo "$XRAY_BIN" ;;
+        snell) echo "$SNELL_BIN" ;;
+        realm) echo "$REALM_BIN" ;;
+    esac
+}
+
+component_service_name() {
+    case "$1" in
+        singbox) echo "sing-box" ;;
+        xray) echo "$XRAY_SERVICE_NAME" ;;
+        snell) echo "snell-v5" ;;
+        realm) echo "$REALM_SERVICE_NAME" ;;
+    esac
+}
+
+component_config_exists() {
+    case "$1" in
+        singbox) [[ -f "$SINGBOX_CONF" ]] ;;
+        xray) [[ -f "$XRAY_CONF" ]] ;;
+        snell) [[ -f "$SNELL_CONF" ]] ;;
+        realm) [[ -f "$REALM_CONF" ]] ;;
+    esac
+}
+
+component_validate_existing_config() {
+    local c="$1"
+    case "$c" in
+        singbox)
+            [[ -f "$SINGBOX_CONF" ]] || return 0
+            "$SINGBOX_BIN" check -c "$SINGBOX_CONF"
+            ;;
+        xray)
+            [[ -f "$XRAY_CONF" ]] || return 0
+            "$XRAY_BIN" run -test -format json -config "$XRAY_CONF"
+            ;;
+        snell)
+            [[ -f "$SNELL_CONF" ]] || return 0
+            snell_binary_works "$SNELL_BIN"
+            ;;
+        realm)
+            [[ -f "$REALM_CONF" ]] || return 0
+            "$REALM_BIN" --version >/dev/null 2>&1
+            ;;
+    esac
+}
+
+component_install_recommended() {
+    local c="$1" label bin svc tmp old_active=0 had_bin=0 ok=0
+    label=$(component_label "$c")
+    bin=$(component_bin_path "$c")
+    svc=$(component_service_name "$c")
+    tmp=$(mktemp -d /tmp/ss2022-core-upgrade.XXXXXX) || return 1
+
+    if [[ -x "$bin" ]]; then
+        cp -a "$bin" "$tmp/old.bin" || { rm -rf "$tmp"; return 1; }
+        had_bin=1
+    fi
+    service_is_active "$svc" && old_active=1 || true
+
+    echo -e "${YELLOW}>> ${label}: 安装/修复到脚本推荐版本 $(component_recommended_version "$c")...${PLAIN}"
+    case "$c" in
+        singbox) install_singbox_core && ok=1 ;;
+        xray) install_xray_core && ok=1 ;;
+        snell) install_snell_v5_core && write_snell_service && ok=1 ;;
+        realm) install_realm_core && ok=1 ;;
+    esac
+
+    if [[ $ok -eq 1 ]] && ! component_validate_existing_config "$c"; then
+        echo -e "${RED}[错误] 新 ${label} 无法兼容当前配置，开始恢复旧二进制。${PLAIN}"
+        ok=0
+    fi
+
+    if [[ $ok -eq 1 ]] && component_config_exists "$c"; then
+        service_daemon_reload >/dev/null 2>&1 || true
+        if ! service_restart "$svc" >/dev/null 2>&1; then
+            echo -e "${RED}[错误] ${label} 新版本启动失败，开始回滚。${PLAIN}"
+            ok=0
+        else
+            sleep 1
+            service_is_active "$svc" || ok=0
+        fi
+    fi
+
+    if [[ $ok -ne 1 ]]; then
+        if [[ $had_bin -eq 1 && -f "$tmp/old.bin" ]]; then
+            install -m 755 "$tmp/old.bin" "$bin" || true
+        elif [[ $had_bin -eq 0 ]]; then
+            rm -f "$bin"
+        fi
+        service_daemon_reload >/dev/null 2>&1 || true
+        [[ $old_active -eq 1 ]] && service_restart "$svc" >/dev/null 2>&1 || true
+        rm -rf "$tmp"
+        echo -e "${RED}[错误] ${label} 升级/修复失败，已尽力恢复原核心。${PLAIN}"
+        return 1
+    fi
+
+    rm -rf "$tmp"
+    echo -e "${GREEN}✔ ${label} 当前版本: $(component_current_version "$c")${PLAIN}"
+    return 0
+}
+
+fetch_github_latest_tag() {
+    local repo="$1"
+    curl -fsSL --retry 1 --connect-timeout 5 --max-time 12 \
+      -H 'Accept: application/vnd.github+json' \
+      "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null \
+      | jq -r '.tag_name // empty' 2>/dev/null | sed 's/^v//'
+}
+
+show_component_versions() {
+    local sb xr sn re
+    sb=$(get_singbox_version_raw); sb=${sb:-未安装}
+    xr=$(get_xray_version_raw); xr=${xr:-未安装}
+    sn=$(get_snell_version_raw); sn=${sn:-未安装}
+    re=$(get_realm_version_raw); re=${re:-未安装}
+    clear
+    echo -e "${CYAN}════════════════════ 组件版本管理 ════════════════════${PLAIN}"
+    echo "【协议核心】"
+    printf '  sing-box      已安装: %-12s 推荐: %s\n' "$sb" "$SINGBOX_VERSION"
+    printf '  Xray-core     已安装: %-12s 推荐: %s\n' "$xr" "$XRAY_VERSION"
+    if platform_is_alpine; then
+        printf '  Snell Server  已安装: %-12s 推荐: %s  [Alpine 暂不支持]\n' "$sn" "$SNELL_VERSION"
+    else
+        printf '  Snell Server  已安装: %-12s 推荐: %s\n' "$sn" "$SNELL_VERSION"
+    fi
+    echo ""
+    echo "【网络组件】"
+    printf '  Realm         已安装: %-12s 推荐: %s\n' "$re" "$REALM_VERSION"
+    if command -v warp-cli >/dev/null 2>&1; then
+        echo "  Cloudflare WARP: 已安装（版本由 Cloudflare 客户端自身管理）"
+    else
+        echo "  Cloudflare WARP: 未安装"
+    fi
+}
+
+check_upstream_versions() {
+    clear
+    echo -e "${CYAN}════════════════════ 上游版本检查 ════════════════════${PLAIN}"
+    echo "说明：仅查询并提示，不会自动安装官方 Latest。"
+    echo ""
+    local latest current
+    current=$(get_singbox_version_raw); current=${current:-未安装}
+    latest=$(fetch_github_latest_tag 'SagerNet/sing-box'); latest=${latest:-查询失败}
+    printf 'sing-box      当前 %-12s 推荐 %-12s 上游 %s\n' "$current" "$SINGBOX_VERSION" "$latest"
+    current=$(get_xray_version_raw); current=${current:-未安装}
+    latest=$(fetch_github_latest_tag 'XTLS/Xray-core'); latest=${latest:-查询失败}
+    printf 'Xray-core     当前 %-12s 推荐 %-12s 上游 %s\n' "$current" "$XRAY_VERSION" "$latest"
+    current=$(get_snell_version_raw); current=${current:-未安装}
+    printf 'Snell Server  当前 %-12s 推荐 %-12s 上游 %s\n' "$current" "$SNELL_VERSION" "请以 Surge 官方发布为准"
+    current=$(get_realm_version_raw); current=${current:-未安装}
+    latest=$(fetch_github_latest_tag 'zhboner/realm'); latest=${latest:-查询失败}
+    printf 'Realm         当前 %-12s 推荐 %-12s 上游 %s\n' "$current" "$REALM_VERSION" "$latest"
+    echo ""
+    echo -e "${YELLOW}上游 Latest 不代表本脚本已验证。请优先使用脚本推荐版本。${PLAIN}"
+    pause
+}
+
+component_single_menu() {
+    local c="$1" label current recommended choice
+    if platform_is_alpine && [[ "$c" == "snell" ]]; then
+        platform_feature_unavailable "Snell v5（Surge 官方 snell-server）"
+        pause
+        return
+    fi
+    label=$(component_label "$c")
+    while true; do
+        clear
+        current=$(component_current_version "$c"); current=${current:-未安装}
+        recommended=$(component_recommended_version "$c")
+        echo -e "${CYAN}════════════════════ ${label} ════════════════════${PLAIN}"
+        echo "当前版本 : $current"
+        echo "推荐版本 : $recommended"
+        echo ""
+        echo "  1. 升级 / 重装到推荐版本"
+        echo "  2. 查看当前版本"
+        echo "  0. 返回"
+        read -rp "请选择 [0-2]: " choice
+        case "$choice" in
+            1) component_install_recommended "$c"; pause ;;
+            2) current=$(component_current_version "$c"); echo "${label}: ${current:-未安装}"; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+upgrade_all_to_recommended() {
+    local c current target failed=0
+    for c in singbox xray snell realm; do
+        if platform_is_alpine && [[ "$c" == "snell" ]]; then
+            echo -e "${YELLOW}○ Snell Server：Alpine 3.21 暂不支持官方 snell-server，跳过。${PLAIN}"
+            continue
+        fi
+        current=$(component_current_version "$c")
+        target=$(component_recommended_version "$c")
+        if [[ -z "$current" ]]; then
+            case "$c" in
+                singbox) [[ -f "$SINGBOX_CONF" ]] || continue ;;
+                xray) [[ -f "$XRAY_CONF" ]] || continue ;;
+                snell) [[ -f "$SNELL_CONF" ]] || continue ;;
+                realm) [[ -f "$REALM_CONF" || -f "$FORWARDING_FILE" ]] || continue ;;
+            esac
+        fi
+        if [[ "$current" == "$target" ]]; then
+            echo -e "${GREEN}✔ $(component_label "$c") 已是推荐版本 $target${PLAIN}"
+            continue
+        fi
+        component_install_recommended "$c" || failed=1
+    done
+    [[ $failed -eq 0 ]]
+}
+
+component_version_management() {
+    while true; do
+        show_component_versions
+        echo ""
+        echo "  1. sing-box"
+        echo "  2. Xray-core"
+        if platform_is_alpine; then
+            echo "  3. Snell Server            [Alpine 暂不支持]"
+        else
+            echo "  3. Snell Server"
+        fi
+        echo "  4. Realm"
+        echo "  5. 检查官方上游版本（仅提示）"
+        echo "  6. 全部升级到脚本推荐版本"
+        echo "  0. 返回"
+        echo -e "${CYAN}═════════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-6]: " c
+        case "$c" in
+            1) component_single_menu singbox ;;
+            2) component_single_menu xray ;;
+            3) component_single_menu snell ;;
+            4) component_single_menu realm ;;
+            5) check_upstream_versions ;;
+            6) upgrade_all_to_recommended; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+# ==============================================================================
+# [13] 脚本自更新
+# ==============================================================================
+
+extract_script_version() {
+    local file="$1"
+    sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' "$file" 2>/dev/null | head -n1
+}
+
+script_source_path() {
+    local src="${BASH_SOURCE[0]}"
+    readlink -f "$src" 2>/dev/null || printf '%s\n' "$src"
+}
+
+proxy_shortcut_is_project_managed() {
+    local target=""
+    [[ -L "$SCRIPT_PROXY_LINK" ]] || return 1
+    target=$(readlink "$SCRIPT_PROXY_LINK" 2>/dev/null || true)
+    [[ "$target" == "$SCRIPT_INSTALL_PATH" || "$target" == "${SCRIPT_INSTALL_PATH##*/}" ]]
+}
+
+ensure_proxy_shortcut() {
+    if [[ -e "$SCRIPT_PROXY_LINK" || -L "$SCRIPT_PROXY_LINK" ]]; then
+        if ! proxy_shortcut_is_project_managed; then
+            echo -e "${YELLOW}[提示] ${SCRIPT_PROXY_LINK} 已被其它文件或链接占用，保留原内容；仍可使用 ${SCRIPT_INSTALL_PATH}。${PLAIN}"
+            return 0
+        fi
+        rm -f "$SCRIPT_PROXY_LINK" || return 1
+    fi
+    ln -s "$SCRIPT_INSTALL_PATH" "$SCRIPT_PROXY_LINK"
+}
+
+compare_script_versions() {
+    # 输出：
+    #   equal         两版本相同
+    #   remote_newer  第二个版本更新
+    #   remote_older  第二个版本更旧
+    #   unknown       无法按 vX.Y.Z[-devN] 规则比较
+    local current="$1"
+    local remote="$2"
+    local c_major c_minor c_patch c_dev r_major r_minor r_patch r_dev
+    local c_is_dev=0 r_is_dev=0
+
+    if [[ "$current" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)(-dev([0-9]+))?$ ]]; then
+        c_major="${BASH_REMATCH[1]}"
+        c_minor="${BASH_REMATCH[2]}"
+        c_patch="${BASH_REMATCH[3]}"
+        if [[ -n "${BASH_REMATCH[4]:-}" ]]; then
+            c_is_dev=1
+            c_dev="${BASH_REMATCH[5]}"
+        else
+            c_dev=0
+        fi
+    else
+        echo "unknown"
+        return
+    fi
+
+    if [[ "$remote" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)(-dev([0-9]+))?$ ]]; then
+        r_major="${BASH_REMATCH[1]}"
+        r_minor="${BASH_REMATCH[2]}"
+        r_patch="${BASH_REMATCH[3]}"
+        if [[ -n "${BASH_REMATCH[4]:-}" ]]; then
+            r_is_dev=1
+            r_dev="${BASH_REMATCH[5]}"
+        else
+            r_dev=0
+        fi
+    else
+        echo "unknown"
+        return
+    fi
+
+    local c r
+    for c_r in major minor patch; do
+        case "$c_r" in
+            major) c="$c_major"; r="$r_major" ;;
+            minor) c="$c_minor"; r="$r_minor" ;;
+            patch) c="$c_patch"; r="$r_patch" ;;
+        esac
+        if (( 10#$r > 10#$c )); then
+            echo "remote_newer"
+            return
+        elif (( 10#$r < 10#$c )); then
+            echo "remote_older"
+            return
+        fi
+    done
+
+    # 同一正式版本号下：正式版 > dev 版。
+    if (( c_is_dev == 1 && r_is_dev == 0 )); then
+        echo "remote_newer"
+        return
+    elif (( c_is_dev == 0 && r_is_dev == 1 )); then
+        echo "remote_older"
+        return
+    elif (( c_is_dev == 0 && r_is_dev == 0 )); then
+        echo "equal"
+        return
+    fi
+
+    if (( 10#$r_dev > 10#$c_dev )); then
+        echo "remote_newer"
+    elif (( 10#$r_dev < 10#$c_dev )); then
+        echo "remote_older"
+    else
+        echo "equal"
+    fi
+}
+
+check_script_update() {
+    clear
+    echo -e "${CYAN}════════════════════ 检查脚本更新 ════════════════════${PLAIN}"
+    echo "更新源 : ${SCRIPT_UPDATE_URL}"
+    echo ""
+
+    command -v curl >/dev/null 2>&1 || {
+        echo -e "${RED}[错误] 未检测到 curl，无法检查更新。${PLAIN}"
+        pause
+        return
+    }
+
+    local tmp remote_version running_file running_version installed_version
+    local running_hash installed_hash remote_hash cache_bust relation
+    local install_reason=""
+    local ans
+
+    running_file=$(script_source_path)
+    running_version=$(extract_script_version "$running_file")
+    [[ -n "$running_version" ]] || running_version="$SCRIPT_VERSION"
+
+    if [[ -f "$SCRIPT_INSTALL_PATH" ]]; then
+        installed_version=$(extract_script_version "$SCRIPT_INSTALL_PATH")
+        installed_hash=$(sha256sum "$SCRIPT_INSTALL_PATH" 2>/dev/null | awk '{print $1}')
+    else
+        installed_version="未安装"
+        installed_hash=""
+    fi
+
+    running_hash=$(sha256sum "$running_file" 2>/dev/null | awk '{print $1}')
+
+    tmp=$(mktemp /tmp/ss2022-update.XXXXXX.sh) || {
+        echo -e "${RED}[错误] 无法创建临时文件。${PLAIN}"
+        pause
+        return
+    }
+    cache_bust=$(date +%s)
+
+    echo -e "${YELLOW}>> 正在从 GitHub main 获取最新脚本...${PLAIN}"
+    if ! curl -fsSL --retry 2 --retry-delay 1 --connect-timeout 8 --max-time 60 \
+        -H 'Cache-Control: no-cache' \
+        "${SCRIPT_UPDATE_URL}?t=${cache_bust}" -o "$tmp"; then
+        rm -f "$tmp"
+        echo -e "${RED}[错误] 下载 GitHub 最新脚本失败。${PLAIN}"
+        pause
+        return
+    fi
+
+    # 只接受本项目脚本，避免 URL / CDN 异常返回 HTML 或其它内容后被直接执行。
+    if ! grep -q '^# 项目名称: vps-bootstrap / ss2022.sh$' "$tmp"; then
+        rm -f "$tmp"
+        echo -e "${RED}[错误] 下载内容不是有效的 vps-bootstrap/ss2022.sh，已拒绝更新。${PLAIN}"
+        pause
+        return
+    fi
+    if ! bash -n "$tmp"; then
+        rm -f "$tmp"
+        echo -e "${RED}[错误] GitHub 脚本未通过 Bash 语法检查，已拒绝更新。${PLAIN}"
+        pause
+        return
+    fi
+
+    remote_version=$(extract_script_version "$tmp")
+    if [[ -z "$remote_version" ]]; then
+        rm -f "$tmp"
+        echo -e "${RED}[错误] 无法读取远程 SCRIPT_VERSION，已拒绝更新。${PLAIN}"
+        pause
+        return
+    fi
+
+    remote_hash=$(sha256sum "$tmp" | awk '{print $1}')
+    relation=$(compare_script_versions "$running_version" "$remote_version")
+
+    echo "当前运行 : ${running_version}"
+    echo "系统安装 : ${installed_version}"
+    echo "GitHub main: ${remote_version}"
+    echo ""
+    echo "运行 SHA : ${running_hash:-无法读取}"
+    echo "安装 SHA : ${installed_hash:-未安装}"
+    echo "远程 SHA : ${remote_hash}"
+    echo ""
+
+    # 情况 1：当前正在运行的文件与 GitHub main 完全一致。
+    if [[ -n "$running_hash" && "$running_hash" == "$remote_hash" ]]; then
+        if [[ -n "$installed_hash" && "$installed_hash" == "$remote_hash" ]]; then
+            rm -f "$tmp"
+            echo -e "${GREEN}✔ 当前运行脚本、系统安装脚本与 GitHub main 完全一致。${PLAIN}"
+            pause
+            return
+        fi
+
+        echo -e "${YELLOW}当前运行脚本已与 GitHub main 一致，但系统安装版本仍不一致。${PLAIN}"
+        echo "可以把当前 GitHub main 版本同步安装到：${SCRIPT_INSTALL_PATH}"
+        install_reason="sync_install"
+    else
+        case "$relation" in
+            remote_newer)
+                echo -e "${GREEN}检测到脚本更新：${running_version} → ${remote_version}${PLAIN}"
+                install_reason="remote_newer"
+                ;;
+            remote_older)
+                rm -f "$tmp"
+                echo -e "${YELLOW}GitHub main 版本比当前运行版本更旧：${remote_version} < ${running_version}${PLAIN}"
+                echo "为避免误降级，本工具不会自动覆盖当前版本。"
+                echo ""
+                echo "如果你刚从测试文件运行了新版，请先把新版 ss2022.sh 提交到 GitHub main，"
+                echo "之后再使用“检查脚本更新”。"
+                pause
+                return
+                ;;
+            equal)
+                echo -e "${YELLOW}检测到同版本号内容变化：${running_version}${PLAIN}"
+                echo "版本号相同，但当前运行文件与 GitHub main 的 SHA256 不同。"
+                install_reason="same_version_changed"
+                ;;
+            *)
+                echo -e "${YELLOW}检测到脚本内容不同，但无法可靠判断版本新旧。${PLAIN}"
+                echo "当前运行：${running_version}"
+                echo "GitHub main：${remote_version}"
+                echo "为避免误降级，默认不自动覆盖。"
+                rm -f "$tmp"
+                pause
+                return
+                ;;
+        esac
+    fi
+
+    echo ""
+    echo "更新将："
+    echo "  1. 备份当前系统安装脚本到 ${SCRIPT_BACKUP_PATH}"
+    echo "  2. 安装 GitHub main 脚本到 ${SCRIPT_INSTALL_PATH}"
+    echo "  3. 若 ${SCRIPT_PROXY_LINK} 未被其它程序占用，则保持该快捷命令"
+    echo "  4. 自动重新进入安装后的管理面板"
+    echo ""
+
+    read -rp "确认安装 / 更新？[y/N]: " ans
+    if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+        rm -f "$tmp"
+        echo "已取消更新。"
+        pause
+        return
+    fi
+
+    # 覆盖前保存最近一个系统安装版本。安装失败时立即恢复。
+    if [[ -f "$SCRIPT_INSTALL_PATH" ]]; then
+        cp -a "$SCRIPT_INSTALL_PATH" "$SCRIPT_BACKUP_PATH" || {
+            rm -f "$tmp"
+            echo -e "${RED}[错误] 无法备份当前脚本，已取消更新。${PLAIN}"
+            pause
+            return
+        }
+    fi
+
+    if ! install -m 0755 "$tmp" "$SCRIPT_INSTALL_PATH"; then
+        [[ -f "$SCRIPT_BACKUP_PATH" ]] && install -m 0755 "$SCRIPT_BACKUP_PATH" "$SCRIPT_INSTALL_PATH" 2>/dev/null || true
+        rm -f "$tmp"
+        echo -e "${RED}[错误] 新脚本安装失败，已尝试恢复旧版本。${PLAIN}"
+        pause
+        return
+    fi
+    rm -f "$tmp"
+
+    if ! bash -n "$SCRIPT_INSTALL_PATH"; then
+        echo -e "${RED}[错误] 安装后的脚本语法校验失败，正在恢复旧版本。${PLAIN}"
+        [[ -f "$SCRIPT_BACKUP_PATH" ]] && install -m 0755 "$SCRIPT_BACKUP_PATH" "$SCRIPT_INSTALL_PATH" 2>/dev/null || true
+        pause
+        return
+    fi
+
+    ensure_proxy_shortcut || echo -e "${YELLOW}[提示] proxy 快捷命令创建失败，不影响 ss2022 主命令。${PLAIN}"
+    echo -e "${GREEN}✔ 脚本安装 / 更新完成：$(extract_script_version "$SCRIPT_INSTALL_PATH")${PLAIN}"
+    echo "正在重新进入安装后的管理面板..."
+    sleep 1
+    exec "$SCRIPT_INSTALL_PATH"
+}
+
+# ==============================================================================
+# [14] 菜单与程序入口
+# ==============================================================================
+
+protocol_management() {
+    while true; do
+        clear
+        echo -e "$CYAN════════════════════ 协议管理 ════════════════════$PLAIN"
+        echo "  1. SS2022"
+        echo "  2. SS2022 + ShadowTLS v3（增强伪装）"
+        echo "  3. VLESS Reality"
+        if platform_is_alpine; then
+            echo "  4. Snell v5                [Alpine 暂不支持]"
+        else
+            echo "  4. Snell v5"
+        fi
+        echo "  0. 返回"
+        echo -e "$CYAN═══════════════════════════════════════════════════$PLAIN"
+        read -rp "请选择 [0-4]: " c
+        case "$c" in
+            1) protocol_action_menu "SS2022" deploy_ss2022 update_ss2022 delete_ss2022 ;;
+            2) protocol_action_menu "SS2022 + ShadowTLS v3" deploy_shadowtls update_shadowtls delete_shadowtls ;;
+            3) protocol_action_menu "VLESS Reality" deploy_vless_reality update_vless_reality delete_vless_reality ;;
+            4)
+                if platform_is_alpine; then
+                    platform_feature_unavailable "Snell v5（Surge 官方 snell-server）"
+                    pause
+                else
+                    protocol_action_menu "Snell v5" deploy_snell_v5 update_snell_v5 delete_snell_v5
+                fi
+                ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+follow_service_log() {
+    local service="$1"
+    service_log_follow "$service"
+}
+restart_service_safe() {
+    local service="$1" label="$2"
+    if service_restart "$service"; then
+        echo -e "$GREEN✔ $label 已重启。$PLAIN"
+    else
+        service_log_tail "$service" 30 || true
+        return 1
+    fi
+}
+server_tool_pkg_manager() {
+    if command -v apt-get >/dev/null 2>&1; then
+        echo "apt"
+    elif command -v dnf >/dev/null 2>&1; then
+        echo "dnf"
+    elif command -v yum >/dev/null 2>&1; then
+        echo "yum"
+    elif command -v apk >/dev/null 2>&1; then
+        echo "apk"
+    else
+        echo "unknown"
+    fi
+}
+
+server_tool_get_ip_profile() {
+    local ipv4="$1" ipv6="$2" target meta hosting proxy mobile org asn isp country region city location
+    local scam_html score risk_label
+
+    SERVER_INFO_IPV4="$ipv4"
+    SERVER_INFO_IPV6="$ipv6"
+    SERVER_INFO_IP_TYPE="未知"
+    SERVER_INFO_IP_RISK="未获取"
+    SERVER_INFO_ISP="未知"
+    SERVER_INFO_ASN="未知"
+    SERVER_INFO_LOCATION="未知"
+
+    target="$ipv4"
+    [[ -n "$target" ]] || target="$ipv6"
+    [[ -n "$target" ]] || return 0
+
+    # ip-api 免费接口用于轻量判定 hosting / proxy / mobile；查询失败时保持“未知”。
+    meta=$(curl -fsS --connect-timeout 3 --max-time 5 \
+        "http://ip-api.com/json/${target}?fields=status,message,country,regionName,city,isp,org,as,hosting,proxy,mobile,query" \
+        2>/dev/null || true)
+
+    if [[ -n "$meta" ]] && jq -e '.status=="success"' >/dev/null 2>&1 <<<"$meta"; then
+        hosting=$(jq -r '.hosting // false' <<<"$meta")
+        proxy=$(jq -r '.proxy // false' <<<"$meta")
+        mobile=$(jq -r '.mobile // false' <<<"$meta")
+        org=$(jq -r '.org // empty' <<<"$meta")
+        isp=$(jq -r '.isp // empty' <<<"$meta")
+        asn=$(jq -r '.as // empty' <<<"$meta")
+        country=$(jq -r '.country // empty' <<<"$meta")
+        region=$(jq -r '.regionName // empty' <<<"$meta")
+        city=$(jq -r '.city // empty' <<<"$meta")
+
+        SERVER_INFO_ISP="${isp:-${org:-未知}}"
+        SERVER_INFO_ASN="${asn:-未知}"
+
+        location=""
+        [[ -n "$country" ]] && location="$country"
+        [[ -n "$region" ]] && location="${location:+${location} / }${region}"
+        [[ -n "$city" ]] && location="${location:+${location} / }${city}"
+        SERVER_INFO_LOCATION="${location:-未知}"
+
+        if [[ "$hosting" == "true" ]]; then
+            SERVER_INFO_IP_TYPE="数据中心"
+        elif [[ "$mobile" == "true" ]]; then
+            SERVER_INFO_IP_TYPE="移动网络"
+        elif [[ "$proxy" == "true" ]]; then
+            SERVER_INFO_IP_TYPE="代理/VPN"
+        else
+            SERVER_INFO_IP_TYPE="宽带/其他"
+        fi
+    fi
+
+    # Scamalytics 网页公开查询结果中包含 Fraud Score；失败时不影响系统信息展示。
+    scam_html=$(curl -A "Mozilla/5.0" -fsSL --connect-timeout 3 --max-time 6 \
+        "https://scamalytics.com/ip/${target}" 2>/dev/null || true)
+
+    if [[ -n "$scam_html" ]]; then
+        score=$(printf '%s' "$scam_html" \
+            | tr '\n' ' ' \
+            | grep -oE '"score"[[:space:]]*:[[:space:]]*"?[0-9]{1,3}"?' \
+            | head -n1 \
+            | grep -oE '[0-9]{1,3}' || true)
+
+        if [[ -z "$score" ]]; then
+            score=$(printf '%s' "$scam_html" \
+                | tr '\n' ' ' \
+                | sed -nE 's/.*Fraud Score:[[:space:]]*([0-9]{1,3}).*/\1/p' \
+                | head -n1 || true)
+        fi
+
+        if [[ "$score" =~ ^[0-9]+$ ]] && [[ "$score" -le 100 ]]; then
+            if [[ "$score" -le 19 ]]; then
+                risk_label="低风险"
+            elif [[ "$score" -le 59 ]]; then
+                risk_label="中等风险"
+            elif [[ "$score" -le 89 ]]; then
+                risk_label="高风险"
+            else
+                risk_label="极高风险"
+            fi
+            SERVER_INFO_IP_RISK="${score}/100（${risk_label}）"
+        fi
+    fi
+}
+
+server_tool_format_bytes() {
+    local bytes="${1:-0}"
+    awk -v b="$bytes" 'BEGIN {
+        if (b >= 1099511627776) printf "%.2f TB", b/1099511627776;
+        else if (b >= 1073741824) printf "%.2f GB", b/1073741824;
+        else if (b >= 1048576) printf "%.2f MB", b/1048576;
+        else if (b >= 1024) printf "%.2f KB", b/1024;
+        else printf "%.0f B", b;
+    }'
+}
+
+server_tool_public_traffic_bytes() {
+    local iface4 iface6 iface path rx tx
+    local total_rx=0 total_tx=0
+    local -A seen=()
+
+    iface4=$(ip -4 route show default 2>/dev/null | awk '
+        {
+            for (i=1;i<=NF;i++) if ($i=="dev" && (i+1)<=NF) {print $(i+1); exit}
+        }')
+    iface6=$(ip -6 route show default 2>/dev/null | awk '
+        {
+            for (i=1;i<=NF;i++) if ($i=="dev" && (i+1)<=NF) {print $(i+1); exit}
+        }')
+
+    for iface in "$iface4" "$iface6"; do
+        [[ -n "$iface" ]] || continue
+        [[ -n "${seen[$iface]:-}" ]] && continue
+        seen[$iface]=1
+        path="/sys/class/net/${iface}/statistics"
+        [[ -r "${path}/rx_bytes" && -r "${path}/tx_bytes" ]] || continue
+        rx=$(cat "${path}/rx_bytes" 2>/dev/null || echo 0)
+        tx=$(cat "${path}/tx_bytes" 2>/dev/null || echo 0)
+        [[ "$rx" =~ ^[0-9]+$ ]] || rx=0
+        [[ "$tx" =~ ^[0-9]+$ ]] || tx=0
+        total_rx=$((total_rx + rx))
+        total_tx=$((total_tx + tx))
+    done
+
+    # 极少数环境没有默认路由设备时，回退到常见公网接口。
+    if [[ ${#seen[@]} -eq 0 ]]; then
+        for path in /sys/class/net/*; do
+            [[ -d "$path/statistics" ]] || continue
+            iface=${path##*/}
+            case "$iface" in
+                lo|docker*|br-*|veth*|tun*|tap*|wg*|warp*|tailscale*) continue ;;
+            esac
+            [[ "$iface" =~ ^(eth|ens|enp|eno|venet|bond) ]] || continue
+            rx=$(cat "$path/statistics/rx_bytes" 2>/dev/null || echo 0)
+            tx=$(cat "$path/statistics/tx_bytes" 2>/dev/null || echo 0)
+            [[ "$rx" =~ ^[0-9]+$ ]] || rx=0
+            [[ "$tx" =~ ^[0-9]+$ ]] || tx=0
+            total_rx=$((total_rx + rx))
+            total_tx=$((total_tx + tx))
+        done
+    fi
+
+    printf '%s %s\n' "$total_rx" "$total_tx"
+}
+
+server_tool_monthly_traffic_bytes() {
+    local raw current_rx current_tx month
+    local state_month="" last_rx=0 last_tx=0 total_rx=0 total_tx=0
+    local tmp
+
+    mkdir -p "$STATE_DIR" || {
+        echo "0 0"
+        return
+    }
+    chmod 700 "$STATE_DIR"
+
+    raw=$(server_tool_public_traffic_bytes)
+    current_rx=$(awk '{print $1}' <<<"$raw")
+    current_tx=$(awk '{print $2}' <<<"$raw")
+    [[ "$current_rx" =~ ^[0-9]+$ ]] || current_rx=0
+    [[ "$current_tx" =~ ^[0-9]+$ ]] || current_tx=0
+
+    month=$(date +%Y-%m)
+
+    if [[ -f "$SYSTEM_INFO_TRAFFIC_STATE" ]]; then
+        state_month=$(awk -F= '$1=="MONTH" {gsub(/\047/,"",$2); print $2}' "$SYSTEM_INFO_TRAFFIC_STATE" 2>/dev/null)
+        last_rx=$(awk -F= '$1=="LAST_RX" {print $2}' "$SYSTEM_INFO_TRAFFIC_STATE" 2>/dev/null)
+        last_tx=$(awk -F= '$1=="LAST_TX" {print $2}' "$SYSTEM_INFO_TRAFFIC_STATE" 2>/dev/null)
+        total_rx=$(awk -F= '$1=="TOTAL_RX" {print $2}' "$SYSTEM_INFO_TRAFFIC_STATE" 2>/dev/null)
+        total_tx=$(awk -F= '$1=="TOTAL_TX" {print $2}' "$SYSTEM_INFO_TRAFFIC_STATE" 2>/dev/null)
+    fi
+
+    [[ "$last_rx" =~ ^[0-9]+$ ]] || last_rx=0
+    [[ "$last_tx" =~ ^[0-9]+$ ]] || last_tx=0
+    [[ "$total_rx" =~ ^[0-9]+$ ]] || total_rx=0
+    [[ "$total_tx" =~ ^[0-9]+$ ]] || total_tx=0
+
+    if [[ "$state_month" != "$month" ]]; then
+        # 新月份从当前时刻重新开始累计。
+        state_month="$month"
+        last_rx="$current_rx"
+        last_tx="$current_tx"
+        total_rx=0
+        total_tx=0
+    else
+        if [[ "$current_rx" -ge "$last_rx" ]]; then
+            total_rx=$((total_rx + current_rx - last_rx))
+        else
+            # VPS 重启或网卡计数归零：保留当月累计，并把当前值作为重启后的新增量。
+            total_rx=$((total_rx + current_rx))
+        fi
+
+        if [[ "$current_tx" -ge "$last_tx" ]]; then
+            total_tx=$((total_tx + current_tx - last_tx))
+        else
+            total_tx=$((total_tx + current_tx))
+        fi
+
+        last_rx="$current_rx"
+        last_tx="$current_tx"
+    fi
+
+    tmp="${SYSTEM_INFO_TRAFFIC_STATE}.tmp.$$"
+    umask 077
+    cat > "$tmp" <<EOF
+MONTH='${state_month}'
+LAST_RX=${last_rx}
+LAST_TX=${last_tx}
+TOTAL_RX=${total_rx}
+TOTAL_TX=${total_tx}
+EOF
+    mv -f "$tmp" "$SYSTEM_INFO_TRAFFIC_STATE"
+    chmod 600 "$SYSTEM_INFO_TRAFFIC_STATE"
+
+    printf '%s %s\n' "$total_rx" "$total_tx"
+}
+
+server_tool_system_info() {
+    local cpu cores mem_total mem_used swap_total swap_used disk_used disk_total
+    local uptime_days timezone dns congestion qdisc os_info ipv4 ipv6 hostname_text
+    local cpu_mhz cpu_ghz traffic_rx traffic_tx traffic_pair
+    local warp_ipv6="" ipv6_display=""
+
+    clear
+    os_info=$(get_sys_info)
+    cpu=$(awk -F: '/model name|Hardware|Processor/ {gsub(/^[ \t]+/,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null)
+    cpu=${cpu:-$(uname -m)}
+    cores=$(nproc 2>/dev/null || echo "?")
+
+    cpu_mhz=$(awk -F: '/cpu MHz/ {gsub(/^[ \t]+/,"",$2); sum+=$2; n++} END {if (n>0) printf "%.0f", sum/n}' /proc/cpuinfo 2>/dev/null)
+    if [[ "$cpu_mhz" =~ ^[0-9]+$ ]] && [[ "$cpu_mhz" -gt 0 ]]; then
+        cpu_ghz=$(awk -v mhz="$cpu_mhz" 'BEGIN {printf "%.2f", mhz/1000}')
+    else
+        cpu_ghz=""
+    fi
+
+    mem_total=$(free -h 2>/dev/null | awk '/^Mem:/ {print $2}')
+    mem_used=$(free -h 2>/dev/null | awk '/^Mem:/ {print $3}')
+    swap_total=$(free -h 2>/dev/null | awk '/^Swap:/ {print $2}')
+    swap_used=$(free -h 2>/dev/null | awk '/^Swap:/ {print $3}')
+    mem_total=${mem_total//Gi/G}
+    mem_total=${mem_total//Mi/M}
+    mem_total=${mem_total//Ki/K}
+    mem_total=${mem_total//Ti/T}
+    mem_used=${mem_used//Gi/G}
+    mem_used=${mem_used//Mi/M}
+    mem_used=${mem_used//Ki/K}
+    mem_used=${mem_used//Ti/T}
+    swap_total=${swap_total//Gi/G}
+    swap_total=${swap_total//Mi/M}
+    swap_total=${swap_total//Ki/K}
+    swap_total=${swap_total//Ti/T}
+    swap_used=${swap_used//Gi/G}
+    swap_used=${swap_used//Mi/M}
+    swap_used=${swap_used//Ki/K}
+    swap_used=${swap_used//Ti/T}
+    disk_used=$(df -h / 2>/dev/null | awk 'NR==2 {print $3}')
+    disk_total=$(df -h / 2>/dev/null | awk 'NR==2 {print $2}')
+
+    uptime_days=$(awk '{printf "%d", $1/86400}' /proc/uptime 2>/dev/null)
+    [[ "$uptime_days" =~ ^[0-9]+$ ]] || uptime_days=0
+
+    timezone=$(timedatectl show -p Timezone --value 2>/dev/null || date +%Z)
+    dns=$(awk '/^[[:space:]]*nameserver[[:space:]]+/ {print $2}' /etc/resolv.conf 2>/dev/null | paste -sd ',' -)
+    congestion=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
+    hostname_text=$(hostname 2>/dev/null || echo "未知")
+
+    traffic_pair=$(server_tool_monthly_traffic_bytes)
+    traffic_rx=$(awk '{print $1}' <<<"$traffic_pair")
+    traffic_tx=$(awk '{print $2}' <<<"$traffic_pair")
+
+    ipv4=$(curl -4fsS --connect-timeout 2 --max-time 4 https://api4.ipify.org 2>/dev/null || true)
+    ipv6=$(curl -6fsS --connect-timeout 2 --max-time 4 https://api6.ipify.org 2>/dev/null || true)
+
+    # WARP 使用 Local Proxy，不会把 Cloudflare IPv6 写入 VPS 本机网络栈。
+    # 因此原生 IPv6 不存在时，需要通过 WARP SOCKS 出口单独查询。
+    if [[ -n "$ipv6" ]]; then
+        ipv6_display="$ipv6"
+    elif warp_proxy_ready 2>/dev/null && warp_family_allowed ipv6 2>/dev/null; then
+        warp_ipv6=$(warp_test_family ipv6 2>/dev/null || true)
+        if [[ -n "$warp_ipv6" ]]; then
+            ipv6_display="${warp_ipv6}（WARP）"
+        else
+            ipv6_display="无 IPv6"
+        fi
+    else
+        ipv6_display="无 IPv6"
+    fi
+
+    # IP 属性继续以 VPS 原生公网地址为准，不使用 WARP 出口覆盖机房/IP 属性。
+    server_tool_get_ip_profile "$ipv4" "$ipv6"
+
+    echo -e "${CYAN}════════════════════ 系统信息 ════════════════════${PLAIN}"
+    echo "  主机名     : ${hostname_text}"
+    echo "  系统       : ${os_info}"
+    echo "  CPU        : ${cpu}"
+    echo "  CPU 核心   : ${cores}$([[ -n "$cpu_ghz" ]] && printf " 核 @ %s GHz" "$cpu_ghz" || printf " 核")"
+    echo "  内存       : ${mem_used:-?} / ${mem_total:-?}"
+    echo "  虚拟内存   : ${swap_used:-?} / ${swap_total:-?}"
+    echo "  硬盘占用   : ${disk_used:-?} / ${disk_total:-?}"
+    echo "  运行时间   : ${uptime_days} 天"
+    echo "  入站流量   : $(server_tool_format_bytes "${traffic_rx:-0}")（本月）"
+    echo "  出站流量   : $(server_tool_format_bytes "${traffic_tx:-0}")（本月）"
+    echo "  时区       : ${timezone:-未知}"
+    echo "  IPv4 地址  : ${ipv4:-无 IPv4}"
+    echo "  IPv6 地址  : ${ipv6_display}"
+    echo "  地理位置   : ${SERVER_INFO_LOCATION}"
+    echo "  ISP / ASN  : ${SERVER_INFO_ISP} / ${SERVER_INFO_ASN}"
+    echo "  IP 性质    : ${SERVER_INFO_IP_TYPE}"
+    echo "  IP 危险性  : ${SERVER_INFO_IP_RISK}"
+    echo "  DNS        : ${dns:-未检测到}"
+    echo "  网络算法   : ${congestion} ${qdisc}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════${PLAIN}"
+}
+
+server_tool_system_update() {
+    local pm action
+    pm=$(server_tool_pkg_manager)
+
+    clear
+    echo -e "${CYAN}════════════════ 系统更新 / 清理 ════════════════${PLAIN}"
+    echo "  1. 更新系统软件包"
+    echo "  2. 清理无用软件包与缓存"
+    echo "  3. 更新 + 清理"
+    echo "  0. 返回"
+    read -rp "请选择 [0-3]: " action
+
+    [[ "$action" == "0" ]] && return
+
+    if [[ "$pm" == "unknown" ]]; then
+        echo -e "${RED}[错误] 未识别当前系统包管理器。${PLAIN}"
+        pause
+        return
+    fi
+
+    if [[ "$action" == "1" || "$action" == "3" ]]; then
+        echo -e "${YELLOW}>> 正在更新系统软件包...${PLAIN}"
+        case "$pm" in
+            apt)
+                DEBIAN_FRONTEND=noninteractive apt-get update -y &&
+                DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y
+                ;;
+            dnf) dnf upgrade -y ;;
+            yum) yum update -y ;;
+            apk) apk update && apk upgrade ;;
+        esac
+    fi
+
+    if [[ "$action" == "2" || "$action" == "3" ]]; then
+        echo -e "${YELLOW}>> 正在清理无用软件包与包管理器缓存...${PLAIN}"
+        case "$pm" in
+            apt)
+                DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y
+                apt-get clean
+                apt-get autoclean
+                ;;
+            dnf)
+                dnf autoremove -y || true
+                dnf clean all
+                ;;
+            yum)
+                yum autoremove -y || true
+                yum clean all
+                ;;
+            apk)
+                apk cache clean
+                ;;
+        esac
+    fi
+
+    echo -e "${GREEN}✔ 操作完成。${PLAIN}"
+    pause
+}
+
+server_tool_swap_status() {
+    echo -e "${YELLOW}当前内存 / Swap:${PLAIN}"
+    free -h 2>/dev/null || true
+    echo ""
+    swapon --show 2>/dev/null || true
+}
+
+server_tool_swap_create() {
+    local size_mb="$1"
+
+    if ! [[ "$size_mb" =~ ^[0-9]+$ ]] || [[ "$size_mb" -lt 256 ]] || [[ "$size_mb" -gt 32768 ]]; then
+        echo -e "${RED}[错误] Swap 大小必须在 256-32768 MB。${PLAIN}"
+        return 1
+    fi
+
+    if platform_is_alpine; then
+        ensure_test_dependency mkswap util-linux-misc || {
+            echo -e "${RED}[错误] Alpine 无法安装 util-linux-misc，不能安全管理 Swap。${PLAIN}"
+            return 1
+        }
+    fi
+    for cmd in mkswap swapon swapoff; do
+        command -v "$cmd" >/dev/null 2>&1 || {
+            echo -e "${RED}[错误] 缺少 $cmd，无法管理 Swap。${PLAIN}"
+            return 1
+        }
+    done
+
+    if swapon --show=NAME --noheadings 2>/dev/null | grep -qx '/swapfile'; then
+        swapoff /swapfile || return 1
+    fi
+    rm -f /swapfile
+    echo -e "${YELLOW}>> 创建 ${size_mb} MB /swapfile...${PLAIN}"
+    if command -v fallocate >/dev/null 2>&1; then
+        fallocate -l "${size_mb}M" /swapfile || return 1
+    else
+        dd if=/dev/zero of=/swapfile bs=1M count="$size_mb" status=progress || return 1
+    fi
+    chmod 600 /swapfile
+    mkswap /swapfile >/dev/null || { rm -f /swapfile; return 1; }
+    swapon /swapfile || { rm -f /swapfile; return 1; }
+    sed -i '\|^/swapfile[[:space:]]|d' /etc/fstab
+    echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    echo -e "${GREEN}✔ /swapfile 已启用。${PLAIN}"
+}
+server_tool_swap_remove() {
+    local ans=""
+    if [[ ! -f /swapfile ]] && ! grep -qE '^/swapfile[[:space:]]' /etc/fstab 2>/dev/null; then
+        echo -e "${YELLOW}未检测到由本工具管理的 /swapfile。${PLAIN}"
+        return 0
+    fi
+
+    read -rp "确认删除 /swapfile？不会影响其他 Swap。[y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || return 0
+
+    swapoff /swapfile >/dev/null 2>&1 || true
+    sed -i '\|^/swapfile[[:space:]]|d' /etc/fstab
+    rm -f /swapfile
+    echo -e "${GREEN}✔ /swapfile 已删除。${PLAIN}"
+}
+
+server_tool_swap_management() {
+    local c custom
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ Swap 管理 ════════════════════${PLAIN}"
+        server_tool_swap_status
+        echo ""
+        echo "  1. 设置 512 MB"
+        echo "  2. 设置 1 GB"
+        echo "  3. 设置 2 GB"
+        echo "  4. 设置 4 GB"
+        echo "  5. 自定义大小"
+        echo "  6. 删除 /swapfile"
+        echo "  0. 返回"
+        read -rp "请选择 [0-6]: " c
+        case "$c" in
+            1) server_tool_swap_create 512; pause ;;
+            2) server_tool_swap_create 1024; pause ;;
+            3) server_tool_swap_create 2048; pause ;;
+            4) server_tool_swap_create 4096; pause ;;
+            5)
+                read -rp "请输入 Swap 大小（MB，256-32768）: " custom
+                server_tool_swap_create "$custom"
+                pause
+                ;;
+            6) server_tool_swap_remove; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+server_tool_bbr_status() {
+    local available current qdisc
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+    current=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || true)
+    echo "当前算法 : ${current:-未知}"
+    echo "可用算法 : ${available:-未知}"
+    echo "当前 qdisc: ${qdisc:-未知}"
+}
+
+server_tool_bbr_enable() {
+    local available
+    modprobe tcp_bbr >/dev/null 2>&1 || true
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+
+    if ! grep -qw bbr <<<"$available"; then
+        echo -e "${RED}[错误] 当前内核没有提供 BBR。${PLAIN}"
+        echo -e "${YELLOW}本脚本不会为了 BBR 自动替换 VPS 内核。${PLAIN}"
+        return 1
+    fi
+
+    mkdir -p /etc/sysctl.d
+    cat > /etc/sysctl.d/99-ss2022-bbr.conf <<'EOF'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+
+    sysctl -p /etc/sysctl.d/99-ss2022-bbr.conf >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1 || return 1
+
+    if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]]; then
+        echo -e "${GREEN}✔ BBR 已启用。${PLAIN}"
+        return 0
+    fi
+
+    echo -e "${RED}[错误] BBR 参数写入后未生效。${PLAIN}"
+    return 1
+}
+
+server_tool_bbr_disable() {
+    local available fallback="cubic"
+    rm -f /etc/sysctl.d/99-ss2022-bbr.conf
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+    grep -qw cubic <<<"$available" || fallback=$(awk '{print $1}' <<<"$available")
+    [[ -n "$fallback" ]] || fallback="reno"
+
+    sysctl -w "net.ipv4.tcp_congestion_control=${fallback}" >/dev/null 2>&1 || true
+    if grep -qw fq_codel <<<"$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"; then
+        :
+    else
+        sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1 || true
+    fi
+    echo -e "${GREEN}✔ 已移除本脚本 BBR 持久化配置；当前算法: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 未知)${PLAIN}"
+}
+
+server_tool_bbr_management() {
+    local c
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ BBR 管理 ════════════════════${PLAIN}"
+        server_tool_bbr_status
+        echo ""
+        echo "  1. 启用当前内核原生 BBR"
+        echo "  2. 移除本脚本 BBR 配置"
+        echo "  0. 返回"
+        read -rp "请选择 [0-2]: " c
+        case "$c" in
+            1) server_tool_bbr_enable; pause ;;
+            2) server_tool_bbr_disable; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+server_tool_dns_show() {
+    echo -e "${YELLOW}当前 /etc/resolv.conf:${PLAIN}"
+    cat /etc/resolv.conf 2>/dev/null || true
+}
+
+server_tool_dns_apply() {
+    local dns_list="$1"
+    local resolved_dropin="/etc/systemd/resolved.conf.d/99-ss2022-dns.conf"
+    local backup="${STATE_DIR}/resolv.conf.server-tools.bak"
+    local dns="" valid_list=""
+
+    for dns in $dns_list; do
+        dns=${dns//,/}
+        [[ -n "$dns" ]] || continue
+
+        if [[ "$dns" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            local IFS=.
+            read -r a b c d <<<"$dns"
+            if (( a <= 255 && b <= 255 && c <= 255 && d <= 255 )); then
+                valid_list+="${dns} "
+            else
+                echo -e "${RED}[错误] 无效 IPv4 DNS: ${dns}${PLAIN}"
+                return 1
+            fi
+        elif [[ "$dns" =~ ^[0-9A-Fa-f:]+$ && "$dns" == *:* ]]; then
+            valid_list+="${dns} "
+        else
+            echo -e "${RED}[错误] 无效 DNS 地址: ${dns}${PLAIN}"
+            return 1
+        fi
+    done
+
+    valid_list=${valid_list% }
+    [[ -n "$valid_list" ]] || {
+        echo -e "${RED}[错误] 未提供有效 DNS 地址。${PLAIN}"
+        return 1
+    }
+
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+
+    if [[ -L /etc/resolv.conf ]] && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        mkdir -p /etc/systemd/resolved.conf.d
+        cat > "$resolved_dropin" <<EOF
+[Resolve]
+DNS=${valid_list}
+FallbackDNS=
+EOF
+        if ! systemctl restart systemd-resolved; then
+            rm -f "$resolved_dropin"
+            systemctl restart systemd-resolved >/dev/null 2>&1 || true
+            return 1
+        fi
+        echo -e "${GREEN}✔ DNS 已通过 systemd-resolved 更新：${valid_list}${PLAIN}"
+        return 0
+    fi
+
+    if [[ -L /etc/resolv.conf ]]; then
+        echo -e "${RED}[错误] /etc/resolv.conf 是符号链接，但未检测到可管理的 systemd-resolved。${PLAIN}"
+        echo -e "${YELLOW}为避免破坏 NetworkManager 或其他网络管理器，本工具不会强制覆盖。${PLAIN}"
+        return 1
+    fi
+
+    if [[ ! -f "$backup" && -f /etc/resolv.conf ]]; then
+        cp -a /etc/resolv.conf "$backup" || return 1
+        chmod 600 "$backup"
+    fi
+
+    : > /etc/resolv.conf
+    for dns in $valid_list; do
+        printf 'nameserver %s\n' "$dns" >> /etc/resolv.conf
+    done
+    printf '%s\n' 'options timeout:2 attempts:2' >> /etc/resolv.conf
+
+    echo -e "${GREEN}✔ DNS 已更新：${valid_list}${PLAIN}"
+}
+
+server_tool_dns_restore() {
+    local resolved_dropin="/etc/systemd/resolved.conf.d/99-ss2022-dns.conf"
+    local backup="${STATE_DIR}/resolv.conf.server-tools.bak"
+
+    if [[ -f "$resolved_dropin" ]]; then
+        rm -f "$resolved_dropin"
+        systemctl restart systemd-resolved >/dev/null 2>&1 || true
+        echo -e "${GREEN}✔ 已移除本脚本的 systemd-resolved DNS 配置。${PLAIN}"
+        return 0
+    fi
+
+    if [[ -f "$backup" && ! -L /etc/resolv.conf ]]; then
+        cp -af "$backup" /etc/resolv.conf
+        rm -f "$backup"
+        echo -e "${GREEN}✔ 已恢复修改前的 DNS 配置。${PLAIN}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}没有找到本工具可恢复的 DNS 备份。${PLAIN}"
+}
+
+server_tool_dns_management() {
+    local c custom_dns
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ DNS 管理 ════════════════════${PLAIN}"
+        server_tool_dns_show
+        echo ""
+        echo "  1. Cloudflare + Google"
+        echo "     1.1.1.1 / 8.8.8.8 / 2606:4700:4700::1111 / 2001:4860:4860::8888"
+        echo "  2. Quad9 + Cloudflare"
+        echo "     9.9.9.9 / 1.1.1.1 / 2620:fe::fe / 2606:4700:4700::1111"
+        echo "  3. 阿里 DNS + DNSPod"
+        echo "     223.5.5.5 / 119.29.29.29 / 2400:3200::1 / 2402:4e00::"
+        echo "  4. 自定义 DNS（支持解锁 DNS）"
+        echo "  5. 恢复修改前 DNS"
+        echo "  0. 返回"
+        read -rp "请选择 [0-5]: " c
+        case "$c" in
+            1)
+                server_tool_dns_apply "1.1.1.1 8.8.8.8 2606:4700:4700::1111 2001:4860:4860::8888"
+                pause
+                ;;
+            2)
+                server_tool_dns_apply "9.9.9.9 1.1.1.1 2620:fe::fe 2606:4700:4700::1111"
+                pause
+                ;;
+            3)
+                server_tool_dns_apply "223.5.5.5 119.29.29.29 2400:3200::1 2402:4e00::"
+                pause
+                ;;
+            4)
+                echo ""
+                echo "请输入厂商提供的 DNS IP。"
+                echo "支持 IPv4 / IPv6；多个地址使用空格分隔。"
+                echo "示例: 1.2.3.4 5.6.7.8"
+                read -rp "自定义 DNS: " custom_dns
+                [[ -n "$custom_dns" ]] && server_tool_dns_apply "$custom_dns"
+                pause
+                ;;
+            5)
+                server_tool_dns_restore
+                pause
+                ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+server_tool_ip_priority_status() {
+    if platform_is_alpine; then
+        echo "Alpine/musl：不使用 gai.conf"
+        return
+    fi
+    if grep -q '^precedence ::ffff:0:0/96[[:space:]]\+100[[:space:]]*# ss2022-prefer-ipv4$' /etc/gai.conf 2>/dev/null; then
+        echo "IPv4 优先"
+    else
+        echo "系统默认（通常 IPv6 优先）"
+    fi
+}
+server_tool_ip_priority_management() {
+    local c
+    if platform_is_alpine; then
+        clear
+        echo -e "${CYAN}════════════ IPv4 / IPv6 地址优先级 ════════════${PLAIN}"
+        echo -e "${YELLOW}Alpine 使用 musl libc，/etc/gai.conf 的 glibc precedence 规则不会生效。${PLAIN}"
+        echo "因此这里不写入无效配置。"
+        echo "vps-bootstrap 业务流量请使用“全局业务出口地址族 / 应用地址族分流”；"
+        echo "需要彻底关闭某地址族时使用下方 IPv4 / IPv6 协议族管理。"
+        pause
+        return
+    fi
+    while true; do
+        clear
+        echo -e "${CYAN}════════════ IPv4 / IPv6 优先级 ════════════${PLAIN}"
+        echo "当前模式: $(server_tool_ip_priority_status)"
+        echo ""
+        echo "  1. 设置 IPv4 优先"
+        echo "  2. 恢复系统默认优先级"
+        echo "  0. 返回"
+        read -rp "请选择 [0-2]: " c
+        case "$c" in
+            1)
+                touch /etc/gai.conf
+                sed -i '/# ss2022-prefer-ipv4$/d' /etc/gai.conf
+                echo 'precedence ::ffff:0:0/96  100 # ss2022-prefer-ipv4' >> /etc/gai.conf
+                echo -e "${GREEN}✔ 已设置 IPv4 优先。${PLAIN}"; pause ;;
+            2)
+                [[ -f /etc/gai.conf ]] && sed -i '/# ss2022-prefer-ipv4$/d' /etc/gai.conf
+                echo -e "${GREEN}✔ 已恢复系统默认地址优先级。${PLAIN}"; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+server_tool_ip_family_mode() {
+    local mode="dual"
+    if [[ -f "$IP_FAMILY_MODE_FILE" ]]; then
+        mode=$(tr -d '[:space:]' < "$IP_FAMILY_MODE_FILE" 2>/dev/null)
+    fi
+    case "$mode" in
+        dual|ipv4-only|ipv6-only) echo "$mode" ;;
+        *) echo "dual" ;;
+    esac
+}
+
+server_tool_ip_family_mode_label() {
+    case "${1:-dual}" in
+        ipv4-only) echo "仅 IPv4（IPv6 已关闭）" ;;
+        ipv6-only) echo "仅 IPv6（IPv4 已关闭）" ;;
+        *) echo "IPv4 + IPv6 双栈" ;;
+    esac
+}
+
+server_tool_ip_family_mode_allows() {
+    local family="${1:-default}" mode
+    [[ "$family" == "default" ]] && return 0
+    mode=$(server_tool_ip_family_mode)
+    case "$mode:$family" in
+        dual:ipv4|dual:ipv6|ipv4-only:ipv4|ipv6-only:ipv6) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+server_tool_current_ssh_family() {
+    local peer=""
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then
+        peer=${SSH_CONNECTION%% *}
+    elif [[ -n "${SSH_CLIENT:-}" ]]; then
+        peer=${SSH_CLIENT%% *}
+    fi
+    [[ -n "$peer" ]] || { echo "unknown"; return; }
+    if [[ "$peer" == *:* ]]; then echo "ipv6"; else echo "ipv4"; fi
+}
+
+server_tool_native_family_ready() {
+    local family="$1"
+    case "$family" in
+        ipv4)
+            ip -4 addr show scope global 2>/dev/null | grep -q 'inet ' || return 1
+            ip -4 route show default 2>/dev/null | grep -q '^default ' || return 1
+            curl -4fsS --connect-timeout 4 --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q '^ip='
+            ;;
+        ipv6)
+            ip -6 addr show scope global 2>/dev/null | grep -q 'inet6 ' || return 1
+            ip -6 route show default 2>/dev/null | grep -q '^default ' || return 1
+            curl -6fsS --connect-timeout 4 --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q '^ip='
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+server_tool_ip_family_policy_conflict() {
+    local mode="$1" blocked="" global default_ref effective count i r ref fam name found=0
+    [[ "$mode" == "ipv4-only" ]] && blocked="ipv6"
+    [[ "$mode" == "ipv6-only" ]] && blocked="ipv4"
+    [[ -n "$blocked" ]] || return 1
+
+    routing_init_state || return 1
+    global=$(routing_global_ip_family)
+    default_ref=$(jq -r '.default_outbound // "direct"' "$ROUTING_FILE")
+    effective=$(routing_effective_family "$global" "$default_ref")
+    if [[ "$effective" == "$blocked" ]]; then
+        echo -e "${RED}[冲突] 全局默认出口当前固定为 $(routing_ip_family_label "$blocked")。${PLAIN}"
+        found=1
+    fi
+
+    count=$(jq '.rules|length' "$ROUTING_FILE")
+    i=0
+    while [[ $i -lt $count ]]; do
+        r=$(jq -c ".rules[$i]" "$ROUTING_FILE")
+        ref=$(jq -r '.outbound // "default"' <<<"$r")
+        fam=$(routing_effective_family "$(jq -r '.ip_family // "default"' <<<"$r")" "$ref")
+        if [[ "$fam" == "$blocked" ]]; then
+            name=$(jq -r '.name // "未命名规则"' <<<"$r")
+            echo -e "${RED}[冲突] 规则 ${name} 当前固定为 $(routing_ip_family_label "$blocked")。${PLAIN}"
+            found=1
+        fi
+        i=$((i+1))
+    done
+
+    [[ $found -eq 1 ]]
+}
+
+server_tool_install_ip_family_guard() {
+    ensure_test_dependency nft nftables || {
+        echo -e "${RED}[错误] nftables 不可用，无法安全管理 IPv4 / IPv6 关闭状态。${PLAIN}"
+        return 1
+    }
+    mkdir -p "$STATE_DIR" /usr/local/lib/ss2022 || return 1
+    chmod 700 "$STATE_DIR"
+    cat > "$IP_FAMILY_APPLY_HELPER" <<'EOF'
+#!/bin/bash
+set -u
+STATE_FILE="/etc/ss2022/ip-family-mode"
+TABLE="ss2022_ip_family"
+mode="dual"
+[[ -f "$STATE_FILE" ]] && mode=$(tr -d '[:space:]' < "$STATE_FILE" 2>/dev/null)
+command -v nft >/dev/null 2>&1 || exit 1
+nft delete table inet "$TABLE" >/dev/null 2>&1 || true
+case "$mode" in
+  dual) exit 0 ;;
+  ipv4-only|ipv6-only) ;;
+  *) exit 1 ;;
+esac
+nft add table inet "$TABLE"
+nft 'add chain inet ss2022_ip_family input { type filter hook input priority -20; policy accept; }'
+nft 'add chain inet ss2022_ip_family output { type filter hook output priority -20; policy accept; }'
+if [[ "$mode" == "ipv4-only" ]]; then
+    nft 'add rule inet ss2022_ip_family input meta nfproto ipv6 iifname != "lo" drop'
+    nft 'add rule inet ss2022_ip_family output meta nfproto ipv6 oifname != "lo" drop'
+else
+    nft 'add rule inet ss2022_ip_family input meta nfproto ipv4 iifname != "lo" drop'
+    nft 'add rule inet ss2022_ip_family output meta nfproto ipv4 oifname != "lo" drop'
+fi
+EOF
+    chmod 700 "$IP_FAMILY_APPLY_HELPER"
+
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        cat > "$IP_FAMILY_SERVICE" <<EOF
+[Unit]
+Description=vps-bootstrap IPv4/IPv6 family guard
+After=network-online.target
+Wants=network-online.target
+Before=sing-box.service ${XRAY_SERVICE_NAME}.service ${REALM_SERVICE_NAME}.service
+
+[Service]
+Type=oneshot
+ExecStart=${IP_FAMILY_APPLY_HELPER}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        chmod 644 "$IP_FAMILY_SERVICE"
+        service_daemon_reload || return 1
+    else
+        cat > "$IP_FAMILY_OPENRC_SERVICE" <<EOF
+#!/sbin/openrc-run
+description="vps-bootstrap IPv4/IPv6 family guard"
+depend() {
+    need net
+    before sing-box ${XRAY_SERVICE_NAME} ${REALM_SERVICE_NAME}
+}
+start() {
+    ebegin "Applying vps-bootstrap IP family guard"
+    ${IP_FAMILY_APPLY_HELPER}
+    eend $?
+}
+stop() {
+    return 0
+}
+EOF
+        chmod 755 "$IP_FAMILY_OPENRC_SERVICE"
+    fi
+    service_enable "$IP_FAMILY_SERVICE_NAME" || return 1
+}
+server_tool_set_ip_family_mode() {
+    local new_mode="$1" old_mode ssh_family keep_family label
+    old_mode=$(server_tool_ip_family_mode)
+    [[ "$new_mode" != "$old_mode" ]] || {
+        echo -e "${GREEN}当前已经是：$(server_tool_ip_family_mode_label "$new_mode")。${PLAIN}"
+        return 0
+    }
+
+    if [[ "$old_mode" != "dual" && "$new_mode" != "dual" ]]; then
+        echo -e "${YELLOW}[提示] 请先恢复 IPv4 + IPv6 双栈，再切换到另一单地址族模式。${PLAIN}"
+        return 1
+    fi
+
+    case "$new_mode" in
+        ipv4-only) keep_family="ipv4" ;;
+        ipv6-only) keep_family="ipv6" ;;
+        dual) keep_family="" ;;
+        *) return 1 ;;
+    esac
+
+    if [[ -n "$keep_family" ]]; then
+        ssh_family=$(server_tool_current_ssh_family)
+        if [[ "$ssh_family" != "unknown" && "$ssh_family" != "$keep_family" ]]; then
+            echo -e "${RED}[拒绝] 当前 SSH 会话正在使用 ${ssh_family^^}，不能关闭该地址族。${PLAIN}"
+            echo "请先用 ${keep_family^^} 地址重新建立 SSH 会话后再操作。"
+            return 1
+        fi
+
+        if ! server_tool_native_family_ready "$keep_family"; then
+            echo -e "${RED}[拒绝] 未确认 ${keep_family^^} 原生公网连接可用，不能关闭另一地址族。${PLAIN}"
+            return 1
+        fi
+
+        if server_tool_ip_family_policy_conflict "$new_mode"; then
+            echo -e "${RED}[拒绝] 请先调整上面的全局/应用地址族规则，再关闭协议族。${PLAIN}"
+            return 1
+        fi
+    fi
+
+    server_tool_install_ip_family_guard || return 1
+    printf '%s
+' "$new_mode" > "$IP_FAMILY_MODE_FILE" || return 1
+    chmod 600 "$IP_FAMILY_MODE_FILE"
+
+    if ! service_restart "$IP_FAMILY_SERVICE_NAME"; then
+        echo -e "${RED}[错误] 新协议族策略应用失败，正在恢复。${PLAIN}"
+        printf '%s
+' "$old_mode" > "$IP_FAMILY_MODE_FILE"
+        service_restart "$IP_FAMILY_SERVICE_NAME" >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    label=$(server_tool_ip_family_mode_label "$new_mode")
+    echo -e "${GREEN}✔ 已切换为：${label}。${PLAIN}"
+    if [[ "$new_mode" != "dual" ]]; then
+        echo -e "${YELLOW}说明: IP 地址本身不会被删除；本脚本通过独立 nftables 表阻断已关闭地址族的公网收发，因此可以安全恢复。${PLAIN}"
+    fi
+}
+
+server_tool_ip_family_status() {
+    local v4="无" v6="无" mode global
+    v4=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | head -n1)
+    v6=$(ip -6 -o addr show scope global 2>/dev/null | awk '{print $4}' | head -n1)
+    v4=${v4:-无}
+    v6=${v6:-无}
+    mode=$(server_tool_ip_family_mode)
+    global=$(routing_global_ip_family)
+    echo "  IPv4 地址     : $v4"
+    echo "  IPv6 地址     : $v6"
+    echo "  系统协议族状态 : $(server_tool_ip_family_mode_label "$mode")"
+    echo "  业务出口地址族 : $(routing_ip_family_label "$global")"
+    echo "  地址优先级     : $(server_tool_ip_priority_status)"
+}
+
+server_tool_ip_family_management() {
+    local c
+    while true; do
+        clear
+        routing_init_state >/dev/null 2>&1 || true
+        echo -e "${CYAN}════════════ IPv4 / IPv6 管理 ════════════${PLAIN}"
+        server_tool_ip_family_status
+        echo ""
+        echo "  1. IPv4 / IPv6 地址优先级"
+        echo "  2. 全局业务出口地址族（双栈 / 仅 IPv4 / 仅 IPv6）"
+        echo "  3. 应用地址族分流（YouTube / ChatGPT / MyTVSuper 等）"
+        echo "  ------------------------------------------"
+        echo "  4. 关闭 IPv4（仅保留 IPv6 公网通信）"
+        echo "  5. 关闭 IPv6（仅保留 IPv4 公网通信）"
+        echo "  6. 恢复 IPv4 + IPv6 双栈公网通信"
+        echo "  0. 返回"
+        read -rp "请选择 [0-6]: " c
+        case "$c" in
+            1) server_tool_ip_priority_management ;;
+            2) routing_global_ip_family_management ;;
+            3) routing_app_family_management ;;
+            4) server_tool_set_ip_family_mode ipv6-only; pause ;;
+            5) server_tool_set_ip_family_mode ipv4-only; pause ;;
+            6) server_tool_set_ip_family_mode dual; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+server_tool_port_usage_show_all() {
+    echo -e "${YELLOW}当前 TCP / UDP 监听端口:${PLAIN}"
+    if command -v ss >/dev/null 2>&1; then
+        ss -H -lntup 2>/dev/null | awk '
+        {
+            proto=$1
+            local_addr=$5
+            proc=""
+            for (i=6;i<=NF;i++) proc=proc $i " "
+            printf "  %-5s %-30s %s\n", proto, local_addr, proc
+        }'
+    else
+        echo "  未找到 ss 命令。"
+    fi
+
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        echo ""
+        echo -e "${YELLOW}Docker 容器端口映射:${PLAIN}"
+        docker ps --format '  {{.Names}}\t{{.Ports}}' 2>/dev/null || true
+    fi
+}
+
+server_tool_port_usage_detail() {
+    local port="$1" found=0
+
+    echo -e "${CYAN}══════════════ 端口 ${port} 占用详情 ══════════════${PLAIN}"
+
+    if command -v ss >/dev/null 2>&1; then
+        local lines
+        lines=$(ss -H -lntup 2>/dev/null | awk -v p="$port" '
+        {
+            addr=$5
+            n=split(addr,a,":")
+            if (a[n] == p) print
+        }')
+        if [[ -n "$lines" ]]; then
+            found=1
+            printf '%s\n' "$lines"
+        fi
+    fi
+
+    if command -v lsof >/dev/null 2>&1; then
+        local lsof_out
+        lsof_out=$(lsof -nP -i ":${port}" 2>/dev/null || true)
+        if [[ -n "$lsof_out" ]]; then
+            found=1
+            echo ""
+            echo -e "${YELLOW}进程详情:${PLAIN}"
+            printf '%s\n' "$lsof_out"
+        fi
+    fi
+
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        local docker_out
+        docker_out=$(docker ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null \
+            | awk -F'\t' -v p="$port" '$2 ~ ("[:]" p "->") || $2 ~ ("0\\.0\\.0\\.0:" p "->") || $2 ~ ("\\[::\\]:" p "->") {print}')
+        if [[ -n "$docker_out" ]]; then
+            found=1
+            echo ""
+            echo -e "${YELLOW}Docker 容器:${PLAIN}"
+            printf '  %s\n' "$docker_out"
+        fi
+    fi
+
+    if [[ $found -eq 0 ]]; then
+        echo -e "${GREEN}未发现端口 ${port} 被监听占用。${PLAIN}"
+    fi
+}
+
+server_tool_port_listener_lines() {
+    local port="$1"
+
+    command -v ss >/dev/null 2>&1 || return 1
+    ss -H -lntup 2>/dev/null | awk -v p="$port" '
+    {
+        addr=$5
+        n=split(addr,a,":")
+        if (a[n] == p) print
+    }'
+}
+
+server_tool_port_listener_pids() {
+    local port="$1"
+    local lines
+
+    lines=$(server_tool_port_listener_lines "$port" 2>/dev/null || true)
+    [[ -n "$lines" ]] || return 0
+
+    printf '%s\n' "$lines" \
+        | grep -oE 'pid=[0-9]+' 2>/dev/null \
+        | cut -d= -f2 \
+        | sort -nu
+}
+
+server_tool_pid_systemd_unit() {
+    local pid="$1" unit="" pf="" pf_pid="" svc=""
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        if [[ -r "/proc/${pid}/cgroup" ]]; then
+            unit=$(sed -nE 's#.*[/]([^/]+\.service)(/.*)?$#\1#p' "/proc/${pid}/cgroup" 2>/dev/null | head -n1)
+        fi
+        if [[ -z "$unit" ]]; then
+            unit=$(systemctl status "$pid" --no-pager 2>/dev/null | sed -nE 's/^[[:space:]]*●[[:space:]]+([^[:space:]]+\.service).*/\1/p' | head -n1)
+        fi
+        [[ -n "$unit" ]] && printf '%s\n' "$unit"
+        return
+    fi
+
+    # OpenRC 没有 systemd cgroup unit 映射；优先从常见 pidfile 反查 init.d 服务。
+    for pf in /run/*.pid /run/*/*.pid /var/run/*.pid /var/run/*/*.pid; do
+        [[ -r "$pf" ]] || continue
+        pf_pid=$(head -n1 "$pf" 2>/dev/null | tr -dc '0-9')
+        [[ "$pf_pid" == "$pid" ]] || continue
+        svc=${pf##*/}; svc=${svc%.pid}
+        [[ -x "/etc/init.d/$svc" ]] || continue
+        printf '%s\n' "$svc"
+        return 0
+    done
+
+    for svc in sing-box "$XRAY_SERVICE_NAME" "$REALM_SERVICE_NAME" sshd chronyd ntpd crond; do
+        [[ -x "/etc/init.d/$svc" ]] || continue
+        [[ "$(service_main_pid "$svc" 2>/dev/null || true)" == "$pid" ]] || continue
+        printf '%s\n' "$svc"
+        return 0
+    done
+    return 1
+}
+server_tool_port_docker_containers() {
+    local port="$1"
+
+    command -v docker >/dev/null 2>&1 || return 0
+    docker info >/dev/null 2>&1 || return 0
+
+    docker ps --format '{{.ID}}\t{{.Names}}\t{{.Ports}}' 2>/dev/null \
+        | awk -F'\t' -v p="$port" '
+          $3 ~ ("0\\.0\\.0\\.0:" p "->") ||
+          $3 ~ ("\\[::\\]:" p "->") ||
+          $3 ~ ("127\\.0\\.0\\.1:" p "->") {
+              print
+          }'
+}
+
+server_tool_port_is_current_ssh() {
+    local port="$1"
+    local ssh_port=""
+
+    [[ -n "${SSH_CONNECTION:-}" ]] || return 1
+    ssh_port=$(awk '{print $4}' <<<"$SSH_CONNECTION")
+    [[ "$ssh_port" == "$port" ]]
+}
+
+server_tool_port_release_show_targets() {
+    local port="$1"
+    local pids pid comm args unit docker_lines lines
+
+    echo -e "${CYAN}══════════════ 端口 ${port} 当前占用 ══════════════${PLAIN}"
+
+    lines=$(server_tool_port_listener_lines "$port" 2>/dev/null || true)
+    if [[ -z "$lines" ]]; then
+        echo -e "${GREEN}当前没有发现监听进程，端口 ${port} 已经空闲。${PLAIN}"
+        return 1
+    fi
+
+    printf '%s\n' "$lines"
+    echo ""
+
+    pids=$(server_tool_port_listener_pids "$port" 2>/dev/null || true)
+    if [[ -n "$pids" ]]; then
+        echo -e "${YELLOW}监听进程:${PLAIN}"
+        while read -r pid; do
+            [[ -n "$pid" ]] || continue
+            comm=$(ps -p "$pid" -o comm= 2>/dev/null | xargs || true)
+            args=$(ps -p "$pid" -o args= 2>/dev/null | xargs || true)
+            unit=$(server_tool_pid_systemd_unit "$pid" 2>/dev/null || true)
+
+            echo "  PID     : ${pid}"
+            echo "  进程    : ${comm:-未知}"
+            [[ -n "$unit" ]] && echo "  服务    : ${unit}"
+            echo "  命令    : ${args:-未知}"
+            echo ""
+        done <<<"$pids"
+    else
+        echo -e "${YELLOW}[提示] ss 没有返回可识别 PID，可能是权限、内核或容器网络限制。${PLAIN}"
+        echo ""
+    fi
+
+    docker_lines=$(server_tool_port_docker_containers "$port" 2>/dev/null || true)
+    if [[ -n "$docker_lines" ]]; then
+        echo -e "${YELLOW}Docker 容器端口映射:${PLAIN}"
+        while IFS=$'\t' read -r cid cname cports; do
+            echo "  容器    : ${cname} (${cid})"
+            echo "  映射    : ${cports}"
+        done <<<"$docker_lines"
+        echo ""
+    fi
+
+    return 0
+}
+
+server_tool_port_stop_systemd_units() {
+    local port="$1" disable="${2:-no}" pids pid unit svc
+    local -A seen_units=()
+    local found=0 failed=0
+
+    pids=$(server_tool_port_listener_pids "$port" 2>/dev/null || true)
+    [[ -n "$pids" ]] || { echo -e "${YELLOW}没有发现可识别的监听 PID。${PLAIN}"; return 1; }
+
+    while read -r pid; do
+        [[ -n "$pid" ]] || continue
+        unit=$(server_tool_pid_systemd_unit "$pid" 2>/dev/null || true)
+        [[ -n "$unit" ]] || continue
+        [[ -n "${seen_units[$unit]:-}" ]] && continue
+        seen_units["$unit"]=1
+        found=1
+        svc=${unit%.service}
+        case "$svc" in
+            ssh|sshd)
+                echo -e "${RED}[拒绝] 不允许通过端口释放工具停止 SSH 服务：${svc}${PLAIN}"
+                failed=1; continue ;;
+        esac
+        echo -e "${YELLOW}>> 处理服务 ${svc}...${PLAIN}"
+        if [[ "$disable" == "yes" ]]; then
+            service_disable_now "$svc"
+            if service_is_active "$svc"; then
+                echo -e "${RED}[错误] ${svc} 停止/禁用失败。${PLAIN}"; failed=1
+            else
+                echo -e "${GREEN}✔ ${svc} 已停止并移除开机自启。${PLAIN}"
+            fi
+        else
+            if service_stop "$svc"; then
+                echo -e "${GREEN}✔ ${svc} 已停止。${PLAIN}"
+            else
+                echo -e "${RED}[错误] ${svc} 停止失败。${PLAIN}"; failed=1
+            fi
+        fi
+    done <<<"$pids"
+
+    [[ $found -eq 1 ]] || { echo -e "${YELLOW}没有检测到对应的系统服务。${PLAIN}"; return 1; }
+    sleep 1
+    [[ -z "$(server_tool_port_listener_lines "$port" 2>/dev/null || true)" ]] || {
+        echo -e "${YELLOW}[提示] 端口 ${port} 仍有监听进程，请重新查看占用详情。${PLAIN}"
+        return 1
+    }
+    [[ $failed -eq 0 ]]
+}
+server_tool_port_stop_docker() {
+    local port="$1"
+    local docker_lines cid cname cports
+    local found=0 failed=0
+
+    docker_lines=$(server_tool_port_docker_containers "$port" 2>/dev/null || true)
+    [[ -n "$docker_lines" ]] || {
+        echo -e "${YELLOW}没有发现映射端口 ${port} 的 Docker 容器。${PLAIN}"
+        return 1
+    }
+
+    while IFS=$'\t' read -r cid cname cports; do
+        [[ -n "$cid" ]] || continue
+        found=1
+        echo -e "${YELLOW}>> 停止 Docker 容器 ${cname} (${cid})...${PLAIN}"
+        if docker stop "$cid"; then
+            echo -e "${GREEN}✔ 容器 ${cname} 已停止。${PLAIN}"
+        else
+            echo -e "${RED}[错误] 容器 ${cname} 停止失败。${PLAIN}"
+            failed=1
+        fi
+    done <<<"$docker_lines"
+
+    sleep 1
+    if [[ -n "$(server_tool_port_listener_lines "$port" 2>/dev/null || true)" ]]; then
+        echo -e "${YELLOW}[提示] 端口 ${port} 仍有监听进程。${PLAIN}"
+        return 1
+    fi
+
+    [[ $found -eq 1 && $failed -eq 0 ]]
+}
+
+server_tool_port_terminate_processes() {
+    local port="$1"
+    local pids pid comm confirm
+    local -a targets=()
+    local -a remaining=()
+
+    pids=$(server_tool_port_listener_pids "$port" 2>/dev/null || true)
+    [[ -n "$pids" ]] || {
+        echo -e "${YELLOW}没有发现可结束的监听 PID。${PLAIN}"
+        return 1
+    }
+
+    while read -r pid; do
+        [[ -n "$pid" ]] || continue
+
+        if [[ "$pid" == "1" || "$pid" == "$$" || "$pid" == "$PPID" ]]; then
+            echo -e "${RED}[拒绝] PID ${pid} 属于关键/当前进程，不允许结束。${PLAIN}"
+            continue
+        fi
+
+        comm=$(ps -p "$pid" -o comm= 2>/dev/null | xargs || true)
+        case "$comm" in
+            sshd|systemd|init)
+                echo -e "${RED}[拒绝] 不允许直接结束关键进程 ${comm} (PID ${pid})。${PLAIN}"
+                continue
+                ;;
+        esac
+
+        targets+=("$pid")
+    done <<<"$pids"
+
+    [[ ${#targets[@]} -gt 0 ]] || {
+        echo -e "${RED}[错误] 没有安全可结束的监听进程。${PLAIN}"
+        return 1
+    }
+
+    echo ""
+    echo -e "${YELLOW}[警告] 将直接结束以下 PID：${targets[*]}${PLAIN}"
+    echo "优先发送 SIGTERM。"
+    read -rp "确认直接结束进程？请输入 RELEASE: " confirm
+    [[ "$confirm" == "RELEASE" ]] || {
+        echo "已取消。"
+        return 0
+    }
+
+    for pid in "${targets[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+
+    sleep 2
+
+    for pid in "${targets[@]}"; do
+        kill -0 "$pid" 2>/dev/null && remaining+=("$pid")
+    done
+
+    if [[ ${#remaining[@]} -gt 0 ]]; then
+        echo -e "${YELLOW}[提示] PID ${remaining[*]} 在 SIGTERM 后仍未退出。${PLAIN}"
+        read -rp "如确认强制结束，请输入 KILL: " confirm
+        if [[ "$confirm" == "KILL" ]]; then
+            for pid in "${remaining[@]}"; do
+                kill -9 "$pid" 2>/dev/null || true
+            done
+            sleep 1
+        else
+            echo "已取消强制结束。"
+        fi
+    fi
+
+    if [[ -z "$(server_tool_port_listener_lines "$port" 2>/dev/null || true)" ]]; then
+        echo -e "${GREEN}✔ 端口 ${port} 已释放。${PLAIN}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}[提示] 端口 ${port} 仍被占用。若进程自动重启，通常说明背后还有 systemd / OpenRC / Docker / Supervisor 等守护机制。${PLAIN}"
+    return 1
+}
+
+server_tool_port_release() {
+    local port c
+    local docker_lines pids pid unit has_unit=0
+
+    clear
+    echo -e "${CYAN}════════════════ 当前全部监听端口 ════════════════${PLAIN}"
+    server_tool_port_usage_show_all
+    echo ""
+    echo -e "${YELLOW}请输入需要释放的端口号；输入 0 返回。${PLAIN}"
+    read -rp "端口号 [0=返回]: " port
+
+    [[ "$port" == "0" ]] && return
+
+    if ! validate_port_number "$port"; then
+        echo -e "${RED}端口无效。${PLAIN}"
+        pause
+        return
+    fi
+
+    if server_tool_port_is_current_ssh "$port"; then
+        echo -e "${RED}════════════════ 安全保护 ════════════════${PLAIN}"
+        echo -e "${RED}[拒绝] 端口 ${port} 正是当前 SSH 会话使用的服务器端口。${PLAIN}"
+        echo -e "${YELLOW}为了避免把当前远程连接直接断开，本工具不会释放该端口。${PLAIN}"
+        pause
+        return
+    fi
+
+    clear
+    if ! server_tool_port_release_show_targets "$port"; then
+        pause
+        return
+    fi
+
+    pids=$(server_tool_port_listener_pids "$port" 2>/dev/null || true)
+    while read -r pid; do
+        [[ -n "$pid" ]] || continue
+        unit=$(server_tool_pid_systemd_unit "$pid" 2>/dev/null || true)
+        if [[ -n "$unit" && "$unit" != "ssh.service" && "$unit" != "sshd.service" ]]; then
+            has_unit=1
+            break
+        fi
+    done <<<"$pids"
+
+    docker_lines=$(server_tool_port_docker_containers "$port" 2>/dev/null || true)
+
+    echo "请选择释放方式："
+    if [[ $has_unit -eq 1 ]]; then
+        echo "  1. 停止对应系统服务"
+        echo "  2. 停止并禁用对应系统服务"
+    else
+        echo "  1. 停止对应系统服务（未检测到）"
+        echo "  2. 停止并禁用对应系统服务（未检测到）"
+    fi
+
+    if [[ -n "$docker_lines" ]]; then
+        echo "  3. 停止对应 Docker 容器"
+    else
+        echo "  3. 停止对应 Docker 容器（未检测到）"
+    fi
+
+    echo "  4. 直接结束监听进程"
+    echo "  0. 取消"
+    read -rp "请选择 [0-4]: " c
+
+    case "$c" in
+        1)
+            server_tool_port_stop_systemd_units "$port" "no"
+            ;;
+        2)
+            echo -e "${YELLOW}[注意] 该操作会同时取消对应服务的开机自启。${PLAIN}"
+            read -rp "确认继续？请输入 DISABLE: " c
+            [[ "$c" == "DISABLE" ]] && server_tool_port_stop_systemd_units "$port" "yes"
+            ;;
+        3)
+            server_tool_port_stop_docker "$port"
+            ;;
+        4)
+            server_tool_port_terminate_processes "$port"
+            ;;
+        0)
+            return
+            ;;
+        *)
+            echo -e "${RED}输入无效。${PLAIN}"
+            ;;
+    esac
+
+    echo ""
+    if [[ -n "$(server_tool_port_listener_lines "$port" 2>/dev/null || true)" ]]; then
+        echo -e "${YELLOW}端口 ${port} 当前仍有监听：${PLAIN}"
+        server_tool_port_listener_lines "$port"
+    else
+        echo -e "${GREEN}✔ 端口 ${port} 当前已空闲。${PLAIN}"
+    fi
+    pause
+}
+
+server_tool_port_usage() {
+    local c port
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ 端口占用 ════════════════════${PLAIN}"
+        echo "  1. 查看全部监听端口"
+        echo "  2. 查询指定端口"
+        echo "  3. 释放指定端口"
+        echo "  0. 返回"
+        echo -e "${CYAN}═══════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-3]: " c
+        case "$c" in
+            1)
+                clear
+                server_tool_port_usage_show_all
+                pause
+                ;;
+            2)
+                read -rp "请输入端口号: " port
+                if ! validate_port_number "$port"; then
+                    echo -e "${RED}端口无效。${PLAIN}"
+                    pause
+                    continue
+                fi
+                clear
+                server_tool_port_usage_detail "$port"
+                pause
+                ;;
+            3)
+                server_tool_port_release
+                ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+server_tool_timezone_management() {
+    local c zone
+    if platform_is_alpine && [[ ! -e /usr/share/zoneinfo/UTC ]]; then
+        pkg_install tzdata || { echo -e "${RED}[错误] tzdata 安装失败。${PLAIN}"; pause; return; }
+    fi
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ 时区管理 ════════════════════${PLAIN}"
+        echo "当前时区: $(timedatectl show -p Timezone --value 2>/dev/null || date +%Z)"
+        echo ""
+        echo "  1. UTC"
+        echo "  2. Asia/Shanghai"
+        echo "  3. Asia/Tokyo"
+        echo "  4. America/Los_Angeles"
+        echo "  5. Europe/London"
+        echo "  6. 自定义 IANA 时区"
+        echo "  0. 返回"
+        read -rp "请选择 [0-6]: " c
+        case "$c" in
+            1) zone="UTC" ;;
+            2) zone="Asia/Shanghai" ;;
+            3) zone="Asia/Tokyo" ;;
+            4) zone="America/Los_Angeles" ;;
+            5) zone="Europe/London" ;;
+            6)
+                read -rp "请输入时区，例如 Asia/Singapore: " zone
+                ;;
+            0) return ;;
+            *) sleep 1; continue ;;
+        esac
+
+        if command -v timedatectl >/dev/null 2>&1 && timedatectl list-timezones 2>/dev/null | grep -Fxq "$zone"; then
+            timedatectl set-timezone "$zone" &&
+                echo -e "${GREEN}✔ 时区已设置为 ${zone}。${PLAIN}"
+        elif [[ -e "/usr/share/zoneinfo/${zone}" ]]; then
+            ln -sf "/usr/share/zoneinfo/${zone}" /etc/localtime
+            echo "$zone" > /etc/timezone 2>/dev/null || true
+            echo -e "${GREEN}✔ 时区已设置为 ${zone}。${PLAIN}"
+        else
+            echo -e "${RED}[错误] 无效时区: ${zone}${PLAIN}"
+        fi
+        pause
+    done
+}
+
+server_tool_ssh_ports() {
+    if command -v sshd >/dev/null 2>&1; then
+        sshd -T 2>/dev/null | awk '$1=="port" {print $2}' | sort -nu
+    fi
+}
+
+server_tool_ssh_add_port() {
+    local new_port old_ports target_conf service_name backup ans tmp_main use_dropin="no"
+    local include_dir="/etc/ssh/sshd_config.d"
+    local dropin="${include_dir}/99-ss2022-port.conf"
+    local main_conf="/etc/ssh/sshd_config"
+
+    command -v sshd >/dev/null 2>&1 || { echo -e "${RED}[错误] 未找到 sshd。${PLAIN}"; return 1; }
+    old_ports=$(server_tool_ssh_ports)
+    echo "当前 SSH 端口: $(tr '\n' ' ' <<<"$old_ports")"
+    read -rp "请输入要新增的 SSH 端口: " new_port
+    validate_port_number "$new_port" || { echo -e "${RED}[错误] 端口无效。${PLAIN}"; return 1; }
+    if grep -qx "$new_port" <<<"$old_ports"; then
+        echo -e "${YELLOW}该端口已经是 SSH 监听端口。${PLAIN}"; return 0
+    fi
+    if port_in_use_by_other_process "$new_port" "" >/tmp/ss2022-ssh-port.$$ 2>/dev/null; then
+        echo -e "${RED}[错误] 端口 ${new_port} 已被其他进程占用。${PLAIN}"
+        cat /tmp/ss2022-ssh-port.$$ 2>/dev/null || true; rm -f /tmp/ss2022-ssh-port.$$; return 1
+    fi
+    rm -f /tmp/ss2022-ssh-port.$$ 2>/dev/null || true
+    echo -e "${YELLOW}[安全策略] 新端口会与现有 SSH 端口同时保留，不会删除旧端口。${PLAIN}"
+    echo -e "${YELLOW}还需确认云厂商安全组/防火墙已放行 ${new_port}/TCP。${PLAIN}"
+    read -rp "确认新增？[y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || return 0
+
+    if grep -Eiq '^[[:space:]]*Include[[:space:]]+.*sshd_config\.d' "$main_conf" 2>/dev/null; then
+        use_dropin="yes"
+        mkdir -p "$include_dir"
+        target_conf="$dropin"
+        backup="${dropin}.bak.$(date +%Y%m%d-%H%M%S)"
+        [[ -f "$dropin" ]] && cp -a "$dropin" "$backup"
+        {
+            echo "# Managed by ss2022.sh - preserve existing SSH ports"
+            while read -r p; do [[ -n "$p" ]] && echo "Port $p"; done <<<"$old_ports"
+            echo "Port $new_port"
+        } > "$dropin"
+    else
+        target_conf="$main_conf"
+        backup="${STATE_DIR}/sshd_config.bak.$(date +%Y%m%d-%H%M%S)"
+        mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
+        cp -a "$main_conf" "$backup" || return 1
+        tmp_main=$(mktemp /tmp/ss2022-sshd.XXXXXX) || return 1
+        awk '
+          $0=="# BEGIN ss2022 managed ports" {skip=1; next}
+          $0=="# END ss2022 managed ports" {skip=0; next}
+          !skip {print}
+        ' "$main_conf" > "$tmp_main"
+        {
+            cat "$tmp_main"
+            echo "# BEGIN ss2022 managed ports"
+            while read -r p; do [[ -n "$p" ]] && echo "Port $p"; done <<<"$old_ports"
+            echo "Port $new_port"
+            echo "# END ss2022 managed ports"
+        } > "$main_conf"
+        rm -f "$tmp_main"
+    fi
+
+    if ! sshd -t; then
+        echo -e "${RED}[错误] sshd 配置校验失败，正在回滚。${PLAIN}"
+        if [[ "$use_dropin" == "yes" ]]; then
+            [[ -f "$backup" ]] && mv -f "$backup" "$dropin" || rm -f "$dropin"
+        else
+            cp -af "$backup" "$main_conf"
+        fi
+        sshd -t >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    if service_exists ssh; then service_name="ssh"; else service_name="sshd"; fi
+    if ! service_reload "$service_name" 2>/dev/null; then
+        echo -e "${RED}[错误] SSH reload 失败，正在回滚。${PLAIN}"
+        if [[ "$use_dropin" == "yes" ]]; then
+            [[ -f "$backup" ]] && mv -f "$backup" "$dropin" || rm -f "$dropin"
+        else
+            cp -af "$backup" "$main_conf"
+        fi
+        service_reload "$service_name" >/dev/null 2>&1 || true
+        return 1
+    fi
+    sleep 1
+    if ss -H -lnt 2>/dev/null | awk -v p="$new_port" '{addr=$4; n=split(addr,a,":"); if (a[n]==p) found=1} END {exit !found}'; then
+        rm -f "$backup"
+        echo -e "${GREEN}✔ SSH 已新增端口 ${new_port}，旧端口继续保留。${PLAIN}"
+        echo -e "${YELLOW}请先新开一个 SSH 会话验证 ${new_port} 可登录，再考虑手工移除旧端口。${PLAIN}"
+        return 0
+    fi
+    echo -e "${YELLOW}[警告] sshd 配置已通过，但暂未检测到 ${new_port} 正在监听。请不要关闭当前 SSH 会话。${PLAIN}"
+    return 1
+}
+server_tool_ssh_management() {
+    local c
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ SSH 端口 ════════════════════${PLAIN}"
+        echo "当前端口:"
+        server_tool_ssh_ports | sed 's/^/  - /'
+        echo ""
+        echo "  1. 安全新增 SSH 端口（保留旧端口）"
+        echo "  0. 返回"
+        read -rp "请选择 [0-1]: " c
+        case "$c" in
+            1) server_tool_ssh_add_port; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+server_tool_tg_monitor_ensure_worker() {
+    install -d -m 755 /usr/local/lib/ss2022 || return 1
+    mkdir -p "$STATE_DIR" || return 1
+    chmod 700 "$STATE_DIR"
+    cat > "$TG_MONITOR_WORKER" <<'TGWORKER'
+#!/bin/bash
+set -u
+CONF="/etc/ss2022/tg-monitor.conf"
+STATE="/etc/ss2022/tg-monitor.state"
+LOCKDIR="/run/ss2022-tg-monitor.lockdir"
+[[ -f "$CONF" ]] || exit 0
+# shellcheck disable=SC1090
+source "$CONF"
+if ! mkdir "$LOCKDIR" 2>/dev/null; then exit 0; fi
+trap 'rmdir "$LOCKDIR" >/dev/null 2>&1 || true' EXIT INT TERM
+
+send_tg() {
+    local msg="$1"
+    [[ -n "${TG_BOT_TOKEN:-}" && -n "${TG_CHAT_ID:-}" ]] || return 0
+    curl -fsS --connect-timeout 5 --max-time 10 -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" --data-urlencode "chat_id=${TG_CHAT_ID}" --data-urlencode "text=${msg}" >/dev/null 2>&1 || true
+}
+traffic_bytes() {
+    awk 'BEGIN {rx=0;tx=0} {iface=$1;gsub(":","",iface); if (iface ~ /^(eth|ens|enp|eno|venet|bond)[A-Za-z0-9_.-]*$/) {rx+=$2;tx+=$10}} END {printf "%.0f %.0f\n",rx,tx}' /proc/net/dev
+}
+period_key() {
+    local day now_day year month prev_year prev_month
+    day="${RESET_DAY:-1}"; now_day=$(date +%d | sed 's/^0//'); year=$(date +%Y); month=$(date +%m | sed 's/^0//')
+    if [[ "$now_day" -ge "$day" ]]; then printf "%04d-%02d" "$year" "$month"; return; fi
+    if [[ "$month" -eq 1 ]]; then prev_year=$((year-1)); prev_month=12; else prev_year=$year; prev_month=$((month-1)); fi
+    printf "%04d-%02d" "$prev_year" "$prev_month"
+}
+human_gb() { awk -v b="$1" 'BEGIN {printf "%.2f",b/1073741824}'; }
+percent_of() { local bytes="$1" limit_gb="$2"; if [[ ! "$limit_gb" =~ ^[0-9]+$ || "$limit_gb" -le 0 ]]; then echo 0; else awk -v b="$bytes" -v g="$limit_gb" 'BEGIN {printf "%.0f",(b/(g*1073741824))*100}'; fi; }
+CURRENT_RX=0; CURRENT_TX=0; read -r CURRENT_RX CURRENT_TX < <(traffic_bytes)
+PERIOD="$(period_key)"
+LAST_RX=0; LAST_TX=0; TOTAL_RX=0; TOTAL_TX=0; STATE_PERIOD=""
+RX_WARN1=0; RX_WARN2=0; RX_CRITICAL=0; TX_WARN1=0; TX_WARN2=0; TX_CRITICAL=0
+if [[ -f "$STATE" ]]; then
+    # shellcheck disable=SC1090
+    source "$STATE"
+fi
+if [[ "$STATE_PERIOD" != "$PERIOD" ]]; then
+    STATE_PERIOD="$PERIOD"; LAST_RX="$CURRENT_RX"; LAST_TX="$CURRENT_TX"; TOTAL_RX=0; TOTAL_TX=0
+    RX_WARN1=0; RX_WARN2=0; RX_CRITICAL=0; TX_WARN1=0; TX_WARN2=0; TX_CRITICAL=0
+else
+    if [[ "$CURRENT_RX" -ge "$LAST_RX" ]]; then TOTAL_RX=$((TOTAL_RX+CURRENT_RX-LAST_RX)); else TOTAL_RX=$((TOTAL_RX+CURRENT_RX)); fi
+    if [[ "$CURRENT_TX" -ge "$LAST_TX" ]]; then TOTAL_TX=$((TOTAL_TX+CURRENT_TX-LAST_TX)); else TOTAL_TX=$((TOTAL_TX+CURRENT_TX)); fi
+    LAST_RX="$CURRENT_RX"; LAST_TX="$CURRENT_TX"
+fi
+HOST_LABEL="${HOST_LABEL:-$(hostname)}"; WARN1_PERCENT="${WARN1_PERCENT:-80}"; WARN2_PERCENT="${WARN2_PERCENT:-90}"; AUTO_SHUTDOWN="${AUTO_SHUTDOWN:-no}"; SHUTDOWN_PERCENT="${SHUTDOWN_PERCENT:-95}"
+rx_percent=$(percent_of "$TOTAL_RX" "${RX_LIMIT_GB:-0}"); tx_percent=$(percent_of "$TOTAL_TX" "${TX_LIMIT_GB:-0}")
+rx_gb=$(human_gb "$TOTAL_RX"); tx_gb=$(human_gb "$TOTAL_TX")
+notify_threshold() {
+    local direction="$1" percent="$2" used_gb="$3" limit="$4" warn1_var warn2_var critical_var
+    if [[ "$direction" == "入站" ]]; then warn1_var="RX_WARN1"; warn2_var="RX_WARN2"; critical_var="RX_CRITICAL"; else warn1_var="TX_WARN1"; warn2_var="TX_WARN2"; critical_var="TX_CRITICAL"; fi
+    [[ "$limit" =~ ^[0-9]+$ && "$limit" -gt 0 ]] || return 0
+    if [[ "$percent" -ge 100 && "${!critical_var}" -eq 0 ]]; then
+        printf -v "$critical_var" 1
+        send_tg "🚨 ${HOST_LABEL}\n${direction}流量已达到 ${used_gb} GB / ${limit} GB（${percent}%）\n已达到流量上限。"
+    elif [[ "$percent" -ge "$WARN2_PERCENT" && "${!warn2_var}" -eq 0 ]]; then
+        printf -v "$warn2_var" 1
+        send_tg "⚠️ ${HOST_LABEL}\n${direction}流量已达到 ${used_gb} GB / ${limit} GB（${percent}%）\n已达到第二预警线 ${WARN2_PERCENT}%。"
+    elif [[ "$percent" -ge "$WARN1_PERCENT" && "${!warn1_var}" -eq 0 ]]; then
+        printf -v "$warn1_var" 1
+        send_tg "⚠️ ${HOST_LABEL}\n${direction}流量已达到 ${used_gb} GB / ${limit} GB（${percent}%）\n已达到第一预警线 ${WARN1_PERCENT}%。"
+    fi
+}
+notify_threshold "入站" "$rx_percent" "$rx_gb" "${RX_LIMIT_GB:-0}"
+notify_threshold "出站" "$tx_percent" "$tx_gb" "${TX_LIMIT_GB:-0}"
+tmp="${STATE}.tmp.$$"; umask 077
+cat > "$tmp" <<EOF
+STATE_PERIOD='${STATE_PERIOD}'
+LAST_RX=${LAST_RX}
+LAST_TX=${LAST_TX}
+TOTAL_RX=${TOTAL_RX}
+TOTAL_TX=${TOTAL_TX}
+RX_WARN1=${RX_WARN1}
+RX_WARN2=${RX_WARN2}
+RX_CRITICAL=${RX_CRITICAL}
+TX_WARN1=${TX_WARN1}
+TX_WARN2=${TX_WARN2}
+TX_CRITICAL=${TX_CRITICAL}
+EOF
+mv -f "$tmp" "$STATE"; chmod 600 "$STATE"
+shutdown_needed=0
+if [[ "${RX_LIMIT_GB:-0}" =~ ^[0-9]+$ && "${RX_LIMIT_GB:-0}" -gt 0 && "$rx_percent" -ge "$SHUTDOWN_PERCENT" ]]; then shutdown_needed=1; fi
+if [[ "${TX_LIMIT_GB:-0}" =~ ^[0-9]+$ && "${TX_LIMIT_GB:-0}" -gt 0 && "$tx_percent" -ge "$SHUTDOWN_PERCENT" ]]; then shutdown_needed=1; fi
+if [[ "$shutdown_needed" -eq 1 && "$AUTO_SHUTDOWN" == "yes" ]]; then
+    send_tg "⛔ ${HOST_LABEL}\n流量达到自动关机阈值 ${SHUTDOWN_PERCENT}%，服务器即将自动关机。"
+    sync
+    shutdown -h now
+fi
+TGWORKER
+    chmod 700 "$TG_MONITOR_WORKER"
+
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        cat > "$TG_MONITOR_SERVICE" <<EOF
+[Unit]
+Description=ss2022 TG-BOT Traffic Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${TG_MONITOR_WORKER}
+EOF
+        cat > "$TG_MONITOR_TIMER" <<'EOF'
+[Unit]
+Description=Run ss2022 TG-BOT Traffic Monitor Every Minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=5s
+Persistent=true
+Unit=ss2022-tg-monitor.service
+
+[Install]
+WantedBy=timers.target
+EOF
+        service_daemon_reload || return 1
+    else
+        mkdir -p "$(dirname "$TG_MONITOR_CRON_FILE")"
+        touch "$TG_MONITOR_CRON_FILE"
+        sed -i "/ss2022-tg-monitor/d" "$TG_MONITOR_CRON_FILE"
+        echo "* * * * * $TG_MONITOR_WORKER >/dev/null 2>&1 $TG_MONITOR_CRON_TAG" >> "$TG_MONITOR_CRON_FILE"
+        service_enable_now crond >/dev/null 2>&1 || {
+            echo -e "${RED}[错误] OpenRC crond 启动失败。${PLAIN}"
+            return 1
+        }
+    fi
+}
+
+server_tool_tg_monitor_send_test() {
+    local token chat_id host
+    [[ -f "$TG_MONITOR_CONF" ]] || {
+        echo -e "${YELLOW}尚未配置 TG-BOT 流量监控。${PLAIN}"
+        return 1
+    }
+
+    # shellcheck disable=SC1090
+    source "$TG_MONITOR_CONF"
+    token="${TG_BOT_TOKEN:-}"
+    chat_id="${TG_CHAT_ID:-}"
+    host="${HOST_LABEL:-$(hostname)}"
+
+    if curl -fsS --connect-timeout 5 --max-time 10 \
+        -X POST "https://api.telegram.org/bot${token}/sendMessage" \
+        --data-urlencode "chat_id=${chat_id}" \
+        --data-urlencode "text=✅ ${host}：ss2022 TG-BOT 流量监控测试消息发送成功。" \
+        >/dev/null 2>&1; then
+        echo -e "${GREEN}✔ Telegram 测试消息已发送。${PLAIN}"
+        return 0
+    fi
+
+    echo -e "${RED}[错误] Telegram 消息发送失败，请检查 Bot Token、Chat ID 和服务器网络。${PLAIN}"
+    return 1
+}
+
+server_tool_tg_monitor_configure() {
+    local token chat_id rx_limit tx_limit reset_day warn1 warn2 shutdown_percent auto_shutdown host_label
+    local current_token="" current_chat="" ans
+
+    if [[ -f "$TG_MONITOR_CONF" ]]; then
+        # shellcheck disable=SC1090
+        source "$TG_MONITOR_CONF"
+        current_token="${TG_BOT_TOKEN:-}"
+        current_chat="${TG_CHAT_ID:-}"
+    fi
+
+    clear
+    echo -e "${CYAN}════════════ TG-BOT 流量监控配置 ════════════${PLAIN}"
+    echo "说明："
+    echo "  - 每分钟累计公网网卡收发流量；累计状态写入磁盘，重启 VPS 后不会清零。"
+    echo "  - 默认在 80% / 90% / 100% 三个阶段发送 Telegram 预警。"
+    echo "  - 自动关机阈值独立配置，默认 95%。"
+    echo "  - 新启用时从当前流量计数作为起点，只统计启用后的流量。"
+    echo ""
+
+    if [[ -n "$current_token" ]]; then
+        read -rp "Telegram Bot Token [回车保持现有 Token]: " token
+        token=${token:-$current_token}
+    else
+        read -rp "Telegram Bot Token: " token
+    fi
+
+    if [[ ! "$token" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then
+        echo -e "${RED}[错误] Bot Token 格式不正确。${PLAIN}"
+        pause
+        return
+    fi
+
+    if [[ -n "$current_chat" ]]; then
+        read -rp "Telegram Chat ID [回车保持: ${current_chat}]: " chat_id
+        chat_id=${chat_id:-$current_chat}
+    else
+        read -rp "Telegram Chat ID: " chat_id
+    fi
+
+    if [[ ! "$chat_id" =~ ^-?[0-9]+$ ]]; then
+        echo -e "${RED}[错误] Chat ID 应为数字，可为负数（群组）。${PLAIN}"
+        pause
+        return
+    fi
+
+    read -rp "每月入站流量上限 GB [默认 1000，0=不限制]: " rx_limit
+    rx_limit=${rx_limit:-1000}
+    read -rp "每月出站流量上限 GB [默认 1000，0=不限制]: " tx_limit
+    tx_limit=${tx_limit:-1000}
+    read -rp "每月流量重置日 [默认 1，范围 1-28]: " reset_day
+    reset_day=${reset_day:-1}
+    read -rp "第一预警百分比 [默认 80]: " warn1
+    warn1=${warn1:-80}
+    read -rp "第二预警百分比 [默认 90]: " warn2
+    warn2=${warn2:-90}
+    read -rp "自动关机阈值百分比 [默认 95]: " shutdown_percent
+    shutdown_percent=${shutdown_percent:-95}
+
+    for n in "$rx_limit" "$tx_limit" "$reset_day" "$warn1" "$warn2" "$shutdown_percent"; do
+        [[ "$n" =~ ^[0-9]+$ ]] || {
+            echo -e "${RED}[错误] 阈值必须为整数。${PLAIN}"
+            pause
+            return
+        }
+    done
+
+    if [[ "$reset_day" -lt 1 || "$reset_day" -gt 28 ]]; then
+        echo -e "${RED}[错误] 重置日必须为 1-28。${PLAIN}"
+        pause
+        return
+    fi
+
+    if [[ "$warn1" -lt 1 || "$warn1" -ge "$warn2" || "$warn2" -ge 100 ]]; then
+        echo -e "${RED}[错误] 预警比例必须满足 1 <= 第一预警 < 第二预警 < 100。${PLAIN}"
+        pause
+        return
+    fi
+
+    if [[ "$shutdown_percent" -lt 1 || "$shutdown_percent" -gt 100 ]]; then
+        echo -e "${RED}[错误] 自动关机阈值必须在 1-100%。${PLAIN}"
+        pause
+        return
+    fi
+
+    read -rp "达到 ${shutdown_percent}% 后自动关机？[y/N]: " ans
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+        auto_shutdown="yes"
+        echo -e "${YELLOW}[警告] 自动关机启用后，任一启用方向达到 ${shutdown_percent}% 会执行 shutdown -h now。${PLAIN}"
+        read -rp "再次确认启用自动关机？[y/N]: " ans
+        [[ "$ans" =~ ^[Yy]$ ]] || auto_shutdown="no"
+    else
+        auto_shutdown="no"
+    fi
+
+    host_label=$(hostname 2>/dev/null || echo "VPS")
+
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+    umask 077
+    cat > "$TG_MONITOR_CONF" <<EOF
+TG_BOT_TOKEN='${token}'
+TG_CHAT_ID='${chat_id}'
+HOST_LABEL='${host_label}'
+RX_LIMIT_GB=${rx_limit}
+TX_LIMIT_GB=${tx_limit}
+RESET_DAY=${reset_day}
+WARN1_PERCENT=${warn1}
+WARN2_PERCENT=${warn2}
+SHUTDOWN_PERCENT=${shutdown_percent}
+AUTO_SHUTDOWN='${auto_shutdown}'
+EOF
+    chmod 600 "$TG_MONITOR_CONF"
+
+    server_tool_tg_monitor_ensure_worker || {
+        echo -e "${RED}[错误] TG-BOT 监控服务生成失败。${PLAIN}"
+        pause
+        return
+    }
+
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        systemctl enable --now ss2022-tg-monitor.timer >/dev/null 2>&1 || {
+            echo -e "${RED}[错误] TG-BOT 监控 timer 启动失败。${PLAIN}"; pause; return
+        }
+    fi
+    # 立即运行一次，建立初始状态。OpenRC 后续由 crond 每分钟执行。
+    "$TG_MONITOR_WORKER" >/dev/null 2>&1 || true
+
+    echo -e "${GREEN}✔ TG-BOT 流量监控已启用。${PLAIN}"
+    server_tool_tg_monitor_send_test
+    pause
+}
+
+server_tool_tg_monitor_status() {
+    local enabled="未启用" rx_limit="-" tx_limit="-" reset_day="-" warn1="-" warn2="-" shutdown_percent="95" auto="-"
+    local total_rx=0 total_tx=0 period="-" rx_gb tx_gb token_masked="-"
+    [[ -f "$TG_MONITOR_CONF" ]] && {
+        # shellcheck disable=SC1090
+        source "$TG_MONITOR_CONF"
+        rx_limit="${RX_LIMIT_GB:-0}"; tx_limit="${TX_LIMIT_GB:-0}"; reset_day="${RESET_DAY:-1}"
+        warn1="${WARN1_PERCENT:-80}"; warn2="${WARN2_PERCENT:-90}"; shutdown_percent="${SHUTDOWN_PERCENT:-95}"; auto="${AUTO_SHUTDOWN:-no}"
+        [[ -n "${TG_BOT_TOKEN:-}" ]] && token_masked="${TG_BOT_TOKEN:0:6}******"
+    }
+    [[ -f "$TG_MONITOR_STATE" ]] && {
+        # shellcheck disable=SC1090
+        source "$TG_MONITOR_STATE"
+        total_rx="${TOTAL_RX:-0}"; total_tx="${TOTAL_TX:-0}"; period="${STATE_PERIOD:--}"
+    }
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        if systemctl is-active --quiet ss2022-tg-monitor.timer 2>/dev/null; then enabled="运行中"; elif systemctl is-enabled --quiet ss2022-tg-monitor.timer 2>/dev/null; then enabled="已启用但未运行"; fi
+    else
+        if grep -q "ss2022-tg-monitor" "$TG_MONITOR_CRON_FILE" 2>/dev/null && service_is_active crond; then enabled="运行中（OpenRC crond）"; elif grep -q "ss2022-tg-monitor" "$TG_MONITOR_CRON_FILE" 2>/dev/null; then enabled="已配置但 crond 未运行"; fi
+    fi
+    rx_gb=$(awk -v b="$total_rx" 'BEGIN {printf "%.2f",b/1073741824}'); tx_gb=$(awk -v b="$total_tx" 'BEGIN {printf "%.2f",b/1073741824}')
+    clear
+    echo -e "${CYAN}════════════ TG-BOT 流量监控状态 ════════════${PLAIN}"
+    echo "  状态         : ${enabled}"
+    echo "  统计周期     : ${period} / 每月 ${reset_day} 日重置"
+    echo "  当前入站累计 : ${rx_gb} GB / ${rx_limit} GB"
+    echo "  当前出站累计 : ${tx_gb} GB / ${tx_limit} GB"
+    echo "  TG Token     : ${token_masked}"
+    echo "  Chat ID      : ${TG_CHAT_ID:--}"
+    echo "  预警线       : ${warn1}% / ${warn2}% / 100%"
+    echo "  关机阈值     : ${shutdown_percent}%"
+    echo "  自动关机     : $([[ "$auto" == "yes" ]] && echo "开启" || echo "关闭")"
+    echo -e "${CYAN}═══════════════════════════════════════════════${PLAIN}"
+}
+server_tool_tg_monitor_disable() {
+    local ans
+    read -rp "确认停用 TG-BOT 流量监控？配置和累计数据会保留。[y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || return 0
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        systemctl disable --now ss2022-tg-monitor.timer >/dev/null 2>&1 || true
+    else
+        [[ -f "$TG_MONITOR_CRON_FILE" ]] && sed -i "/ss2022-tg-monitor/d" "$TG_MONITOR_CRON_FILE"
+    fi
+    echo -e "${GREEN}✔ TG-BOT 流量监控已停用。${PLAIN}"
+}
+server_tool_tg_monitor_reset() {
+    local ans
+    read -rp "确认清零当前累计流量和预警状态？[y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || return 0
+    rm -f "$TG_MONITOR_STATE"
+    [[ -x "$TG_MONITOR_WORKER" ]] && "$TG_MONITOR_WORKER" >/dev/null 2>&1 || true
+    echo -e "${GREEN}✔ 流量累计已重新从当前时刻开始统计。${PLAIN}"
+}
+server_tool_tg_monitor_remove() {
+    local ans
+    read -rp "确认彻底删除 TG-BOT 流量监控配置、Token 和累计数据？[y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || return 0
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        systemctl disable --now ss2022-tg-monitor.timer >/dev/null 2>&1 || true
+    else
+        [[ -f "$TG_MONITOR_CRON_FILE" ]] && sed -i "/ss2022-tg-monitor/d" "$TG_MONITOR_CRON_FILE"
+    fi
+    rm -f "$TG_MONITOR_TIMER" "$TG_MONITOR_SERVICE" "$TG_MONITOR_WORKER" "$TG_MONITOR_CONF" "$TG_MONITOR_STATE"
+    service_daemon_reload >/dev/null 2>&1 || true
+    echo -e "${GREEN}✔ TG-BOT 流量监控已彻底删除。${PLAIN}"
+}
+server_tool_tg_monitor_management() {
+    local c
+    while true; do
+        server_tool_tg_monitor_status
+        echo ""
+        echo "  1. 配置 / 启用监控"
+        echo "  2. 发送 TG 测试消息"
+        echo "  3. 清零流量累计"
+        echo "  4. 停用监控（保留配置）"
+        echo "  5. 删除监控配置"
+        echo "  0. 返回"
+        read -rp "请选择 [0-5]: " c
+        case "$c" in
+            1) server_tool_tg_monitor_configure ;;
+            2) server_tool_tg_monitor_send_test; pause ;;
+            3) server_tool_tg_monitor_reset; pause ;;
+            4) server_tool_tg_monitor_disable; pause ;;
+            5) server_tool_tg_monitor_remove; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+server_tool_reboot() {
+    local ans
+    clear
+    echo -e "${RED}════════════════════ 重启服务器 ════════════════════${PLAIN}"
+    echo -e "${YELLOW}[警告] 重启会立即中断当前 SSH 会话和正在运行的任务。${PLAIN}"
+    echo ""
+    echo "为避免误触，请完整输入：REBOOT"
+    read -rp "确认字符: " ans
+    [[ "$ans" == "REBOOT" ]] || {
+        echo "已取消重启。"
+        pause
+        return
+    }
+    sync
+    reboot
+}
+
+server_management_tools() {
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ 服务器管理工具 ════════════════════${PLAIN}"
+        echo "  1. 系统信息"
+        echo "  2. 查看端口占用"
+        echo "  3. TG-BOT 流量监控 / 预警 / 自动关机"
+        echo "  4. 系统更新 / 清理"
+        echo "  5. Swap 虚拟内存"
+        echo "  6. BBR 加速"
+        echo "  7. DNS 管理"
+        echo "  8. IPv4 / IPv6 管理"
+        echo "  9. 系统时区"
+        echo " 10. SSH 端口管理"
+        echo " 11. 重启服务器"
+        echo "  0. 返回"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-11]: " c
+        case "$c" in
+            1) server_tool_system_info; pause ;;
+            2) server_tool_port_usage ;;
+            3) server_tool_tg_monitor_management ;;
+            4) server_tool_system_update ;;
+            5) server_tool_swap_management ;;
+            6) server_tool_bbr_management ;;
+            7) server_tool_dns_management ;;
+            8) server_tool_ip_family_management ;;
+            9) server_tool_timezone_management ;;
+            10) server_tool_ssh_management ;;
+            11) server_tool_reboot ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+ensure_test_dependency() {
+    local cmd="$1"
+    local pkg="${2:-$1}"
+
+    command -v "$cmd" >/dev/null 2>&1 && return 0
+
+    echo -e "${YELLOW}>> 缺少 ${cmd}，正在安装 ${pkg}...${PLAIN}"
+
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -y >/dev/null 2>&1 || return 1
+        apt-get install -y "$pkg" >/dev/null 2>&1 || return 1
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y "$pkg" >/dev/null 2>&1 || return 1
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y "$pkg" >/dev/null 2>&1 || return 1
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache "$pkg" >/dev/null 2>&1 || return 1
+    else
+        echo -e "${RED}[错误] 未识别包管理器，请手动安装 ${pkg}。${PLAIN}"
+        return 1
+    fi
+
+    command -v "$cmd" >/dev/null 2>&1
+}
+
+show_external_test_source() {
+    local name="$1"
+    local source="$2"
+    echo ""
+    echo -e "${CYAN}════════════════════ ${name} ════════════════════${PLAIN}"
+    echo -e "${YELLOW}测试来源: ${source}${PLAIN}"
+    echo -e "${YELLOW}说明: 测试组件仅用于检测；临时下载到 /tmp，校验来源完整性后执行，用完删除，不修改协议或分流配置。${PLAIN}"
+    echo ""
+}
+server_test_download_release_asset() {
+    local repo="$1" tag="$2" asset="$3" out="$4"
+    local api meta url digest expected actual source ok=0
+
+    ensure_test_dependency curl curl || return 1
+    ensure_test_dependency jq jq || return 1
+    command -v sha256sum >/dev/null 2>&1 || ensure_test_dependency sha256sum coreutils || return 1
+
+    if [[ "$tag" == "latest" ]]; then
+        api="https://api.github.com/repos/${repo}/releases/latest"
+    else
+        api="https://api.github.com/repos/${repo}/releases/tags/${tag}"
+    fi
+    meta=$(mktemp /tmp/ss2022-test-release.XXXXXX.json) || return 1
+    if ! curl -fsSL --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 30 -H "Accept: application/vnd.github+json" "$api" -o "$meta"; then
+        rm -f "$meta"
+        echo -e "${RED}[错误] 无法获取 ${repo} Release 元数据。${PLAIN}"
+        return 1
+    fi
+    url=$(jq -r --arg a "$asset" '.assets[]? | select(.name==$a) | .browser_download_url // empty' "$meta" | head -n1)
+    digest=$(jq -r --arg a "$asset" '.assets[]? | select(.name==$a) | .digest // empty' "$meta" | head -n1)
+    rm -f "$meta"
+    expected=${digest#sha256:}
+    if [[ -z "$url" || ! "$expected" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        echo -e "${RED}[错误] Release 中未找到 ${asset} 或缺少官方 SHA256 digest。${PLAIN}"
+        return 1
+    fi
+
+    local sources=("$url" "https://ghproxy.net/${url}" "https://gh-proxy.com/${url}")
+    for source in "${sources[@]}"; do
+        rm -f "$out"
+        echo -e "${YELLOW}>> 下载并校验 ${asset}...${PLAIN}"
+        if ! curl -fL --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 120 "$source" -o "$out"; then
+            continue
+        fi
+        actual=$(sha256sum "$out" | awk '{print $1}')
+        if [[ "${actual,,}" == "${expected,,}" ]]; then
+            ok=1
+            break
+        fi
+        echo -e "${RED}[警告] SHA256 不匹配，拒绝执行当前下载结果。${PLAIN}"
+    done
+    [[ $ok -eq 1 ]] || { rm -f "$out"; echo -e "${RED}[错误] ${asset} 下载失败或 SHA256 校验失败。${PLAIN}"; return 1; }
+    chmod 700 "$out"
+    return 0
+}
+
+server_test_arch_asset() {
+    local prefix="$1"
+    case "$(uname -m)" in
+        x86_64|amd64) printf "%s-linux-amd64" "$prefix" ;;
+        aarch64|arm64) printf "%s-linux-arm64" "$prefix" ;;
+        i386|i686) printf "%s-linux-386" "$prefix" ;;
+        armv7l|armv7*) printf "%s-linux-arm" "$prefix" ;;
+        *) return 1 ;;
+    esac
+}
+
+server_test_detect_family_mode() {
+    local has4=0 has6=0
+    get_public_ipv4 >/dev/null 2>&1 && has4=1 || true
+    get_public_ipv6 >/dev/null 2>&1 && has6=1 || true
+    if [[ $has4 -eq 1 && $has6 -eq 1 ]]; then echo "both"
+    elif [[ $has4 -eq 1 ]]; then echo "ipv4"
+    elif [[ $has6 -eq 1 ]]; then echo "ipv6"
+    else echo "none"; fi
+}
+
+run_external_curl_test() {
+    local label="$1"
+    local url="$2"
+    shift 2
+
+    local tmp=""
+    tmp=$(mktemp /tmp/ss2022-external-test.XXXXXX.sh) || {
+        echo -e "${RED}[错误] 无法创建临时测试文件。${PLAIN}"
+        return 1
+    }
+
+    if ! curl -fLsS --retry 2 --retry-delay 1 \
+        --connect-timeout 10 --max-time 60 \
+        "$url" -o "$tmp"; then
+        rm -f "$tmp"
+        echo -e "${RED}[错误] ${label}脚本下载失败。${PLAIN}"
+        return 1
+    fi
+
+    if [[ ! -s "$tmp" ]]; then
+        rm -f "$tmp"
+        echo -e "${RED}[错误] ${label}脚本下载结果为空。${PLAIN}"
+        return 1
+    fi
+
+    chmod 700 "$tmp"
+
+    # 第三方检测脚本可能用非 0 返回码表达内部检测状态。
+    # 这里不把它二次解释成“脚本执行失败”；实际检测结果以第三方输出为准。
+    bash "$tmp" "$@" || true
+
+    rm -f "$tmp"
+    return 0
+}
+
+test_ip_quality() {
+    local asset tmp family check_mode
+    clear
+    show_external_test_source "IP 质量测试" "oneclickvirt/securityCheck"
+    asset=$(server_test_arch_asset "securityCheck") || {
+        echo -e "${RED}[错误] 当前 CPU 架构暂无 securityCheck 测试资产。${PLAIN}"; pause; return
+    }
+    family=$(server_test_detect_family_mode)
+    case "$family" in
+        both) check_mode="both" ;;
+        ipv4) check_mode="ipv4" ;;
+        ipv6) check_mode="ipv6" ;;
+        *) echo -e "${RED}[错误] 未检测到可用公网 IPv4 / IPv6。${PLAIN}"; pause; return ;;
+    esac
+    tmp=$(mktemp /tmp/ss2022-securitycheck.XXXXXX) || { pause; return; }
+    if server_test_download_release_asset "oneclickvirt/securityCheck" "output" "$asset" "$tmp"; then
+        echo -e "${CYAN}检测地址族: ${check_mode}${PLAIN}"
+        "$tmp" -l zh -c "$check_mode" -e yes || true
+    fi
+    rm -f "$tmp"
+    echo ""
+    pause
+}
+server_test_nexttrace_asset() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo "nexttrace-tiny_linux_amd64" ;;
+        aarch64|arm64) echo "nexttrace-tiny_linux_arm64" ;;
+        i386|i686) echo "nexttrace-tiny_linux_386" ;;
+        armv7l|armv7*) echo "nexttrace-tiny_linux_armv7" ;;
+        *) return 1 ;;
+    esac
+}
+
+server_test_write_return_targets() {
+    local family="$1" out="$2"
+    case "$family" in
+        4)
+            cat >"$out" <<'EOF'
+ipv4.pek-4134.endpoint.nxtrace.org 北京电信
+ipv4.pek-4837.endpoint.nxtrace.org 北京联通
+ipv4.pek-9808.endpoint.nxtrace.org 北京移动
+ipv4.sha-4134.endpoint.nxtrace.org 上海电信
+ipv4.sha-4837.endpoint.nxtrace.org 上海联通
+ipv4.sha-9808.endpoint.nxtrace.org 上海移动
+ipv4.can-4134.endpoint.nxtrace.org 广州电信
+ipv4.can-4837.endpoint.nxtrace.org 广州联通
+ipv4.can-9808.endpoint.nxtrace.org 广州移动
+EOF
+            ;;
+        6)
+            cat >"$out" <<'EOF'
+ipv6.pek-4134.endpoint.nxtrace.org 北京电信
+ipv6.pek-4837.endpoint.nxtrace.org 北京联通
+ipv6.pek-9808.endpoint.nxtrace.org 北京移动
+ipv6.sha-4134.endpoint.nxtrace.org 上海电信
+ipv6.sha-4837.endpoint.nxtrace.org 上海联通
+ipv6.sha-9808.endpoint.nxtrace.org 上海移动
+ipv6.can-4134.endpoint.nxtrace.org 广州电信
+ipv6.can-4837.endpoint.nxtrace.org 广州联通
+ipv6.can-9808.endpoint.nxtrace.org 广州移动
+EOF
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+server_test_run_nexttrace_family() {
+    local bin="$1" family="$2" targets title
+    targets=$(mktemp /tmp/ss2022-nexttrace-targets.XXXXXX) || return 1
+    server_test_write_return_targets "$family" "$targets" || {
+        rm -f "$targets"
+        return 1
+    }
+
+    [[ "$family" == "6" ]] && title="IPv6" || title="IPv4"
+    echo ""
+    echo -e "${CYAN}════════ ${title} 三网逐跳回程 ════════${PLAIN}"
+    echo -e "${YELLOW}目标: 北京 / 上海 / 广州 × 电信 / 联通 / 移动；TCP 80；每一跳显示 IP / ASN / 地区 / 延迟。${PLAIN}"
+    echo ""
+
+    "$bin" --traceroute --file "$targets"         --tcp --port 80         --queries 1 --max-hops 30 --timeout 2000         --language cn --no-color -M || true
+
+    rm -f "$targets"
+}
+
+test_return_route() {
+    local asset tmp family
+    clear
+    show_external_test_source "IPv4 / IPv6 三网逐跳回程" "nxtrace/NTrace-core"
+    echo -e "${YELLOW}本项显示完整 traceroute，每个目标会逐跳列出经过的 IP、ASN、地区与延迟。${PLAIN}"
+    echo -e "${CYAN}检测目标: 北京 / 上海 / 广州 × 电信 / 联通 / 移动，共 9 条/地址族。${PLAIN}"
+
+    server_test_select_ip_mode || return
+    family=$(server_test_detect_family_mode)
+
+    asset=$(server_test_nexttrace_asset) || {
+        echo -e "${RED}[错误] 当前 CPU 架构暂无 NextTrace 测试资产。${PLAIN}"
+        pause
+        return
+    }
+
+    tmp=$(mktemp /tmp/ss2022-nexttrace.XXXXXX) || { pause; return; }
+    if ! server_test_download_release_asset "nxtrace/NTrace-core" "latest" "$asset" "$tmp"; then
+        rm -f "$tmp"
+        pause
+        return
+    fi
+
+    case "$SERVER_TEST_IP_MODE:$family" in
+        4:both|4:ipv4)
+            server_test_run_nexttrace_family "$tmp" 4
+            ;;
+        4:*)
+            echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv4。${PLAIN}"
+            ;;
+        6:both|6:ipv6)
+            server_test_run_nexttrace_family "$tmp" 6
+            ;;
+        6:*)
+            echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv6。${PLAIN}"
+            ;;
+        0:both)
+            server_test_run_nexttrace_family "$tmp" 4
+            server_test_run_nexttrace_family "$tmp" 6
+            ;;
+        0:ipv4)
+            server_test_run_nexttrace_family "$tmp" 4
+            ;;
+        0:ipv6)
+            server_test_run_nexttrace_family "$tmp" 6
+            ;;
+        *)
+            echo -e "${RED}[错误] 未检测到可用公网 IPv4 / IPv6。${PLAIN}"
+            ;;
+    esac
+
+    rm -f "$tmp"
+    echo ""
+    pause
+}
+
+server_test_run_unlocktests() {
+    local selection="$1" label="$2" mode="${3:-0}" selector="${4:-f}" asset tmp
+    asset=$(server_test_arch_asset "ut") || {
+        echo -e "${RED}[错误] 当前 CPU 架构暂无 UnlockTests 测试资产。${PLAIN}"
+        return 1
+    }
+    tmp=$(mktemp /tmp/ss2022-unlocktests.XXXXXX) || return 1
+    if ! server_test_download_release_asset "oneclickvirt/UnlockTests" "output" "$asset" "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    echo -e "${CYAN}${label}${PLAIN}"
+    case "$selector" in
+        region) "$tmp" -L zh -m "$mode" -region "$selection" -b=false -cache || true ;;
+        test) "$tmp" -L zh -m "$mode" -test "$selection" -b=false -cache || true ;;
+        *) "$tmp" -L zh -m "$mode" -f "$selection" -b=false -cache || true ;;
+    esac
+    rm -f "$tmp"
+}
+server_test_select_ip_mode() {
+    local c
+    SERVER_TEST_IP_MODE="0"
+    while true; do
+        echo ""
+        echo "请选择测试地址族："
+        echo "  1. IPv4 + IPv6（按 VPS 实际可用性）"
+        echo "  2. 仅 IPv4"
+        echo "  3. 仅 IPv6"
+        echo "  0. 返回"
+        read -rp "请选择 [0-3，默认 1]: " c
+        c=${c:-1}
+        case "$c" in
+            1) SERVER_TEST_IP_MODE="0"; return 0 ;;
+            2) SERVER_TEST_IP_MODE="4"; return 0 ;;
+            3) SERVER_TEST_IP_MODE="6"; return 0 ;;
+            0) return 1 ;;
+            *) echo -e "${RED}输入无效。${PLAIN}" ;;
+        esac
+    done
+}
+
+server_test_region_map_local_choice() {
+    case "$1" in
+        2) echo "TW_UnlockTest" ;;
+        3) echo "HK_UnlockTest" ;;
+        4) echo "JP_UnlockTest" ;;
+        5) echo "KR_UnlockTest" ;;
+        6) echo "NA_UnlockTest" ;;
+        7) echo "SA_UnlockTest" ;;
+        8) echo "EU_UnlockTest" ;;
+        9) echo "AF_UnlockTest" ;;
+        10) echo "SEA_UnlockTest" ;;
+        11) echo "OA_UnlockTest" ;;
+        12) echo "Sport_UnlockTest" ;;
+        *) return 1 ;;
+    esac
+}
+
+server_test_select_streaming_region() {
+    local c raw token mapped result="" label=""
+    SERVER_TEST_REGION_SELECTION=""
+    SERVER_TEST_REGION_LABEL="通用流媒体"
+    while true; do
+        echo ""
+        echo "请选择流媒体 / 区域检测范围："
+        echo "  1. 通用流媒体（Netflix / YouTube Premium / Disney+ / Prime Video / Google 等）"
+        echo "  2. 台湾"
+        echo "  3. 香港"
+        echo "  4. 日本"
+        echo "  5. 韩国"
+        echo "  6. 北美"
+        echo "  7. 南美"
+        echo "  8. 欧洲"
+        echo "  9. 非洲"
+        echo " 10. 东南亚"
+        echo " 11. 大洋洲"
+        echo " 12. 体育平台"
+        echo " 13. 全部流媒体平台（不含 AI）"
+        echo " 14. 自定义多地区组合"
+        echo "  0. 返回"
+        read -rp "请选择 [0-14，默认 1]: " c
+        c=${c:-1}
+        case "$c" in
+            1) SERVER_TEST_REGION_SELECTION=""; SERVER_TEST_REGION_LABEL="通用流媒体"; return 0 ;;
+            2) SERVER_TEST_REGION_SELECTION="TW_UnlockTest"; SERVER_TEST_REGION_LABEL="台湾平台"; return 0 ;;
+            3) SERVER_TEST_REGION_SELECTION="HK_UnlockTest"; SERVER_TEST_REGION_LABEL="香港平台"; return 0 ;;
+            4) SERVER_TEST_REGION_SELECTION="JP_UnlockTest"; SERVER_TEST_REGION_LABEL="日本平台"; return 0 ;;
+            5) SERVER_TEST_REGION_SELECTION="KR_UnlockTest"; SERVER_TEST_REGION_LABEL="韩国平台"; return 0 ;;
+            6) SERVER_TEST_REGION_SELECTION="NA_UnlockTest"; SERVER_TEST_REGION_LABEL="北美平台"; return 0 ;;
+            7) SERVER_TEST_REGION_SELECTION="SA_UnlockTest"; SERVER_TEST_REGION_LABEL="南美平台"; return 0 ;;
+            8) SERVER_TEST_REGION_SELECTION="EU_UnlockTest"; SERVER_TEST_REGION_LABEL="欧洲平台"; return 0 ;;
+            9) SERVER_TEST_REGION_SELECTION="AF_UnlockTest"; SERVER_TEST_REGION_LABEL="非洲平台"; return 0 ;;
+            10) SERVER_TEST_REGION_SELECTION="SEA_UnlockTest"; SERVER_TEST_REGION_LABEL="东南亚平台"; return 0 ;;
+            11) SERVER_TEST_REGION_SELECTION="OA_UnlockTest"; SERVER_TEST_REGION_LABEL="大洋洲平台"; return 0 ;;
+            12) SERVER_TEST_REGION_SELECTION="Sport_UnlockTest"; SERVER_TEST_REGION_LABEL="体育平台"; return 0 ;;
+            13)
+                SERVER_TEST_REGION_SELECTION="TW_UnlockTest,HK_UnlockTest,JP_UnlockTest,KR_UnlockTest,NA_UnlockTest,SA_UnlockTest,EU_UnlockTest,AF_UnlockTest,SEA_UnlockTest,OA_UnlockTest,Sport_UnlockTest"
+                SERVER_TEST_REGION_LABEL="全部地区平台"
+                return 0
+                ;;
+            14)
+                echo ""
+                echo "输入上面地区编号，可选多个，以空格分隔。"
+                echo "示例：3 4 10 = 香港 + 日本 + 东南亚"
+                echo "可组合 2-12；通用流媒体固定只检测一次。"
+                read -rp "地区编号: " raw
+                result=""; label=""
+                for token in $raw; do
+                    [[ "$token" =~ ^([2-9]|1[0-2])$ ]] || {
+                        echo -e "${RED}[错误] 无效地区编号: ${token}${PLAIN}"; result=""; break
+                    }
+                    mapped=$(server_test_region_map_local_choice "$token") || { result=""; break; }
+                    if [[ ",${result}," != *",${mapped},"* ]]; then
+                        result="${result:+${result},}${mapped}"
+                        case "$token" in
+                            2) label="${label:+${label} + }台湾" ;;
+                            3) label="${label:+${label} + }香港" ;;
+                            4) label="${label:+${label} + }日本" ;;
+                            5) label="${label:+${label} + }韩国" ;;
+                            6) label="${label:+${label} + }北美" ;;
+                            7) label="${label:+${label} + }南美" ;;
+                            8) label="${label:+${label} + }欧洲" ;;
+                            9) label="${label:+${label} + }非洲" ;;
+                            10) label="${label:+${label} + }东南亚" ;;
+                            11) label="${label:+${label} + }大洋洲" ;;
+                            12) label="${label:+${label} + }体育" ;;
+                        esac
+                    fi
+                done
+                [[ -n "$result" ]] || { echo -e "${RED}[错误] 未选择有效地区。${PLAIN}"; continue; }
+                SERVER_TEST_REGION_SELECTION="$result"
+                SERVER_TEST_REGION_LABEL="$label"
+                return 0
+                ;;
+            0) return 1 ;;
+            *) echo -e "${RED}输入无效。${PLAIN}" ;;
+        esac
+    done
+}
+
+server_test_show_exit_info_for_mode() {
+    local mode="${1:-0}" family
+    family=$(server_test_detect_family_mode)
+    case "$mode" in
+        4)
+            case "$family" in
+                both|ipv4)
+                    echo "===========[ IPV4 流媒体出口 ]============"
+                    server_test_exit_info "ipv4"
+                    ;;
+                *) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv4。${PLAIN}" ;;
+            esac
+            ;;
+        6)
+            case "$family" in
+                both|ipv6)
+                    echo "===========[ IPV6 流媒体出口 ]============"
+                    server_test_exit_info "ipv6"
+                    ;;
+                *) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv6。${PLAIN}" ;;
+            esac
+            ;;
+        *)
+            case "$family" in
+                both)
+                    echo "===========[ IPV4 流媒体出口 ]============"
+                    server_test_exit_info "ipv4"
+                    echo ""
+                    echo "===========[ IPV6 流媒体出口 ]============"
+                    server_test_exit_info "ipv6"
+                    ;;
+                ipv4)
+                    echo "===========[ IPV4 流媒体出口 ]============"
+                    server_test_exit_info "ipv4"
+                    ;;
+                ipv6)
+                    echo "===========[ IPV6 流媒体出口 ]============"
+                    server_test_exit_info "ipv6"
+                    ;;
+                *) echo -e "${RED}[错误] 未检测到可用公网 IPv4 / IPv6。${PLAIN}" ;;
+            esac
+            ;;
+    esac
+}
+
+server_test_download_rrc_source() {
+    local out="$1"
+    local commit="ab6829eb07c4c592c1f8f3dac736d675667d1a08"
+    local blob="9cd4e7fd81f49acfa4336ee48322114f8d88a6ad"
+    local raw="https://raw.githubusercontent.com/1-stream/RegionRestrictionCheck/${commit}/check.sh"
+    local source size actual ok=0
+
+    ensure_test_dependency curl curl || return 1
+    command -v sha1sum >/dev/null 2>&1 || ensure_test_dependency sha1sum coreutils || return 1
+
+    for source in "$raw" "https://ghproxy.net/$raw" "https://gh-proxy.com/$raw"; do
+        rm -f "$out"
+        echo -e "${YELLOW}>> 下载并校验 RegionRestrictionCheck...${PLAIN}"
+        if ! curl -fL --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 90 "$source" -o "$out"; then
+            continue
+        fi
+        size=$(wc -c <"$out" | tr -d '[:space:]')
+        actual=$(
+            {
+                printf 'blob %s\0' "$size"
+                cat "$out"
+            } | sha1sum | awk '{print $1}'
+        )
+        if [[ "${actual,,}" == "${blob,,}" ]]; then
+            ok=1
+            break
+        fi
+        echo -e "${RED}[警告] Git blob 校验失败，拒绝执行当前下载结果。${PLAIN}"
+    done
+
+    [[ $ok -eq 1 ]] || {
+        rm -f "$out"
+        echo -e "${RED}[错误] RegionRestrictionCheck 下载失败或来源完整性校验失败。${PLAIN}"
+        return 1
+    }
+    chmod 700 "$out"
+    return 0
+}
+
+server_test_run_region_restriction_check() {
+    local selection="$1" mode="${2:-0}"
+    local source runner family run_mode
+    source=$(mktemp /tmp/ss2022-rrc-source.XXXXXX.sh) || return 1
+    runner=$(mktemp /tmp/ss2022-rrc-runner.XXXXXX.sh) || { rm -f "$source"; return 1; }
+
+    ensure_test_dependency jq jq || { rm -f "$source" "$runner"; return 1; }
+    ensure_test_dependency python3 python3 || { rm -f "$source" "$runner"; return 1; }
+    ensure_test_dependency grep grep || { rm -f "$source" "$runner"; return 1; }
+    ensure_test_dependency openssl openssl || { rm -f "$source" "$runner"; return 1; }
+
+    if ! server_test_download_rrc_source "$source"; then
+        rm -f "$source" "$runner"
+        return 1
+    fi
+
+    if ! grep -q '^function ScriptTitle()' "$source" ||
+       ! grep -q '^function Global_UnlockTest()' "$source"; then
+        echo -e "${RED}[错误] 上游脚本结构发生变化，已停止执行以避免误调用。${PLAIN}"
+        rm -f "$source" "$runner"
+        return 1
+    fi
+
+    sed '/^function ScriptTitle()/,$d' "$source" >"$runner"
+    cat >>"$runner" <<'RRC_RUNNER'
+
+ss2022_rrc_run_family() {
+    local fam="$1" fn
+    echo ""
+    echo "===========[ IPV$fam 通用流媒体 ]============"
+    Global_UnlockTest "$fam"
+
+    if [[ -n "$SS2022_RRC_REGIONS" ]]; then
+        IFS=',' read -r -a ss2022_rrc_funcs <<<"$SS2022_RRC_REGIONS"
+        for fn in "${ss2022_rrc_funcs[@]}"; do
+            case "$fn" in
+                TW_UnlockTest|HK_UnlockTest|JP_UnlockTest|KR_UnlockTest|NA_UnlockTest|SA_UnlockTest|EU_UnlockTest|AF_UnlockTest|SEA_UnlockTest|OA_UnlockTest|Sport_UnlockTest)
+                    "$fn" "$fam"
+                    ;;
+            esac
+        done
+    fi
+}
+
+case "$SS2022_RRC_MODE" in
+    4) ss2022_rrc_run_family 4 ;;
+    6) ss2022_rrc_run_family 6 ;;
+    *)
+        ss2022_rrc_run_family 4
+        ss2022_rrc_run_family 6
+        ;;
+esac
+RRC_RUNNER
+    chmod 700 "$runner"
+
+    family=$(server_test_detect_family_mode)
+    run_mode="$mode"
+    case "$mode:$family" in
+        4:both|4:ipv4) run_mode=4 ;;
+        4:*) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv4，跳过流媒体 IPv4 检测。${PLAIN}"; rm -f "$source" "$runner"; return 0 ;;
+        6:both|6:ipv6) run_mode=6 ;;
+        6:*) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv6，跳过流媒体 IPv6 检测。${PLAIN}"; rm -f "$source" "$runner"; return 0 ;;
+        0:both) run_mode=0 ;;
+        0:ipv4) run_mode=4 ;;
+        0:ipv6) run_mode=6 ;;
+        0:*) echo -e "${RED}[错误] 未检测到可用公网 IPv4 / IPv6。${PLAIN}"; rm -f "$source" "$runner"; return 1 ;;
+    esac
+
+    SS2022_RRC_REGIONS="$selection" SS2022_RRC_MODE="$run_mode" bash "$runner" || true
+    rm -f "$source" "$runner"
+    return 0
+}
+
+test_streaming_unlock() {
+    clear
+    show_external_test_source "流媒体 / 区域解锁测试" "1-stream/RegionRestrictionCheck"
+    echo -e "${YELLOW}通用流媒体固定检测；地区平台按选择追加。AI 平台不会在本项执行。${PLAIN}"
+    echo -e "${CYAN}通用项目包含 Netflix / YouTube Premium / Disney+ / Prime Video / Spotify / Google 等。${PLAIN}"
+    server_test_select_streaming_region || return
+    server_test_select_ip_mode || return
+    echo ""
+    echo -e "${CYAN}检测范围: 通用流媒体${SERVER_TEST_REGION_SELECTION:+ + ${SERVER_TEST_REGION_LABEL}}${PLAIN}"
+    case "$SERVER_TEST_IP_MODE" in
+        4) echo -e "${CYAN}地址族: 仅 IPv4${PLAIN}" ;;
+        6) echo -e "${CYAN}地址族: 仅 IPv6${PLAIN}" ;;
+        *) echo -e "${CYAN}地址族: IPv4 + IPv6${PLAIN}" ;;
+    esac
+    echo ""
+    server_test_show_exit_info_for_mode "$SERVER_TEST_IP_MODE"
+    echo ""
+    server_test_run_region_restriction_check "$SERVER_TEST_REGION_SELECTION" "$SERVER_TEST_IP_MODE" || true
+    echo ""
+    pause
+}
+
+test_ai_unlock() {
+    clear
+    show_external_test_source "AI 工具测试" "oneclickvirt/UnlockTests"
+    echo -e "${CYAN}检测模式: AI-only（ChatGPT / Gemini / Claude / Copilot / Grok / Perplexity / Poe 等）${PLAIN}"
+    echo -e "${YELLOW}结果区分 YES / NO / Restricted / Banned / TIMEOUT / DNS失败等状态。${PLAIN}"
+    server_test_select_ip_mode || return
+    echo ""
+    case "$SERVER_TEST_IP_MODE" in
+        4) echo -e "${CYAN}地址族: 仅 IPv4${PLAIN}" ;;
+        6) echo -e "${CYAN}地址族: 仅 IPv6${PLAIN}" ;;
+        *) echo -e "${CYAN}地址族: IPv4 + IPv6${PLAIN}" ;;
+    esac
+    echo ""
+    server_test_run_unlocktests "21" "AI 平台检测" "$SERVER_TEST_IP_MODE" "region" || true
+    echo ""
+    pause
+}
+
+server_test_communication_probe() {
+    local family="$1" name="$2" url="$3" family_flag errfile http_code rc status
+    [[ "$family" == "ipv6" ]] && family_flag="-6" || family_flag="-4"
+    errfile=$(mktemp /tmp/ss2022-comm.XXXXXX) || return 1
+    http_code=$(curl "$family_flag" -sS -o /dev/null -w '%{http_code}' \
+        --connect-timeout 6 --max-time 12 "$url" 2>"$errfile")
+    rc=$?
+    rm -f "$errfile"
+    case "$rc" in
+        0) status="YES${http_code:+ (HTTP ${http_code})}" ;;
+        6) status="N/A (DNS Resolve Failed)" ;;
+        7) status="NO (Connect Failed)" ;;
+        28) status="TIMEOUT" ;;
+        35|60) status="NO (TLS Failed)" ;;
+        *) status="NO (curl ${rc})" ;;
+    esac
+    printf " %-25s %s\n" "$name" "$status"
+}
+
+server_test_exit_info() {
+    local family="$1" family_flag ip trace country
+    [[ "$family" == "ipv6" ]] && family_flag="-6" || family_flag="-4"
+
+    if [[ "$family" == "ipv6" ]]; then
+        ip=$(get_public_ipv6 2>/dev/null || true)
+    else
+        ip=$(get_public_ipv4 2>/dev/null || true)
+    fi
+
+    trace=$(curl "$family_flag" -fsS --connect-timeout 5 --max-time 8 \
+        "https://www.cloudflare.com/cdn-cgi/trace" 2>/dev/null || true)
+    country=$(awk -F= '$1=="loc" {print $2; exit}' <<<"$trace")
+    [[ "$country" =~ ^[A-Z]{2}$ ]] || country="未知"
+
+    printf " %-25s %s\n" "出口 IP" "${ip:-未知}"
+    printf " %-25s %s\n" "出口地区" "$country"
+}
+
+server_test_run_communication_family() {
+    local family="$1" title
+    [[ "$family" == "ipv6" ]] && title="IPV6" || title="IPV4"
+    echo "===========[ ${title} 通信软件 ]============"
+    server_test_exit_info "$family"
+    server_test_communication_probe "$family" "Telegram" "https://web.telegram.org/"
+    server_test_communication_probe "$family" "WhatsApp" "https://web.whatsapp.com/"
+    server_test_communication_probe "$family" "Signal" "https://signal.org/"
+    server_test_communication_probe "$family" "Discord" "https://discord.com/api/v10/gateway"
+}
+
+test_communication_access() {
+    local family
+    clear
+    echo -e "${CYAN}════════════════════ 通信软件网络可达性测试 ════════════════════${PLAIN}"
+    echo -e "${YELLOW}检测 DNS / TCP / TLS / HTTPS 可达性，不登录账号，也不代表消息发送功能。${PLAIN}"
+    server_test_select_ip_mode || return
+    family=$(server_test_detect_family_mode)
+    echo ""
+    case "$SERVER_TEST_IP_MODE" in
+        4)
+            case "$family" in
+                both|ipv4) server_test_run_communication_family "ipv4" ;;
+                *) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv4。${PLAIN}" ;;
+            esac
+            ;;
+        6)
+            case "$family" in
+                both|ipv6) server_test_run_communication_family "ipv6" ;;
+                *) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv6。${PLAIN}" ;;
+            esac
+            ;;
+        *)
+            case "$family" in
+                both)
+                    server_test_run_communication_family "ipv4"
+                    echo ""
+                    server_test_run_communication_family "ipv6"
+                    ;;
+                ipv4) server_test_run_communication_family "ipv4" ;;
+                ipv6) server_test_run_communication_family "ipv6" ;;
+                *) echo -e "${RED}[错误] 未检测到可用公网 IPv4 / IPv6。${PLAIN}" ;;
+            esac
+            ;;
+    esac
+    echo ""
+    pause
+}
+
+test_platform_media_ai_communication_unlock() {
+    local family
+    clear
+    echo -e "${CYAN}════════════ 平台流媒体AI通信软件解锁测试 ════════════${PLAIN}"
+    echo -e "${YELLOW}一次选择地址族后，依次执行流媒体、AI、通信软件检测。${PLAIN}"
+    echo -e "${YELLOW}通信软件部分检测网络可达性，不登录账号，也不代表消息发送功能。${PLAIN}"
+
+    server_test_select_streaming_region || return
+    server_test_select_ip_mode || return
+    family=$(server_test_detect_family_mode)
+
+    echo ""
+    echo -e "${CYAN}════════════ 1/3 流媒体解锁 ════════════${PLAIN}"
+    show_external_test_source "流媒体 / 区域解锁测试" "1-stream/RegionRestrictionCheck"
+    echo -e "${CYAN}检测范围: 通用流媒体${SERVER_TEST_REGION_SELECTION:+ + ${SERVER_TEST_REGION_LABEL}}${PLAIN}"
+    case "$SERVER_TEST_IP_MODE" in
+        4) echo -e "${CYAN}地址族: 仅 IPv4${PLAIN}" ;;
+        6) echo -e "${CYAN}地址族: 仅 IPv6${PLAIN}" ;;
+        *) echo -e "${CYAN}地址族: IPv4 + IPv6${PLAIN}" ;;
+    esac
+    echo ""
+    server_test_show_exit_info_for_mode "$SERVER_TEST_IP_MODE"
+    echo ""
+    server_test_run_region_restriction_check "$SERVER_TEST_REGION_SELECTION" "$SERVER_TEST_IP_MODE" || true
+
+    echo ""
+    echo -e "${CYAN}════════════ 2/3 AI 工具解锁 ════════════${PLAIN}"
+    show_external_test_source "AI 工具测试" "oneclickvirt/UnlockTests"
+    server_test_run_unlocktests "21" "AI 平台检测" "$SERVER_TEST_IP_MODE" "region" || true
+
+    echo ""
+    echo -e "${CYAN}════════════ 3/3 通信软件解锁 ════════════${PLAIN}"
+    echo -e "${YELLOW}此处“解锁”表示网络可达性检测，不代表账号区服或消息发送能力。${PLAIN}"
+    case "$SERVER_TEST_IP_MODE" in
+        4)
+            case "$family" in
+                both|ipv4) server_test_run_communication_family "ipv4" ;;
+                *) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv4。${PLAIN}" ;;
+            esac
+            ;;
+        6)
+            case "$family" in
+                both|ipv6) server_test_run_communication_family "ipv6" ;;
+                *) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv6。${PLAIN}" ;;
+            esac
+            ;;
+        *)
+            case "$family" in
+                both)
+                    server_test_run_communication_family "ipv4"
+                    echo ""
+                    server_test_run_communication_family "ipv6"
+                    ;;
+                ipv4) server_test_run_communication_family "ipv4" ;;
+                ipv6) server_test_run_communication_family "ipv6" ;;
+                *) echo -e "${RED}[错误] 未检测到可用公网 IPv4 / IPv6。${PLAIN}" ;;
+            esac
+            ;;
+    esac
+
+    echo ""
+    pause
+}
+
+server_test_management() {
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ 服务器测试管理 ════════════════════${PLAIN}"
+        echo "  1. IP 质量 / 风险测试"
+        echo "  2. IPv4 / IPv6 三网逐跳回程"
+        echo "  3. 平台流媒体AI通信软件解锁测试"
+        echo "  0. 返回"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-3]: " c
+        case "$c" in
+            1) test_ip_quality ;;
+            2) test_return_route ;;
+            3) test_platform_media_ai_communication_unlock ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+protocol_operations_management() {
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ 协议运维管理 ════════════════════${PLAIN}"
+        echo "  1. 查看全部服务状态与监听端口"
+        echo "  2. 查看 sing-box 实时日志"
+        echo "  3. 查看 ss2022-xray 实时日志"
+        echo "  4. 查看 Snell v5 实时日志"
+        echo "  5. 查看 Realm 转发实时日志"
+        echo "  6. 重启 sing-box"
+        echo "  7. 重启 ss2022-xray"
+        echo "  8. 重启 Snell v5"
+        echo "  9. 重启 Realm 转发"
+        echo " 10. 查看 IPv6 Keepalive 状态"
+        echo "  0. 返回"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-10]: " c
+        case "$c" in
+            1) show_service_status; pause ;;
+            2) follow_service_log sing-box ;;
+            3) follow_service_log "$XRAY_SERVICE_NAME" ;;
+            4) follow_service_log snell-v5 ;;
+            5) follow_service_log "$REALM_SERVICE_NAME" ;;
+            6) restart_service_safe sing-box "sing-box"; pause ;;
+            7) restart_service_safe "$XRAY_SERVICE_NAME" "ss2022-xray"; pause ;;
+            8) restart_service_safe snell-v5 "Snell v5"; pause ;;
+            9) restart_service_safe "$REALM_SERVICE_NAME" "Realm 转发"; pause ;;
+            10)
+                if service_is_active "$(keepalive_service_name)"; then
+                    echo "IPv6 Keepalive: Running"
+                    service_status_output "$(keepalive_service_name)" 2>/dev/null || true
+                else
+                    echo "IPv6 Keepalive: 未运行"
+                fi
+                pause
+                ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+main() {
+    check_root
+    detect_platform || exit 1
+    if platform_is_alpine; then
+        echo "[v1.9.0] 已检测到 Alpine / OpenRC；核心协议、服务管理、服务器工具与测试已接入稳定支持范围。"
+        echo "[提示] Snell v5 官方二进制与 Cloudflare WARP 官方客户端暂不在 Alpine 开放。"
+    fi
+
+    # 兼容旧安装：已有 local-dns 缺少 prefer_go:true 时执行一次安全迁移。
+    # 失败不会覆盖旧配置，也不会阻断管理面板。
+    migrate_singbox_local_dns_prefer_go || true
+
+    while true; do
+        show_dashboard
+        echo "  1. 协议管理"
+        echo "  2. 分流管理"
+        echo "  3. 端口转发（Realm）"
+        echo "  4. 查看当前节点参数与客户端配置"
+        echo "  5. 协议运维管理"
+        echo "  6. 组件版本管理"
+        echo "  - - - - - - - - - - - - - - - -"
+        echo "  7. 服务器管理工具"
+        echo "  8. 服务器测试管理"
+        echo "  - - - - - - - - - - - - - - - -"
+        echo "  9. 检查脚本更新"
+        echo -e "${RED} 10. 完全卸载脚本${PLAIN}"
+        echo "  0. 退出管理面板"
+        echo -e "${CYAN}═════════════════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请输入选项编号 [0-10]: " choice
+
+        case "$choice" in
+            1) protocol_management ;;
+            2) routing_management ;;
+            3) forwarding_management ;;
+            4) view_config_menu ;;
+            5) protocol_operations_management ;;
+            6) component_version_management ;;
+            7) server_management_tools ;;
+            8) server_test_management ;;
+            9) check_script_update ;;
+            10) full_uninstall ;;
+            0)
+                echo "已安全退出。随时输入 ss2022 唤出！"
+                exit 0
+                ;;
+            *)
+                echo -e "${RED}请输入有效编号！${PLAIN}"
+                sleep 1
+                ;;
+        esac
+    done
+} 
+
+# CI / smoke test can load the function library without entering the interactive UI.
+# Normal users never need to set this variable.
+if [[ "${SS2022_LIB_ONLY:-0}" != "1" ]]; then
+    main
+fi
+\t'}
+    echo "TVB HLS-1: ${code1:-失败}"
+    [[ "$code1" == "200" ]] || {
+        rm -f "$api_file" "$master_file" "$variant_file"
+        return 1
+    }
+
+    variant=$(awk 'NF && $0 !~ /^#/ && $0 ~ /\.m3u8([?].*)?$/ {gsub(/\r/,""); print; exit}' "$master_file")
+    if [[ -z "$variant" ]]; then
+        echo -e "${YELLOW}TVB HLS-2: master 未发现子清单（可能 HLS-1 已是媒体清单）${PLAIN}"
+        rm -f "$api_file" "$master_file" "$variant_file"
+        return 0
+    fi
+    url2=$(app_egress_url_join "$eff1" "$variant")
+    result=$(curl -sS -L --proxy "$proxy" --connect-timeout 8 --max-time 20 \
+      -H 'Referer: https://news.tvb.com/' \
+      -o "$variant_file" -w '%{http_code}\t%{url_effective}' "$url2" 2>/dev/null || true)
+    code2=${result%%    while true; do
+        clear
+        routing_init_state || return
+        local def count rules warp_state="未连接"
+        def=$(jq -r '.default_outbound' "$ROUTING_FILE")
+        count=$(jq '.chain_nodes|length' "$ROUTING_FILE")
+        rules=$(jq '.rules|length' "$ROUTING_FILE")
+        warp_proxy_ready && warp_state="Running"
+        echo -e "${CYAN}════════════════════ 分流管理 ════════════════════${PLAIN}"
+        echo "服务端分流适用：SS2022 / SS2022+ShadowTLS / VLESS Reality"
+        echo "Snell v5：保持官方 snell-server，分流请使用 Surge Rules"
+        echo ""
+        echo "默认出口 : $(routing_outbound_label "$def")"
+        echo "地址族   : $(routing_ip_family_label "$(routing_global_ip_family)")"
+        if [[ "$warp_state" == "Running" ]]; then
+            warp_detect_direct_profile
+            echo "WARP     : ${warp_state} / $(warp_profile_label "$WARP_PROFILE")"
+        else
+            echo "WARP     : ${warp_state}"
+        fi
+        echo "落地节点 : ${count} 个"
+        echo "规则     : ${rules} 条"
+        echo ""
+        echo "  1. WARP 出口管理"
+        echo "  2. 落地节点管理"
+        echo "  3. 分流规则管理"
+        echo "  4. 查看当前分流配置"
+        echo "  5. 测试分流效果"
+        echo "  0. 返回"
+        echo -e "${CYAN}══════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-5]: " c
+        case "$c" in
+            1) warp_management ;;
+            2) chain_management ;;
+            3) routing_rule_management ;;
+            4) routing_show_config; pause ;;
+            5) routing_test_effect; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+# ==============================================================================
+# [10] Realm L4 端口转发
+# ==============================================================================
+
+ensure_realm_user() {
+    ensure_managed_system_user "$REALM_USER" "$REALM_GROUP" "$REALM_USER_MARKER" "$REALM_GROUP_MARKER"
+}
+write_realm_service() {
+    ensure_realm_user || return 1
+    mkdir -p "$(dirname "$REALM_CONF")" "$(dirname "$REALM_BIN")" || return 1
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        cat > "$REALM_SERVICE" <<SERVICE
+[Unit]
+Description=ss2022.sh managed Realm L4 forwarding service
+Documentation=https://github.com/zhboner/realm
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${REALM_USER}
+Group=${REALM_GROUP}
+ExecStart=${REALM_BIN} -c ${REALM_CONF}
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=1048576
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+        service_daemon_reload || return 1
+        return 0
+    fi
+    mkdir -p /var/log/ss2022 || return 1
+    touch "$REALM_OPENRC_LOG" || return 1
+    chown "$REALM_USER:$REALM_GROUP" "$REALM_OPENRC_LOG" || return 1
+    chmod 640 "$REALM_OPENRC_LOG"
+    cat > "$REALM_OPENRC_SERVICE" <<SERVICE
+#!/sbin/openrc-run
+description="vps-bootstrap Realm L4 forwarding"
+command="$REALM_BIN"
+command_args="-c $REALM_CONF"
+command_user="$REALM_USER:$REALM_GROUP"
+supervisor="supervise-daemon"
+pidfile="$REALM_OPENRC_PID"
+output_log="$REALM_OPENRC_LOG"
+error_log="$REALM_OPENRC_LOG"
+respawn_delay=3
+respawn_max=0
+umask=0077
+
+depend() {
+    need net
+    use dns
+}
+SERVICE
+    chmod 755 "$REALM_OPENRC_SERVICE"
+    return 0
+}
+forwarding_init_state() {
+    mkdir -p "$STATE_DIR" || return 1
+    chmod 700 "$STATE_DIR"
+    if [[ ! -f "$FORWARDING_FILE" ]]; then
+        cat > "$FORWARDING_FILE" <<'EOF'
+{
+  "version": 1,
+  "rules": []
+}
+EOF
+        chmod 600 "$FORWARDING_FILE"
+        return 0
+    fi
+
+    if ! jq -e 'type=="object" and ((.rules // [])|type=="array")' "$FORWARDING_FILE" >/dev/null 2>&1; then
+        echo -e "${RED}[错误] ${FORWARDING_FILE} 格式损坏，请先备份后修复。${PLAIN}"
+        return 1
+    fi
+
+    local tmp=""
+    tmp=$(mktemp "${STATE_DIR}/forwarding.json.tmp.XXXXXX") || return 1
+    if ! jq '.version=(.version // 1) | .rules=(.rules // [])' "$FORWARDING_FILE" > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    mv -f "$tmp" "$FORWARDING_FILE"
+    chmod 600 "$FORWARDING_FILE"
+}
+
+realm_asset_name() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo "realm-x86_64-unknown-linux-musl.tar.gz" ;;
+        aarch64|arm64) echo "realm-aarch64-unknown-linux-musl.tar.gz" ;;
+        *) return 1 ;;
+    esac
+}
+
+realm_fetch_asset_metadata() {
+    local asset="$1" api tmp expected url
+    api="https://api.github.com/repos/zhboner/realm/releases/tags/v${REALM_VERSION}"
+    tmp=$(mktemp /tmp/ss2022-realm-meta.XXXXXX) || return 1
+
+    if ! curl -fsSL --retry 2 --connect-timeout 10 --max-time 30 \
+        -H 'Accept: application/vnd.github+json' "$api" -o "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+
+    url=$(jq -r --arg a "$asset" '.assets[]? | select(.name==$a) | .browser_download_url // empty' "$tmp" | head -n1)
+    expected=$(jq -r --arg a "$asset" '.assets[]? | select(.name==$a) | .digest // empty' "$tmp" | head -n1)
+    rm -f "$tmp"
+
+    expected=${expected#sha256:}
+    [[ -n "$url" && "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || return 1
+    printf '%s\t%s\n' "$url" "$expected"
+}
+
+install_realm_core() {
+    install_dependencies || return 1
+
+    local asset="" metadata="" url="" expected="" archive="" actual="" tmpdir="" src="" download_url=""
+    asset=$(realm_asset_name) || {
+        echo -e "${RED}[错误] Realm 当前仅支持 x86_64 / aarch64 Linux。${PLAIN}"
+        return 1
+    }
+
+    echo -e "${YELLOW}>> 获取 Realm v${REALM_VERSION} 官方 Release 校验信息...${PLAIN}"
+    metadata=$(realm_fetch_asset_metadata "$asset") || {
+        echo -e "${RED}[错误] 无法从 GitHub 官方 Release 获取 ${asset} 的 SHA256 digest，拒绝不校验安装。${PLAIN}"
+        return 1
+    }
+    url=${metadata%%$'\t'*}
+    expected=${metadata#*$'\t'}
+
+    archive="/tmp/ss2022-${asset}"
+    rm -f "$archive"
+    local sources=(
+        "$url"
+        "https://ghproxy.net/${url}"
+        "https://gh-proxy.com/${url}"
+        "https://ghps.cc/${url}"
+    )
+
+    local ok=0
+    for download_url in "${sources[@]}"; do
+        echo -e "   尝试下载: ${CYAN}${download_url}${PLAIN}"
+        rm -f "$archive"
+        if ! curl -fL --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 120 "$download_url" -o "$archive"; then
+            echo -e "${YELLOW}   下载失败，尝试下一个源。${PLAIN}"
+            continue
+        fi
+        actual=$(sha256sum "$archive" | awk '{print $1}')
+        if [[ "${actual,,}" != "${expected,,}" ]]; then
+            echo -e "${RED}   SHA256 校验失败，拒绝安装。${PLAIN}"
+            echo "   期望: $expected"
+            echo "   实际: $actual"
+            continue
+        fi
+        if ! tar -tzf "$archive" >/dev/null 2>&1; then
+            echo -e "${RED}   Realm 压缩包结构无效。${PLAIN}"
+            continue
+        fi
+        if tar -tzf "$archive" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
+            echo -e "${RED}   Realm 压缩包包含不安全路径，拒绝解压。${PLAIN}"
+            continue
+        fi
+        ok=1
+        break
+    done
+    [[ $ok -eq 1 ]] || { rm -f "$archive"; return 1; }
+
+    tmpdir=$(mktemp -d /tmp/ss2022-realm-install.XXXXXX) || { rm -f "$archive"; return 1; }
+    tar -xzf "$archive" -C "$tmpdir" || { rm -rf "$tmpdir" "$archive"; return 1; }
+    src=$(find "$tmpdir" -type f -name realm -perm -u+x -print -quit 2>/dev/null || true)
+    if [[ -z "$src" ]]; then
+        src=$(find "$tmpdir" -type f -name realm -print -quit 2>/dev/null || true)
+    fi
+    [[ -n "$src" ]] || {
+        echo -e "${RED}[错误] Realm 压缩包中未找到二进制。${PLAIN}"
+        rm -rf "$tmpdir" "$archive"
+        return 1
+    }
+
+    mkdir -p "$(dirname "$REALM_BIN")"
+    install -m 0755 "$src" "$REALM_BIN" || { rm -rf "$tmpdir" "$archive"; return 1; }
+    rm -rf "$tmpdir" "$archive"
+
+    local installed_version=""
+    installed_version=$("$REALM_BIN" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)
+    if [[ "$installed_version" != "$REALM_VERSION" ]]; then
+        echo -e "${RED}[错误] Realm 安装后版本校验失败：期望 ${REALM_VERSION}，实际 ${installed_version:-未知}。${PLAIN}"
+        rm -f "$REALM_BIN"
+        return 1
+    fi
+
+    if platform_is_alpine; then
+        command -v setcap >/dev/null 2>&1 || { echo -e "${RED}[错误] Alpine 缺少 setcap。${PLAIN}"; return 1; }
+        setcap cap_net_bind_service=+ep "$REALM_BIN" || { echo -e "${RED}[错误] 无法为 Realm 设置低端口 capability。${PLAIN}"; return 1; }
+        "$REALM_BIN" --version >/dev/null 2>&1 || { echo -e "${RED}[错误] Realm 设置 capability 后无法执行。${PLAIN}"; return 1; }
+    fi
+    write_realm_service || return 1
+    echo -e "${GREEN}✔ Realm v${REALM_VERSION} 已安装并通过 SHA256/版本校验。${PLAIN}"
+}
+
+forwarding_format_host_port() {
+    local host="$1" port="$2"
+    host=${host#[}
+    host=${host%]}
+    if [[ "$host" == *:* ]]; then
+        printf '[%s]:%s' "$host" "$port"
+    else
+        printf '%s:%s' "$host" "$port"
+    fi
+}
+
+forwarding_network_json() {
+    local proto="$1" ipv6_only="${2:-false}"
+    case "$proto" in
+        tcp) jq -nc --argjson v6 "$ipv6_only" '{no_tcp:false,use_udp:false,ipv6_only:$v6}' ;;
+        udp) jq -nc --argjson v6 "$ipv6_only" '{no_tcp:true,use_udp:true,ipv6_only:$v6}' ;;
+        both) jq -nc --argjson v6 "$ipv6_only" '{no_tcp:false,use_udp:true,ipv6_only:$v6}' ;;
+        *) return 1 ;;
+    esac
+}
+
+realm_build_config_from_state() {
+    local state="$1" out="$2"
+    [[ -f "$state" ]] || return 1
+
+    local endpoints='[]' rule="" id="" type="" family="" proto="" host=""
+    local lport="" rport="" lstart="" lend="" rstart="" p="" rp=""
+    local remote="" network="" ep="" listen=""
+    while IFS= read -r rule; do
+        [[ -n "$rule" ]] || continue
+        id=$(jq -r '.id' <<<"$rule")
+        type=$(jq -r '.type' <<<"$rule")
+        family=$(jq -r '.listen_family' <<<"$rule")
+        proto=$(jq -r '.protocol' <<<"$rule")
+        host=$(jq -r '.remote_host' <<<"$rule")
+
+        if [[ "$type" == "single" ]]; then
+            lstart=$(jq -r '.listen_port' <<<"$rule")
+            lend="$lstart"
+            rstart=$(jq -r '.remote_port' <<<"$rule")
+        else
+            lstart=$(jq -r '.listen_start' <<<"$rule")
+            lend=$(jq -r '.listen_end' <<<"$rule")
+            rstart=$(jq -r '.remote_start' <<<"$rule")
+        fi
+
+        p="$lstart"
+        while [[ "$p" -le "$lend" ]]; do
+            rp=$((rstart + p - lstart))
+            remote=$(forwarding_format_host_port "$host" "$rp")
+
+            case "$family" in
+                ipv4)
+                    listen="0.0.0.0:${p}"
+                    network=$(forwarding_network_json "$proto" false) || return 1
+                    ep=$(jq -nc --arg l "$listen" --arg r "$remote" --argjson n "$network" --arg id "$id" \
+                        '{listen:$l,remote:$r,network:$n}')
+                    endpoints=$(jq -nc --argjson a "$endpoints" --argjson e "$ep" '$a + [$e]')
+                    ;;
+                ipv6)
+                    listen="[::]:${p}"
+                    network=$(forwarding_network_json "$proto" true) || return 1
+                    ep=$(jq -nc --arg l "$listen" --arg r "$remote" --argjson n "$network" --arg id "$id" \
+                        '{listen:$l,remote:$r,network:$n}')
+                    endpoints=$(jq -nc --argjson a "$endpoints" --argjson e "$ep" '$a + [$e]')
+                    ;;
+                dual)
+                    # Realm 官方语义：[::]:port + ipv6_only=false 会同时接受 IPv6 与 IPv4-mapped IPv6，
+                    # 因此双栈只生成一个 endpoint，避免同端口重复 bind。
+                    listen="[::]:${p}"
+                    network=$(forwarding_network_json "$proto" false) || return 1
+                    ep=$(jq -nc --arg l "$listen" --arg r "$remote" --argjson n "$network" --arg id "$id" \
+                        '{listen:$l,remote:$r,network:$n}')
+                    endpoints=$(jq -nc --argjson a "$endpoints" --argjson e "$ep" '$a + [$e]')
+                    ;;
+                *) return 1 ;;
+            esac
+            p=$((p+1))
+        done
+    done < <(jq -c '.rules[]?' "$state")
+
+    jq -n --argjson eps "$endpoints" '{
+      log:{level:"warn",output:"stdout"},
+      network:{
+        no_tcp:false,
+        use_udp:false,
+        tcp_timeout:5,
+        udp_timeout:30,
+        tcp_keepalive:15,
+        tcp_keepalive_probe:3
+      },
+      endpoints:$eps
+    }' > "$out"
+    jq -e '.endpoints|type=="array"' "$out" >/dev/null 2>&1
+}
+
+forwarding_rule_interval() {
+    local rule="$1"
+    if [[ "$(jq -r '.type' <<<"$rule")" == "single" ]]; then
+        printf '%s %s\n' "$(jq -r '.listen_port' <<<"$rule")" "$(jq -r '.listen_port' <<<"$rule")"
+    else
+        printf '%s %s\n' "$(jq -r '.listen_start' <<<"$rule")" "$(jq -r '.listen_end' <<<"$rule")"
+    fi
+}
+
+forwarding_state_port_conflict() {
+    local start="$1" end="$2" exclude_id="${3:-}" rule="" s="" e=""
+    while IFS= read -r rule; do
+        [[ -n "$rule" ]] || continue
+        [[ -n "$exclude_id" && "$(jq -r '.id' <<<"$rule")" == "$exclude_id" ]] && continue
+        read -r s e < <(forwarding_rule_interval "$rule")
+        if (( start <= e && end >= s )); then
+            return 0
+        fi
+    done < <(jq -c '.rules[]?' "$FORWARDING_FILE")
+    return 1
+}
+
+forwarding_os_port_conflict_range() {
+    local start="$1" end="$2" allowed_pid=""
+    allowed_pid=$(service_main_pid "$REALM_SERVICE_NAME" 2>/dev/null || true)
+    local p lines conflicts
+    lines=$(ss -H -lntup 2>/dev/null || true)
+    p="$start"
+    while [[ "$p" -le "$end" ]]; do
+        conflicts=$(printf '%s\n' "$lines" | awk -v p="$p" '
+          {
+            addr=$5; n=split(addr,a,":");
+            if (a[n] == p) print
+          }')
+        if [[ -n "$conflicts" && "$allowed_pid" =~ ^[0-9]+$ && "$allowed_pid" -gt 0 ]]; then
+            conflicts=$(printf '%s\n' "$conflicts" | grep -v "pid=${allowed_pid}," || true)
+        fi
+        if [[ -n "$conflicts" ]]; then
+            echo -e "${RED}[错误] 端口 ${p} 已被其他进程占用：${PLAIN}"
+            printf '%s\n' "$conflicts"
+            return 0
+        fi
+        p=$((p+1))
+    done
+    return 1
+}
+
+forwarding_apply_state_candidate() {
+    local candidate="$1" cfg_tmp="" state_backup="" cfg_backup="" old_count=0 new_count=0
+    [[ -f "$candidate" ]] || return 1
+    jq -e 'type=="object" and (.rules|type=="array")' "$candidate" >/dev/null 2>&1 || {
+        rm -f "$candidate"
+        return 1
+    }
+
+    new_count=$(jq '.rules|length' "$candidate")
+    if [[ "$new_count" -gt 0 && ! -x "$REALM_BIN" ]]; then
+        install_realm_core || { rm -f "$candidate"; return 1; }
+    fi
+    [[ "$new_count" -eq 0 ]] || write_realm_service || { rm -f "$candidate"; return 1; }
+
+    mkdir -p /etc/ss2022-realm || { rm -f "$candidate"; return 1; }
+    cfg_tmp=$(mktemp "/etc/ss2022-realm/config.json.tmp.XXXXXX") || { rm -f "$candidate"; return 1; }
+    if ! realm_build_config_from_state "$candidate" "$cfg_tmp"; then
+        rm -f "$candidate" "$cfg_tmp"
+        echo -e "${RED}[错误] Realm 配置生成失败。${PLAIN}"
+        return 1
+    fi
+
+    state_backup=$(mktemp "${STATE_DIR}/forwarding.rollback.XXXXXX") || { rm -f "$candidate" "$cfg_tmp"; return 1; }
+    cp -a "$FORWARDING_FILE" "$state_backup" || { rm -f "$candidate" "$cfg_tmp" "$state_backup"; return 1; }
+    old_count=$(jq '.rules|length' "$state_backup" 2>/dev/null || echo 0)
+
+    mkdir -p "$(dirname "$REALM_CONF")"
+    if [[ -f "$REALM_CONF" ]]; then
+        cfg_backup=$(mktemp "/etc/ss2022-realm/config.rollback.XXXXXX") || { rm -f "$candidate" "$cfg_tmp" "$state_backup"; return 1; }
+        cp -a "$REALM_CONF" "$cfg_backup"
+    fi
+
+    mv -f "$candidate" "$FORWARDING_FILE"
+    chmod 600 "$FORWARDING_FILE"
+    mv -f "$cfg_tmp" "$REALM_CONF"
+    chown root:"$REALM_GROUP" "$REALM_CONF"
+    chmod 640 "$REALM_CONF"
+
+    if [[ "$new_count" -eq 0 ]]; then
+        service_disable_now "$REALM_SERVICE_NAME"
+        rm -f "$state_backup" "$cfg_backup"
+        echo -e "${GREEN}✔ Realm 转发规则已清空，服务已停止。${PLAIN}"
+        return 0
+    fi
+
+    service_daemon_reload || true
+    service_enable "$REALM_SERVICE_NAME" >/dev/null 2>&1 || true
+    if service_restart "$REALM_SERVICE_NAME" && sleep 1 && service_is_active "$REALM_SERVICE_NAME"; then
+        rm -f "$state_backup" "$cfg_backup"
+        echo -e "${GREEN}✔ Realm 转发配置已应用。${PLAIN}"
+        return 0
+    fi
+
+    echo -e "${RED}[错误] Realm 新配置启动失败，正在恢复旧配置和旧规则...${PLAIN}"
+    mv -f "$state_backup" "$FORWARDING_FILE"
+    if [[ -n "$cfg_backup" && -f "$cfg_backup" ]]; then
+        mv -f "$cfg_backup" "$REALM_CONF"
+        chown root:"$REALM_GROUP" "$REALM_CONF" 2>/dev/null || true
+        chmod 640 "$REALM_CONF"
+    else
+        rm -f "$REALM_CONF"
+    fi
+    if [[ "$old_count" -gt 0 ]]; then
+        service_restart "$REALM_SERVICE_NAME" >/dev/null 2>&1 || true
+    else
+        service_disable_now "$REALM_SERVICE_NAME"
+    fi
+    service_log_tail "$REALM_SERVICE_NAME" 30 || true
+    return 1
+}
+
+forwarding_choose_family() {
+    local default="${1:-ipv4}" c=""
+    echo "请选择监听网络：" >&2
+    echo "  1. IPv4" >&2
+    echo "  2. IPv6" >&2
+    echo "  3. 双栈 IPv4 + IPv6" >&2
+    local d=1
+    [[ "$default" == "ipv6" ]] && d=2
+    [[ "$default" == "dual" ]] && d=3
+    read -rp "请选择 [1-3，默认 ${d}]: " c
+    c=${c:-$d}
+    case "$c" in
+        1) echo ipv4 ;;
+        2) echo ipv6 ;;
+        3) echo dual ;;
+        *) return 1 ;;
+    esac
+}
+
+forwarding_choose_protocol() {
+    local default="${1:-both}" c=""
+    echo "请选择转发协议：" >&2
+    echo "  1. TCP" >&2
+    echo "  2. UDP" >&2
+    echo "  3. TCP + UDP" >&2
+    local d=3
+    [[ "$default" == "tcp" ]] && d=1
+    [[ "$default" == "udp" ]] && d=2
+    read -rp "请选择 [1-3，默认 ${d}]: " c
+    c=${c:-$d}
+    case "$c" in
+        1) echo tcp ;;
+        2) echo udp ;;
+        3) echo both ;;
+        *) return 1 ;;
+    esac
+}
+
+forwarding_sanitize_host() {
+    local h="$1"
+    h=${h#[}
+    h=${h%]}
+    [[ -n "$h" && "$h" != *[[:space:]]* ]] || return 1
+    printf '%s' "$h"
+}
+
+forwarding_next_name() {
+    local base="$1" name="" n=2
+    name="$base"
+    while jq -e --arg n "$name" '.rules[]? | select(.name==$n)' "$FORWARDING_FILE" >/dev/null 2>&1; do
+        name="${base}-${n}"
+        n=$((n+1))
+    done
+    echo "$name"
+}
+
+forwarding_add_single() {
+    forwarding_init_state || return
+    local port="" rhost="" rport="" family="" proto="" name="" candidate="" id=""
+    while true; do
+        read -rp "本机监听端口: " port
+        validate_port_number "$port" && break
+        echo -e "${RED}端口必须为 1-65535。${PLAIN}"
+    done
+
+    if forwarding_state_port_conflict "$port" "$port"; then
+        echo -e "${RED}[错误] 端口 ${port} 已存在 Realm 转发规则。${PLAIN}"
+        pause; return
+    fi
+    if forwarding_os_port_conflict_range "$port" "$port"; then
+        pause; return
+    fi
+
+    family=$(forwarding_choose_family ipv4) || { echo "无效选择"; pause; return; }
+    proto=$(forwarding_choose_protocol both) || { echo "无效选择"; pause; return; }
+
+    while true; do
+        read -rp "目标服务器 IP/域名: " rhost
+        rhost=$(forwarding_sanitize_host "$rhost" 2>/dev/null || true)
+        [[ -n "$rhost" ]] && break
+        echo -e "${RED}目标地址不能为空或包含空格。${PLAIN}"
+    done
+    while true; do
+        read -rp "目标端口 [默认: ${port}]: " rport
+        rport=${rport:-$port}
+        validate_port_number "$rport" && break
+        echo -e "${RED}目标端口必须为 1-65535。${PLAIN}"
+    done
+
+    read -rp "规则备注 [默认: PF-${port}]: " name
+    name=${name:-"PF-${port}"}
+    name=$(forwarding_next_name "$name")
+    id="pf-$(date +%s)-${RANDOM}"
+
+    echo ""
+    echo "确认添加：${name}"
+    echo "  监听 : ${family} / ${port}"
+    echo "  目标 : ${rhost}:${rport}"
+    echo "  协议 : ${proto}"
+    local yes=""
+    read -rp "确认？[Y/n]: " yes
+    [[ ! "$yes" =~ ^[Nn]$ ]] || return
+
+    candidate=$(mktemp "${STATE_DIR}/forwarding.candidate.XXXXXX") || return
+    if ! jq \
+        --arg id "$id" --arg name "$name" --arg family "$family" --arg proto "$proto" \
+        --arg host "$rhost" --argjson lp "$port" --argjson rp "$rport" \
+        '.rules += [{id:$id,name:$name,type:"single",listen_family:$family,protocol:$proto,listen_port:$lp,remote_host:$host,remote_port:$rp}]' \
+        "$FORWARDING_FILE" > "$candidate"; then
+        rm -f "$candidate"; return
+    fi
+    forwarding_apply_state_candidate "$candidate"
+    pause
+}
+
+forwarding_add_range() {
+    forwarding_init_state || return
+    local start="" end="" rhost="" rstart="" rend="" family="" proto="" name="" candidate="" id="" count=""
+    while true; do
+        read -rp "本机起始端口: " start
+        validate_port_number "$start" && break
+        echo -e "${RED}端口必须为 1-65535。${PLAIN}"
+    done
+    while true; do
+        read -rp "本机结束端口: " end
+        if validate_port_number "$end" && [[ "$end" -ge "$start" ]]; then break; fi
+        echo -e "${RED}结束端口必须 >= 起始端口且 <= 65535。${PLAIN}"
+    done
+    count=$((end-start+1))
+    if [[ "$count" -gt "$REALM_MAX_RANGE_PORTS" ]]; then
+        echo -e "${RED}[错误] 单条端口段最多 ${REALM_MAX_RANGE_PORTS} 个端口。${PLAIN}"
+        pause; return
+    fi
+    if forwarding_state_port_conflict "$start" "$end"; then
+        echo -e "${RED}[错误] ${start}-${end} 与现有 Realm 转发规则端口重叠。${PLAIN}"
+        pause; return
+    fi
+    if forwarding_os_port_conflict_range "$start" "$end"; then
+        pause; return
+    fi
+
+    family=$(forwarding_choose_family ipv4) || { echo "无效选择"; pause; return; }
+    proto=$(forwarding_choose_protocol both) || { echo "无效选择"; pause; return; }
+
+    while true; do
+        read -rp "目标服务器 IP/域名: " rhost
+        rhost=$(forwarding_sanitize_host "$rhost" 2>/dev/null || true)
+        [[ -n "$rhost" ]] && break
+        echo -e "${RED}目标地址不能为空或包含空格。${PLAIN}"
+    done
+    while true; do
+        read -rp "目标起始端口 [默认: ${start}]: " rstart
+        rstart=${rstart:-$start}
+        if validate_port_number "$rstart"; then
+            rend=$((rstart+count-1))
+            [[ "$rend" -le 65535 ]] && break
+        fi
+        echo -e "${RED}目标端口段必须落在 1-65535。${PLAIN}"
+    done
+
+    read -rp "规则备注 [默认: PF-${start}-${end}]: " name
+    name=${name:-"PF-${start}-${end}"}
+    name=$(forwarding_next_name "$name")
+    id="pf-$(date +%s)-${RANDOM}"
+
+    echo ""
+    echo "确认添加：${name}"
+    echo "  监听 : ${family} / ${start}-${end}"
+    echo "  目标 : ${rhost}:${rstart}-${rend}"
+    echo "  协议 : ${proto}"
+    local yes=""
+    read -rp "确认？[Y/n]: " yes
+    [[ ! "$yes" =~ ^[Nn]$ ]] || return
+
+    candidate=$(mktemp "${STATE_DIR}/forwarding.candidate.XXXXXX") || return
+    if ! jq \
+        --arg id "$id" --arg name "$name" --arg family "$family" --arg proto "$proto" \
+        --arg host "$rhost" --argjson ls "$start" --argjson le "$end" --argjson rs "$rstart" \
+        '.rules += [{id:$id,name:$name,type:"range",listen_family:$family,protocol:$proto,listen_start:$ls,listen_end:$le,remote_host:$host,remote_start:$rs}]' \
+        "$FORWARDING_FILE" > "$candidate"; then
+        rm -f "$candidate"; return
+    fi
+    forwarding_apply_state_candidate "$candidate"
+    pause
+}
+
+forwarding_print_rules() {
+    forwarding_init_state || return 1
+    local count="" i=0 r="" type="" ports="" remote="" rstart="" rend="" lstart="" lend=""
+    count=$(jq '.rules|length' "$FORWARDING_FILE")
+    if [[ "$count" -eq 0 ]]; then
+        echo "暂无 Realm 转发规则。"
+        return 0
+    fi
+    printf "%-4s %-22s %-9s %-7s %-15s %s\n" "序号" "备注" "监听" "协议" "本机端口" "目标"
+    echo "------------------------------------------------------------------------------------------------"
+    while [[ "$i" -lt "$count" ]]; do
+        r=$(jq -c ".rules[$i]" "$FORWARDING_FILE")
+        type=$(jq -r '.type' <<<"$r")
+        if [[ "$type" == "single" ]]; then
+            ports=$(jq -r '.listen_port|tostring' <<<"$r")
+            remote="$(jq -r '.remote_host' <<<"$r"):$(jq -r '.remote_port' <<<"$r")"
+        else
+            lstart=$(jq -r '.listen_start' <<<"$r"); lend=$(jq -r '.listen_end' <<<"$r")
+            rstart=$(jq -r '.remote_start' <<<"$r"); rend=$((rstart+lend-lstart))
+            ports="${lstart}-${lend}"
+            remote="$(jq -r '.remote_host' <<<"$r"):${rstart}-${rend}"
+        fi
+        printf "%-4s %-22s %-9s %-7s %-15s %s\n" \
+            "$((i+1))" "$(jq -r '.name' <<<"$r")" "$(jq -r '.listen_family' <<<"$r")" \
+            "$(jq -r '.protocol' <<<"$r")" "$ports" "$remote"
+        i=$((i+1))
+    done
+}
+
+forwarding_select_rule_index() {
+    forwarding_print_rules >&2
+    local count="" c=""
+    count=$(jq '.rules|length' "$FORWARDING_FILE")
+    [[ "$count" -gt 0 ]] || return 1
+    read -rp "请选择规则序号 [1-${count}]: " c
+    [[ "$c" =~ ^[0-9]+$ && "$c" -ge 1 && "$c" -le "$count" ]] || return 1
+    echo $((c-1))
+}
+
+forwarding_edit_rule() {
+    forwarding_init_state || return
+    local idx="" rule="" id="" c="" candidate="" new="" old_start="" old_end="" start="" end="" rstart="" count="" rend=""
+    idx=$(forwarding_select_rule_index) || { echo "无效选择。"; pause; return; }
+    rule=$(jq -c ".rules[$idx]" "$FORWARDING_FILE")
+    id=$(jq -r '.id' <<<"$rule")
+
+    while true; do
+        clear
+        rule=$(jq -c --arg id "$id" '.rules[] | select(.id==$id)' "$FORWARDING_FILE")
+        [[ -n "$rule" ]] || return
+        echo -e "${CYAN}════════════════════ 修改转发规则 ════════════════════${PLAIN}"
+        echo "备注 : $(jq -r '.name' <<<"$rule")"
+        echo "监听 : $(jq -r '.listen_family' <<<"$rule")"
+        echo "协议 : $(jq -r '.protocol' <<<"$rule")"
+        if [[ "$(jq -r '.type' <<<"$rule")" == "single" ]]; then
+            echo "端口 : $(jq -r '.listen_port' <<<"$rule") → $(jq -r '.remote_host' <<<"$rule"):$(jq -r '.remote_port' <<<"$rule")"
+        else
+            old_start=$(jq -r '.listen_start' <<<"$rule"); old_end=$(jq -r '.listen_end' <<<"$rule")
+            rstart=$(jq -r '.remote_start' <<<"$rule"); rend=$((rstart+old_end-old_start))
+            echo "端口 : ${old_start}-${old_end} → $(jq -r '.remote_host' <<<"$rule"):${rstart}-${rend}"
+        fi
+        echo ""
+        echo "  1. 修改备注"
+        echo "  2. 修改监听网络"
+        echo "  3. 修改转发协议"
+        echo "  4. 修改目标服务器/目标端口"
+        echo "  5. 修改本机监听端口/端口段"
+        echo "  0. 返回"
+        read -rp "请选择 [0-5]: " c
+        [[ "$c" == "0" ]] && return
+
+        candidate=$(mktemp "${STATE_DIR}/forwarding.candidate.XXXXXX") || return
+        case "$c" in
+            1)
+                read -rp "新备注: " new
+                [[ -n "$new" ]] || { rm -f "$candidate"; continue; }
+                jq --arg id "$id" --arg v "$new" '(.rules[]|select(.id==$id)|.name)=$v' "$FORWARDING_FILE" > "$candidate"
+                ;;
+            2)
+                new=$(forwarding_choose_family "$(jq -r '.listen_family' <<<"$rule")") || { rm -f "$candidate"; continue; }
+                jq --arg id "$id" --arg v "$new" '(.rules[]|select(.id==$id)|.listen_family)=$v' "$FORWARDING_FILE" > "$candidate"
+                ;;
+            3)
+                new=$(forwarding_choose_protocol "$(jq -r '.protocol' <<<"$rule")") || { rm -f "$candidate"; continue; }
+                jq --arg id "$id" --arg v "$new" '(.rules[]|select(.id==$id)|.protocol)=$v' "$FORWARDING_FILE" > "$candidate"
+                ;;
+            4)
+                local nhost="" nr=""
+                read -rp "目标服务器 IP/域名 [当前: $(jq -r '.remote_host' <<<"$rule")]: " nhost
+                nhost=${nhost:-$(jq -r '.remote_host' <<<"$rule")}
+                nhost=$(forwarding_sanitize_host "$nhost" 2>/dev/null || true)
+                [[ -n "$nhost" ]] || { rm -f "$candidate"; continue; }
+                if [[ "$(jq -r '.type' <<<"$rule")" == "single" ]]; then
+                    nr=$(jq -r '.remote_port' <<<"$rule")
+                    read -rp "目标端口 [当前: ${nr}]: " new
+                    new=${new:-$nr}
+                    validate_port_number "$new" || { rm -f "$candidate"; continue; }
+                    jq --arg id "$id" --arg h "$nhost" --argjson p "$new" \
+                        '(.rules[]|select(.id==$id)|.remote_host)=$h | (.rules[]|select(.id==$id)|.remote_port)=$p' \
+                        "$FORWARDING_FILE" > "$candidate"
+                else
+                    nr=$(jq -r '.remote_start' <<<"$rule")
+                    count=$(( $(jq -r '.listen_end' <<<"$rule") - $(jq -r '.listen_start' <<<"$rule") + 1 ))
+                    read -rp "目标起始端口 [当前: ${nr}]: " new
+                    new=${new:-$nr}
+                    validate_port_number "$new" || { rm -f "$candidate"; continue; }
+                    [[ $((new+count-1)) -le 65535 ]] || { echo "目标端口段越界。"; rm -f "$candidate"; pause; continue; }
+                    jq --arg id "$id" --arg h "$nhost" --argjson p "$new" \
+                        '(.rules[]|select(.id==$id)|.remote_host)=$h | (.rules[]|select(.id==$id)|.remote_start)=$p' \
+                        "$FORWARDING_FILE" > "$candidate"
+                fi
+                ;;
+            5)
+                read -r old_start old_end < <(forwarding_rule_interval "$rule")
+                if [[ "$(jq -r '.type' <<<"$rule")" == "single" ]]; then
+                    read -rp "新监听端口 [当前: ${old_start}]: " start
+                    start=${start:-$old_start}
+                    validate_port_number "$start" || { rm -f "$candidate"; continue; }
+                    end="$start"
+                else
+                    read -rp "新起始端口 [当前: ${old_start}]: " start
+                    start=${start:-$old_start}
+                    read -rp "新结束端口 [当前: ${old_end}]: " end
+                    end=${end:-$old_end}
+                    if ! validate_port_number "$start" || ! validate_port_number "$end" || [[ "$end" -lt "$start" ]]; then
+                        rm -f "$candidate"; continue
+                    fi
+                    count=$((end-start+1))
+                    [[ "$count" -le "$REALM_MAX_RANGE_PORTS" ]] || { echo "端口段过大。"; rm -f "$candidate"; pause; continue; }
+                fi
+                if forwarding_state_port_conflict "$start" "$end" "$id"; then
+                    echo "与其他 Realm 转发规则端口重叠。"; rm -f "$candidate"; pause; continue
+                fi
+                if [[ "$start" != "$old_start" || "$end" != "$old_end" ]] && forwarding_os_port_conflict_range "$start" "$end"; then
+                    rm -f "$candidate"; pause; continue
+                fi
+                if [[ "$(jq -r '.type' <<<"$rule")" == "single" ]]; then
+                    jq --arg id "$id" --argjson p "$start" '(.rules[]|select(.id==$id)|.listen_port)=$p' "$FORWARDING_FILE" > "$candidate"
+                else
+                    rstart=$(jq -r '.remote_start' <<<"$rule")
+                    count=$((end-start+1))
+                    [[ $((rstart+count-1)) -le 65535 ]] || { echo "目标端口段会越界，请先修改目标起始端口。"; rm -f "$candidate"; pause; continue; }
+                    jq --arg id "$id" --argjson s "$start" --argjson e "$end" \
+                        '(.rules[]|select(.id==$id)|.listen_start)=$s | (.rules[]|select(.id==$id)|.listen_end)=$e' \
+                        "$FORWARDING_FILE" > "$candidate"
+                fi
+                ;;
+            *) rm -f "$candidate"; continue ;;
+        esac
+
+        if forwarding_apply_state_candidate "$candidate"; then
+            echo -e "${GREEN}✔ 规则已更新。${PLAIN}"
+        fi
+        pause
+    done
+}
+
+forwarding_delete_rule() {
+    forwarding_init_state || return
+    local idx="" rule="" id="" candidate="" yes=""
+    idx=$(forwarding_select_rule_index) || { echo "无效选择。"; pause; return; }
+    rule=$(jq -c ".rules[$idx]" "$FORWARDING_FILE")
+    id=$(jq -r '.id' <<<"$rule")
+    read -rp "确认删除“$(jq -r '.name' <<<"$rule")”？[y/N]: " yes
+    [[ "$yes" =~ ^[Yy]$ ]] || return
+    candidate=$(mktemp "${STATE_DIR}/forwarding.candidate.XXXXXX") || return
+    jq --arg id "$id" '.rules |= map(select(.id != $id))' "$FORWARDING_FILE" > "$candidate" || { rm -f "$candidate"; return; }
+    forwarding_apply_state_candidate "$candidate"
+    pause
+}
+
+forwarding_test_tcp_target() {
+    local host="$1" port="$2" hp=""
+    hp=$(forwarding_format_host_port "$host" "$port")
+    local out=""
+    out=$(curl -v --connect-timeout 3 --max-time 3 "telnet://${hp}" </dev/null 2>&1 || true)
+    if grep -qE 'Connected to .* port|Connected to ' <<<"$out"; then
+        return 0
+    fi
+    return 1
+}
+
+forwarding_test_rule() {
+    forwarding_init_state || return
+    local idx="" rule="" type="" proto="" family="" host="" lp="" rp="" ls="" le="" rs="" re="" tcp_test_port=""
+    idx=$(forwarding_select_rule_index) || { echo "无效选择。"; pause; return; }
+    rule=$(jq -c ".rules[$idx]" "$FORWARDING_FILE")
+    type=$(jq -r '.type' <<<"$rule")
+    proto=$(jq -r '.protocol' <<<"$rule")
+    family=$(jq -r '.listen_family' <<<"$rule")
+    host=$(jq -r '.remote_host' <<<"$rule")
+    if [[ "$type" == "single" ]]; then
+        lp=$(jq -r '.listen_port' <<<"$rule")
+        rp=$(jq -r '.remote_port' <<<"$rule")
+        echo "规则：$(jq -r '.name' <<<"$rule")  ${lp} → ${host}:${rp} (${proto}/${family})"
+        tcp_test_port="$rp"
+    else
+        ls=$(jq -r '.listen_start' <<<"$rule"); le=$(jq -r '.listen_end' <<<"$rule")
+        rs=$(jq -r '.remote_start' <<<"$rule"); re=$((rs+le-ls))
+        echo "规则：$(jq -r '.name' <<<"$rule")  ${ls}-${le} → ${host}:${rs}-${re} (${proto}/${family})"
+        lp="$ls"; tcp_test_port="$rs"
+    fi
+
+    echo ""
+    echo "【服务状态】"
+    if service_is_active "$REALM_SERVICE_NAME"; then
+        echo -e "  Realm : ${GREEN}Running${PLAIN}"
+    else
+        echo -e "  Realm : ${RED}Stopped${PLAIN}"
+    fi
+
+    echo "【监听检查】"
+    if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
+        if ss -H -lntp 2>/dev/null | awk -v p="$lp" '{a=$4; n=split(a,x,":"); if(x[n]==p) ok=1} END{exit !ok}'; then
+            echo -e "  TCP ${lp}: ${GREEN}✓ 已监听${PLAIN}"
+        else
+            echo -e "  TCP ${lp}: ${RED}✗ 未监听${PLAIN}"
+        fi
+    fi
+    if [[ "$proto" == "udp" || "$proto" == "both" ]]; then
+        if ss -H -lnup 2>/dev/null | awk -v p="$lp" '{a=$4; n=split(a,x,":"); if(x[n]==p) ok=1} END{exit !ok}'; then
+            echo -e "  UDP ${lp}: ${GREEN}✓ 已监听${PLAIN}"
+        else
+            echo -e "  UDP ${lp}: ${RED}✗ 未监听${PLAIN}"
+        fi
+    fi
+
+    if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
+        echo "【目标 TCP 连通性】"
+        if forwarding_test_tcp_target "$host" "$tcp_test_port"; then
+            echo -e "  ${host}:${tcp_test_port}: ${GREEN}✓ TCP 可连接${PLAIN}"
+        else
+            echo -e "  ${host}:${tcp_test_port}: ${YELLOW}未能建立 TCP 连接（目标服务可能拒绝探测；请结合实际客户端验证）${PLAIN}"
+        fi
+    fi
+    if [[ "$proto" == "udp" || "$proto" == "both" ]]; then
+        echo -e "${YELLOW}[说明] UDP 没有通用握手，脚本只验证监听状态；最终以真实 UDP 应用流量为准。${PLAIN}"
+    fi
+    pause
+}
+
+forwarding_show_config() {
+    forwarding_init_state || return
+    forwarding_print_rules
+    echo ""
+    echo "Realm 二进制 : ${REALM_BIN}"
+    if [[ -x "$REALM_BIN" ]]; then
+        echo "Realm 版本   : $("$REALM_BIN" --version 2>/dev/null | head -n1)"
+    else
+        echo "Realm 版本   : 未安装"
+    fi
+    echo "Realm 配置   : ${REALM_CONF}"
+    echo "规则状态文件 : ${FORWARDING_FILE}"
+    case "$PLATFORM_INIT" in
+        systemd) echo "服务管理     : systemd (${REALM_SERVICE_NAME}.service)" ;;
+        openrc) echo "服务管理     : OpenRC (${REALM_OPENRC_SERVICE})" ;;
+        *) echo "服务管理     : 未知" ;;
+    esac
+}
+
+uninstall_realm_forwarding() {
+    local yes=""
+    echo -e "${YELLOW}此操作只删除 ss2022.sh 管理的 Realm 转发组件和 forwarding.json；不会删除服务器已有 realm.service 或 /usr/local/bin/realm。${PLAIN}"
+    read -rp "确认卸载 Realm 转发组件？[y/N]: " yes
+    [[ "$yes" =~ ^[Yy]$ ]] || return
+    service_disable_now "$REALM_SERVICE_NAME"
+    rm -f "$REALM_SERVICE" "$REALM_OPENRC_SERVICE" "$REALM_BIN" "$FORWARDING_FILE" "$REALM_OPENRC_PID" "$REALM_OPENRC_LOG"
+    rm -rf /etc/ss2022-realm
+    if [[ -f "$REALM_USER_MARKER" ]]; then
+        delete_system_user "$REALM_USER"
+        rm -f "$REALM_USER_MARKER"
+    fi
+    if [[ -f "$REALM_GROUP_MARKER" ]]; then
+        delete_system_group "$REALM_GROUP"
+        rm -f "$REALM_GROUP_MARKER"
+    fi
+    service_daemon_reload || true
+    echo -e "${GREEN}✔ ss2022.sh Realm 转发组件已卸载。${PLAIN}"
+    pause
+}
+realm_service_management() {
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ Realm 服务管理 ════════════════════${PLAIN}"
+        echo "  1. 安装 / 重新安装固定版本 Realm v${REALM_VERSION}"
+        echo "  2. 查看服务状态"
+        echo "  3. 查看实时日志"
+        echo "  4. 重启服务"
+        echo "  5. 停止服务"
+        echo "  6. 启动服务"
+        echo "  7. 卸载 Realm 转发组件"
+        echo "  0. 返回"
+        read -rp "请选择 [0-7]: " c
+        case "$c" in
+            1)
+                if install_realm_core; then
+                    forwarding_init_state || true
+                    if [[ $(jq '.rules|length' "$FORWARDING_FILE" 2>/dev/null || echo 0) -gt 0 ]]; then
+                        local tmp=""
+                        tmp=$(mktemp "${STATE_DIR}/forwarding.candidate.XXXXXX") || { pause; continue; }
+                        cp -a "$FORWARDING_FILE" "$tmp"
+                        forwarding_apply_state_candidate "$tmp" || true
+                    fi
+                fi
+                pause
+                ;;
+            2) service_status_output "$REALM_SERVICE_NAME" || echo "未运行"; pause ;;
+            3) service_log_follow "$REALM_SERVICE_NAME" ;;
+            4) service_restart "$REALM_SERVICE_NAME" && echo "已重启" || service_log_tail "$REALM_SERVICE_NAME" 30; pause ;;
+            5) service_stop "$REALM_SERVICE_NAME" && echo "已停止"; pause ;;
+            6) service_start "$REALM_SERVICE_NAME" && echo "已启动" || service_log_tail "$REALM_SERVICE_NAME" 30; pause ;;
+            7) uninstall_realm_forwarding ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+forwarding_management() {
+    forwarding_init_state || { pause; return; }
+    while true; do
+        clear
+        forwarding_init_state || return
+        local count="" state="未安装"
+        count=$(jq '.rules|length' "$FORWARDING_FILE")
+        if [[ -x "$REALM_BIN" ]]; then
+            if service_is_active "$REALM_SERVICE_NAME"; then state="Running"; else state="Stopped"; fi
+        fi
+        echo -e "${CYAN}════════════════════ Realm 端口转发 ════════════════════${PLAIN}"
+        echo "Realm     : ${state}"
+        echo "版本      : v${REALM_VERSION}"
+        echo "转发规则  : ${count} 条"
+        echo ""
+        echo "  1. 添加单端口转发"
+        echo "  2. 添加端口段转发"
+        echo "  3. 查看转发规则"
+        echo "  4. 修改转发规则"
+        echo "  5. 删除转发规则"
+        echo "  6. 测试转发规则"
+        echo "  7. Realm 服务管理"
+        echo "  0. 返回"
+        echo -e "${CYAN}═════════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-7]: " c
+        case "$c" in
+            1) forwarding_add_single ;;
+            2) forwarding_add_range ;;
+            3) clear; forwarding_show_config; pause ;;
+            4) forwarding_edit_rule ;;
+            5) forwarding_delete_rule ;;
+            6) forwarding_test_rule ;;
+            7) realm_service_management ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+# ==============================================================================
+# [11] 服务运维与彻底卸载
+# ==============================================================================
+
+show_service_status() {
+    echo ""
+    echo -e "$YELLOW【sing-box】$PLAIN"
+    service_status_output sing-box | head -n 15 || echo "未安装/未加载"
+    echo ""
+    echo -e "$YELLOW【ss2022-xray / VLESS Reality】$PLAIN"
+    service_status_output "$XRAY_SERVICE_NAME" | head -n 15 || echo "未安装/未加载"
+    echo ""
+    echo -e "$YELLOW【Snell v5】$PLAIN"
+    service_status_output snell-v5 | head -n 15 || echo "未安装/未加载"
+    echo ""
+    echo -e "$YELLOW【Realm 端口转发】$PLAIN"
+    service_status_output "$REALM_SERVICE_NAME" | head -n 15 || echo "未安装/未加载"
+    echo ""
+    echo -e "$YELLOW【监听端口】$PLAIN"
+    ss -lntup 2>/dev/null | grep -E 'sing-box|xray|snell-server|ss2022-realm|realm' || echo "未检测到相关监听"
+}
+full_uninstall() {
+    local yes="" singbox_managed=0 snell_managed=0 proxy_link_managed=0
+    local warp_package_managed=0 warp_repo_managed=0
+    singbox_is_project_managed && singbox_managed=1 || true
+    snell_is_project_managed && snell_managed=1 || true
+    proxy_shortcut_is_project_managed && proxy_link_managed=1 || true
+    warp_package_is_project_managed && warp_package_managed=1 || true
+    warp_repo_is_project_managed && warp_repo_managed=1 || true
+    echo -e "${RED}========== 完全卸载 ss2022.sh ==========${PLAIN}"
+    echo ""
+    echo -e "${RED}此操作会删除本脚本管理的协议核心、节点/分流/端口转发配置与服务。不会删除服务器原有 xray.service 或 realm.service。${PLAIN}"
+    echo -e "${YELLOW}[保留] 服务器工具中由你主动设置的 BBR、DNS、SSH 端口和 IPv4/IPv6 地址优先级不会自动回滚。${PLAIN}"
+    echo -e "${YELLOW}[说明] 这些属于服务器系统设置；自动恢复可能改变网络或 SSH 可达性，需要时请在卸载前通过对应菜单手动恢复。${PLAIN}"
+    echo ""
+    read -rp "确认彻底卸载？请输入 DELETE: " yes
+    [[ "$yes" == "DELETE" ]] || { echo "已取消。"; sleep 1; return; }
+
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        [[ $singbox_managed -eq 1 ]] && systemctl disable --now sing-box >/dev/null 2>&1 || true
+        [[ $snell_managed -eq 1 ]] && systemctl disable --now snell-v5 >/dev/null 2>&1 || true
+        systemctl disable --now "$XRAY_SERVICE_NAME" "$REALM_SERVICE_NAME" "${IPV6_KEEPALIVE_SYSTEMD_SERVICE_NAME}.timer" >/dev/null 2>&1 || true
+        systemctl disable --now "$IP_FAMILY_SERVICE_NAME" ss2022-tg-monitor.timer >/dev/null 2>&1 || true
+        systemctl stop "${IPV6_KEEPALIVE_SYSTEMD_SERVICE_NAME}.service" ss2022-tg-monitor.service >/dev/null 2>&1 || true
+        cleanup_legacy_ipv6_keepalive_if_managed
+    else
+        [[ $singbox_managed -eq 1 ]] && service_disable_now sing-box
+        service_disable_now "$XRAY_SERVICE_NAME"
+        [[ $snell_managed -eq 1 ]] && service_disable_now snell-v5
+        service_disable_now "$REALM_SERVICE_NAME"
+        service_disable_now "$IP_FAMILY_SERVICE_NAME"
+        service_disable_now ss2022-ipv6-keepalive
+    fi
+
+    command -v nft >/dev/null 2>&1 && nft delete table inet ss2022_ip_family >/dev/null 2>&1 || true
+
+    if [[ $singbox_managed -eq 1 ]] && platform_is_alpine && [[ -f "$SINGBOX_ALPINE_PKG_MARKER" ]]; then
+        apk del sing-box >/dev/null 2>&1 || true
+        rm -f "$SINGBOX_ALPINE_PKG_MARKER"
+    fi
+
+    if [[ $warp_package_managed -eq 1 || $warp_repo_managed -eq 1 ]]; then
+        if command -v warp-cli >/dev/null 2>&1; then
+            warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
+            [[ $warp_package_managed -eq 1 ]] && warp-cli --accept-tos registration delete >/dev/null 2>&1 || true
+        fi
+        warp_remove_managed_install_assets
+    fi
+
+    if [[ $singbox_managed -eq 1 ]]; then
+        rm -f "$SINGBOX_CONF" "${SINGBOX_CONF_DIR}"/.ss2022-*
+        rm -f "$SINGBOX_BIN" "$SINGBOX_SERVICE" "$SINGBOX_OPENRC_SERVICE" "$SINGBOX_MANAGED_MARKER"
+        if [[ -f "$SINGBOX_DIR_MARKER" ]]; then
+            rmdir "$SINGBOX_CONF_DIR" 2>/dev/null || true
+            rm -f "$SINGBOX_DIR_MARKER"
+        fi
+    fi
+    if [[ $snell_managed -eq 1 ]]; then
+        rm -f "$SNELL_CONF" "${SNELL_CONF_DIR}"/.ss2022-*
+        rm -f "$SNELL_BIN" "$SNELL_SERVICE" "$SNELL_OPENRC_SERVICE" "$SNELL_MANAGED_MARKER"
+        if [[ -f "$SNELL_DIR_MARKER" ]]; then
+            rmdir "$SNELL_CONF_DIR" 2>/dev/null || true
+            rm -f "$SNELL_DIR_MARKER"
+        fi
+    fi
+    rm -rf /etc/ss2022-xray /etc/ss2022-realm "$STATE_DIR" /usr/local/lib/ss2022 /var/log/ss2022
+
+    [[ $proxy_link_managed -eq 1 ]] && rm -f "$SCRIPT_PROXY_LINK"
+    rm -f \
+        "$SCRIPT_INSTALL_PATH" \
+        "$SCRIPT_BACKUP_PATH" \
+        "${SNELL_CANDIDATE_PREFIX}".* \
+        "$XRAY_BIN" \
+        "$XRAY_SERVICE" \
+        "$REALM_SERVICE" \
+        "$IP_FAMILY_SERVICE" \
+        "$XRAY_OPENRC_SERVICE" \
+        "$REALM_OPENRC_SERVICE" \
+        "$IP_FAMILY_OPENRC_SERVICE" \
+        "$IPV6_KEEPALIVE_OPENRC_SERVICE" \
+        "$IPV6_KEEPALIVE_SYSTEMD_SERVICE" \
+        "$IPV6_KEEPALIVE_SYSTEMD_TIMER" \
+        "$TG_MONITOR_SERVICE" \
+        "$TG_MONITOR_TIMER" \
+        "$FORCE_IPV6_CONF"
+
+    if [[ -f "$DNS_MARKER" || -f "$BACKUP_DNS" ]]; then
+        if ! restore_ipv4_apt_and_dns_if_needed; then
+            echo -e "${YELLOW}[提示] IPv6-only 临时 DNS 未能自动恢复；脚本专属备份会保留供手动恢复。${PLAIN}"
+        fi
+    fi
+    rm -f "$DNS_MARKER"
+
+    if [[ -f "$SINGBOX_USER_MARKER" ]]; then delete_system_user "$SINGBOX_USER"; rm -f "$SINGBOX_USER_MARKER"; fi
+    if [[ -f "$SINGBOX_GROUP_MARKER" ]]; then delete_system_group "$SINGBOX_GROUP"; rm -f "$SINGBOX_GROUP_MARKER"; fi
+
+    if [[ -f "$XRAY_USER_MARKER" ]]; then delete_system_user "$XRAY_USER"; rm -f "$XRAY_USER_MARKER"; fi
+    if [[ -f "$XRAY_GROUP_MARKER" ]]; then delete_system_group "$XRAY_GROUP"; rm -f "$XRAY_GROUP_MARKER"; fi
+
+    if [[ -f "$REALM_USER_MARKER" ]]; then delete_system_user "$REALM_USER"; rm -f "$REALM_USER_MARKER"; fi
+    if [[ -f "$REALM_GROUP_MARKER" ]]; then delete_system_group "$REALM_GROUP"; rm -f "$REALM_GROUP_MARKER"; fi
+
+    if [[ -f "$SNELL_USER_MARKER" ]]; then delete_system_user "$SNELL_USER"; rm -f "$SNELL_USER_MARKER"; fi
+    if [[ -f "$SNELL_GROUP_MARKER" ]]; then delete_system_group "$SNELL_GROUP"; rm -f "$SNELL_GROUP_MARKER"; fi
+
+    [[ -f "$TG_MONITOR_CRON_FILE" ]] && sed -i "/ss2022-tg-monitor/d" "$TG_MONITOR_CRON_FILE" 2>/dev/null || true
+    rm -f "$SINGBOX_OPENRC_PID" "$XRAY_OPENRC_PID" "$SNELL_OPENRC_PID" "$REALM_OPENRC_PID"
+    rm -rf /run/ss2022-tg-monitor.lockdir
+    rm -rf /tmp/ss2022-* 2>/dev/null || true
+    service_daemon_reload || true
+    echo -e "${GREEN}✔ vps-bootstrap 协议核心、服务与运行文件已清理完成。${PLAIN}"
+    echo -e "${YELLOW}[保留] BBR / DNS / SSH 端口 / IPv4-IPv6 地址优先级等用户主动系统设置保持当前状态。${PLAIN}"
+    exit 0
+}
+get_singbox_version_raw() {
+    if [[ -x "$SINGBOX_BIN" ]]; then
+        "$SINGBOX_BIN" version 2>/dev/null | head -n1 | awk '{print $3}'
+    fi
+}
+
+get_xray_version_raw() {
+    if [[ -x "$XRAY_BIN" ]]; then
+        "$XRAY_BIN" version 2>/dev/null | head -n1 | awk '{print $2}'
+    fi
+}
+
+get_snell_version_raw() {
+    [[ -x "$SNELL_BIN" ]] && printf '%s\n' "$SNELL_VERSION" || true
+}
+
+get_realm_version_raw() {
+    if [[ -x "$REALM_BIN" ]]; then
+        "$REALM_BIN" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1
+    fi
+}
+
+component_current_version() {
+    case "$1" in
+        singbox) get_singbox_version_raw ;;
+        xray) get_xray_version_raw ;;
+        snell) get_snell_version_raw ;;
+        realm) get_realm_version_raw ;;
+    esac
+}
+
+component_recommended_version() {
+    case "$1" in
+        singbox) echo "$SINGBOX_VERSION" ;;
+        xray) echo "$XRAY_VERSION" ;;
+        snell) echo "$SNELL_VERSION" ;;
+        realm) echo "$REALM_VERSION" ;;
+    esac
+}
+
+component_label() {
+    case "$1" in
+        singbox) echo "sing-box" ;;
+        xray) echo "Xray-core" ;;
+        snell) echo "Snell Server" ;;
+        realm) echo "Realm" ;;
+    esac
+}
+
+component_bin_path() {
+    case "$1" in
+        singbox) echo "$SINGBOX_BIN" ;;
+        xray) echo "$XRAY_BIN" ;;
+        snell) echo "$SNELL_BIN" ;;
+        realm) echo "$REALM_BIN" ;;
+    esac
+}
+
+component_service_name() {
+    case "$1" in
+        singbox) echo "sing-box" ;;
+        xray) echo "$XRAY_SERVICE_NAME" ;;
+        snell) echo "snell-v5" ;;
+        realm) echo "$REALM_SERVICE_NAME" ;;
+    esac
+}
+
+component_config_exists() {
+    case "$1" in
+        singbox) [[ -f "$SINGBOX_CONF" ]] ;;
+        xray) [[ -f "$XRAY_CONF" ]] ;;
+        snell) [[ -f "$SNELL_CONF" ]] ;;
+        realm) [[ -f "$REALM_CONF" ]] ;;
+    esac
+}
+
+component_validate_existing_config() {
+    local c="$1"
+    case "$c" in
+        singbox)
+            [[ -f "$SINGBOX_CONF" ]] || return 0
+            "$SINGBOX_BIN" check -c "$SINGBOX_CONF"
+            ;;
+        xray)
+            [[ -f "$XRAY_CONF" ]] || return 0
+            "$XRAY_BIN" run -test -format json -config "$XRAY_CONF"
+            ;;
+        snell)
+            [[ -f "$SNELL_CONF" ]] || return 0
+            snell_binary_works "$SNELL_BIN"
+            ;;
+        realm)
+            [[ -f "$REALM_CONF" ]] || return 0
+            "$REALM_BIN" --version >/dev/null 2>&1
+            ;;
+    esac
+}
+
+component_install_recommended() {
+    local c="$1" label bin svc tmp old_active=0 had_bin=0 ok=0
+    label=$(component_label "$c")
+    bin=$(component_bin_path "$c")
+    svc=$(component_service_name "$c")
+    tmp=$(mktemp -d /tmp/ss2022-core-upgrade.XXXXXX) || return 1
+
+    if [[ -x "$bin" ]]; then
+        cp -a "$bin" "$tmp/old.bin" || { rm -rf "$tmp"; return 1; }
+        had_bin=1
+    fi
+    service_is_active "$svc" && old_active=1 || true
+
+    echo -e "${YELLOW}>> ${label}: 安装/修复到脚本推荐版本 $(component_recommended_version "$c")...${PLAIN}"
+    case "$c" in
+        singbox) install_singbox_core && ok=1 ;;
+        xray) install_xray_core && ok=1 ;;
+        snell) install_snell_v5_core && write_snell_service && ok=1 ;;
+        realm) install_realm_core && ok=1 ;;
+    esac
+
+    if [[ $ok -eq 1 ]] && ! component_validate_existing_config "$c"; then
+        echo -e "${RED}[错误] 新 ${label} 无法兼容当前配置，开始恢复旧二进制。${PLAIN}"
+        ok=0
+    fi
+
+    if [[ $ok -eq 1 ]] && component_config_exists "$c"; then
+        service_daemon_reload >/dev/null 2>&1 || true
+        if ! service_restart "$svc" >/dev/null 2>&1; then
+            echo -e "${RED}[错误] ${label} 新版本启动失败，开始回滚。${PLAIN}"
+            ok=0
+        else
+            sleep 1
+            service_is_active "$svc" || ok=0
+        fi
+    fi
+
+    if [[ $ok -ne 1 ]]; then
+        if [[ $had_bin -eq 1 && -f "$tmp/old.bin" ]]; then
+            install -m 755 "$tmp/old.bin" "$bin" || true
+        elif [[ $had_bin -eq 0 ]]; then
+            rm -f "$bin"
+        fi
+        service_daemon_reload >/dev/null 2>&1 || true
+        [[ $old_active -eq 1 ]] && service_restart "$svc" >/dev/null 2>&1 || true
+        rm -rf "$tmp"
+        echo -e "${RED}[错误] ${label} 升级/修复失败，已尽力恢复原核心。${PLAIN}"
+        return 1
+    fi
+
+    rm -rf "$tmp"
+    echo -e "${GREEN}✔ ${label} 当前版本: $(component_current_version "$c")${PLAIN}"
+    return 0
+}
+
+fetch_github_latest_tag() {
+    local repo="$1"
+    curl -fsSL --retry 1 --connect-timeout 5 --max-time 12 \
+      -H 'Accept: application/vnd.github+json' \
+      "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null \
+      | jq -r '.tag_name // empty' 2>/dev/null | sed 's/^v//'
+}
+
+show_component_versions() {
+    local sb xr sn re
+    sb=$(get_singbox_version_raw); sb=${sb:-未安装}
+    xr=$(get_xray_version_raw); xr=${xr:-未安装}
+    sn=$(get_snell_version_raw); sn=${sn:-未安装}
+    re=$(get_realm_version_raw); re=${re:-未安装}
+    clear
+    echo -e "${CYAN}════════════════════ 组件版本管理 ════════════════════${PLAIN}"
+    echo "【协议核心】"
+    printf '  sing-box      已安装: %-12s 推荐: %s\n' "$sb" "$SINGBOX_VERSION"
+    printf '  Xray-core     已安装: %-12s 推荐: %s\n' "$xr" "$XRAY_VERSION"
+    if platform_is_alpine; then
+        printf '  Snell Server  已安装: %-12s 推荐: %s  [Alpine 暂不支持]\n' "$sn" "$SNELL_VERSION"
+    else
+        printf '  Snell Server  已安装: %-12s 推荐: %s\n' "$sn" "$SNELL_VERSION"
+    fi
+    echo ""
+    echo "【网络组件】"
+    printf '  Realm         已安装: %-12s 推荐: %s\n' "$re" "$REALM_VERSION"
+    if command -v warp-cli >/dev/null 2>&1; then
+        echo "  Cloudflare WARP: 已安装（版本由 Cloudflare 客户端自身管理）"
+    else
+        echo "  Cloudflare WARP: 未安装"
+    fi
+}
+
+check_upstream_versions() {
+    clear
+    echo -e "${CYAN}════════════════════ 上游版本检查 ════════════════════${PLAIN}"
+    echo "说明：仅查询并提示，不会自动安装官方 Latest。"
+    echo ""
+    local latest current
+    current=$(get_singbox_version_raw); current=${current:-未安装}
+    latest=$(fetch_github_latest_tag 'SagerNet/sing-box'); latest=${latest:-查询失败}
+    printf 'sing-box      当前 %-12s 推荐 %-12s 上游 %s\n' "$current" "$SINGBOX_VERSION" "$latest"
+    current=$(get_xray_version_raw); current=${current:-未安装}
+    latest=$(fetch_github_latest_tag 'XTLS/Xray-core'); latest=${latest:-查询失败}
+    printf 'Xray-core     当前 %-12s 推荐 %-12s 上游 %s\n' "$current" "$XRAY_VERSION" "$latest"
+    current=$(get_snell_version_raw); current=${current:-未安装}
+    printf 'Snell Server  当前 %-12s 推荐 %-12s 上游 %s\n' "$current" "$SNELL_VERSION" "请以 Surge 官方发布为准"
+    current=$(get_realm_version_raw); current=${current:-未安装}
+    latest=$(fetch_github_latest_tag 'zhboner/realm'); latest=${latest:-查询失败}
+    printf 'Realm         当前 %-12s 推荐 %-12s 上游 %s\n' "$current" "$REALM_VERSION" "$latest"
+    echo ""
+    echo -e "${YELLOW}上游 Latest 不代表本脚本已验证。请优先使用脚本推荐版本。${PLAIN}"
+    pause
+}
+
+component_single_menu() {
+    local c="$1" label current recommended choice
+    if platform_is_alpine && [[ "$c" == "snell" ]]; then
+        platform_feature_unavailable "Snell v5（Surge 官方 snell-server）"
+        pause
+        return
+    fi
+    label=$(component_label "$c")
+    while true; do
+        clear
+        current=$(component_current_version "$c"); current=${current:-未安装}
+        recommended=$(component_recommended_version "$c")
+        echo -e "${CYAN}════════════════════ ${label} ════════════════════${PLAIN}"
+        echo "当前版本 : $current"
+        echo "推荐版本 : $recommended"
+        echo ""
+        echo "  1. 升级 / 重装到推荐版本"
+        echo "  2. 查看当前版本"
+        echo "  0. 返回"
+        read -rp "请选择 [0-2]: " choice
+        case "$choice" in
+            1) component_install_recommended "$c"; pause ;;
+            2) current=$(component_current_version "$c"); echo "${label}: ${current:-未安装}"; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+upgrade_all_to_recommended() {
+    local c current target failed=0
+    for c in singbox xray snell realm; do
+        if platform_is_alpine && [[ "$c" == "snell" ]]; then
+            echo -e "${YELLOW}○ Snell Server：Alpine 3.21 暂不支持官方 snell-server，跳过。${PLAIN}"
+            continue
+        fi
+        current=$(component_current_version "$c")
+        target=$(component_recommended_version "$c")
+        if [[ -z "$current" ]]; then
+            case "$c" in
+                singbox) [[ -f "$SINGBOX_CONF" ]] || continue ;;
+                xray) [[ -f "$XRAY_CONF" ]] || continue ;;
+                snell) [[ -f "$SNELL_CONF" ]] || continue ;;
+                realm) [[ -f "$REALM_CONF" || -f "$FORWARDING_FILE" ]] || continue ;;
+            esac
+        fi
+        if [[ "$current" == "$target" ]]; then
+            echo -e "${GREEN}✔ $(component_label "$c") 已是推荐版本 $target${PLAIN}"
+            continue
+        fi
+        component_install_recommended "$c" || failed=1
+    done
+    [[ $failed -eq 0 ]]
+}
+
+component_version_management() {
+    while true; do
+        show_component_versions
+        echo ""
+        echo "  1. sing-box"
+        echo "  2. Xray-core"
+        if platform_is_alpine; then
+            echo "  3. Snell Server            [Alpine 暂不支持]"
+        else
+            echo "  3. Snell Server"
+        fi
+        echo "  4. Realm"
+        echo "  5. 检查官方上游版本（仅提示）"
+        echo "  6. 全部升级到脚本推荐版本"
+        echo "  0. 返回"
+        echo -e "${CYAN}═════════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-6]: " c
+        case "$c" in
+            1) component_single_menu singbox ;;
+            2) component_single_menu xray ;;
+            3) component_single_menu snell ;;
+            4) component_single_menu realm ;;
+            5) check_upstream_versions ;;
+            6) upgrade_all_to_recommended; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+# ==============================================================================
+# [13] 脚本自更新
+# ==============================================================================
+
+extract_script_version() {
+    local file="$1"
+    sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' "$file" 2>/dev/null | head -n1
+}
+
+script_source_path() {
+    local src="${BASH_SOURCE[0]}"
+    readlink -f "$src" 2>/dev/null || printf '%s\n' "$src"
+}
+
+proxy_shortcut_is_project_managed() {
+    local target=""
+    [[ -L "$SCRIPT_PROXY_LINK" ]] || return 1
+    target=$(readlink "$SCRIPT_PROXY_LINK" 2>/dev/null || true)
+    [[ "$target" == "$SCRIPT_INSTALL_PATH" || "$target" == "${SCRIPT_INSTALL_PATH##*/}" ]]
+}
+
+ensure_proxy_shortcut() {
+    if [[ -e "$SCRIPT_PROXY_LINK" || -L "$SCRIPT_PROXY_LINK" ]]; then
+        if ! proxy_shortcut_is_project_managed; then
+            echo -e "${YELLOW}[提示] ${SCRIPT_PROXY_LINK} 已被其它文件或链接占用，保留原内容；仍可使用 ${SCRIPT_INSTALL_PATH}。${PLAIN}"
+            return 0
+        fi
+        rm -f "$SCRIPT_PROXY_LINK" || return 1
+    fi
+    ln -s "$SCRIPT_INSTALL_PATH" "$SCRIPT_PROXY_LINK"
+}
+
+compare_script_versions() {
+    # 输出：
+    #   equal         两版本相同
+    #   remote_newer  第二个版本更新
+    #   remote_older  第二个版本更旧
+    #   unknown       无法按 vX.Y.Z[-devN] 规则比较
+    local current="$1"
+    local remote="$2"
+    local c_major c_minor c_patch c_dev r_major r_minor r_patch r_dev
+    local c_is_dev=0 r_is_dev=0
+
+    if [[ "$current" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)(-dev([0-9]+))?$ ]]; then
+        c_major="${BASH_REMATCH[1]}"
+        c_minor="${BASH_REMATCH[2]}"
+        c_patch="${BASH_REMATCH[3]}"
+        if [[ -n "${BASH_REMATCH[4]:-}" ]]; then
+            c_is_dev=1
+            c_dev="${BASH_REMATCH[5]}"
+        else
+            c_dev=0
+        fi
+    else
+        echo "unknown"
+        return
+    fi
+
+    if [[ "$remote" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)(-dev([0-9]+))?$ ]]; then
+        r_major="${BASH_REMATCH[1]}"
+        r_minor="${BASH_REMATCH[2]}"
+        r_patch="${BASH_REMATCH[3]}"
+        if [[ -n "${BASH_REMATCH[4]:-}" ]]; then
+            r_is_dev=1
+            r_dev="${BASH_REMATCH[5]}"
+        else
+            r_dev=0
+        fi
+    else
+        echo "unknown"
+        return
+    fi
+
+    local c r
+    for c_r in major minor patch; do
+        case "$c_r" in
+            major) c="$c_major"; r="$r_major" ;;
+            minor) c="$c_minor"; r="$r_minor" ;;
+            patch) c="$c_patch"; r="$r_patch" ;;
+        esac
+        if (( 10#$r > 10#$c )); then
+            echo "remote_newer"
+            return
+        elif (( 10#$r < 10#$c )); then
+            echo "remote_older"
+            return
+        fi
+    done
+
+    # 同一正式版本号下：正式版 > dev 版。
+    if (( c_is_dev == 1 && r_is_dev == 0 )); then
+        echo "remote_newer"
+        return
+    elif (( c_is_dev == 0 && r_is_dev == 1 )); then
+        echo "remote_older"
+        return
+    elif (( c_is_dev == 0 && r_is_dev == 0 )); then
+        echo "equal"
+        return
+    fi
+
+    if (( 10#$r_dev > 10#$c_dev )); then
+        echo "remote_newer"
+    elif (( 10#$r_dev < 10#$c_dev )); then
+        echo "remote_older"
+    else
+        echo "equal"
+    fi
+}
+
+check_script_update() {
+    clear
+    echo -e "${CYAN}════════════════════ 检查脚本更新 ════════════════════${PLAIN}"
+    echo "更新源 : ${SCRIPT_UPDATE_URL}"
+    echo ""
+
+    command -v curl >/dev/null 2>&1 || {
+        echo -e "${RED}[错误] 未检测到 curl，无法检查更新。${PLAIN}"
+        pause
+        return
+    }
+
+    local tmp remote_version running_file running_version installed_version
+    local running_hash installed_hash remote_hash cache_bust relation
+    local install_reason=""
+    local ans
+
+    running_file=$(script_source_path)
+    running_version=$(extract_script_version "$running_file")
+    [[ -n "$running_version" ]] || running_version="$SCRIPT_VERSION"
+
+    if [[ -f "$SCRIPT_INSTALL_PATH" ]]; then
+        installed_version=$(extract_script_version "$SCRIPT_INSTALL_PATH")
+        installed_hash=$(sha256sum "$SCRIPT_INSTALL_PATH" 2>/dev/null | awk '{print $1}')
+    else
+        installed_version="未安装"
+        installed_hash=""
+    fi
+
+    running_hash=$(sha256sum "$running_file" 2>/dev/null | awk '{print $1}')
+
+    tmp=$(mktemp /tmp/ss2022-update.XXXXXX.sh) || {
+        echo -e "${RED}[错误] 无法创建临时文件。${PLAIN}"
+        pause
+        return
+    }
+    cache_bust=$(date +%s)
+
+    echo -e "${YELLOW}>> 正在从 GitHub main 获取最新脚本...${PLAIN}"
+    if ! curl -fsSL --retry 2 --retry-delay 1 --connect-timeout 8 --max-time 60 \
+        -H 'Cache-Control: no-cache' \
+        "${SCRIPT_UPDATE_URL}?t=${cache_bust}" -o "$tmp"; then
+        rm -f "$tmp"
+        echo -e "${RED}[错误] 下载 GitHub 最新脚本失败。${PLAIN}"
+        pause
+        return
+    fi
+
+    # 只接受本项目脚本，避免 URL / CDN 异常返回 HTML 或其它内容后被直接执行。
+    if ! grep -q '^# 项目名称: vps-bootstrap / ss2022.sh$' "$tmp"; then
+        rm -f "$tmp"
+        echo -e "${RED}[错误] 下载内容不是有效的 vps-bootstrap/ss2022.sh，已拒绝更新。${PLAIN}"
+        pause
+        return
+    fi
+    if ! bash -n "$tmp"; then
+        rm -f "$tmp"
+        echo -e "${RED}[错误] GitHub 脚本未通过 Bash 语法检查，已拒绝更新。${PLAIN}"
+        pause
+        return
+    fi
+
+    remote_version=$(extract_script_version "$tmp")
+    if [[ -z "$remote_version" ]]; then
+        rm -f "$tmp"
+        echo -e "${RED}[错误] 无法读取远程 SCRIPT_VERSION，已拒绝更新。${PLAIN}"
+        pause
+        return
+    fi
+
+    remote_hash=$(sha256sum "$tmp" | awk '{print $1}')
+    relation=$(compare_script_versions "$running_version" "$remote_version")
+
+    echo "当前运行 : ${running_version}"
+    echo "系统安装 : ${installed_version}"
+    echo "GitHub main: ${remote_version}"
+    echo ""
+    echo "运行 SHA : ${running_hash:-无法读取}"
+    echo "安装 SHA : ${installed_hash:-未安装}"
+    echo "远程 SHA : ${remote_hash}"
+    echo ""
+
+    # 情况 1：当前正在运行的文件与 GitHub main 完全一致。
+    if [[ -n "$running_hash" && "$running_hash" == "$remote_hash" ]]; then
+        if [[ -n "$installed_hash" && "$installed_hash" == "$remote_hash" ]]; then
+            rm -f "$tmp"
+            echo -e "${GREEN}✔ 当前运行脚本、系统安装脚本与 GitHub main 完全一致。${PLAIN}"
+            pause
+            return
+        fi
+
+        echo -e "${YELLOW}当前运行脚本已与 GitHub main 一致，但系统安装版本仍不一致。${PLAIN}"
+        echo "可以把当前 GitHub main 版本同步安装到：${SCRIPT_INSTALL_PATH}"
+        install_reason="sync_install"
+    else
+        case "$relation" in
+            remote_newer)
+                echo -e "${GREEN}检测到脚本更新：${running_version} → ${remote_version}${PLAIN}"
+                install_reason="remote_newer"
+                ;;
+            remote_older)
+                rm -f "$tmp"
+                echo -e "${YELLOW}GitHub main 版本比当前运行版本更旧：${remote_version} < ${running_version}${PLAIN}"
+                echo "为避免误降级，本工具不会自动覆盖当前版本。"
+                echo ""
+                echo "如果你刚从测试文件运行了新版，请先把新版 ss2022.sh 提交到 GitHub main，"
+                echo "之后再使用“检查脚本更新”。"
+                pause
+                return
+                ;;
+            equal)
+                echo -e "${YELLOW}检测到同版本号内容变化：${running_version}${PLAIN}"
+                echo "版本号相同，但当前运行文件与 GitHub main 的 SHA256 不同。"
+                install_reason="same_version_changed"
+                ;;
+            *)
+                echo -e "${YELLOW}检测到脚本内容不同，但无法可靠判断版本新旧。${PLAIN}"
+                echo "当前运行：${running_version}"
+                echo "GitHub main：${remote_version}"
+                echo "为避免误降级，默认不自动覆盖。"
+                rm -f "$tmp"
+                pause
+                return
+                ;;
+        esac
+    fi
+
+    echo ""
+    echo "更新将："
+    echo "  1. 备份当前系统安装脚本到 ${SCRIPT_BACKUP_PATH}"
+    echo "  2. 安装 GitHub main 脚本到 ${SCRIPT_INSTALL_PATH}"
+    echo "  3. 若 ${SCRIPT_PROXY_LINK} 未被其它程序占用，则保持该快捷命令"
+    echo "  4. 自动重新进入安装后的管理面板"
+    echo ""
+
+    read -rp "确认安装 / 更新？[y/N]: " ans
+    if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+        rm -f "$tmp"
+        echo "已取消更新。"
+        pause
+        return
+    fi
+
+    # 覆盖前保存最近一个系统安装版本。安装失败时立即恢复。
+    if [[ -f "$SCRIPT_INSTALL_PATH" ]]; then
+        cp -a "$SCRIPT_INSTALL_PATH" "$SCRIPT_BACKUP_PATH" || {
+            rm -f "$tmp"
+            echo -e "${RED}[错误] 无法备份当前脚本，已取消更新。${PLAIN}"
+            pause
+            return
+        }
+    fi
+
+    if ! install -m 0755 "$tmp" "$SCRIPT_INSTALL_PATH"; then
+        [[ -f "$SCRIPT_BACKUP_PATH" ]] && install -m 0755 "$SCRIPT_BACKUP_PATH" "$SCRIPT_INSTALL_PATH" 2>/dev/null || true
+        rm -f "$tmp"
+        echo -e "${RED}[错误] 新脚本安装失败，已尝试恢复旧版本。${PLAIN}"
+        pause
+        return
+    fi
+    rm -f "$tmp"
+
+    if ! bash -n "$SCRIPT_INSTALL_PATH"; then
+        echo -e "${RED}[错误] 安装后的脚本语法校验失败，正在恢复旧版本。${PLAIN}"
+        [[ -f "$SCRIPT_BACKUP_PATH" ]] && install -m 0755 "$SCRIPT_BACKUP_PATH" "$SCRIPT_INSTALL_PATH" 2>/dev/null || true
+        pause
+        return
+    fi
+
+    ensure_proxy_shortcut || echo -e "${YELLOW}[提示] proxy 快捷命令创建失败，不影响 ss2022 主命令。${PLAIN}"
+    echo -e "${GREEN}✔ 脚本安装 / 更新完成：$(extract_script_version "$SCRIPT_INSTALL_PATH")${PLAIN}"
+    echo "正在重新进入安装后的管理面板..."
+    sleep 1
+    exec "$SCRIPT_INSTALL_PATH"
+}
+
+# ==============================================================================
+# [14] 菜单与程序入口
+# ==============================================================================
+
+protocol_management() {
+    while true; do
+        clear
+        echo -e "$CYAN════════════════════ 协议管理 ════════════════════$PLAIN"
+        echo "  1. SS2022"
+        echo "  2. SS2022 + ShadowTLS v3（增强伪装）"
+        echo "  3. VLESS Reality"
+        if platform_is_alpine; then
+            echo "  4. Snell v5                [Alpine 暂不支持]"
+        else
+            echo "  4. Snell v5"
+        fi
+        echo "  0. 返回"
+        echo -e "$CYAN═══════════════════════════════════════════════════$PLAIN"
+        read -rp "请选择 [0-4]: " c
+        case "$c" in
+            1) protocol_action_menu "SS2022" deploy_ss2022 update_ss2022 delete_ss2022 ;;
+            2) protocol_action_menu "SS2022 + ShadowTLS v3" deploy_shadowtls update_shadowtls delete_shadowtls ;;
+            3) protocol_action_menu "VLESS Reality" deploy_vless_reality update_vless_reality delete_vless_reality ;;
+            4)
+                if platform_is_alpine; then
+                    platform_feature_unavailable "Snell v5（Surge 官方 snell-server）"
+                    pause
+                else
+                    protocol_action_menu "Snell v5" deploy_snell_v5 update_snell_v5 delete_snell_v5
+                fi
+                ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+follow_service_log() {
+    local service="$1"
+    service_log_follow "$service"
+}
+restart_service_safe() {
+    local service="$1" label="$2"
+    if service_restart "$service"; then
+        echo -e "$GREEN✔ $label 已重启。$PLAIN"
+    else
+        service_log_tail "$service" 30 || true
+        return 1
+    fi
+}
+server_tool_pkg_manager() {
+    if command -v apt-get >/dev/null 2>&1; then
+        echo "apt"
+    elif command -v dnf >/dev/null 2>&1; then
+        echo "dnf"
+    elif command -v yum >/dev/null 2>&1; then
+        echo "yum"
+    elif command -v apk >/dev/null 2>&1; then
+        echo "apk"
+    else
+        echo "unknown"
+    fi
+}
+
+server_tool_get_ip_profile() {
+    local ipv4="$1" ipv6="$2" target meta hosting proxy mobile org asn isp country region city location
+    local scam_html score risk_label
+
+    SERVER_INFO_IPV4="$ipv4"
+    SERVER_INFO_IPV6="$ipv6"
+    SERVER_INFO_IP_TYPE="未知"
+    SERVER_INFO_IP_RISK="未获取"
+    SERVER_INFO_ISP="未知"
+    SERVER_INFO_ASN="未知"
+    SERVER_INFO_LOCATION="未知"
+
+    target="$ipv4"
+    [[ -n "$target" ]] || target="$ipv6"
+    [[ -n "$target" ]] || return 0
+
+    # ip-api 免费接口用于轻量判定 hosting / proxy / mobile；查询失败时保持“未知”。
+    meta=$(curl -fsS --connect-timeout 3 --max-time 5 \
+        "http://ip-api.com/json/${target}?fields=status,message,country,regionName,city,isp,org,as,hosting,proxy,mobile,query" \
+        2>/dev/null || true)
+
+    if [[ -n "$meta" ]] && jq -e '.status=="success"' >/dev/null 2>&1 <<<"$meta"; then
+        hosting=$(jq -r '.hosting // false' <<<"$meta")
+        proxy=$(jq -r '.proxy // false' <<<"$meta")
+        mobile=$(jq -r '.mobile // false' <<<"$meta")
+        org=$(jq -r '.org // empty' <<<"$meta")
+        isp=$(jq -r '.isp // empty' <<<"$meta")
+        asn=$(jq -r '.as // empty' <<<"$meta")
+        country=$(jq -r '.country // empty' <<<"$meta")
+        region=$(jq -r '.regionName // empty' <<<"$meta")
+        city=$(jq -r '.city // empty' <<<"$meta")
+
+        SERVER_INFO_ISP="${isp:-${org:-未知}}"
+        SERVER_INFO_ASN="${asn:-未知}"
+
+        location=""
+        [[ -n "$country" ]] && location="$country"
+        [[ -n "$region" ]] && location="${location:+${location} / }${region}"
+        [[ -n "$city" ]] && location="${location:+${location} / }${city}"
+        SERVER_INFO_LOCATION="${location:-未知}"
+
+        if [[ "$hosting" == "true" ]]; then
+            SERVER_INFO_IP_TYPE="数据中心"
+        elif [[ "$mobile" == "true" ]]; then
+            SERVER_INFO_IP_TYPE="移动网络"
+        elif [[ "$proxy" == "true" ]]; then
+            SERVER_INFO_IP_TYPE="代理/VPN"
+        else
+            SERVER_INFO_IP_TYPE="宽带/其他"
+        fi
+    fi
+
+    # Scamalytics 网页公开查询结果中包含 Fraud Score；失败时不影响系统信息展示。
+    scam_html=$(curl -A "Mozilla/5.0" -fsSL --connect-timeout 3 --max-time 6 \
+        "https://scamalytics.com/ip/${target}" 2>/dev/null || true)
+
+    if [[ -n "$scam_html" ]]; then
+        score=$(printf '%s' "$scam_html" \
+            | tr '\n' ' ' \
+            | grep -oE '"score"[[:space:]]*:[[:space:]]*"?[0-9]{1,3}"?' \
+            | head -n1 \
+            | grep -oE '[0-9]{1,3}' || true)
+
+        if [[ -z "$score" ]]; then
+            score=$(printf '%s' "$scam_html" \
+                | tr '\n' ' ' \
+                | sed -nE 's/.*Fraud Score:[[:space:]]*([0-9]{1,3}).*/\1/p' \
+                | head -n1 || true)
+        fi
+
+        if [[ "$score" =~ ^[0-9]+$ ]] && [[ "$score" -le 100 ]]; then
+            if [[ "$score" -le 19 ]]; then
+                risk_label="低风险"
+            elif [[ "$score" -le 59 ]]; then
+                risk_label="中等风险"
+            elif [[ "$score" -le 89 ]]; then
+                risk_label="高风险"
+            else
+                risk_label="极高风险"
+            fi
+            SERVER_INFO_IP_RISK="${score}/100（${risk_label}）"
+        fi
+    fi
+}
+
+server_tool_format_bytes() {
+    local bytes="${1:-0}"
+    awk -v b="$bytes" 'BEGIN {
+        if (b >= 1099511627776) printf "%.2f TB", b/1099511627776;
+        else if (b >= 1073741824) printf "%.2f GB", b/1073741824;
+        else if (b >= 1048576) printf "%.2f MB", b/1048576;
+        else if (b >= 1024) printf "%.2f KB", b/1024;
+        else printf "%.0f B", b;
+    }'
+}
+
+server_tool_public_traffic_bytes() {
+    local iface4 iface6 iface path rx tx
+    local total_rx=0 total_tx=0
+    local -A seen=()
+
+    iface4=$(ip -4 route show default 2>/dev/null | awk '
+        {
+            for (i=1;i<=NF;i++) if ($i=="dev" && (i+1)<=NF) {print $(i+1); exit}
+        }')
+    iface6=$(ip -6 route show default 2>/dev/null | awk '
+        {
+            for (i=1;i<=NF;i++) if ($i=="dev" && (i+1)<=NF) {print $(i+1); exit}
+        }')
+
+    for iface in "$iface4" "$iface6"; do
+        [[ -n "$iface" ]] || continue
+        [[ -n "${seen[$iface]:-}" ]] && continue
+        seen[$iface]=1
+        path="/sys/class/net/${iface}/statistics"
+        [[ -r "${path}/rx_bytes" && -r "${path}/tx_bytes" ]] || continue
+        rx=$(cat "${path}/rx_bytes" 2>/dev/null || echo 0)
+        tx=$(cat "${path}/tx_bytes" 2>/dev/null || echo 0)
+        [[ "$rx" =~ ^[0-9]+$ ]] || rx=0
+        [[ "$tx" =~ ^[0-9]+$ ]] || tx=0
+        total_rx=$((total_rx + rx))
+        total_tx=$((total_tx + tx))
+    done
+
+    # 极少数环境没有默认路由设备时，回退到常见公网接口。
+    if [[ ${#seen[@]} -eq 0 ]]; then
+        for path in /sys/class/net/*; do
+            [[ -d "$path/statistics" ]] || continue
+            iface=${path##*/}
+            case "$iface" in
+                lo|docker*|br-*|veth*|tun*|tap*|wg*|warp*|tailscale*) continue ;;
+            esac
+            [[ "$iface" =~ ^(eth|ens|enp|eno|venet|bond) ]] || continue
+            rx=$(cat "$path/statistics/rx_bytes" 2>/dev/null || echo 0)
+            tx=$(cat "$path/statistics/tx_bytes" 2>/dev/null || echo 0)
+            [[ "$rx" =~ ^[0-9]+$ ]] || rx=0
+            [[ "$tx" =~ ^[0-9]+$ ]] || tx=0
+            total_rx=$((total_rx + rx))
+            total_tx=$((total_tx + tx))
+        done
+    fi
+
+    printf '%s %s\n' "$total_rx" "$total_tx"
+}
+
+server_tool_monthly_traffic_bytes() {
+    local raw current_rx current_tx month
+    local state_month="" last_rx=0 last_tx=0 total_rx=0 total_tx=0
+    local tmp
+
+    mkdir -p "$STATE_DIR" || {
+        echo "0 0"
+        return
+    }
+    chmod 700 "$STATE_DIR"
+
+    raw=$(server_tool_public_traffic_bytes)
+    current_rx=$(awk '{print $1}' <<<"$raw")
+    current_tx=$(awk '{print $2}' <<<"$raw")
+    [[ "$current_rx" =~ ^[0-9]+$ ]] || current_rx=0
+    [[ "$current_tx" =~ ^[0-9]+$ ]] || current_tx=0
+
+    month=$(date +%Y-%m)
+
+    if [[ -f "$SYSTEM_INFO_TRAFFIC_STATE" ]]; then
+        state_month=$(awk -F= '$1=="MONTH" {gsub(/\047/,"",$2); print $2}' "$SYSTEM_INFO_TRAFFIC_STATE" 2>/dev/null)
+        last_rx=$(awk -F= '$1=="LAST_RX" {print $2}' "$SYSTEM_INFO_TRAFFIC_STATE" 2>/dev/null)
+        last_tx=$(awk -F= '$1=="LAST_TX" {print $2}' "$SYSTEM_INFO_TRAFFIC_STATE" 2>/dev/null)
+        total_rx=$(awk -F= '$1=="TOTAL_RX" {print $2}' "$SYSTEM_INFO_TRAFFIC_STATE" 2>/dev/null)
+        total_tx=$(awk -F= '$1=="TOTAL_TX" {print $2}' "$SYSTEM_INFO_TRAFFIC_STATE" 2>/dev/null)
+    fi
+
+    [[ "$last_rx" =~ ^[0-9]+$ ]] || last_rx=0
+    [[ "$last_tx" =~ ^[0-9]+$ ]] || last_tx=0
+    [[ "$total_rx" =~ ^[0-9]+$ ]] || total_rx=0
+    [[ "$total_tx" =~ ^[0-9]+$ ]] || total_tx=0
+
+    if [[ "$state_month" != "$month" ]]; then
+        # 新月份从当前时刻重新开始累计。
+        state_month="$month"
+        last_rx="$current_rx"
+        last_tx="$current_tx"
+        total_rx=0
+        total_tx=0
+    else
+        if [[ "$current_rx" -ge "$last_rx" ]]; then
+            total_rx=$((total_rx + current_rx - last_rx))
+        else
+            # VPS 重启或网卡计数归零：保留当月累计，并把当前值作为重启后的新增量。
+            total_rx=$((total_rx + current_rx))
+        fi
+
+        if [[ "$current_tx" -ge "$last_tx" ]]; then
+            total_tx=$((total_tx + current_tx - last_tx))
+        else
+            total_tx=$((total_tx + current_tx))
+        fi
+
+        last_rx="$current_rx"
+        last_tx="$current_tx"
+    fi
+
+    tmp="${SYSTEM_INFO_TRAFFIC_STATE}.tmp.$$"
+    umask 077
+    cat > "$tmp" <<EOF
+MONTH='${state_month}'
+LAST_RX=${last_rx}
+LAST_TX=${last_tx}
+TOTAL_RX=${total_rx}
+TOTAL_TX=${total_tx}
+EOF
+    mv -f "$tmp" "$SYSTEM_INFO_TRAFFIC_STATE"
+    chmod 600 "$SYSTEM_INFO_TRAFFIC_STATE"
+
+    printf '%s %s\n' "$total_rx" "$total_tx"
+}
+
+server_tool_system_info() {
+    local cpu cores mem_total mem_used swap_total swap_used disk_used disk_total
+    local uptime_days timezone dns congestion qdisc os_info ipv4 ipv6 hostname_text
+    local cpu_mhz cpu_ghz traffic_rx traffic_tx traffic_pair
+    local warp_ipv6="" ipv6_display=""
+
+    clear
+    os_info=$(get_sys_info)
+    cpu=$(awk -F: '/model name|Hardware|Processor/ {gsub(/^[ \t]+/,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null)
+    cpu=${cpu:-$(uname -m)}
+    cores=$(nproc 2>/dev/null || echo "?")
+
+    cpu_mhz=$(awk -F: '/cpu MHz/ {gsub(/^[ \t]+/,"",$2); sum+=$2; n++} END {if (n>0) printf "%.0f", sum/n}' /proc/cpuinfo 2>/dev/null)
+    if [[ "$cpu_mhz" =~ ^[0-9]+$ ]] && [[ "$cpu_mhz" -gt 0 ]]; then
+        cpu_ghz=$(awk -v mhz="$cpu_mhz" 'BEGIN {printf "%.2f", mhz/1000}')
+    else
+        cpu_ghz=""
+    fi
+
+    mem_total=$(free -h 2>/dev/null | awk '/^Mem:/ {print $2}')
+    mem_used=$(free -h 2>/dev/null | awk '/^Mem:/ {print $3}')
+    swap_total=$(free -h 2>/dev/null | awk '/^Swap:/ {print $2}')
+    swap_used=$(free -h 2>/dev/null | awk '/^Swap:/ {print $3}')
+    mem_total=${mem_total//Gi/G}
+    mem_total=${mem_total//Mi/M}
+    mem_total=${mem_total//Ki/K}
+    mem_total=${mem_total//Ti/T}
+    mem_used=${mem_used//Gi/G}
+    mem_used=${mem_used//Mi/M}
+    mem_used=${mem_used//Ki/K}
+    mem_used=${mem_used//Ti/T}
+    swap_total=${swap_total//Gi/G}
+    swap_total=${swap_total//Mi/M}
+    swap_total=${swap_total//Ki/K}
+    swap_total=${swap_total//Ti/T}
+    swap_used=${swap_used//Gi/G}
+    swap_used=${swap_used//Mi/M}
+    swap_used=${swap_used//Ki/K}
+    swap_used=${swap_used//Ti/T}
+    disk_used=$(df -h / 2>/dev/null | awk 'NR==2 {print $3}')
+    disk_total=$(df -h / 2>/dev/null | awk 'NR==2 {print $2}')
+
+    uptime_days=$(awk '{printf "%d", $1/86400}' /proc/uptime 2>/dev/null)
+    [[ "$uptime_days" =~ ^[0-9]+$ ]] || uptime_days=0
+
+    timezone=$(timedatectl show -p Timezone --value 2>/dev/null || date +%Z)
+    dns=$(awk '/^[[:space:]]*nameserver[[:space:]]+/ {print $2}' /etc/resolv.conf 2>/dev/null | paste -sd ',' -)
+    congestion=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
+    hostname_text=$(hostname 2>/dev/null || echo "未知")
+
+    traffic_pair=$(server_tool_monthly_traffic_bytes)
+    traffic_rx=$(awk '{print $1}' <<<"$traffic_pair")
+    traffic_tx=$(awk '{print $2}' <<<"$traffic_pair")
+
+    ipv4=$(curl -4fsS --connect-timeout 2 --max-time 4 https://api4.ipify.org 2>/dev/null || true)
+    ipv6=$(curl -6fsS --connect-timeout 2 --max-time 4 https://api6.ipify.org 2>/dev/null || true)
+
+    # WARP 使用 Local Proxy，不会把 Cloudflare IPv6 写入 VPS 本机网络栈。
+    # 因此原生 IPv6 不存在时，需要通过 WARP SOCKS 出口单独查询。
+    if [[ -n "$ipv6" ]]; then
+        ipv6_display="$ipv6"
+    elif warp_proxy_ready 2>/dev/null && warp_family_allowed ipv6 2>/dev/null; then
+        warp_ipv6=$(warp_test_family ipv6 2>/dev/null || true)
+        if [[ -n "$warp_ipv6" ]]; then
+            ipv6_display="${warp_ipv6}（WARP）"
+        else
+            ipv6_display="无 IPv6"
+        fi
+    else
+        ipv6_display="无 IPv6"
+    fi
+
+    # IP 属性继续以 VPS 原生公网地址为准，不使用 WARP 出口覆盖机房/IP 属性。
+    server_tool_get_ip_profile "$ipv4" "$ipv6"
+
+    echo -e "${CYAN}════════════════════ 系统信息 ════════════════════${PLAIN}"
+    echo "  主机名     : ${hostname_text}"
+    echo "  系统       : ${os_info}"
+    echo "  CPU        : ${cpu}"
+    echo "  CPU 核心   : ${cores}$([[ -n "$cpu_ghz" ]] && printf " 核 @ %s GHz" "$cpu_ghz" || printf " 核")"
+    echo "  内存       : ${mem_used:-?} / ${mem_total:-?}"
+    echo "  虚拟内存   : ${swap_used:-?} / ${swap_total:-?}"
+    echo "  硬盘占用   : ${disk_used:-?} / ${disk_total:-?}"
+    echo "  运行时间   : ${uptime_days} 天"
+    echo "  入站流量   : $(server_tool_format_bytes "${traffic_rx:-0}")（本月）"
+    echo "  出站流量   : $(server_tool_format_bytes "${traffic_tx:-0}")（本月）"
+    echo "  时区       : ${timezone:-未知}"
+    echo "  IPv4 地址  : ${ipv4:-无 IPv4}"
+    echo "  IPv6 地址  : ${ipv6_display}"
+    echo "  地理位置   : ${SERVER_INFO_LOCATION}"
+    echo "  ISP / ASN  : ${SERVER_INFO_ISP} / ${SERVER_INFO_ASN}"
+    echo "  IP 性质    : ${SERVER_INFO_IP_TYPE}"
+    echo "  IP 危险性  : ${SERVER_INFO_IP_RISK}"
+    echo "  DNS        : ${dns:-未检测到}"
+    echo "  网络算法   : ${congestion} ${qdisc}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════${PLAIN}"
+}
+
+server_tool_system_update() {
+    local pm action
+    pm=$(server_tool_pkg_manager)
+
+    clear
+    echo -e "${CYAN}════════════════ 系统更新 / 清理 ════════════════${PLAIN}"
+    echo "  1. 更新系统软件包"
+    echo "  2. 清理无用软件包与缓存"
+    echo "  3. 更新 + 清理"
+    echo "  0. 返回"
+    read -rp "请选择 [0-3]: " action
+
+    [[ "$action" == "0" ]] && return
+
+    if [[ "$pm" == "unknown" ]]; then
+        echo -e "${RED}[错误] 未识别当前系统包管理器。${PLAIN}"
+        pause
+        return
+    fi
+
+    if [[ "$action" == "1" || "$action" == "3" ]]; then
+        echo -e "${YELLOW}>> 正在更新系统软件包...${PLAIN}"
+        case "$pm" in
+            apt)
+                DEBIAN_FRONTEND=noninteractive apt-get update -y &&
+                DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y
+                ;;
+            dnf) dnf upgrade -y ;;
+            yum) yum update -y ;;
+            apk) apk update && apk upgrade ;;
+        esac
+    fi
+
+    if [[ "$action" == "2" || "$action" == "3" ]]; then
+        echo -e "${YELLOW}>> 正在清理无用软件包与包管理器缓存...${PLAIN}"
+        case "$pm" in
+            apt)
+                DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y
+                apt-get clean
+                apt-get autoclean
+                ;;
+            dnf)
+                dnf autoremove -y || true
+                dnf clean all
+                ;;
+            yum)
+                yum autoremove -y || true
+                yum clean all
+                ;;
+            apk)
+                apk cache clean
+                ;;
+        esac
+    fi
+
+    echo -e "${GREEN}✔ 操作完成。${PLAIN}"
+    pause
+}
+
+server_tool_swap_status() {
+    echo -e "${YELLOW}当前内存 / Swap:${PLAIN}"
+    free -h 2>/dev/null || true
+    echo ""
+    swapon --show 2>/dev/null || true
+}
+
+server_tool_swap_create() {
+    local size_mb="$1"
+
+    if ! [[ "$size_mb" =~ ^[0-9]+$ ]] || [[ "$size_mb" -lt 256 ]] || [[ "$size_mb" -gt 32768 ]]; then
+        echo -e "${RED}[错误] Swap 大小必须在 256-32768 MB。${PLAIN}"
+        return 1
+    fi
+
+    if platform_is_alpine; then
+        ensure_test_dependency mkswap util-linux-misc || {
+            echo -e "${RED}[错误] Alpine 无法安装 util-linux-misc，不能安全管理 Swap。${PLAIN}"
+            return 1
+        }
+    fi
+    for cmd in mkswap swapon swapoff; do
+        command -v "$cmd" >/dev/null 2>&1 || {
+            echo -e "${RED}[错误] 缺少 $cmd，无法管理 Swap。${PLAIN}"
+            return 1
+        }
+    done
+
+    if swapon --show=NAME --noheadings 2>/dev/null | grep -qx '/swapfile'; then
+        swapoff /swapfile || return 1
+    fi
+    rm -f /swapfile
+    echo -e "${YELLOW}>> 创建 ${size_mb} MB /swapfile...${PLAIN}"
+    if command -v fallocate >/dev/null 2>&1; then
+        fallocate -l "${size_mb}M" /swapfile || return 1
+    else
+        dd if=/dev/zero of=/swapfile bs=1M count="$size_mb" status=progress || return 1
+    fi
+    chmod 600 /swapfile
+    mkswap /swapfile >/dev/null || { rm -f /swapfile; return 1; }
+    swapon /swapfile || { rm -f /swapfile; return 1; }
+    sed -i '\|^/swapfile[[:space:]]|d' /etc/fstab
+    echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    echo -e "${GREEN}✔ /swapfile 已启用。${PLAIN}"
+}
+server_tool_swap_remove() {
+    local ans=""
+    if [[ ! -f /swapfile ]] && ! grep -qE '^/swapfile[[:space:]]' /etc/fstab 2>/dev/null; then
+        echo -e "${YELLOW}未检测到由本工具管理的 /swapfile。${PLAIN}"
+        return 0
+    fi
+
+    read -rp "确认删除 /swapfile？不会影响其他 Swap。[y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || return 0
+
+    swapoff /swapfile >/dev/null 2>&1 || true
+    sed -i '\|^/swapfile[[:space:]]|d' /etc/fstab
+    rm -f /swapfile
+    echo -e "${GREEN}✔ /swapfile 已删除。${PLAIN}"
+}
+
+server_tool_swap_management() {
+    local c custom
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ Swap 管理 ════════════════════${PLAIN}"
+        server_tool_swap_status
+        echo ""
+        echo "  1. 设置 512 MB"
+        echo "  2. 设置 1 GB"
+        echo "  3. 设置 2 GB"
+        echo "  4. 设置 4 GB"
+        echo "  5. 自定义大小"
+        echo "  6. 删除 /swapfile"
+        echo "  0. 返回"
+        read -rp "请选择 [0-6]: " c
+        case "$c" in
+            1) server_tool_swap_create 512; pause ;;
+            2) server_tool_swap_create 1024; pause ;;
+            3) server_tool_swap_create 2048; pause ;;
+            4) server_tool_swap_create 4096; pause ;;
+            5)
+                read -rp "请输入 Swap 大小（MB，256-32768）: " custom
+                server_tool_swap_create "$custom"
+                pause
+                ;;
+            6) server_tool_swap_remove; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+server_tool_bbr_status() {
+    local available current qdisc
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+    current=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || true)
+    echo "当前算法 : ${current:-未知}"
+    echo "可用算法 : ${available:-未知}"
+    echo "当前 qdisc: ${qdisc:-未知}"
+}
+
+server_tool_bbr_enable() {
+    local available
+    modprobe tcp_bbr >/dev/null 2>&1 || true
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+
+    if ! grep -qw bbr <<<"$available"; then
+        echo -e "${RED}[错误] 当前内核没有提供 BBR。${PLAIN}"
+        echo -e "${YELLOW}本脚本不会为了 BBR 自动替换 VPS 内核。${PLAIN}"
+        return 1
+    fi
+
+    mkdir -p /etc/sysctl.d
+    cat > /etc/sysctl.d/99-ss2022-bbr.conf <<'EOF'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+
+    sysctl -p /etc/sysctl.d/99-ss2022-bbr.conf >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1 || return 1
+
+    if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]]; then
+        echo -e "${GREEN}✔ BBR 已启用。${PLAIN}"
+        return 0
+    fi
+
+    echo -e "${RED}[错误] BBR 参数写入后未生效。${PLAIN}"
+    return 1
+}
+
+server_tool_bbr_disable() {
+    local available fallback="cubic"
+    rm -f /etc/sysctl.d/99-ss2022-bbr.conf
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+    grep -qw cubic <<<"$available" || fallback=$(awk '{print $1}' <<<"$available")
+    [[ -n "$fallback" ]] || fallback="reno"
+
+    sysctl -w "net.ipv4.tcp_congestion_control=${fallback}" >/dev/null 2>&1 || true
+    if grep -qw fq_codel <<<"$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"; then
+        :
+    else
+        sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1 || true
+    fi
+    echo -e "${GREEN}✔ 已移除本脚本 BBR 持久化配置；当前算法: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 未知)${PLAIN}"
+}
+
+server_tool_bbr_management() {
+    local c
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ BBR 管理 ════════════════════${PLAIN}"
+        server_tool_bbr_status
+        echo ""
+        echo "  1. 启用当前内核原生 BBR"
+        echo "  2. 移除本脚本 BBR 配置"
+        echo "  0. 返回"
+        read -rp "请选择 [0-2]: " c
+        case "$c" in
+            1) server_tool_bbr_enable; pause ;;
+            2) server_tool_bbr_disable; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+server_tool_dns_show() {
+    echo -e "${YELLOW}当前 /etc/resolv.conf:${PLAIN}"
+    cat /etc/resolv.conf 2>/dev/null || true
+}
+
+server_tool_dns_apply() {
+    local dns_list="$1"
+    local resolved_dropin="/etc/systemd/resolved.conf.d/99-ss2022-dns.conf"
+    local backup="${STATE_DIR}/resolv.conf.server-tools.bak"
+    local dns="" valid_list=""
+
+    for dns in $dns_list; do
+        dns=${dns//,/}
+        [[ -n "$dns" ]] || continue
+
+        if [[ "$dns" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            local IFS=.
+            read -r a b c d <<<"$dns"
+            if (( a <= 255 && b <= 255 && c <= 255 && d <= 255 )); then
+                valid_list+="${dns} "
+            else
+                echo -e "${RED}[错误] 无效 IPv4 DNS: ${dns}${PLAIN}"
+                return 1
+            fi
+        elif [[ "$dns" =~ ^[0-9A-Fa-f:]+$ && "$dns" == *:* ]]; then
+            valid_list+="${dns} "
+        else
+            echo -e "${RED}[错误] 无效 DNS 地址: ${dns}${PLAIN}"
+            return 1
+        fi
+    done
+
+    valid_list=${valid_list% }
+    [[ -n "$valid_list" ]] || {
+        echo -e "${RED}[错误] 未提供有效 DNS 地址。${PLAIN}"
+        return 1
+    }
+
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+
+    if [[ -L /etc/resolv.conf ]] && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        mkdir -p /etc/systemd/resolved.conf.d
+        cat > "$resolved_dropin" <<EOF
+[Resolve]
+DNS=${valid_list}
+FallbackDNS=
+EOF
+        if ! systemctl restart systemd-resolved; then
+            rm -f "$resolved_dropin"
+            systemctl restart systemd-resolved >/dev/null 2>&1 || true
+            return 1
+        fi
+        echo -e "${GREEN}✔ DNS 已通过 systemd-resolved 更新：${valid_list}${PLAIN}"
+        return 0
+    fi
+
+    if [[ -L /etc/resolv.conf ]]; then
+        echo -e "${RED}[错误] /etc/resolv.conf 是符号链接，但未检测到可管理的 systemd-resolved。${PLAIN}"
+        echo -e "${YELLOW}为避免破坏 NetworkManager 或其他网络管理器，本工具不会强制覆盖。${PLAIN}"
+        return 1
+    fi
+
+    if [[ ! -f "$backup" && -f /etc/resolv.conf ]]; then
+        cp -a /etc/resolv.conf "$backup" || return 1
+        chmod 600 "$backup"
+    fi
+
+    : > /etc/resolv.conf
+    for dns in $valid_list; do
+        printf 'nameserver %s\n' "$dns" >> /etc/resolv.conf
+    done
+    printf '%s\n' 'options timeout:2 attempts:2' >> /etc/resolv.conf
+
+    echo -e "${GREEN}✔ DNS 已更新：${valid_list}${PLAIN}"
+}
+
+server_tool_dns_restore() {
+    local resolved_dropin="/etc/systemd/resolved.conf.d/99-ss2022-dns.conf"
+    local backup="${STATE_DIR}/resolv.conf.server-tools.bak"
+
+    if [[ -f "$resolved_dropin" ]]; then
+        rm -f "$resolved_dropin"
+        systemctl restart systemd-resolved >/dev/null 2>&1 || true
+        echo -e "${GREEN}✔ 已移除本脚本的 systemd-resolved DNS 配置。${PLAIN}"
+        return 0
+    fi
+
+    if [[ -f "$backup" && ! -L /etc/resolv.conf ]]; then
+        cp -af "$backup" /etc/resolv.conf
+        rm -f "$backup"
+        echo -e "${GREEN}✔ 已恢复修改前的 DNS 配置。${PLAIN}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}没有找到本工具可恢复的 DNS 备份。${PLAIN}"
+}
+
+server_tool_dns_management() {
+    local c custom_dns
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ DNS 管理 ════════════════════${PLAIN}"
+        server_tool_dns_show
+        echo ""
+        echo "  1. Cloudflare + Google"
+        echo "     1.1.1.1 / 8.8.8.8 / 2606:4700:4700::1111 / 2001:4860:4860::8888"
+        echo "  2. Quad9 + Cloudflare"
+        echo "     9.9.9.9 / 1.1.1.1 / 2620:fe::fe / 2606:4700:4700::1111"
+        echo "  3. 阿里 DNS + DNSPod"
+        echo "     223.5.5.5 / 119.29.29.29 / 2400:3200::1 / 2402:4e00::"
+        echo "  4. 自定义 DNS（支持解锁 DNS）"
+        echo "  5. 恢复修改前 DNS"
+        echo "  0. 返回"
+        read -rp "请选择 [0-5]: " c
+        case "$c" in
+            1)
+                server_tool_dns_apply "1.1.1.1 8.8.8.8 2606:4700:4700::1111 2001:4860:4860::8888"
+                pause
+                ;;
+            2)
+                server_tool_dns_apply "9.9.9.9 1.1.1.1 2620:fe::fe 2606:4700:4700::1111"
+                pause
+                ;;
+            3)
+                server_tool_dns_apply "223.5.5.5 119.29.29.29 2400:3200::1 2402:4e00::"
+                pause
+                ;;
+            4)
+                echo ""
+                echo "请输入厂商提供的 DNS IP。"
+                echo "支持 IPv4 / IPv6；多个地址使用空格分隔。"
+                echo "示例: 1.2.3.4 5.6.7.8"
+                read -rp "自定义 DNS: " custom_dns
+                [[ -n "$custom_dns" ]] && server_tool_dns_apply "$custom_dns"
+                pause
+                ;;
+            5)
+                server_tool_dns_restore
+                pause
+                ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+server_tool_ip_priority_status() {
+    if platform_is_alpine; then
+        echo "Alpine/musl：不使用 gai.conf"
+        return
+    fi
+    if grep -q '^precedence ::ffff:0:0/96[[:space:]]\+100[[:space:]]*# ss2022-prefer-ipv4$' /etc/gai.conf 2>/dev/null; then
+        echo "IPv4 优先"
+    else
+        echo "系统默认（通常 IPv6 优先）"
+    fi
+}
+server_tool_ip_priority_management() {
+    local c
+    if platform_is_alpine; then
+        clear
+        echo -e "${CYAN}════════════ IPv4 / IPv6 地址优先级 ════════════${PLAIN}"
+        echo -e "${YELLOW}Alpine 使用 musl libc，/etc/gai.conf 的 glibc precedence 规则不会生效。${PLAIN}"
+        echo "因此这里不写入无效配置。"
+        echo "vps-bootstrap 业务流量请使用“全局业务出口地址族 / 应用地址族分流”；"
+        echo "需要彻底关闭某地址族时使用下方 IPv4 / IPv6 协议族管理。"
+        pause
+        return
+    fi
+    while true; do
+        clear
+        echo -e "${CYAN}════════════ IPv4 / IPv6 优先级 ════════════${PLAIN}"
+        echo "当前模式: $(server_tool_ip_priority_status)"
+        echo ""
+        echo "  1. 设置 IPv4 优先"
+        echo "  2. 恢复系统默认优先级"
+        echo "  0. 返回"
+        read -rp "请选择 [0-2]: " c
+        case "$c" in
+            1)
+                touch /etc/gai.conf
+                sed -i '/# ss2022-prefer-ipv4$/d' /etc/gai.conf
+                echo 'precedence ::ffff:0:0/96  100 # ss2022-prefer-ipv4' >> /etc/gai.conf
+                echo -e "${GREEN}✔ 已设置 IPv4 优先。${PLAIN}"; pause ;;
+            2)
+                [[ -f /etc/gai.conf ]] && sed -i '/# ss2022-prefer-ipv4$/d' /etc/gai.conf
+                echo -e "${GREEN}✔ 已恢复系统默认地址优先级。${PLAIN}"; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+server_tool_ip_family_mode() {
+    local mode="dual"
+    if [[ -f "$IP_FAMILY_MODE_FILE" ]]; then
+        mode=$(tr -d '[:space:]' < "$IP_FAMILY_MODE_FILE" 2>/dev/null)
+    fi
+    case "$mode" in
+        dual|ipv4-only|ipv6-only) echo "$mode" ;;
+        *) echo "dual" ;;
+    esac
+}
+
+server_tool_ip_family_mode_label() {
+    case "${1:-dual}" in
+        ipv4-only) echo "仅 IPv4（IPv6 已关闭）" ;;
+        ipv6-only) echo "仅 IPv6（IPv4 已关闭）" ;;
+        *) echo "IPv4 + IPv6 双栈" ;;
+    esac
+}
+
+server_tool_ip_family_mode_allows() {
+    local family="${1:-default}" mode
+    [[ "$family" == "default" ]] && return 0
+    mode=$(server_tool_ip_family_mode)
+    case "$mode:$family" in
+        dual:ipv4|dual:ipv6|ipv4-only:ipv4|ipv6-only:ipv6) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+server_tool_current_ssh_family() {
+    local peer=""
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then
+        peer=${SSH_CONNECTION%% *}
+    elif [[ -n "${SSH_CLIENT:-}" ]]; then
+        peer=${SSH_CLIENT%% *}
+    fi
+    [[ -n "$peer" ]] || { echo "unknown"; return; }
+    if [[ "$peer" == *:* ]]; then echo "ipv6"; else echo "ipv4"; fi
+}
+
+server_tool_native_family_ready() {
+    local family="$1"
+    case "$family" in
+        ipv4)
+            ip -4 addr show scope global 2>/dev/null | grep -q 'inet ' || return 1
+            ip -4 route show default 2>/dev/null | grep -q '^default ' || return 1
+            curl -4fsS --connect-timeout 4 --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q '^ip='
+            ;;
+        ipv6)
+            ip -6 addr show scope global 2>/dev/null | grep -q 'inet6 ' || return 1
+            ip -6 route show default 2>/dev/null | grep -q '^default ' || return 1
+            curl -6fsS --connect-timeout 4 --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q '^ip='
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+server_tool_ip_family_policy_conflict() {
+    local mode="$1" blocked="" global default_ref effective count i r ref fam name found=0
+    [[ "$mode" == "ipv4-only" ]] && blocked="ipv6"
+    [[ "$mode" == "ipv6-only" ]] && blocked="ipv4"
+    [[ -n "$blocked" ]] || return 1
+
+    routing_init_state || return 1
+    global=$(routing_global_ip_family)
+    default_ref=$(jq -r '.default_outbound // "direct"' "$ROUTING_FILE")
+    effective=$(routing_effective_family "$global" "$default_ref")
+    if [[ "$effective" == "$blocked" ]]; then
+        echo -e "${RED}[冲突] 全局默认出口当前固定为 $(routing_ip_family_label "$blocked")。${PLAIN}"
+        found=1
+    fi
+
+    count=$(jq '.rules|length' "$ROUTING_FILE")
+    i=0
+    while [[ $i -lt $count ]]; do
+        r=$(jq -c ".rules[$i]" "$ROUTING_FILE")
+        ref=$(jq -r '.outbound // "default"' <<<"$r")
+        fam=$(routing_effective_family "$(jq -r '.ip_family // "default"' <<<"$r")" "$ref")
+        if [[ "$fam" == "$blocked" ]]; then
+            name=$(jq -r '.name // "未命名规则"' <<<"$r")
+            echo -e "${RED}[冲突] 规则 ${name} 当前固定为 $(routing_ip_family_label "$blocked")。${PLAIN}"
+            found=1
+        fi
+        i=$((i+1))
+    done
+
+    [[ $found -eq 1 ]]
+}
+
+server_tool_install_ip_family_guard() {
+    ensure_test_dependency nft nftables || {
+        echo -e "${RED}[错误] nftables 不可用，无法安全管理 IPv4 / IPv6 关闭状态。${PLAIN}"
+        return 1
+    }
+    mkdir -p "$STATE_DIR" /usr/local/lib/ss2022 || return 1
+    chmod 700 "$STATE_DIR"
+    cat > "$IP_FAMILY_APPLY_HELPER" <<'EOF'
+#!/bin/bash
+set -u
+STATE_FILE="/etc/ss2022/ip-family-mode"
+TABLE="ss2022_ip_family"
+mode="dual"
+[[ -f "$STATE_FILE" ]] && mode=$(tr -d '[:space:]' < "$STATE_FILE" 2>/dev/null)
+command -v nft >/dev/null 2>&1 || exit 1
+nft delete table inet "$TABLE" >/dev/null 2>&1 || true
+case "$mode" in
+  dual) exit 0 ;;
+  ipv4-only|ipv6-only) ;;
+  *) exit 1 ;;
+esac
+nft add table inet "$TABLE"
+nft 'add chain inet ss2022_ip_family input { type filter hook input priority -20; policy accept; }'
+nft 'add chain inet ss2022_ip_family output { type filter hook output priority -20; policy accept; }'
+if [[ "$mode" == "ipv4-only" ]]; then
+    nft 'add rule inet ss2022_ip_family input meta nfproto ipv6 iifname != "lo" drop'
+    nft 'add rule inet ss2022_ip_family output meta nfproto ipv6 oifname != "lo" drop'
+else
+    nft 'add rule inet ss2022_ip_family input meta nfproto ipv4 iifname != "lo" drop'
+    nft 'add rule inet ss2022_ip_family output meta nfproto ipv4 oifname != "lo" drop'
+fi
+EOF
+    chmod 700 "$IP_FAMILY_APPLY_HELPER"
+
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        cat > "$IP_FAMILY_SERVICE" <<EOF
+[Unit]
+Description=vps-bootstrap IPv4/IPv6 family guard
+After=network-online.target
+Wants=network-online.target
+Before=sing-box.service ${XRAY_SERVICE_NAME}.service ${REALM_SERVICE_NAME}.service
+
+[Service]
+Type=oneshot
+ExecStart=${IP_FAMILY_APPLY_HELPER}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        chmod 644 "$IP_FAMILY_SERVICE"
+        service_daemon_reload || return 1
+    else
+        cat > "$IP_FAMILY_OPENRC_SERVICE" <<EOF
+#!/sbin/openrc-run
+description="vps-bootstrap IPv4/IPv6 family guard"
+depend() {
+    need net
+    before sing-box ${XRAY_SERVICE_NAME} ${REALM_SERVICE_NAME}
+}
+start() {
+    ebegin "Applying vps-bootstrap IP family guard"
+    ${IP_FAMILY_APPLY_HELPER}
+    eend $?
+}
+stop() {
+    return 0
+}
+EOF
+        chmod 755 "$IP_FAMILY_OPENRC_SERVICE"
+    fi
+    service_enable "$IP_FAMILY_SERVICE_NAME" || return 1
+}
+server_tool_set_ip_family_mode() {
+    local new_mode="$1" old_mode ssh_family keep_family label
+    old_mode=$(server_tool_ip_family_mode)
+    [[ "$new_mode" != "$old_mode" ]] || {
+        echo -e "${GREEN}当前已经是：$(server_tool_ip_family_mode_label "$new_mode")。${PLAIN}"
+        return 0
+    }
+
+    if [[ "$old_mode" != "dual" && "$new_mode" != "dual" ]]; then
+        echo -e "${YELLOW}[提示] 请先恢复 IPv4 + IPv6 双栈，再切换到另一单地址族模式。${PLAIN}"
+        return 1
+    fi
+
+    case "$new_mode" in
+        ipv4-only) keep_family="ipv4" ;;
+        ipv6-only) keep_family="ipv6" ;;
+        dual) keep_family="" ;;
+        *) return 1 ;;
+    esac
+
+    if [[ -n "$keep_family" ]]; then
+        ssh_family=$(server_tool_current_ssh_family)
+        if [[ "$ssh_family" != "unknown" && "$ssh_family" != "$keep_family" ]]; then
+            echo -e "${RED}[拒绝] 当前 SSH 会话正在使用 ${ssh_family^^}，不能关闭该地址族。${PLAIN}"
+            echo "请先用 ${keep_family^^} 地址重新建立 SSH 会话后再操作。"
+            return 1
+        fi
+
+        if ! server_tool_native_family_ready "$keep_family"; then
+            echo -e "${RED}[拒绝] 未确认 ${keep_family^^} 原生公网连接可用，不能关闭另一地址族。${PLAIN}"
+            return 1
+        fi
+
+        if server_tool_ip_family_policy_conflict "$new_mode"; then
+            echo -e "${RED}[拒绝] 请先调整上面的全局/应用地址族规则，再关闭协议族。${PLAIN}"
+            return 1
+        fi
+    fi
+
+    server_tool_install_ip_family_guard || return 1
+    printf '%s
+' "$new_mode" > "$IP_FAMILY_MODE_FILE" || return 1
+    chmod 600 "$IP_FAMILY_MODE_FILE"
+
+    if ! service_restart "$IP_FAMILY_SERVICE_NAME"; then
+        echo -e "${RED}[错误] 新协议族策略应用失败，正在恢复。${PLAIN}"
+        printf '%s
+' "$old_mode" > "$IP_FAMILY_MODE_FILE"
+        service_restart "$IP_FAMILY_SERVICE_NAME" >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    label=$(server_tool_ip_family_mode_label "$new_mode")
+    echo -e "${GREEN}✔ 已切换为：${label}。${PLAIN}"
+    if [[ "$new_mode" != "dual" ]]; then
+        echo -e "${YELLOW}说明: IP 地址本身不会被删除；本脚本通过独立 nftables 表阻断已关闭地址族的公网收发，因此可以安全恢复。${PLAIN}"
+    fi
+}
+
+server_tool_ip_family_status() {
+    local v4="无" v6="无" mode global
+    v4=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | head -n1)
+    v6=$(ip -6 -o addr show scope global 2>/dev/null | awk '{print $4}' | head -n1)
+    v4=${v4:-无}
+    v6=${v6:-无}
+    mode=$(server_tool_ip_family_mode)
+    global=$(routing_global_ip_family)
+    echo "  IPv4 地址     : $v4"
+    echo "  IPv6 地址     : $v6"
+    echo "  系统协议族状态 : $(server_tool_ip_family_mode_label "$mode")"
+    echo "  业务出口地址族 : $(routing_ip_family_label "$global")"
+    echo "  地址优先级     : $(server_tool_ip_priority_status)"
+}
+
+server_tool_ip_family_management() {
+    local c
+    while true; do
+        clear
+        routing_init_state >/dev/null 2>&1 || true
+        echo -e "${CYAN}════════════ IPv4 / IPv6 管理 ════════════${PLAIN}"
+        server_tool_ip_family_status
+        echo ""
+        echo "  1. IPv4 / IPv6 地址优先级"
+        echo "  2. 全局业务出口地址族（双栈 / 仅 IPv4 / 仅 IPv6）"
+        echo "  3. 应用地址族分流（YouTube / ChatGPT / MyTVSuper 等）"
+        echo "  ------------------------------------------"
+        echo "  4. 关闭 IPv4（仅保留 IPv6 公网通信）"
+        echo "  5. 关闭 IPv6（仅保留 IPv4 公网通信）"
+        echo "  6. 恢复 IPv4 + IPv6 双栈公网通信"
+        echo "  0. 返回"
+        read -rp "请选择 [0-6]: " c
+        case "$c" in
+            1) server_tool_ip_priority_management ;;
+            2) routing_global_ip_family_management ;;
+            3) routing_app_family_management ;;
+            4) server_tool_set_ip_family_mode ipv6-only; pause ;;
+            5) server_tool_set_ip_family_mode ipv4-only; pause ;;
+            6) server_tool_set_ip_family_mode dual; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+server_tool_port_usage_show_all() {
+    echo -e "${YELLOW}当前 TCP / UDP 监听端口:${PLAIN}"
+    if command -v ss >/dev/null 2>&1; then
+        ss -H -lntup 2>/dev/null | awk '
+        {
+            proto=$1
+            local_addr=$5
+            proc=""
+            for (i=6;i<=NF;i++) proc=proc $i " "
+            printf "  %-5s %-30s %s\n", proto, local_addr, proc
+        }'
+    else
+        echo "  未找到 ss 命令。"
+    fi
+
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        echo ""
+        echo -e "${YELLOW}Docker 容器端口映射:${PLAIN}"
+        docker ps --format '  {{.Names}}\t{{.Ports}}' 2>/dev/null || true
+    fi
+}
+
+server_tool_port_usage_detail() {
+    local port="$1" found=0
+
+    echo -e "${CYAN}══════════════ 端口 ${port} 占用详情 ══════════════${PLAIN}"
+
+    if command -v ss >/dev/null 2>&1; then
+        local lines
+        lines=$(ss -H -lntup 2>/dev/null | awk -v p="$port" '
+        {
+            addr=$5
+            n=split(addr,a,":")
+            if (a[n] == p) print
+        }')
+        if [[ -n "$lines" ]]; then
+            found=1
+            printf '%s\n' "$lines"
+        fi
+    fi
+
+    if command -v lsof >/dev/null 2>&1; then
+        local lsof_out
+        lsof_out=$(lsof -nP -i ":${port}" 2>/dev/null || true)
+        if [[ -n "$lsof_out" ]]; then
+            found=1
+            echo ""
+            echo -e "${YELLOW}进程详情:${PLAIN}"
+            printf '%s\n' "$lsof_out"
+        fi
+    fi
+
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        local docker_out
+        docker_out=$(docker ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null \
+            | awk -F'\t' -v p="$port" '$2 ~ ("[:]" p "->") || $2 ~ ("0\\.0\\.0\\.0:" p "->") || $2 ~ ("\\[::\\]:" p "->") {print}')
+        if [[ -n "$docker_out" ]]; then
+            found=1
+            echo ""
+            echo -e "${YELLOW}Docker 容器:${PLAIN}"
+            printf '  %s\n' "$docker_out"
+        fi
+    fi
+
+    if [[ $found -eq 0 ]]; then
+        echo -e "${GREEN}未发现端口 ${port} 被监听占用。${PLAIN}"
+    fi
+}
+
+server_tool_port_listener_lines() {
+    local port="$1"
+
+    command -v ss >/dev/null 2>&1 || return 1
+    ss -H -lntup 2>/dev/null | awk -v p="$port" '
+    {
+        addr=$5
+        n=split(addr,a,":")
+        if (a[n] == p) print
+    }'
+}
+
+server_tool_port_listener_pids() {
+    local port="$1"
+    local lines
+
+    lines=$(server_tool_port_listener_lines "$port" 2>/dev/null || true)
+    [[ -n "$lines" ]] || return 0
+
+    printf '%s\n' "$lines" \
+        | grep -oE 'pid=[0-9]+' 2>/dev/null \
+        | cut -d= -f2 \
+        | sort -nu
+}
+
+server_tool_pid_systemd_unit() {
+    local pid="$1" unit="" pf="" pf_pid="" svc=""
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        if [[ -r "/proc/${pid}/cgroup" ]]; then
+            unit=$(sed -nE 's#.*[/]([^/]+\.service)(/.*)?$#\1#p' "/proc/${pid}/cgroup" 2>/dev/null | head -n1)
+        fi
+        if [[ -z "$unit" ]]; then
+            unit=$(systemctl status "$pid" --no-pager 2>/dev/null | sed -nE 's/^[[:space:]]*●[[:space:]]+([^[:space:]]+\.service).*/\1/p' | head -n1)
+        fi
+        [[ -n "$unit" ]] && printf '%s\n' "$unit"
+        return
+    fi
+
+    # OpenRC 没有 systemd cgroup unit 映射；优先从常见 pidfile 反查 init.d 服务。
+    for pf in /run/*.pid /run/*/*.pid /var/run/*.pid /var/run/*/*.pid; do
+        [[ -r "$pf" ]] || continue
+        pf_pid=$(head -n1 "$pf" 2>/dev/null | tr -dc '0-9')
+        [[ "$pf_pid" == "$pid" ]] || continue
+        svc=${pf##*/}; svc=${svc%.pid}
+        [[ -x "/etc/init.d/$svc" ]] || continue
+        printf '%s\n' "$svc"
+        return 0
+    done
+
+    for svc in sing-box "$XRAY_SERVICE_NAME" "$REALM_SERVICE_NAME" sshd chronyd ntpd crond; do
+        [[ -x "/etc/init.d/$svc" ]] || continue
+        [[ "$(service_main_pid "$svc" 2>/dev/null || true)" == "$pid" ]] || continue
+        printf '%s\n' "$svc"
+        return 0
+    done
+    return 1
+}
+server_tool_port_docker_containers() {
+    local port="$1"
+
+    command -v docker >/dev/null 2>&1 || return 0
+    docker info >/dev/null 2>&1 || return 0
+
+    docker ps --format '{{.ID}}\t{{.Names}}\t{{.Ports}}' 2>/dev/null \
+        | awk -F'\t' -v p="$port" '
+          $3 ~ ("0\\.0\\.0\\.0:" p "->") ||
+          $3 ~ ("\\[::\\]:" p "->") ||
+          $3 ~ ("127\\.0\\.0\\.1:" p "->") {
+              print
+          }'
+}
+
+server_tool_port_is_current_ssh() {
+    local port="$1"
+    local ssh_port=""
+
+    [[ -n "${SSH_CONNECTION:-}" ]] || return 1
+    ssh_port=$(awk '{print $4}' <<<"$SSH_CONNECTION")
+    [[ "$ssh_port" == "$port" ]]
+}
+
+server_tool_port_release_show_targets() {
+    local port="$1"
+    local pids pid comm args unit docker_lines lines
+
+    echo -e "${CYAN}══════════════ 端口 ${port} 当前占用 ══════════════${PLAIN}"
+
+    lines=$(server_tool_port_listener_lines "$port" 2>/dev/null || true)
+    if [[ -z "$lines" ]]; then
+        echo -e "${GREEN}当前没有发现监听进程，端口 ${port} 已经空闲。${PLAIN}"
+        return 1
+    fi
+
+    printf '%s\n' "$lines"
+    echo ""
+
+    pids=$(server_tool_port_listener_pids "$port" 2>/dev/null || true)
+    if [[ -n "$pids" ]]; then
+        echo -e "${YELLOW}监听进程:${PLAIN}"
+        while read -r pid; do
+            [[ -n "$pid" ]] || continue
+            comm=$(ps -p "$pid" -o comm= 2>/dev/null | xargs || true)
+            args=$(ps -p "$pid" -o args= 2>/dev/null | xargs || true)
+            unit=$(server_tool_pid_systemd_unit "$pid" 2>/dev/null || true)
+
+            echo "  PID     : ${pid}"
+            echo "  进程    : ${comm:-未知}"
+            [[ -n "$unit" ]] && echo "  服务    : ${unit}"
+            echo "  命令    : ${args:-未知}"
+            echo ""
+        done <<<"$pids"
+    else
+        echo -e "${YELLOW}[提示] ss 没有返回可识别 PID，可能是权限、内核或容器网络限制。${PLAIN}"
+        echo ""
+    fi
+
+    docker_lines=$(server_tool_port_docker_containers "$port" 2>/dev/null || true)
+    if [[ -n "$docker_lines" ]]; then
+        echo -e "${YELLOW}Docker 容器端口映射:${PLAIN}"
+        while IFS=$'\t' read -r cid cname cports; do
+            echo "  容器    : ${cname} (${cid})"
+            echo "  映射    : ${cports}"
+        done <<<"$docker_lines"
+        echo ""
+    fi
+
+    return 0
+}
+
+server_tool_port_stop_systemd_units() {
+    local port="$1" disable="${2:-no}" pids pid unit svc
+    local -A seen_units=()
+    local found=0 failed=0
+
+    pids=$(server_tool_port_listener_pids "$port" 2>/dev/null || true)
+    [[ -n "$pids" ]] || { echo -e "${YELLOW}没有发现可识别的监听 PID。${PLAIN}"; return 1; }
+
+    while read -r pid; do
+        [[ -n "$pid" ]] || continue
+        unit=$(server_tool_pid_systemd_unit "$pid" 2>/dev/null || true)
+        [[ -n "$unit" ]] || continue
+        [[ -n "${seen_units[$unit]:-}" ]] && continue
+        seen_units["$unit"]=1
+        found=1
+        svc=${unit%.service}
+        case "$svc" in
+            ssh|sshd)
+                echo -e "${RED}[拒绝] 不允许通过端口释放工具停止 SSH 服务：${svc}${PLAIN}"
+                failed=1; continue ;;
+        esac
+        echo -e "${YELLOW}>> 处理服务 ${svc}...${PLAIN}"
+        if [[ "$disable" == "yes" ]]; then
+            service_disable_now "$svc"
+            if service_is_active "$svc"; then
+                echo -e "${RED}[错误] ${svc} 停止/禁用失败。${PLAIN}"; failed=1
+            else
+                echo -e "${GREEN}✔ ${svc} 已停止并移除开机自启。${PLAIN}"
+            fi
+        else
+            if service_stop "$svc"; then
+                echo -e "${GREEN}✔ ${svc} 已停止。${PLAIN}"
+            else
+                echo -e "${RED}[错误] ${svc} 停止失败。${PLAIN}"; failed=1
+            fi
+        fi
+    done <<<"$pids"
+
+    [[ $found -eq 1 ]] || { echo -e "${YELLOW}没有检测到对应的系统服务。${PLAIN}"; return 1; }
+    sleep 1
+    [[ -z "$(server_tool_port_listener_lines "$port" 2>/dev/null || true)" ]] || {
+        echo -e "${YELLOW}[提示] 端口 ${port} 仍有监听进程，请重新查看占用详情。${PLAIN}"
+        return 1
+    }
+    [[ $failed -eq 0 ]]
+}
+server_tool_port_stop_docker() {
+    local port="$1"
+    local docker_lines cid cname cports
+    local found=0 failed=0
+
+    docker_lines=$(server_tool_port_docker_containers "$port" 2>/dev/null || true)
+    [[ -n "$docker_lines" ]] || {
+        echo -e "${YELLOW}没有发现映射端口 ${port} 的 Docker 容器。${PLAIN}"
+        return 1
+    }
+
+    while IFS=$'\t' read -r cid cname cports; do
+        [[ -n "$cid" ]] || continue
+        found=1
+        echo -e "${YELLOW}>> 停止 Docker 容器 ${cname} (${cid})...${PLAIN}"
+        if docker stop "$cid"; then
+            echo -e "${GREEN}✔ 容器 ${cname} 已停止。${PLAIN}"
+        else
+            echo -e "${RED}[错误] 容器 ${cname} 停止失败。${PLAIN}"
+            failed=1
+        fi
+    done <<<"$docker_lines"
+
+    sleep 1
+    if [[ -n "$(server_tool_port_listener_lines "$port" 2>/dev/null || true)" ]]; then
+        echo -e "${YELLOW}[提示] 端口 ${port} 仍有监听进程。${PLAIN}"
+        return 1
+    fi
+
+    [[ $found -eq 1 && $failed -eq 0 ]]
+}
+
+server_tool_port_terminate_processes() {
+    local port="$1"
+    local pids pid comm confirm
+    local -a targets=()
+    local -a remaining=()
+
+    pids=$(server_tool_port_listener_pids "$port" 2>/dev/null || true)
+    [[ -n "$pids" ]] || {
+        echo -e "${YELLOW}没有发现可结束的监听 PID。${PLAIN}"
+        return 1
+    }
+
+    while read -r pid; do
+        [[ -n "$pid" ]] || continue
+
+        if [[ "$pid" == "1" || "$pid" == "$$" || "$pid" == "$PPID" ]]; then
+            echo -e "${RED}[拒绝] PID ${pid} 属于关键/当前进程，不允许结束。${PLAIN}"
+            continue
+        fi
+
+        comm=$(ps -p "$pid" -o comm= 2>/dev/null | xargs || true)
+        case "$comm" in
+            sshd|systemd|init)
+                echo -e "${RED}[拒绝] 不允许直接结束关键进程 ${comm} (PID ${pid})。${PLAIN}"
+                continue
+                ;;
+        esac
+
+        targets+=("$pid")
+    done <<<"$pids"
+
+    [[ ${#targets[@]} -gt 0 ]] || {
+        echo -e "${RED}[错误] 没有安全可结束的监听进程。${PLAIN}"
+        return 1
+    }
+
+    echo ""
+    echo -e "${YELLOW}[警告] 将直接结束以下 PID：${targets[*]}${PLAIN}"
+    echo "优先发送 SIGTERM。"
+    read -rp "确认直接结束进程？请输入 RELEASE: " confirm
+    [[ "$confirm" == "RELEASE" ]] || {
+        echo "已取消。"
+        return 0
+    }
+
+    for pid in "${targets[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+
+    sleep 2
+
+    for pid in "${targets[@]}"; do
+        kill -0 "$pid" 2>/dev/null && remaining+=("$pid")
+    done
+
+    if [[ ${#remaining[@]} -gt 0 ]]; then
+        echo -e "${YELLOW}[提示] PID ${remaining[*]} 在 SIGTERM 后仍未退出。${PLAIN}"
+        read -rp "如确认强制结束，请输入 KILL: " confirm
+        if [[ "$confirm" == "KILL" ]]; then
+            for pid in "${remaining[@]}"; do
+                kill -9 "$pid" 2>/dev/null || true
+            done
+            sleep 1
+        else
+            echo "已取消强制结束。"
+        fi
+    fi
+
+    if [[ -z "$(server_tool_port_listener_lines "$port" 2>/dev/null || true)" ]]; then
+        echo -e "${GREEN}✔ 端口 ${port} 已释放。${PLAIN}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}[提示] 端口 ${port} 仍被占用。若进程自动重启，通常说明背后还有 systemd / OpenRC / Docker / Supervisor 等守护机制。${PLAIN}"
+    return 1
+}
+
+server_tool_port_release() {
+    local port c
+    local docker_lines pids pid unit has_unit=0
+
+    clear
+    echo -e "${CYAN}════════════════ 当前全部监听端口 ════════════════${PLAIN}"
+    server_tool_port_usage_show_all
+    echo ""
+    echo -e "${YELLOW}请输入需要释放的端口号；输入 0 返回。${PLAIN}"
+    read -rp "端口号 [0=返回]: " port
+
+    [[ "$port" == "0" ]] && return
+
+    if ! validate_port_number "$port"; then
+        echo -e "${RED}端口无效。${PLAIN}"
+        pause
+        return
+    fi
+
+    if server_tool_port_is_current_ssh "$port"; then
+        echo -e "${RED}════════════════ 安全保护 ════════════════${PLAIN}"
+        echo -e "${RED}[拒绝] 端口 ${port} 正是当前 SSH 会话使用的服务器端口。${PLAIN}"
+        echo -e "${YELLOW}为了避免把当前远程连接直接断开，本工具不会释放该端口。${PLAIN}"
+        pause
+        return
+    fi
+
+    clear
+    if ! server_tool_port_release_show_targets "$port"; then
+        pause
+        return
+    fi
+
+    pids=$(server_tool_port_listener_pids "$port" 2>/dev/null || true)
+    while read -r pid; do
+        [[ -n "$pid" ]] || continue
+        unit=$(server_tool_pid_systemd_unit "$pid" 2>/dev/null || true)
+        if [[ -n "$unit" && "$unit" != "ssh.service" && "$unit" != "sshd.service" ]]; then
+            has_unit=1
+            break
+        fi
+    done <<<"$pids"
+
+    docker_lines=$(server_tool_port_docker_containers "$port" 2>/dev/null || true)
+
+    echo "请选择释放方式："
+    if [[ $has_unit -eq 1 ]]; then
+        echo "  1. 停止对应系统服务"
+        echo "  2. 停止并禁用对应系统服务"
+    else
+        echo "  1. 停止对应系统服务（未检测到）"
+        echo "  2. 停止并禁用对应系统服务（未检测到）"
+    fi
+
+    if [[ -n "$docker_lines" ]]; then
+        echo "  3. 停止对应 Docker 容器"
+    else
+        echo "  3. 停止对应 Docker 容器（未检测到）"
+    fi
+
+    echo "  4. 直接结束监听进程"
+    echo "  0. 取消"
+    read -rp "请选择 [0-4]: " c
+
+    case "$c" in
+        1)
+            server_tool_port_stop_systemd_units "$port" "no"
+            ;;
+        2)
+            echo -e "${YELLOW}[注意] 该操作会同时取消对应服务的开机自启。${PLAIN}"
+            read -rp "确认继续？请输入 DISABLE: " c
+            [[ "$c" == "DISABLE" ]] && server_tool_port_stop_systemd_units "$port" "yes"
+            ;;
+        3)
+            server_tool_port_stop_docker "$port"
+            ;;
+        4)
+            server_tool_port_terminate_processes "$port"
+            ;;
+        0)
+            return
+            ;;
+        *)
+            echo -e "${RED}输入无效。${PLAIN}"
+            ;;
+    esac
+
+    echo ""
+    if [[ -n "$(server_tool_port_listener_lines "$port" 2>/dev/null || true)" ]]; then
+        echo -e "${YELLOW}端口 ${port} 当前仍有监听：${PLAIN}"
+        server_tool_port_listener_lines "$port"
+    else
+        echo -e "${GREEN}✔ 端口 ${port} 当前已空闲。${PLAIN}"
+    fi
+    pause
+}
+
+server_tool_port_usage() {
+    local c port
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ 端口占用 ════════════════════${PLAIN}"
+        echo "  1. 查看全部监听端口"
+        echo "  2. 查询指定端口"
+        echo "  3. 释放指定端口"
+        echo "  0. 返回"
+        echo -e "${CYAN}═══════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-3]: " c
+        case "$c" in
+            1)
+                clear
+                server_tool_port_usage_show_all
+                pause
+                ;;
+            2)
+                read -rp "请输入端口号: " port
+                if ! validate_port_number "$port"; then
+                    echo -e "${RED}端口无效。${PLAIN}"
+                    pause
+                    continue
+                fi
+                clear
+                server_tool_port_usage_detail "$port"
+                pause
+                ;;
+            3)
+                server_tool_port_release
+                ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+server_tool_timezone_management() {
+    local c zone
+    if platform_is_alpine && [[ ! -e /usr/share/zoneinfo/UTC ]]; then
+        pkg_install tzdata || { echo -e "${RED}[错误] tzdata 安装失败。${PLAIN}"; pause; return; }
+    fi
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ 时区管理 ════════════════════${PLAIN}"
+        echo "当前时区: $(timedatectl show -p Timezone --value 2>/dev/null || date +%Z)"
+        echo ""
+        echo "  1. UTC"
+        echo "  2. Asia/Shanghai"
+        echo "  3. Asia/Tokyo"
+        echo "  4. America/Los_Angeles"
+        echo "  5. Europe/London"
+        echo "  6. 自定义 IANA 时区"
+        echo "  0. 返回"
+        read -rp "请选择 [0-6]: " c
+        case "$c" in
+            1) zone="UTC" ;;
+            2) zone="Asia/Shanghai" ;;
+            3) zone="Asia/Tokyo" ;;
+            4) zone="America/Los_Angeles" ;;
+            5) zone="Europe/London" ;;
+            6)
+                read -rp "请输入时区，例如 Asia/Singapore: " zone
+                ;;
+            0) return ;;
+            *) sleep 1; continue ;;
+        esac
+
+        if command -v timedatectl >/dev/null 2>&1 && timedatectl list-timezones 2>/dev/null | grep -Fxq "$zone"; then
+            timedatectl set-timezone "$zone" &&
+                echo -e "${GREEN}✔ 时区已设置为 ${zone}。${PLAIN}"
+        elif [[ -e "/usr/share/zoneinfo/${zone}" ]]; then
+            ln -sf "/usr/share/zoneinfo/${zone}" /etc/localtime
+            echo "$zone" > /etc/timezone 2>/dev/null || true
+            echo -e "${GREEN}✔ 时区已设置为 ${zone}。${PLAIN}"
+        else
+            echo -e "${RED}[错误] 无效时区: ${zone}${PLAIN}"
+        fi
+        pause
+    done
+}
+
+server_tool_ssh_ports() {
+    if command -v sshd >/dev/null 2>&1; then
+        sshd -T 2>/dev/null | awk '$1=="port" {print $2}' | sort -nu
+    fi
+}
+
+server_tool_ssh_add_port() {
+    local new_port old_ports target_conf service_name backup ans tmp_main use_dropin="no"
+    local include_dir="/etc/ssh/sshd_config.d"
+    local dropin="${include_dir}/99-ss2022-port.conf"
+    local main_conf="/etc/ssh/sshd_config"
+
+    command -v sshd >/dev/null 2>&1 || { echo -e "${RED}[错误] 未找到 sshd。${PLAIN}"; return 1; }
+    old_ports=$(server_tool_ssh_ports)
+    echo "当前 SSH 端口: $(tr '\n' ' ' <<<"$old_ports")"
+    read -rp "请输入要新增的 SSH 端口: " new_port
+    validate_port_number "$new_port" || { echo -e "${RED}[错误] 端口无效。${PLAIN}"; return 1; }
+    if grep -qx "$new_port" <<<"$old_ports"; then
+        echo -e "${YELLOW}该端口已经是 SSH 监听端口。${PLAIN}"; return 0
+    fi
+    if port_in_use_by_other_process "$new_port" "" >/tmp/ss2022-ssh-port.$$ 2>/dev/null; then
+        echo -e "${RED}[错误] 端口 ${new_port} 已被其他进程占用。${PLAIN}"
+        cat /tmp/ss2022-ssh-port.$$ 2>/dev/null || true; rm -f /tmp/ss2022-ssh-port.$$; return 1
+    fi
+    rm -f /tmp/ss2022-ssh-port.$$ 2>/dev/null || true
+    echo -e "${YELLOW}[安全策略] 新端口会与现有 SSH 端口同时保留，不会删除旧端口。${PLAIN}"
+    echo -e "${YELLOW}还需确认云厂商安全组/防火墙已放行 ${new_port}/TCP。${PLAIN}"
+    read -rp "确认新增？[y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || return 0
+
+    if grep -Eiq '^[[:space:]]*Include[[:space:]]+.*sshd_config\.d' "$main_conf" 2>/dev/null; then
+        use_dropin="yes"
+        mkdir -p "$include_dir"
+        target_conf="$dropin"
+        backup="${dropin}.bak.$(date +%Y%m%d-%H%M%S)"
+        [[ -f "$dropin" ]] && cp -a "$dropin" "$backup"
+        {
+            echo "# Managed by ss2022.sh - preserve existing SSH ports"
+            while read -r p; do [[ -n "$p" ]] && echo "Port $p"; done <<<"$old_ports"
+            echo "Port $new_port"
+        } > "$dropin"
+    else
+        target_conf="$main_conf"
+        backup="${STATE_DIR}/sshd_config.bak.$(date +%Y%m%d-%H%M%S)"
+        mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
+        cp -a "$main_conf" "$backup" || return 1
+        tmp_main=$(mktemp /tmp/ss2022-sshd.XXXXXX) || return 1
+        awk '
+          $0=="# BEGIN ss2022 managed ports" {skip=1; next}
+          $0=="# END ss2022 managed ports" {skip=0; next}
+          !skip {print}
+        ' "$main_conf" > "$tmp_main"
+        {
+            cat "$tmp_main"
+            echo "# BEGIN ss2022 managed ports"
+            while read -r p; do [[ -n "$p" ]] && echo "Port $p"; done <<<"$old_ports"
+            echo "Port $new_port"
+            echo "# END ss2022 managed ports"
+        } > "$main_conf"
+        rm -f "$tmp_main"
+    fi
+
+    if ! sshd -t; then
+        echo -e "${RED}[错误] sshd 配置校验失败，正在回滚。${PLAIN}"
+        if [[ "$use_dropin" == "yes" ]]; then
+            [[ -f "$backup" ]] && mv -f "$backup" "$dropin" || rm -f "$dropin"
+        else
+            cp -af "$backup" "$main_conf"
+        fi
+        sshd -t >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    if service_exists ssh; then service_name="ssh"; else service_name="sshd"; fi
+    if ! service_reload "$service_name" 2>/dev/null; then
+        echo -e "${RED}[错误] SSH reload 失败，正在回滚。${PLAIN}"
+        if [[ "$use_dropin" == "yes" ]]; then
+            [[ -f "$backup" ]] && mv -f "$backup" "$dropin" || rm -f "$dropin"
+        else
+            cp -af "$backup" "$main_conf"
+        fi
+        service_reload "$service_name" >/dev/null 2>&1 || true
+        return 1
+    fi
+    sleep 1
+    if ss -H -lnt 2>/dev/null | awk -v p="$new_port" '{addr=$4; n=split(addr,a,":"); if (a[n]==p) found=1} END {exit !found}'; then
+        rm -f "$backup"
+        echo -e "${GREEN}✔ SSH 已新增端口 ${new_port}，旧端口继续保留。${PLAIN}"
+        echo -e "${YELLOW}请先新开一个 SSH 会话验证 ${new_port} 可登录，再考虑手工移除旧端口。${PLAIN}"
+        return 0
+    fi
+    echo -e "${YELLOW}[警告] sshd 配置已通过，但暂未检测到 ${new_port} 正在监听。请不要关闭当前 SSH 会话。${PLAIN}"
+    return 1
+}
+server_tool_ssh_management() {
+    local c
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ SSH 端口 ════════════════════${PLAIN}"
+        echo "当前端口:"
+        server_tool_ssh_ports | sed 's/^/  - /'
+        echo ""
+        echo "  1. 安全新增 SSH 端口（保留旧端口）"
+        echo "  0. 返回"
+        read -rp "请选择 [0-1]: " c
+        case "$c" in
+            1) server_tool_ssh_add_port; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+server_tool_tg_monitor_ensure_worker() {
+    install -d -m 755 /usr/local/lib/ss2022 || return 1
+    mkdir -p "$STATE_DIR" || return 1
+    chmod 700 "$STATE_DIR"
+    cat > "$TG_MONITOR_WORKER" <<'TGWORKER'
+#!/bin/bash
+set -u
+CONF="/etc/ss2022/tg-monitor.conf"
+STATE="/etc/ss2022/tg-monitor.state"
+LOCKDIR="/run/ss2022-tg-monitor.lockdir"
+[[ -f "$CONF" ]] || exit 0
+# shellcheck disable=SC1090
+source "$CONF"
+if ! mkdir "$LOCKDIR" 2>/dev/null; then exit 0; fi
+trap 'rmdir "$LOCKDIR" >/dev/null 2>&1 || true' EXIT INT TERM
+
+send_tg() {
+    local msg="$1"
+    [[ -n "${TG_BOT_TOKEN:-}" && -n "${TG_CHAT_ID:-}" ]] || return 0
+    curl -fsS --connect-timeout 5 --max-time 10 -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" --data-urlencode "chat_id=${TG_CHAT_ID}" --data-urlencode "text=${msg}" >/dev/null 2>&1 || true
+}
+traffic_bytes() {
+    awk 'BEGIN {rx=0;tx=0} {iface=$1;gsub(":","",iface); if (iface ~ /^(eth|ens|enp|eno|venet|bond)[A-Za-z0-9_.-]*$/) {rx+=$2;tx+=$10}} END {printf "%.0f %.0f\n",rx,tx}' /proc/net/dev
+}
+period_key() {
+    local day now_day year month prev_year prev_month
+    day="${RESET_DAY:-1}"; now_day=$(date +%d | sed 's/^0//'); year=$(date +%Y); month=$(date +%m | sed 's/^0//')
+    if [[ "$now_day" -ge "$day" ]]; then printf "%04d-%02d" "$year" "$month"; return; fi
+    if [[ "$month" -eq 1 ]]; then prev_year=$((year-1)); prev_month=12; else prev_year=$year; prev_month=$((month-1)); fi
+    printf "%04d-%02d" "$prev_year" "$prev_month"
+}
+human_gb() { awk -v b="$1" 'BEGIN {printf "%.2f",b/1073741824}'; }
+percent_of() { local bytes="$1" limit_gb="$2"; if [[ ! "$limit_gb" =~ ^[0-9]+$ || "$limit_gb" -le 0 ]]; then echo 0; else awk -v b="$bytes" -v g="$limit_gb" 'BEGIN {printf "%.0f",(b/(g*1073741824))*100}'; fi; }
+CURRENT_RX=0; CURRENT_TX=0; read -r CURRENT_RX CURRENT_TX < <(traffic_bytes)
+PERIOD="$(period_key)"
+LAST_RX=0; LAST_TX=0; TOTAL_RX=0; TOTAL_TX=0; STATE_PERIOD=""
+RX_WARN1=0; RX_WARN2=0; RX_CRITICAL=0; TX_WARN1=0; TX_WARN2=0; TX_CRITICAL=0
+if [[ -f "$STATE" ]]; then
+    # shellcheck disable=SC1090
+    source "$STATE"
+fi
+if [[ "$STATE_PERIOD" != "$PERIOD" ]]; then
+    STATE_PERIOD="$PERIOD"; LAST_RX="$CURRENT_RX"; LAST_TX="$CURRENT_TX"; TOTAL_RX=0; TOTAL_TX=0
+    RX_WARN1=0; RX_WARN2=0; RX_CRITICAL=0; TX_WARN1=0; TX_WARN2=0; TX_CRITICAL=0
+else
+    if [[ "$CURRENT_RX" -ge "$LAST_RX" ]]; then TOTAL_RX=$((TOTAL_RX+CURRENT_RX-LAST_RX)); else TOTAL_RX=$((TOTAL_RX+CURRENT_RX)); fi
+    if [[ "$CURRENT_TX" -ge "$LAST_TX" ]]; then TOTAL_TX=$((TOTAL_TX+CURRENT_TX-LAST_TX)); else TOTAL_TX=$((TOTAL_TX+CURRENT_TX)); fi
+    LAST_RX="$CURRENT_RX"; LAST_TX="$CURRENT_TX"
+fi
+HOST_LABEL="${HOST_LABEL:-$(hostname)}"; WARN1_PERCENT="${WARN1_PERCENT:-80}"; WARN2_PERCENT="${WARN2_PERCENT:-90}"; AUTO_SHUTDOWN="${AUTO_SHUTDOWN:-no}"; SHUTDOWN_PERCENT="${SHUTDOWN_PERCENT:-95}"
+rx_percent=$(percent_of "$TOTAL_RX" "${RX_LIMIT_GB:-0}"); tx_percent=$(percent_of "$TOTAL_TX" "${TX_LIMIT_GB:-0}")
+rx_gb=$(human_gb "$TOTAL_RX"); tx_gb=$(human_gb "$TOTAL_TX")
+notify_threshold() {
+    local direction="$1" percent="$2" used_gb="$3" limit="$4" warn1_var warn2_var critical_var
+    if [[ "$direction" == "入站" ]]; then warn1_var="RX_WARN1"; warn2_var="RX_WARN2"; critical_var="RX_CRITICAL"; else warn1_var="TX_WARN1"; warn2_var="TX_WARN2"; critical_var="TX_CRITICAL"; fi
+    [[ "$limit" =~ ^[0-9]+$ && "$limit" -gt 0 ]] || return 0
+    if [[ "$percent" -ge 100 && "${!critical_var}" -eq 0 ]]; then
+        printf -v "$critical_var" 1
+        send_tg "🚨 ${HOST_LABEL}\n${direction}流量已达到 ${used_gb} GB / ${limit} GB（${percent}%）\n已达到流量上限。"
+    elif [[ "$percent" -ge "$WARN2_PERCENT" && "${!warn2_var}" -eq 0 ]]; then
+        printf -v "$warn2_var" 1
+        send_tg "⚠️ ${HOST_LABEL}\n${direction}流量已达到 ${used_gb} GB / ${limit} GB（${percent}%）\n已达到第二预警线 ${WARN2_PERCENT}%。"
+    elif [[ "$percent" -ge "$WARN1_PERCENT" && "${!warn1_var}" -eq 0 ]]; then
+        printf -v "$warn1_var" 1
+        send_tg "⚠️ ${HOST_LABEL}\n${direction}流量已达到 ${used_gb} GB / ${limit} GB（${percent}%）\n已达到第一预警线 ${WARN1_PERCENT}%。"
+    fi
+}
+notify_threshold "入站" "$rx_percent" "$rx_gb" "${RX_LIMIT_GB:-0}"
+notify_threshold "出站" "$tx_percent" "$tx_gb" "${TX_LIMIT_GB:-0}"
+tmp="${STATE}.tmp.$$"; umask 077
+cat > "$tmp" <<EOF
+STATE_PERIOD='${STATE_PERIOD}'
+LAST_RX=${LAST_RX}
+LAST_TX=${LAST_TX}
+TOTAL_RX=${TOTAL_RX}
+TOTAL_TX=${TOTAL_TX}
+RX_WARN1=${RX_WARN1}
+RX_WARN2=${RX_WARN2}
+RX_CRITICAL=${RX_CRITICAL}
+TX_WARN1=${TX_WARN1}
+TX_WARN2=${TX_WARN2}
+TX_CRITICAL=${TX_CRITICAL}
+EOF
+mv -f "$tmp" "$STATE"; chmod 600 "$STATE"
+shutdown_needed=0
+if [[ "${RX_LIMIT_GB:-0}" =~ ^[0-9]+$ && "${RX_LIMIT_GB:-0}" -gt 0 && "$rx_percent" -ge "$SHUTDOWN_PERCENT" ]]; then shutdown_needed=1; fi
+if [[ "${TX_LIMIT_GB:-0}" =~ ^[0-9]+$ && "${TX_LIMIT_GB:-0}" -gt 0 && "$tx_percent" -ge "$SHUTDOWN_PERCENT" ]]; then shutdown_needed=1; fi
+if [[ "$shutdown_needed" -eq 1 && "$AUTO_SHUTDOWN" == "yes" ]]; then
+    send_tg "⛔ ${HOST_LABEL}\n流量达到自动关机阈值 ${SHUTDOWN_PERCENT}%，服务器即将自动关机。"
+    sync
+    shutdown -h now
+fi
+TGWORKER
+    chmod 700 "$TG_MONITOR_WORKER"
+
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        cat > "$TG_MONITOR_SERVICE" <<EOF
+[Unit]
+Description=ss2022 TG-BOT Traffic Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${TG_MONITOR_WORKER}
+EOF
+        cat > "$TG_MONITOR_TIMER" <<'EOF'
+[Unit]
+Description=Run ss2022 TG-BOT Traffic Monitor Every Minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=5s
+Persistent=true
+Unit=ss2022-tg-monitor.service
+
+[Install]
+WantedBy=timers.target
+EOF
+        service_daemon_reload || return 1
+    else
+        mkdir -p "$(dirname "$TG_MONITOR_CRON_FILE")"
+        touch "$TG_MONITOR_CRON_FILE"
+        sed -i "/ss2022-tg-monitor/d" "$TG_MONITOR_CRON_FILE"
+        echo "* * * * * $TG_MONITOR_WORKER >/dev/null 2>&1 $TG_MONITOR_CRON_TAG" >> "$TG_MONITOR_CRON_FILE"
+        service_enable_now crond >/dev/null 2>&1 || {
+            echo -e "${RED}[错误] OpenRC crond 启动失败。${PLAIN}"
+            return 1
+        }
+    fi
+}
+
+server_tool_tg_monitor_send_test() {
+    local token chat_id host
+    [[ -f "$TG_MONITOR_CONF" ]] || {
+        echo -e "${YELLOW}尚未配置 TG-BOT 流量监控。${PLAIN}"
+        return 1
+    }
+
+    # shellcheck disable=SC1090
+    source "$TG_MONITOR_CONF"
+    token="${TG_BOT_TOKEN:-}"
+    chat_id="${TG_CHAT_ID:-}"
+    host="${HOST_LABEL:-$(hostname)}"
+
+    if curl -fsS --connect-timeout 5 --max-time 10 \
+        -X POST "https://api.telegram.org/bot${token}/sendMessage" \
+        --data-urlencode "chat_id=${chat_id}" \
+        --data-urlencode "text=✅ ${host}：ss2022 TG-BOT 流量监控测试消息发送成功。" \
+        >/dev/null 2>&1; then
+        echo -e "${GREEN}✔ Telegram 测试消息已发送。${PLAIN}"
+        return 0
+    fi
+
+    echo -e "${RED}[错误] Telegram 消息发送失败，请检查 Bot Token、Chat ID 和服务器网络。${PLAIN}"
+    return 1
+}
+
+server_tool_tg_monitor_configure() {
+    local token chat_id rx_limit tx_limit reset_day warn1 warn2 shutdown_percent auto_shutdown host_label
+    local current_token="" current_chat="" ans
+
+    if [[ -f "$TG_MONITOR_CONF" ]]; then
+        # shellcheck disable=SC1090
+        source "$TG_MONITOR_CONF"
+        current_token="${TG_BOT_TOKEN:-}"
+        current_chat="${TG_CHAT_ID:-}"
+    fi
+
+    clear
+    echo -e "${CYAN}════════════ TG-BOT 流量监控配置 ════════════${PLAIN}"
+    echo "说明："
+    echo "  - 每分钟累计公网网卡收发流量；累计状态写入磁盘，重启 VPS 后不会清零。"
+    echo "  - 默认在 80% / 90% / 100% 三个阶段发送 Telegram 预警。"
+    echo "  - 自动关机阈值独立配置，默认 95%。"
+    echo "  - 新启用时从当前流量计数作为起点，只统计启用后的流量。"
+    echo ""
+
+    if [[ -n "$current_token" ]]; then
+        read -rp "Telegram Bot Token [回车保持现有 Token]: " token
+        token=${token:-$current_token}
+    else
+        read -rp "Telegram Bot Token: " token
+    fi
+
+    if [[ ! "$token" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then
+        echo -e "${RED}[错误] Bot Token 格式不正确。${PLAIN}"
+        pause
+        return
+    fi
+
+    if [[ -n "$current_chat" ]]; then
+        read -rp "Telegram Chat ID [回车保持: ${current_chat}]: " chat_id
+        chat_id=${chat_id:-$current_chat}
+    else
+        read -rp "Telegram Chat ID: " chat_id
+    fi
+
+    if [[ ! "$chat_id" =~ ^-?[0-9]+$ ]]; then
+        echo -e "${RED}[错误] Chat ID 应为数字，可为负数（群组）。${PLAIN}"
+        pause
+        return
+    fi
+
+    read -rp "每月入站流量上限 GB [默认 1000，0=不限制]: " rx_limit
+    rx_limit=${rx_limit:-1000}
+    read -rp "每月出站流量上限 GB [默认 1000，0=不限制]: " tx_limit
+    tx_limit=${tx_limit:-1000}
+    read -rp "每月流量重置日 [默认 1，范围 1-28]: " reset_day
+    reset_day=${reset_day:-1}
+    read -rp "第一预警百分比 [默认 80]: " warn1
+    warn1=${warn1:-80}
+    read -rp "第二预警百分比 [默认 90]: " warn2
+    warn2=${warn2:-90}
+    read -rp "自动关机阈值百分比 [默认 95]: " shutdown_percent
+    shutdown_percent=${shutdown_percent:-95}
+
+    for n in "$rx_limit" "$tx_limit" "$reset_day" "$warn1" "$warn2" "$shutdown_percent"; do
+        [[ "$n" =~ ^[0-9]+$ ]] || {
+            echo -e "${RED}[错误] 阈值必须为整数。${PLAIN}"
+            pause
+            return
+        }
+    done
+
+    if [[ "$reset_day" -lt 1 || "$reset_day" -gt 28 ]]; then
+        echo -e "${RED}[错误] 重置日必须为 1-28。${PLAIN}"
+        pause
+        return
+    fi
+
+    if [[ "$warn1" -lt 1 || "$warn1" -ge "$warn2" || "$warn2" -ge 100 ]]; then
+        echo -e "${RED}[错误] 预警比例必须满足 1 <= 第一预警 < 第二预警 < 100。${PLAIN}"
+        pause
+        return
+    fi
+
+    if [[ "$shutdown_percent" -lt 1 || "$shutdown_percent" -gt 100 ]]; then
+        echo -e "${RED}[错误] 自动关机阈值必须在 1-100%。${PLAIN}"
+        pause
+        return
+    fi
+
+    read -rp "达到 ${shutdown_percent}% 后自动关机？[y/N]: " ans
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+        auto_shutdown="yes"
+        echo -e "${YELLOW}[警告] 自动关机启用后，任一启用方向达到 ${shutdown_percent}% 会执行 shutdown -h now。${PLAIN}"
+        read -rp "再次确认启用自动关机？[y/N]: " ans
+        [[ "$ans" =~ ^[Yy]$ ]] || auto_shutdown="no"
+    else
+        auto_shutdown="no"
+    fi
+
+    host_label=$(hostname 2>/dev/null || echo "VPS")
+
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+    umask 077
+    cat > "$TG_MONITOR_CONF" <<EOF
+TG_BOT_TOKEN='${token}'
+TG_CHAT_ID='${chat_id}'
+HOST_LABEL='${host_label}'
+RX_LIMIT_GB=${rx_limit}
+TX_LIMIT_GB=${tx_limit}
+RESET_DAY=${reset_day}
+WARN1_PERCENT=${warn1}
+WARN2_PERCENT=${warn2}
+SHUTDOWN_PERCENT=${shutdown_percent}
+AUTO_SHUTDOWN='${auto_shutdown}'
+EOF
+    chmod 600 "$TG_MONITOR_CONF"
+
+    server_tool_tg_monitor_ensure_worker || {
+        echo -e "${RED}[错误] TG-BOT 监控服务生成失败。${PLAIN}"
+        pause
+        return
+    }
+
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        systemctl enable --now ss2022-tg-monitor.timer >/dev/null 2>&1 || {
+            echo -e "${RED}[错误] TG-BOT 监控 timer 启动失败。${PLAIN}"; pause; return
+        }
+    fi
+    # 立即运行一次，建立初始状态。OpenRC 后续由 crond 每分钟执行。
+    "$TG_MONITOR_WORKER" >/dev/null 2>&1 || true
+
+    echo -e "${GREEN}✔ TG-BOT 流量监控已启用。${PLAIN}"
+    server_tool_tg_monitor_send_test
+    pause
+}
+
+server_tool_tg_monitor_status() {
+    local enabled="未启用" rx_limit="-" tx_limit="-" reset_day="-" warn1="-" warn2="-" shutdown_percent="95" auto="-"
+    local total_rx=0 total_tx=0 period="-" rx_gb tx_gb token_masked="-"
+    [[ -f "$TG_MONITOR_CONF" ]] && {
+        # shellcheck disable=SC1090
+        source "$TG_MONITOR_CONF"
+        rx_limit="${RX_LIMIT_GB:-0}"; tx_limit="${TX_LIMIT_GB:-0}"; reset_day="${RESET_DAY:-1}"
+        warn1="${WARN1_PERCENT:-80}"; warn2="${WARN2_PERCENT:-90}"; shutdown_percent="${SHUTDOWN_PERCENT:-95}"; auto="${AUTO_SHUTDOWN:-no}"
+        [[ -n "${TG_BOT_TOKEN:-}" ]] && token_masked="${TG_BOT_TOKEN:0:6}******"
+    }
+    [[ -f "$TG_MONITOR_STATE" ]] && {
+        # shellcheck disable=SC1090
+        source "$TG_MONITOR_STATE"
+        total_rx="${TOTAL_RX:-0}"; total_tx="${TOTAL_TX:-0}"; period="${STATE_PERIOD:--}"
+    }
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        if systemctl is-active --quiet ss2022-tg-monitor.timer 2>/dev/null; then enabled="运行中"; elif systemctl is-enabled --quiet ss2022-tg-monitor.timer 2>/dev/null; then enabled="已启用但未运行"; fi
+    else
+        if grep -q "ss2022-tg-monitor" "$TG_MONITOR_CRON_FILE" 2>/dev/null && service_is_active crond; then enabled="运行中（OpenRC crond）"; elif grep -q "ss2022-tg-monitor" "$TG_MONITOR_CRON_FILE" 2>/dev/null; then enabled="已配置但 crond 未运行"; fi
+    fi
+    rx_gb=$(awk -v b="$total_rx" 'BEGIN {printf "%.2f",b/1073741824}'); tx_gb=$(awk -v b="$total_tx" 'BEGIN {printf "%.2f",b/1073741824}')
+    clear
+    echo -e "${CYAN}════════════ TG-BOT 流量监控状态 ════════════${PLAIN}"
+    echo "  状态         : ${enabled}"
+    echo "  统计周期     : ${period} / 每月 ${reset_day} 日重置"
+    echo "  当前入站累计 : ${rx_gb} GB / ${rx_limit} GB"
+    echo "  当前出站累计 : ${tx_gb} GB / ${tx_limit} GB"
+    echo "  TG Token     : ${token_masked}"
+    echo "  Chat ID      : ${TG_CHAT_ID:--}"
+    echo "  预警线       : ${warn1}% / ${warn2}% / 100%"
+    echo "  关机阈值     : ${shutdown_percent}%"
+    echo "  自动关机     : $([[ "$auto" == "yes" ]] && echo "开启" || echo "关闭")"
+    echo -e "${CYAN}═══════════════════════════════════════════════${PLAIN}"
+}
+server_tool_tg_monitor_disable() {
+    local ans
+    read -rp "确认停用 TG-BOT 流量监控？配置和累计数据会保留。[y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || return 0
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        systemctl disable --now ss2022-tg-monitor.timer >/dev/null 2>&1 || true
+    else
+        [[ -f "$TG_MONITOR_CRON_FILE" ]] && sed -i "/ss2022-tg-monitor/d" "$TG_MONITOR_CRON_FILE"
+    fi
+    echo -e "${GREEN}✔ TG-BOT 流量监控已停用。${PLAIN}"
+}
+server_tool_tg_monitor_reset() {
+    local ans
+    read -rp "确认清零当前累计流量和预警状态？[y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || return 0
+    rm -f "$TG_MONITOR_STATE"
+    [[ -x "$TG_MONITOR_WORKER" ]] && "$TG_MONITOR_WORKER" >/dev/null 2>&1 || true
+    echo -e "${GREEN}✔ 流量累计已重新从当前时刻开始统计。${PLAIN}"
+}
+server_tool_tg_monitor_remove() {
+    local ans
+    read -rp "确认彻底删除 TG-BOT 流量监控配置、Token 和累计数据？[y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || return 0
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        systemctl disable --now ss2022-tg-monitor.timer >/dev/null 2>&1 || true
+    else
+        [[ -f "$TG_MONITOR_CRON_FILE" ]] && sed -i "/ss2022-tg-monitor/d" "$TG_MONITOR_CRON_FILE"
+    fi
+    rm -f "$TG_MONITOR_TIMER" "$TG_MONITOR_SERVICE" "$TG_MONITOR_WORKER" "$TG_MONITOR_CONF" "$TG_MONITOR_STATE"
+    service_daemon_reload >/dev/null 2>&1 || true
+    echo -e "${GREEN}✔ TG-BOT 流量监控已彻底删除。${PLAIN}"
+}
+server_tool_tg_monitor_management() {
+    local c
+    while true; do
+        server_tool_tg_monitor_status
+        echo ""
+        echo "  1. 配置 / 启用监控"
+        echo "  2. 发送 TG 测试消息"
+        echo "  3. 清零流量累计"
+        echo "  4. 停用监控（保留配置）"
+        echo "  5. 删除监控配置"
+        echo "  0. 返回"
+        read -rp "请选择 [0-5]: " c
+        case "$c" in
+            1) server_tool_tg_monitor_configure ;;
+            2) server_tool_tg_monitor_send_test; pause ;;
+            3) server_tool_tg_monitor_reset; pause ;;
+            4) server_tool_tg_monitor_disable; pause ;;
+            5) server_tool_tg_monitor_remove; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+server_tool_reboot() {
+    local ans
+    clear
+    echo -e "${RED}════════════════════ 重启服务器 ════════════════════${PLAIN}"
+    echo -e "${YELLOW}[警告] 重启会立即中断当前 SSH 会话和正在运行的任务。${PLAIN}"
+    echo ""
+    echo "为避免误触，请完整输入：REBOOT"
+    read -rp "确认字符: " ans
+    [[ "$ans" == "REBOOT" ]] || {
+        echo "已取消重启。"
+        pause
+        return
+    }
+    sync
+    reboot
+}
+
+server_management_tools() {
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ 服务器管理工具 ════════════════════${PLAIN}"
+        echo "  1. 系统信息"
+        echo "  2. 查看端口占用"
+        echo "  3. TG-BOT 流量监控 / 预警 / 自动关机"
+        echo "  4. 系统更新 / 清理"
+        echo "  5. Swap 虚拟内存"
+        echo "  6. BBR 加速"
+        echo "  7. DNS 管理"
+        echo "  8. IPv4 / IPv6 管理"
+        echo "  9. 系统时区"
+        echo " 10. SSH 端口管理"
+        echo " 11. 重启服务器"
+        echo "  0. 返回"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-11]: " c
+        case "$c" in
+            1) server_tool_system_info; pause ;;
+            2) server_tool_port_usage ;;
+            3) server_tool_tg_monitor_management ;;
+            4) server_tool_system_update ;;
+            5) server_tool_swap_management ;;
+            6) server_tool_bbr_management ;;
+            7) server_tool_dns_management ;;
+            8) server_tool_ip_family_management ;;
+            9) server_tool_timezone_management ;;
+            10) server_tool_ssh_management ;;
+            11) server_tool_reboot ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+ensure_test_dependency() {
+    local cmd="$1"
+    local pkg="${2:-$1}"
+
+    command -v "$cmd" >/dev/null 2>&1 && return 0
+
+    echo -e "${YELLOW}>> 缺少 ${cmd}，正在安装 ${pkg}...${PLAIN}"
+
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -y >/dev/null 2>&1 || return 1
+        apt-get install -y "$pkg" >/dev/null 2>&1 || return 1
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y "$pkg" >/dev/null 2>&1 || return 1
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y "$pkg" >/dev/null 2>&1 || return 1
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache "$pkg" >/dev/null 2>&1 || return 1
+    else
+        echo -e "${RED}[错误] 未识别包管理器，请手动安装 ${pkg}。${PLAIN}"
+        return 1
+    fi
+
+    command -v "$cmd" >/dev/null 2>&1
+}
+
+show_external_test_source() {
+    local name="$1"
+    local source="$2"
+    echo ""
+    echo -e "${CYAN}════════════════════ ${name} ════════════════════${PLAIN}"
+    echo -e "${YELLOW}测试来源: ${source}${PLAIN}"
+    echo -e "${YELLOW}说明: 测试组件仅用于检测；临时下载到 /tmp，校验来源完整性后执行，用完删除，不修改协议或分流配置。${PLAIN}"
+    echo ""
+}
+server_test_download_release_asset() {
+    local repo="$1" tag="$2" asset="$3" out="$4"
+    local api meta url digest expected actual source ok=0
+
+    ensure_test_dependency curl curl || return 1
+    ensure_test_dependency jq jq || return 1
+    command -v sha256sum >/dev/null 2>&1 || ensure_test_dependency sha256sum coreutils || return 1
+
+    if [[ "$tag" == "latest" ]]; then
+        api="https://api.github.com/repos/${repo}/releases/latest"
+    else
+        api="https://api.github.com/repos/${repo}/releases/tags/${tag}"
+    fi
+    meta=$(mktemp /tmp/ss2022-test-release.XXXXXX.json) || return 1
+    if ! curl -fsSL --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 30 -H "Accept: application/vnd.github+json" "$api" -o "$meta"; then
+        rm -f "$meta"
+        echo -e "${RED}[错误] 无法获取 ${repo} Release 元数据。${PLAIN}"
+        return 1
+    fi
+    url=$(jq -r --arg a "$asset" '.assets[]? | select(.name==$a) | .browser_download_url // empty' "$meta" | head -n1)
+    digest=$(jq -r --arg a "$asset" '.assets[]? | select(.name==$a) | .digest // empty' "$meta" | head -n1)
+    rm -f "$meta"
+    expected=${digest#sha256:}
+    if [[ -z "$url" || ! "$expected" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        echo -e "${RED}[错误] Release 中未找到 ${asset} 或缺少官方 SHA256 digest。${PLAIN}"
+        return 1
+    fi
+
+    local sources=("$url" "https://ghproxy.net/${url}" "https://gh-proxy.com/${url}")
+    for source in "${sources[@]}"; do
+        rm -f "$out"
+        echo -e "${YELLOW}>> 下载并校验 ${asset}...${PLAIN}"
+        if ! curl -fL --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 120 "$source" -o "$out"; then
+            continue
+        fi
+        actual=$(sha256sum "$out" | awk '{print $1}')
+        if [[ "${actual,,}" == "${expected,,}" ]]; then
+            ok=1
+            break
+        fi
+        echo -e "${RED}[警告] SHA256 不匹配，拒绝执行当前下载结果。${PLAIN}"
+    done
+    [[ $ok -eq 1 ]] || { rm -f "$out"; echo -e "${RED}[错误] ${asset} 下载失败或 SHA256 校验失败。${PLAIN}"; return 1; }
+    chmod 700 "$out"
+    return 0
+}
+
+server_test_arch_asset() {
+    local prefix="$1"
+    case "$(uname -m)" in
+        x86_64|amd64) printf "%s-linux-amd64" "$prefix" ;;
+        aarch64|arm64) printf "%s-linux-arm64" "$prefix" ;;
+        i386|i686) printf "%s-linux-386" "$prefix" ;;
+        armv7l|armv7*) printf "%s-linux-arm" "$prefix" ;;
+        *) return 1 ;;
+    esac
+}
+
+server_test_detect_family_mode() {
+    local has4=0 has6=0
+    get_public_ipv4 >/dev/null 2>&1 && has4=1 || true
+    get_public_ipv6 >/dev/null 2>&1 && has6=1 || true
+    if [[ $has4 -eq 1 && $has6 -eq 1 ]]; then echo "both"
+    elif [[ $has4 -eq 1 ]]; then echo "ipv4"
+    elif [[ $has6 -eq 1 ]]; then echo "ipv6"
+    else echo "none"; fi
+}
+
+run_external_curl_test() {
+    local label="$1"
+    local url="$2"
+    shift 2
+
+    local tmp=""
+    tmp=$(mktemp /tmp/ss2022-external-test.XXXXXX.sh) || {
+        echo -e "${RED}[错误] 无法创建临时测试文件。${PLAIN}"
+        return 1
+    }
+
+    if ! curl -fLsS --retry 2 --retry-delay 1 \
+        --connect-timeout 10 --max-time 60 \
+        "$url" -o "$tmp"; then
+        rm -f "$tmp"
+        echo -e "${RED}[错误] ${label}脚本下载失败。${PLAIN}"
+        return 1
+    fi
+
+    if [[ ! -s "$tmp" ]]; then
+        rm -f "$tmp"
+        echo -e "${RED}[错误] ${label}脚本下载结果为空。${PLAIN}"
+        return 1
+    fi
+
+    chmod 700 "$tmp"
+
+    # 第三方检测脚本可能用非 0 返回码表达内部检测状态。
+    # 这里不把它二次解释成“脚本执行失败”；实际检测结果以第三方输出为准。
+    bash "$tmp" "$@" || true
+
+    rm -f "$tmp"
+    return 0
+}
+
+test_ip_quality() {
+    local asset tmp family check_mode
+    clear
+    show_external_test_source "IP 质量测试" "oneclickvirt/securityCheck"
+    asset=$(server_test_arch_asset "securityCheck") || {
+        echo -e "${RED}[错误] 当前 CPU 架构暂无 securityCheck 测试资产。${PLAIN}"; pause; return
+    }
+    family=$(server_test_detect_family_mode)
+    case "$family" in
+        both) check_mode="both" ;;
+        ipv4) check_mode="ipv4" ;;
+        ipv6) check_mode="ipv6" ;;
+        *) echo -e "${RED}[错误] 未检测到可用公网 IPv4 / IPv6。${PLAIN}"; pause; return ;;
+    esac
+    tmp=$(mktemp /tmp/ss2022-securitycheck.XXXXXX) || { pause; return; }
+    if server_test_download_release_asset "oneclickvirt/securityCheck" "output" "$asset" "$tmp"; then
+        echo -e "${CYAN}检测地址族: ${check_mode}${PLAIN}"
+        "$tmp" -l zh -c "$check_mode" -e yes || true
+    fi
+    rm -f "$tmp"
+    echo ""
+    pause
+}
+server_test_nexttrace_asset() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo "nexttrace-tiny_linux_amd64" ;;
+        aarch64|arm64) echo "nexttrace-tiny_linux_arm64" ;;
+        i386|i686) echo "nexttrace-tiny_linux_386" ;;
+        armv7l|armv7*) echo "nexttrace-tiny_linux_armv7" ;;
+        *) return 1 ;;
+    esac
+}
+
+server_test_write_return_targets() {
+    local family="$1" out="$2"
+    case "$family" in
+        4)
+            cat >"$out" <<'EOF'
+ipv4.pek-4134.endpoint.nxtrace.org 北京电信
+ipv4.pek-4837.endpoint.nxtrace.org 北京联通
+ipv4.pek-9808.endpoint.nxtrace.org 北京移动
+ipv4.sha-4134.endpoint.nxtrace.org 上海电信
+ipv4.sha-4837.endpoint.nxtrace.org 上海联通
+ipv4.sha-9808.endpoint.nxtrace.org 上海移动
+ipv4.can-4134.endpoint.nxtrace.org 广州电信
+ipv4.can-4837.endpoint.nxtrace.org 广州联通
+ipv4.can-9808.endpoint.nxtrace.org 广州移动
+EOF
+            ;;
+        6)
+            cat >"$out" <<'EOF'
+ipv6.pek-4134.endpoint.nxtrace.org 北京电信
+ipv6.pek-4837.endpoint.nxtrace.org 北京联通
+ipv6.pek-9808.endpoint.nxtrace.org 北京移动
+ipv6.sha-4134.endpoint.nxtrace.org 上海电信
+ipv6.sha-4837.endpoint.nxtrace.org 上海联通
+ipv6.sha-9808.endpoint.nxtrace.org 上海移动
+ipv6.can-4134.endpoint.nxtrace.org 广州电信
+ipv6.can-4837.endpoint.nxtrace.org 广州联通
+ipv6.can-9808.endpoint.nxtrace.org 广州移动
+EOF
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+server_test_run_nexttrace_family() {
+    local bin="$1" family="$2" targets title
+    targets=$(mktemp /tmp/ss2022-nexttrace-targets.XXXXXX) || return 1
+    server_test_write_return_targets "$family" "$targets" || {
+        rm -f "$targets"
+        return 1
+    }
+
+    [[ "$family" == "6" ]] && title="IPv6" || title="IPv4"
+    echo ""
+    echo -e "${CYAN}════════ ${title} 三网逐跳回程 ════════${PLAIN}"
+    echo -e "${YELLOW}目标: 北京 / 上海 / 广州 × 电信 / 联通 / 移动；TCP 80；每一跳显示 IP / ASN / 地区 / 延迟。${PLAIN}"
+    echo ""
+
+    "$bin" --traceroute --file "$targets"         --tcp --port 80         --queries 1 --max-hops 30 --timeout 2000         --language cn --no-color -M || true
+
+    rm -f "$targets"
+}
+
+test_return_route() {
+    local asset tmp family
+    clear
+    show_external_test_source "IPv4 / IPv6 三网逐跳回程" "nxtrace/NTrace-core"
+    echo -e "${YELLOW}本项显示完整 traceroute，每个目标会逐跳列出经过的 IP、ASN、地区与延迟。${PLAIN}"
+    echo -e "${CYAN}检测目标: 北京 / 上海 / 广州 × 电信 / 联通 / 移动，共 9 条/地址族。${PLAIN}"
+
+    server_test_select_ip_mode || return
+    family=$(server_test_detect_family_mode)
+
+    asset=$(server_test_nexttrace_asset) || {
+        echo -e "${RED}[错误] 当前 CPU 架构暂无 NextTrace 测试资产。${PLAIN}"
+        pause
+        return
+    }
+
+    tmp=$(mktemp /tmp/ss2022-nexttrace.XXXXXX) || { pause; return; }
+    if ! server_test_download_release_asset "nxtrace/NTrace-core" "latest" "$asset" "$tmp"; then
+        rm -f "$tmp"
+        pause
+        return
+    fi
+
+    case "$SERVER_TEST_IP_MODE:$family" in
+        4:both|4:ipv4)
+            server_test_run_nexttrace_family "$tmp" 4
+            ;;
+        4:*)
+            echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv4。${PLAIN}"
+            ;;
+        6:both|6:ipv6)
+            server_test_run_nexttrace_family "$tmp" 6
+            ;;
+        6:*)
+            echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv6。${PLAIN}"
+            ;;
+        0:both)
+            server_test_run_nexttrace_family "$tmp" 4
+            server_test_run_nexttrace_family "$tmp" 6
+            ;;
+        0:ipv4)
+            server_test_run_nexttrace_family "$tmp" 4
+            ;;
+        0:ipv6)
+            server_test_run_nexttrace_family "$tmp" 6
+            ;;
+        *)
+            echo -e "${RED}[错误] 未检测到可用公网 IPv4 / IPv6。${PLAIN}"
+            ;;
+    esac
+
+    rm -f "$tmp"
+    echo ""
+    pause
+}
+
+server_test_run_unlocktests() {
+    local selection="$1" label="$2" mode="${3:-0}" selector="${4:-f}" asset tmp
+    asset=$(server_test_arch_asset "ut") || {
+        echo -e "${RED}[错误] 当前 CPU 架构暂无 UnlockTests 测试资产。${PLAIN}"
+        return 1
+    }
+    tmp=$(mktemp /tmp/ss2022-unlocktests.XXXXXX) || return 1
+    if ! server_test_download_release_asset "oneclickvirt/UnlockTests" "output" "$asset" "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    echo -e "${CYAN}${label}${PLAIN}"
+    case "$selector" in
+        region) "$tmp" -L zh -m "$mode" -region "$selection" -b=false -cache || true ;;
+        test) "$tmp" -L zh -m "$mode" -test "$selection" -b=false -cache || true ;;
+        *) "$tmp" -L zh -m "$mode" -f "$selection" -b=false -cache || true ;;
+    esac
+    rm -f "$tmp"
+}
+server_test_select_ip_mode() {
+    local c
+    SERVER_TEST_IP_MODE="0"
+    while true; do
+        echo ""
+        echo "请选择测试地址族："
+        echo "  1. IPv4 + IPv6（按 VPS 实际可用性）"
+        echo "  2. 仅 IPv4"
+        echo "  3. 仅 IPv6"
+        echo "  0. 返回"
+        read -rp "请选择 [0-3，默认 1]: " c
+        c=${c:-1}
+        case "$c" in
+            1) SERVER_TEST_IP_MODE="0"; return 0 ;;
+            2) SERVER_TEST_IP_MODE="4"; return 0 ;;
+            3) SERVER_TEST_IP_MODE="6"; return 0 ;;
+            0) return 1 ;;
+            *) echo -e "${RED}输入无效。${PLAIN}" ;;
+        esac
+    done
+}
+
+server_test_region_map_local_choice() {
+    case "$1" in
+        2) echo "TW_UnlockTest" ;;
+        3) echo "HK_UnlockTest" ;;
+        4) echo "JP_UnlockTest" ;;
+        5) echo "KR_UnlockTest" ;;
+        6) echo "NA_UnlockTest" ;;
+        7) echo "SA_UnlockTest" ;;
+        8) echo "EU_UnlockTest" ;;
+        9) echo "AF_UnlockTest" ;;
+        10) echo "SEA_UnlockTest" ;;
+        11) echo "OA_UnlockTest" ;;
+        12) echo "Sport_UnlockTest" ;;
+        *) return 1 ;;
+    esac
+}
+
+server_test_select_streaming_region() {
+    local c raw token mapped result="" label=""
+    SERVER_TEST_REGION_SELECTION=""
+    SERVER_TEST_REGION_LABEL="通用流媒体"
+    while true; do
+        echo ""
+        echo "请选择流媒体 / 区域检测范围："
+        echo "  1. 通用流媒体（Netflix / YouTube Premium / Disney+ / Prime Video / Google 等）"
+        echo "  2. 台湾"
+        echo "  3. 香港"
+        echo "  4. 日本"
+        echo "  5. 韩国"
+        echo "  6. 北美"
+        echo "  7. 南美"
+        echo "  8. 欧洲"
+        echo "  9. 非洲"
+        echo " 10. 东南亚"
+        echo " 11. 大洋洲"
+        echo " 12. 体育平台"
+        echo " 13. 全部流媒体平台（不含 AI）"
+        echo " 14. 自定义多地区组合"
+        echo "  0. 返回"
+        read -rp "请选择 [0-14，默认 1]: " c
+        c=${c:-1}
+        case "$c" in
+            1) SERVER_TEST_REGION_SELECTION=""; SERVER_TEST_REGION_LABEL="通用流媒体"; return 0 ;;
+            2) SERVER_TEST_REGION_SELECTION="TW_UnlockTest"; SERVER_TEST_REGION_LABEL="台湾平台"; return 0 ;;
+            3) SERVER_TEST_REGION_SELECTION="HK_UnlockTest"; SERVER_TEST_REGION_LABEL="香港平台"; return 0 ;;
+            4) SERVER_TEST_REGION_SELECTION="JP_UnlockTest"; SERVER_TEST_REGION_LABEL="日本平台"; return 0 ;;
+            5) SERVER_TEST_REGION_SELECTION="KR_UnlockTest"; SERVER_TEST_REGION_LABEL="韩国平台"; return 0 ;;
+            6) SERVER_TEST_REGION_SELECTION="NA_UnlockTest"; SERVER_TEST_REGION_LABEL="北美平台"; return 0 ;;
+            7) SERVER_TEST_REGION_SELECTION="SA_UnlockTest"; SERVER_TEST_REGION_LABEL="南美平台"; return 0 ;;
+            8) SERVER_TEST_REGION_SELECTION="EU_UnlockTest"; SERVER_TEST_REGION_LABEL="欧洲平台"; return 0 ;;
+            9) SERVER_TEST_REGION_SELECTION="AF_UnlockTest"; SERVER_TEST_REGION_LABEL="非洲平台"; return 0 ;;
+            10) SERVER_TEST_REGION_SELECTION="SEA_UnlockTest"; SERVER_TEST_REGION_LABEL="东南亚平台"; return 0 ;;
+            11) SERVER_TEST_REGION_SELECTION="OA_UnlockTest"; SERVER_TEST_REGION_LABEL="大洋洲平台"; return 0 ;;
+            12) SERVER_TEST_REGION_SELECTION="Sport_UnlockTest"; SERVER_TEST_REGION_LABEL="体育平台"; return 0 ;;
+            13)
+                SERVER_TEST_REGION_SELECTION="TW_UnlockTest,HK_UnlockTest,JP_UnlockTest,KR_UnlockTest,NA_UnlockTest,SA_UnlockTest,EU_UnlockTest,AF_UnlockTest,SEA_UnlockTest,OA_UnlockTest,Sport_UnlockTest"
+                SERVER_TEST_REGION_LABEL="全部地区平台"
+                return 0
+                ;;
+            14)
+                echo ""
+                echo "输入上面地区编号，可选多个，以空格分隔。"
+                echo "示例：3 4 10 = 香港 + 日本 + 东南亚"
+                echo "可组合 2-12；通用流媒体固定只检测一次。"
+                read -rp "地区编号: " raw
+                result=""; label=""
+                for token in $raw; do
+                    [[ "$token" =~ ^([2-9]|1[0-2])$ ]] || {
+                        echo -e "${RED}[错误] 无效地区编号: ${token}${PLAIN}"; result=""; break
+                    }
+                    mapped=$(server_test_region_map_local_choice "$token") || { result=""; break; }
+                    if [[ ",${result}," != *",${mapped},"* ]]; then
+                        result="${result:+${result},}${mapped}"
+                        case "$token" in
+                            2) label="${label:+${label} + }台湾" ;;
+                            3) label="${label:+${label} + }香港" ;;
+                            4) label="${label:+${label} + }日本" ;;
+                            5) label="${label:+${label} + }韩国" ;;
+                            6) label="${label:+${label} + }北美" ;;
+                            7) label="${label:+${label} + }南美" ;;
+                            8) label="${label:+${label} + }欧洲" ;;
+                            9) label="${label:+${label} + }非洲" ;;
+                            10) label="${label:+${label} + }东南亚" ;;
+                            11) label="${label:+${label} + }大洋洲" ;;
+                            12) label="${label:+${label} + }体育" ;;
+                        esac
+                    fi
+                done
+                [[ -n "$result" ]] || { echo -e "${RED}[错误] 未选择有效地区。${PLAIN}"; continue; }
+                SERVER_TEST_REGION_SELECTION="$result"
+                SERVER_TEST_REGION_LABEL="$label"
+                return 0
+                ;;
+            0) return 1 ;;
+            *) echo -e "${RED}输入无效。${PLAIN}" ;;
+        esac
+    done
+}
+
+server_test_show_exit_info_for_mode() {
+    local mode="${1:-0}" family
+    family=$(server_test_detect_family_mode)
+    case "$mode" in
+        4)
+            case "$family" in
+                both|ipv4)
+                    echo "===========[ IPV4 流媒体出口 ]============"
+                    server_test_exit_info "ipv4"
+                    ;;
+                *) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv4。${PLAIN}" ;;
+            esac
+            ;;
+        6)
+            case "$family" in
+                both|ipv6)
+                    echo "===========[ IPV6 流媒体出口 ]============"
+                    server_test_exit_info "ipv6"
+                    ;;
+                *) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv6。${PLAIN}" ;;
+            esac
+            ;;
+        *)
+            case "$family" in
+                both)
+                    echo "===========[ IPV4 流媒体出口 ]============"
+                    server_test_exit_info "ipv4"
+                    echo ""
+                    echo "===========[ IPV6 流媒体出口 ]============"
+                    server_test_exit_info "ipv6"
+                    ;;
+                ipv4)
+                    echo "===========[ IPV4 流媒体出口 ]============"
+                    server_test_exit_info "ipv4"
+                    ;;
+                ipv6)
+                    echo "===========[ IPV6 流媒体出口 ]============"
+                    server_test_exit_info "ipv6"
+                    ;;
+                *) echo -e "${RED}[错误] 未检测到可用公网 IPv4 / IPv6。${PLAIN}" ;;
+            esac
+            ;;
+    esac
+}
+
+server_test_download_rrc_source() {
+    local out="$1"
+    local commit="ab6829eb07c4c592c1f8f3dac736d675667d1a08"
+    local blob="9cd4e7fd81f49acfa4336ee48322114f8d88a6ad"
+    local raw="https://raw.githubusercontent.com/1-stream/RegionRestrictionCheck/${commit}/check.sh"
+    local source size actual ok=0
+
+    ensure_test_dependency curl curl || return 1
+    command -v sha1sum >/dev/null 2>&1 || ensure_test_dependency sha1sum coreutils || return 1
+
+    for source in "$raw" "https://ghproxy.net/$raw" "https://gh-proxy.com/$raw"; do
+        rm -f "$out"
+        echo -e "${YELLOW}>> 下载并校验 RegionRestrictionCheck...${PLAIN}"
+        if ! curl -fL --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 90 "$source" -o "$out"; then
+            continue
+        fi
+        size=$(wc -c <"$out" | tr -d '[:space:]')
+        actual=$(
+            {
+                printf 'blob %s\0' "$size"
+                cat "$out"
+            } | sha1sum | awk '{print $1}'
+        )
+        if [[ "${actual,,}" == "${blob,,}" ]]; then
+            ok=1
+            break
+        fi
+        echo -e "${RED}[警告] Git blob 校验失败，拒绝执行当前下载结果。${PLAIN}"
+    done
+
+    [[ $ok -eq 1 ]] || {
+        rm -f "$out"
+        echo -e "${RED}[错误] RegionRestrictionCheck 下载失败或来源完整性校验失败。${PLAIN}"
+        return 1
+    }
+    chmod 700 "$out"
+    return 0
+}
+
+server_test_run_region_restriction_check() {
+    local selection="$1" mode="${2:-0}"
+    local source runner family run_mode
+    source=$(mktemp /tmp/ss2022-rrc-source.XXXXXX.sh) || return 1
+    runner=$(mktemp /tmp/ss2022-rrc-runner.XXXXXX.sh) || { rm -f "$source"; return 1; }
+
+    ensure_test_dependency jq jq || { rm -f "$source" "$runner"; return 1; }
+    ensure_test_dependency python3 python3 || { rm -f "$source" "$runner"; return 1; }
+    ensure_test_dependency grep grep || { rm -f "$source" "$runner"; return 1; }
+    ensure_test_dependency openssl openssl || { rm -f "$source" "$runner"; return 1; }
+
+    if ! server_test_download_rrc_source "$source"; then
+        rm -f "$source" "$runner"
+        return 1
+    fi
+
+    if ! grep -q '^function ScriptTitle()' "$source" ||
+       ! grep -q '^function Global_UnlockTest()' "$source"; then
+        echo -e "${RED}[错误] 上游脚本结构发生变化，已停止执行以避免误调用。${PLAIN}"
+        rm -f "$source" "$runner"
+        return 1
+    fi
+
+    sed '/^function ScriptTitle()/,$d' "$source" >"$runner"
+    cat >>"$runner" <<'RRC_RUNNER'
+
+ss2022_rrc_run_family() {
+    local fam="$1" fn
+    echo ""
+    echo "===========[ IPV$fam 通用流媒体 ]============"
+    Global_UnlockTest "$fam"
+
+    if [[ -n "$SS2022_RRC_REGIONS" ]]; then
+        IFS=',' read -r -a ss2022_rrc_funcs <<<"$SS2022_RRC_REGIONS"
+        for fn in "${ss2022_rrc_funcs[@]}"; do
+            case "$fn" in
+                TW_UnlockTest|HK_UnlockTest|JP_UnlockTest|KR_UnlockTest|NA_UnlockTest|SA_UnlockTest|EU_UnlockTest|AF_UnlockTest|SEA_UnlockTest|OA_UnlockTest|Sport_UnlockTest)
+                    "$fn" "$fam"
+                    ;;
+            esac
+        done
+    fi
+}
+
+case "$SS2022_RRC_MODE" in
+    4) ss2022_rrc_run_family 4 ;;
+    6) ss2022_rrc_run_family 6 ;;
+    *)
+        ss2022_rrc_run_family 4
+        ss2022_rrc_run_family 6
+        ;;
+esac
+RRC_RUNNER
+    chmod 700 "$runner"
+
+    family=$(server_test_detect_family_mode)
+    run_mode="$mode"
+    case "$mode:$family" in
+        4:both|4:ipv4) run_mode=4 ;;
+        4:*) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv4，跳过流媒体 IPv4 检测。${PLAIN}"; rm -f "$source" "$runner"; return 0 ;;
+        6:both|6:ipv6) run_mode=6 ;;
+        6:*) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv6，跳过流媒体 IPv6 检测。${PLAIN}"; rm -f "$source" "$runner"; return 0 ;;
+        0:both) run_mode=0 ;;
+        0:ipv4) run_mode=4 ;;
+        0:ipv6) run_mode=6 ;;
+        0:*) echo -e "${RED}[错误] 未检测到可用公网 IPv4 / IPv6。${PLAIN}"; rm -f "$source" "$runner"; return 1 ;;
+    esac
+
+    SS2022_RRC_REGIONS="$selection" SS2022_RRC_MODE="$run_mode" bash "$runner" || true
+    rm -f "$source" "$runner"
+    return 0
+}
+
+test_streaming_unlock() {
+    clear
+    show_external_test_source "流媒体 / 区域解锁测试" "1-stream/RegionRestrictionCheck"
+    echo -e "${YELLOW}通用流媒体固定检测；地区平台按选择追加。AI 平台不会在本项执行。${PLAIN}"
+    echo -e "${CYAN}通用项目包含 Netflix / YouTube Premium / Disney+ / Prime Video / Spotify / Google 等。${PLAIN}"
+    server_test_select_streaming_region || return
+    server_test_select_ip_mode || return
+    echo ""
+    echo -e "${CYAN}检测范围: 通用流媒体${SERVER_TEST_REGION_SELECTION:+ + ${SERVER_TEST_REGION_LABEL}}${PLAIN}"
+    case "$SERVER_TEST_IP_MODE" in
+        4) echo -e "${CYAN}地址族: 仅 IPv4${PLAIN}" ;;
+        6) echo -e "${CYAN}地址族: 仅 IPv6${PLAIN}" ;;
+        *) echo -e "${CYAN}地址族: IPv4 + IPv6${PLAIN}" ;;
+    esac
+    echo ""
+    server_test_show_exit_info_for_mode "$SERVER_TEST_IP_MODE"
+    echo ""
+    server_test_run_region_restriction_check "$SERVER_TEST_REGION_SELECTION" "$SERVER_TEST_IP_MODE" || true
+    echo ""
+    pause
+}
+
+test_ai_unlock() {
+    clear
+    show_external_test_source "AI 工具测试" "oneclickvirt/UnlockTests"
+    echo -e "${CYAN}检测模式: AI-only（ChatGPT / Gemini / Claude / Copilot / Grok / Perplexity / Poe 等）${PLAIN}"
+    echo -e "${YELLOW}结果区分 YES / NO / Restricted / Banned / TIMEOUT / DNS失败等状态。${PLAIN}"
+    server_test_select_ip_mode || return
+    echo ""
+    case "$SERVER_TEST_IP_MODE" in
+        4) echo -e "${CYAN}地址族: 仅 IPv4${PLAIN}" ;;
+        6) echo -e "${CYAN}地址族: 仅 IPv6${PLAIN}" ;;
+        *) echo -e "${CYAN}地址族: IPv4 + IPv6${PLAIN}" ;;
+    esac
+    echo ""
+    server_test_run_unlocktests "21" "AI 平台检测" "$SERVER_TEST_IP_MODE" "region" || true
+    echo ""
+    pause
+}
+
+server_test_communication_probe() {
+    local family="$1" name="$2" url="$3" family_flag errfile http_code rc status
+    [[ "$family" == "ipv6" ]] && family_flag="-6" || family_flag="-4"
+    errfile=$(mktemp /tmp/ss2022-comm.XXXXXX) || return 1
+    http_code=$(curl "$family_flag" -sS -o /dev/null -w '%{http_code}' \
+        --connect-timeout 6 --max-time 12 "$url" 2>"$errfile")
+    rc=$?
+    rm -f "$errfile"
+    case "$rc" in
+        0) status="YES${http_code:+ (HTTP ${http_code})}" ;;
+        6) status="N/A (DNS Resolve Failed)" ;;
+        7) status="NO (Connect Failed)" ;;
+        28) status="TIMEOUT" ;;
+        35|60) status="NO (TLS Failed)" ;;
+        *) status="NO (curl ${rc})" ;;
+    esac
+    printf " %-25s %s\n" "$name" "$status"
+}
+
+server_test_exit_info() {
+    local family="$1" family_flag ip trace country
+    [[ "$family" == "ipv6" ]] && family_flag="-6" || family_flag="-4"
+
+    if [[ "$family" == "ipv6" ]]; then
+        ip=$(get_public_ipv6 2>/dev/null || true)
+    else
+        ip=$(get_public_ipv4 2>/dev/null || true)
+    fi
+
+    trace=$(curl "$family_flag" -fsS --connect-timeout 5 --max-time 8 \
+        "https://www.cloudflare.com/cdn-cgi/trace" 2>/dev/null || true)
+    country=$(awk -F= '$1=="loc" {print $2; exit}' <<<"$trace")
+    [[ "$country" =~ ^[A-Z]{2}$ ]] || country="未知"
+
+    printf " %-25s %s\n" "出口 IP" "${ip:-未知}"
+    printf " %-25s %s\n" "出口地区" "$country"
+}
+
+server_test_run_communication_family() {
+    local family="$1" title
+    [[ "$family" == "ipv6" ]] && title="IPV6" || title="IPV4"
+    echo "===========[ ${title} 通信软件 ]============"
+    server_test_exit_info "$family"
+    server_test_communication_probe "$family" "Telegram" "https://web.telegram.org/"
+    server_test_communication_probe "$family" "WhatsApp" "https://web.whatsapp.com/"
+    server_test_communication_probe "$family" "Signal" "https://signal.org/"
+    server_test_communication_probe "$family" "Discord" "https://discord.com/api/v10/gateway"
+}
+
+test_communication_access() {
+    local family
+    clear
+    echo -e "${CYAN}════════════════════ 通信软件网络可达性测试 ════════════════════${PLAIN}"
+    echo -e "${YELLOW}检测 DNS / TCP / TLS / HTTPS 可达性，不登录账号，也不代表消息发送功能。${PLAIN}"
+    server_test_select_ip_mode || return
+    family=$(server_test_detect_family_mode)
+    echo ""
+    case "$SERVER_TEST_IP_MODE" in
+        4)
+            case "$family" in
+                both|ipv4) server_test_run_communication_family "ipv4" ;;
+                *) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv4。${PLAIN}" ;;
+            esac
+            ;;
+        6)
+            case "$family" in
+                both|ipv6) server_test_run_communication_family "ipv6" ;;
+                *) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv6。${PLAIN}" ;;
+            esac
+            ;;
+        *)
+            case "$family" in
+                both)
+                    server_test_run_communication_family "ipv4"
+                    echo ""
+                    server_test_run_communication_family "ipv6"
+                    ;;
+                ipv4) server_test_run_communication_family "ipv4" ;;
+                ipv6) server_test_run_communication_family "ipv6" ;;
+                *) echo -e "${RED}[错误] 未检测到可用公网 IPv4 / IPv6。${PLAIN}" ;;
+            esac
+            ;;
+    esac
+    echo ""
+    pause
+}
+
+test_platform_media_ai_communication_unlock() {
+    local family
+    clear
+    echo -e "${CYAN}════════════ 平台流媒体AI通信软件解锁测试 ════════════${PLAIN}"
+    echo -e "${YELLOW}一次选择地址族后，依次执行流媒体、AI、通信软件检测。${PLAIN}"
+    echo -e "${YELLOW}通信软件部分检测网络可达性，不登录账号，也不代表消息发送功能。${PLAIN}"
+
+    server_test_select_streaming_region || return
+    server_test_select_ip_mode || return
+    family=$(server_test_detect_family_mode)
+
+    echo ""
+    echo -e "${CYAN}════════════ 1/3 流媒体解锁 ════════════${PLAIN}"
+    show_external_test_source "流媒体 / 区域解锁测试" "1-stream/RegionRestrictionCheck"
+    echo -e "${CYAN}检测范围: 通用流媒体${SERVER_TEST_REGION_SELECTION:+ + ${SERVER_TEST_REGION_LABEL}}${PLAIN}"
+    case "$SERVER_TEST_IP_MODE" in
+        4) echo -e "${CYAN}地址族: 仅 IPv4${PLAIN}" ;;
+        6) echo -e "${CYAN}地址族: 仅 IPv6${PLAIN}" ;;
+        *) echo -e "${CYAN}地址族: IPv4 + IPv6${PLAIN}" ;;
+    esac
+    echo ""
+    server_test_show_exit_info_for_mode "$SERVER_TEST_IP_MODE"
+    echo ""
+    server_test_run_region_restriction_check "$SERVER_TEST_REGION_SELECTION" "$SERVER_TEST_IP_MODE" || true
+
+    echo ""
+    echo -e "${CYAN}════════════ 2/3 AI 工具解锁 ════════════${PLAIN}"
+    show_external_test_source "AI 工具测试" "oneclickvirt/UnlockTests"
+    server_test_run_unlocktests "21" "AI 平台检测" "$SERVER_TEST_IP_MODE" "region" || true
+
+    echo ""
+    echo -e "${CYAN}════════════ 3/3 通信软件解锁 ════════════${PLAIN}"
+    echo -e "${YELLOW}此处“解锁”表示网络可达性检测，不代表账号区服或消息发送能力。${PLAIN}"
+    case "$SERVER_TEST_IP_MODE" in
+        4)
+            case "$family" in
+                both|ipv4) server_test_run_communication_family "ipv4" ;;
+                *) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv4。${PLAIN}" ;;
+            esac
+            ;;
+        6)
+            case "$family" in
+                both|ipv6) server_test_run_communication_family "ipv6" ;;
+                *) echo -e "${YELLOW}当前 VPS 未检测到可用公网 IPv6。${PLAIN}" ;;
+            esac
+            ;;
+        *)
+            case "$family" in
+                both)
+                    server_test_run_communication_family "ipv4"
+                    echo ""
+                    server_test_run_communication_family "ipv6"
+                    ;;
+                ipv4) server_test_run_communication_family "ipv4" ;;
+                ipv6) server_test_run_communication_family "ipv6" ;;
+                *) echo -e "${RED}[错误] 未检测到可用公网 IPv4 / IPv6。${PLAIN}" ;;
+            esac
+            ;;
+    esac
+
+    echo ""
+    pause
+}
+
+server_test_management() {
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ 服务器测试管理 ════════════════════${PLAIN}"
+        echo "  1. IP 质量 / 风险测试"
+        echo "  2. IPv4 / IPv6 三网逐跳回程"
+        echo "  3. 平台流媒体AI通信软件解锁测试"
+        echo "  0. 返回"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-3]: " c
+        case "$c" in
+            1) test_ip_quality ;;
+            2) test_return_route ;;
+            3) test_platform_media_ai_communication_unlock ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+protocol_operations_management() {
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ 协议运维管理 ════════════════════${PLAIN}"
+        echo "  1. 查看全部服务状态与监听端口"
+        echo "  2. 查看 sing-box 实时日志"
+        echo "  3. 查看 ss2022-xray 实时日志"
+        echo "  4. 查看 Snell v5 实时日志"
+        echo "  5. 查看 Realm 转发实时日志"
+        echo "  6. 重启 sing-box"
+        echo "  7. 重启 ss2022-xray"
+        echo "  8. 重启 Snell v5"
+        echo "  9. 重启 Realm 转发"
+        echo " 10. 查看 IPv6 Keepalive 状态"
+        echo "  0. 返回"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-10]: " c
+        case "$c" in
+            1) show_service_status; pause ;;
+            2) follow_service_log sing-box ;;
+            3) follow_service_log "$XRAY_SERVICE_NAME" ;;
+            4) follow_service_log snell-v5 ;;
+            5) follow_service_log "$REALM_SERVICE_NAME" ;;
+            6) restart_service_safe sing-box "sing-box"; pause ;;
+            7) restart_service_safe "$XRAY_SERVICE_NAME" "ss2022-xray"; pause ;;
+            8) restart_service_safe snell-v5 "Snell v5"; pause ;;
+            9) restart_service_safe "$REALM_SERVICE_NAME" "Realm 转发"; pause ;;
+            10)
+                if service_is_active "$(keepalive_service_name)"; then
+                    echo "IPv6 Keepalive: Running"
+                    service_status_output "$(keepalive_service_name)" 2>/dev/null || true
+                else
+                    echo "IPv6 Keepalive: 未运行"
+                fi
+                pause
+                ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+main() {
+    check_root
+    detect_platform || exit 1
+    if platform_is_alpine; then
+        echo "[v1.9.0] 已检测到 Alpine / OpenRC；核心协议、服务管理、服务器工具与测试已接入稳定支持范围。"
+        echo "[提示] Snell v5 官方二进制与 Cloudflare WARP 官方客户端暂不在 Alpine 开放。"
+    fi
+
+    # 兼容旧安装：已有 local-dns 缺少 prefer_go:true 时执行一次安全迁移。
+    # 失败不会覆盖旧配置，也不会阻断管理面板。
+    migrate_singbox_local_dns_prefer_go || true
+
+    while true; do
+        show_dashboard
+        echo "  1. 协议管理"
+        echo "  2. 分流管理"
+        echo "  3. 端口转发（Realm）"
+        echo "  4. 查看当前节点参数与客户端配置"
+        echo "  5. 协议运维管理"
+        echo "  6. 组件版本管理"
+        echo "  - - - - - - - - - - - - - - - -"
+        echo "  7. 服务器管理工具"
+        echo "  8. 服务器测试管理"
+        echo "  - - - - - - - - - - - - - - - -"
+        echo "  9. 检查脚本更新"
+        echo -e "${RED} 10. 完全卸载脚本${PLAIN}"
+        echo "  0. 退出管理面板"
+        echo -e "${CYAN}═════════════════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请输入选项编号 [0-10]: " choice
+
+        case "$choice" in
+            1) protocol_management ;;
+            2) routing_management ;;
+            3) forwarding_management ;;
+            4) view_config_menu ;;
+            5) protocol_operations_management ;;
+            6) component_version_management ;;
+            7) server_management_tools ;;
+            8) server_test_management ;;
+            9) check_script_update ;;
+            10) full_uninstall ;;
+            0)
+                echo "已安全退出。随时输入 ss2022 唤出！"
+                exit 0
+                ;;
+            *)
+                echo -e "${RED}请输入有效编号！${PLAIN}"
+                sleep 1
+                ;;
+        esac
+    done
+} 
+
+# CI / smoke test can load the function library without entering the interactive UI.
+# Normal users never need to set this variable.
+if [[ "${SS2022_LIB_ONLY:-0}" != "1" ]]; then
+    main
+fi
+\t'*}
+    echo "TVB HLS-2: ${code2:-失败}"
+    rm -f "$api_file" "$master_file" "$variant_file"
+
+    if [[ "$code2" == "200" ]]; then
+        echo -e "${GREEN}✔ TVB 二级媒体清单已通过该应用出口，香港落地链路可供 HomeSphere 使用。${PLAIN}"
+        return 0
+    fi
+    echo -e "${RED}[错误] TVB 二级媒体清单仍被拒绝；请确认这个 SS 节点实际出口属于香港且可访问 TVB。${PLAIN}"
+    return 1
+}
+
+app_egress_link_homesphere() {
+    local proxy
+    proxy=$(app_egress_proxy_url 2>/dev/null || true)
+    [[ -n "$proxy" && -f "$APP_EGRESS_CONF" ]] || {
+        echo -e "${RED}[错误] 请先配置应用出口。${PLAIN}"
+        return 1
+    }
+    app_egress_homesphere_set_proxy "$proxy"
+}
+
+app_egress_remove() {
+    local quiet="${1:-false}"
+    service_disable_now "$APP_EGRESS_SERVICE_NAME"
+    rm -f "$APP_EGRESS_CONF" "$APP_EGRESS_STATE" \
+        "$APP_EGRESS_SERVICE" "$APP_EGRESS_OPENRC_SERVICE" \
+        "$APP_EGRESS_OPENRC_PID" "$APP_EGRESS_OPENRC_LOG"
+    service_daemon_reload || true
+    app_egress_homesphere_clear_proxy || true
+
+    if command -v docker >/dev/null 2>&1 &&
+       docker network inspect "$APP_EGRESS_DOCKER_NETWORK" >/dev/null 2>&1; then
+        if [[ "$(docker network inspect -f '{{len .Containers}}' "$APP_EGRESS_DOCKER_NETWORK" 2>/dev/null || echo 1)" == "0" ]]; then
+            docker network rm "$APP_EGRESS_DOCKER_NETWORK" >/dev/null 2>&1 || true
+        fi
+    fi
+    [[ "$quiet" == "true" ]] ||
+        echo -e "${GREEN}✔ 本机 / Docker 应用出口已删除，并解除 HomeSphere TVB 出口关联。${PLAIN}"
+}
+
+app_egress_management() {
+    local c yes
+    while true; do
+        clear
+        app_egress_show_status
+        echo ""
+        echo "  1. 导入 / 更换 Shadowsocks 节点"
+        echo "  2. 测试应用出口（含 TVB HLS-2）"
+        echo "  3. 重新关联 HomeSphere"
+        echo "  4. 删除应用出口"
+        echo "  0. 返回"
+        echo ""
+        echo "说明："
+        echo "- 只需粘贴 ss://；自动识别 SS2022 / 标准 Shadowsocks。"
+        echo "- 入口只监听 Docker 专用 bridge 网关，不开放 VPS 公网端口。"
+        echo "- HomeSphere 仅将 TVB / myTV SUPER 服务端请求交给该出口。"
+        read -rp "请选择 [0-4]: " c
+        case "$c" in
+            1) app_egress_import_ss; pause ;;
+            2) app_egress_test; pause ;;
+            3) app_egress_link_homesphere; pause ;;
+            4)
+                read -rp "确认删除应用出口？[y/N]: " yes
+                [[ "$yes" =~ ^[Yy]$ ]] && app_egress_remove
+                pause
+                ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
 routing_management() {
     while true; do
         clear
