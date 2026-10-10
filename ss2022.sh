@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
-# 当前版本: v1.9.0
+# 当前版本: v1.10.0-dev1
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,11 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.10.0-dev1:
+#   - 网络调优第一阶段：只读网络诊断、原始状态快照、原生 BBR/fq 安全迁移与恢复
+#   - 拒绝接管管理员自定义 sysctl 和修改过的旧 BBR 配置；默认不触及 HTB、测速和路由
+#   - 快照保存在 /var/lib/ss2022-network-tuning；完全卸载保留 BBR 与快照
 #
 # v1.9.0 Release:
 #   - 正式支持 Debian / Ubuntu + systemd，并将 Alpine 3.21 + OpenRC 纳入稳定支持范围
@@ -632,7 +637,7 @@
 # 注意: v1.9.0 为稳定正式版；Alpine 3.21 上 Snell v5 与 Cloudflare WARP 仍受官方组件兼容性限制。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0"
+SCRIPT_VERSION="v1.10.0-dev1"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -9197,74 +9202,298 @@ server_tool_swap_management() {
     done
 }
 
-server_tool_bbr_status() {
-    local available current qdisc
-    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
-    current=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
-    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || true)
-    echo "当前算法 : ${current:-未知}"
-    echo "可用算法 : ${available:-未知}"
-    echo "当前 qdisc: ${qdisc:-未知}"
+# ==============================================================================
+# [12A] 网络调优 v1.10.0-dev1：只读诊断 / 初始快照 / BBR 最小事务
+# ==============================================================================
+# 禁止把网络调优状态存进 STATE_DIR：完全卸载默认保留用户主动网络设置，
+# 必须同时保留恢复所需的 baseline，避免留下无法回滚的 sysctl 配置。
+NET_TUNE_DIR="/var/lib/ss2022-network-tuning"
+NET_TUNE_SNAPSHOT="${NET_TUNE_DIR}/original.json"
+NET_TUNE_CONF="/etc/sysctl.d/99-ss2022-network-tuning.conf"
+NET_TUNE_LEGACY_CONF="/etc/sysctl.d/99-ss2022-bbr.conf"
+NET_TUNE_SYSCTL_DIR="/etc/sysctl.d"
+
+network_tuning_legacy_status() {
+    if [[ ! -e "$NET_TUNE_LEGACY_CONF" && ! -L "$NET_TUNE_LEGACY_CONF" ]]; then
+        printf 'absent'
+    elif [[ -f "$NET_TUNE_LEGACY_CONF" && ! -L "$NET_TUNE_LEGACY_CONF" ]] &&
+         [[ "$(cat "$NET_TUNE_LEGACY_CONF")" == $'net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr' ]]; then
+        printf 'owned'
+    else
+        printf 'modified'
+    fi
 }
 
-server_tool_bbr_enable() {
-    local available
-    modprobe tcp_bbr >/dev/null 2>&1 || true
-    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+network_tuning_conf_is_owned() {
+    [[ -f "$NET_TUNE_CONF" && ! -L "$NET_TUNE_CONF" ]] || return 1
+    [[ "$(cat "$NET_TUNE_CONF")" == $'# vps-bootstrap network tuning: BBR/fq (managed by ss2022.sh)\nnet.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr' ]]
+}
 
-    if ! grep -qw bbr <<<"$available"; then
-        echo -e "${RED}[错误] 当前内核没有提供 BBR。${PLAIN}"
-        echo -e "${YELLOW}本脚本不会为了 BBR 自动替换 VPS 内核。${PLAIN}"
-        return 1
-    fi
-
-    mkdir -p /etc/sysctl.d
-    cat > /etc/sysctl.d/99-ss2022-bbr.conf <<'EOF'
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-EOF
-
-    sysctl -p /etc/sysctl.d/99-ss2022-bbr.conf >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1 || return 1
-
-    if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]]; then
-        echo -e "${GREEN}✔ BBR 已启用。${PLAIN}"
-        return 0
-    fi
-
-    echo -e "${RED}[错误] BBR 参数写入后未生效。${PLAIN}"
+network_tuning_conflict_file() {
+    local f
+    # 操作系统原生 /usr/lib/sysctl.d 属发行版默认值；本模块仅拒绝覆盖管理员
+    # 在 /etc/sysctl.conf、/etc/sysctl.d 手工维护的相同键。
+    for f in /etc/sysctl.conf "$NET_TUNE_SYSCTL_DIR"/*.conf; do
+        [[ -f "$f" ]] || continue
+        [[ "$f" == "$NET_TUNE_CONF" || "$f" == "$NET_TUNE_LEGACY_CONF" ]] && continue
+        if awk '/^[[:space:]]*(net\.core\.default_qdisc|net\.ipv4\.tcp_congestion_control)[[:space:]]*=/{found=1} END{exit !found}' "$f"; then
+            printf '%s\n' "$f"
+            return 0
+        fi
+    done
     return 1
 }
 
-server_tool_bbr_disable() {
-    local available fallback="cubic"
-    rm -f /etc/sysctl.d/99-ss2022-bbr.conf
-    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
-    grep -qw cubic <<<"$available" || fallback=$(awk '{print $1}' <<<"$available")
-    [[ -n "$fallback" ]] || fallback="reno"
-
-    sysctl -w "net.ipv4.tcp_congestion_control=${fallback}" >/dev/null 2>&1 || true
-    if grep -qw fq_codel <<<"$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"; then
-        :
-    else
-        sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1 || true
+network_tuning_assert_safe() {
+    local legacy conflict
+    legacy=$(network_tuning_legacy_status)
+    if [[ "$legacy" == modified ]]; then
+        echo "[保护] 检测到非官方内容的旧 BBR 文件，拒绝接管：$NET_TUNE_LEGACY_CONF"
+        return 1
     fi
-    echo -e "${GREEN}✔ 已移除本脚本 BBR 持久化配置；当前算法: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 未知)${PLAIN}"
+    if [[ -e "$NET_TUNE_CONF" || -L "$NET_TUNE_CONF" ]] && ! network_tuning_conf_is_owned; then
+        echo "[保护] 新版网络调优文件内容已被修改，拒绝覆盖：$NET_TUNE_CONF"
+        return 1
+    fi
+    conflict=$(network_tuning_conflict_file) && {
+        echo "[保护] 管理员已有相同 sysctl 键配置，拒绝覆盖：$conflict"
+        return 1
+    }
+    return 0
 }
 
-server_tool_bbr_management() {
-    local c
+network_tuning_get_iface() {
+    local family="$1" target="$2" route line prev="" field
+    command -v ip >/dev/null 2>&1 || return 1
+    route=$(ip "-${family}" route get "$target" 2>/dev/null) || return 1
+    # 不使用 ip | grep -q；在 pipefail + 单核/多网卡环境中会误判 SIGPIPE。
+    line=${route%%$'\n'*}
+    for field in $line; do
+        if [[ "$prev" == dev ]]; then printf '%s\n' "$field"; return 0; fi
+        prev="$field"
+    done
+    return 1
+}
+
+network_tuning_status() {
+    local cc available qdisc v4 v6 iface active legacy snapshot_note conflict
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || true)
+    v4=$(network_tuning_get_iface 4 1.1.1.1 || true)
+    v6=$(network_tuning_get_iface 6 2606:4700:4700::1111 || true)
+    iface=${v4:-$v6}
+    active="未检测"
+    if [[ -n "$iface" ]] && command -v tc >/dev/null 2>&1; then
+        active=$(tc qdisc show dev "$iface" 2>/dev/null | awk '$1=="qdisc" && $0 ~ / root / {print $2; exit}')
+        [[ -n "$active" ]] || active="系统默认/未显示根队列"
+    fi
+    legacy=$(network_tuning_legacy_status)
+    snapshot_note="未建立"
+    [[ -f "$NET_TUNE_SNAPSHOT" ]] && snapshot_note="已保存"
+    echo -e "${CYAN}══════════════════ 网络状态 ══════════════════${PLAIN}"
+    echo "拥塞算法       : ${cc:-未知}"
+    echo "内核可用算法   : ${available:-未知}"
+    echo "默认 qdisc     : ${qdisc:-未知}"
+    echo "当前出口 qdisc : $active"
+    echo "IPv4 出口设备  : ${v4:-不可用/未识别}"
+    echo "IPv6 出口设备  : ${v6:-不可用/未识别}"
+    echo "旧版 BBR 配置  : $legacy"
+    echo "初始快照       : $snapshot_note"
+    if [[ -e "$NET_TUNE_CONF" || -L "$NET_TUNE_CONF" ]]; then
+        if network_tuning_conf_is_owned; then
+            echo "BBR 持久化     : v1.10.0 管理"
+        else
+            echo "BBR 持久化     : 文件已修改，拒绝接管"
+        fi
+    elif [[ "$legacy" == owned ]]; then
+        echo "BBR 持久化     : v1.9.0 管理（尚未迁移）"
+    else
+        echo "BBR 持久化     : 无本模块配置"
+    fi
+    conflict=$(network_tuning_conflict_file) && echo "外部 sysctl    : $conflict"
+    echo ""
+    echo "说明：网卡识别仅使用路由查询，不主动发包；"
+    echo "      新版本暂不进行 iperf3 测速、HTB 整形或 initcwnd 修改。"
+}
+
+network_tuning_snapshot() {
+    local cc qdisc legacy tmp key value
+    command -v jq >/dev/null 2>&1 || { echo "[错误] 缺少 jq，无法创建可信快照。"; return 1; }
+    network_tuning_assert_safe || return 1
+    if [[ -f "$NET_TUNE_SNAPSHOT" ]]; then
+        jq -e '.schema == 1 and (.baseline.congestion|type=="string") and (.baseline.qdisc|type=="string")' \
+            "$NET_TUNE_SNAPSHOT" >/dev/null 2>&1 || {
+            echo "[保护] 已有快照格式异常，拒绝覆盖。"
+            return 1
+        }
+        echo "原始快照已存在，保留首次记录：$NET_TUNE_SNAPSHOT"
+        return 0
+    fi
+    if [[ -e "$NET_TUNE_CONF" || -L "$NET_TUNE_CONF" ]]; then
+        echo "[保护] 已有新模块配置但没有初始快照，不得把调优后的状态冒充基线。"
+        return 1
+    fi
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) || return 1
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null) || return 1
+    [[ "$cc" =~ ^[a-zA-Z0-9_]+$ && "$qdisc" =~ ^[a-zA-Z0-9_]+$ ]] || return 1
+    legacy=$(network_tuning_legacy_status)
+    # 未来 BDP 调优也需要最初的四项 buffer 值，首版就完整保存，避免以后无法回滚。
+    local rmem_max wmem_max tcp_rmem tcp_wmem
+    rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null) || return 1
+    wmem_max=$(sysctl -n net.core.wmem_max 2>/dev/null) || return 1
+    tcp_rmem=$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null) || return 1
+    tcp_wmem=$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null) || return 1
+    umask 077
+    mkdir -p "$NET_TUNE_DIR" || return 1
+    chmod 700 "$NET_TUNE_DIR" || return 1
+    tmp=$(mktemp "$NET_TUNE_DIR/.original.XXXXXXXX") || return 1
+    if ! jq -n \
+        --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg cc "$cc" --arg q "$qdisc" --arg legacy "$legacy" \
+        --arg rmax "$rmem_max" --arg wmax "$wmem_max" \
+        --arg tr "$tcp_rmem" --arg tw "$tcp_wmem" \
+        '{schema:1,created_at:$at,legacy_bbr:$legacy,baseline:{
+           congestion:$cc,qdisc:$q,rmem_max:$rmax,wmem_max:$wmax,tcp_rmem:$tr,tcp_wmem:$tw
+         }}' > "$tmp" ||
+       ! jq -e '.schema == 1 and .baseline.congestion != "" and .baseline.qdisc != "" and
+                .baseline.rmem_max != "" and .baseline.wmem_max != "" and
+                .baseline.tcp_rmem != "" and .baseline.tcp_wmem != ""' "$tmp" >/dev/null; then
+        rm -f "$tmp"
+        echo "[错误] 快照写入或校验失败，未修改网络。"
+        return 1
+    fi
+    if [[ -e "$NET_TUNE_SNAPSHOT" ]]; then
+        rm -f "$tmp"
+        echo "[保护] 快照由另一会话创建，保留现有版本。"
+        return 1
+    fi
+    chmod 600 "$tmp" && mv "$tmp" "$NET_TUNE_SNAPSHOT" || {
+        rm -f "$tmp"
+        echo "[错误] 无法原子保存快照，未修改网络。"
+        return 1
+    }
+    echo -e "${GREEN}✔ 原始快照已保存：$NET_TUNE_SNAPSHOT${PLAIN}"
+    echo "  旧版 BBR 的当前值如已生效，将被视为这次迁移的基线。"
+}
+
+network_tuning_enable_bbr() (
+    local cc qdisc available tmp="" legacy
+    network_tuning_assert_safe || exit 1
+    network_tuning_snapshot || exit 1
+    modprobe tcp_bbr >/dev/null 2>&1 || true
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+    if [[ " $available " != *" bbr "* ]]; then
+        echo "[错误] 当前内核不提供 BBR；不会自动更换内核。"
+        exit 1
+    fi
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) || exit 1
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null) || exit 1
+    legacy=$(network_tuning_legacy_status)
+    umask 077
+    mkdir -p "$NET_TUNE_SYSCTL_DIR" || exit 1
+    tmp=$(mktemp "$NET_TUNE_SYSCTL_DIR/.ss2022-network-tuning.XXXXXXXX") || exit 1
+    trap 'rm -f "$tmp"' EXIT
+    printf '%s\n' \
+        '# vps-bootstrap network tuning: BBR/fq (managed by ss2022.sh)' \
+        'net.core.default_qdisc=fq' \
+        'net.ipv4.tcp_congestion_control=bbr' > "$tmp" || exit 1
+    if ! sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 ||
+       ! sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 ||
+       [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" != bbr ]]; then
+        sysctl -w "net.ipv4.tcp_congestion_control=$cc" >/dev/null 2>&1 || true
+        sysctl -w "net.core.default_qdisc=$qdisc" >/dev/null 2>&1 || true
+        echo "[错误] BBR/fq 未能完全生效，已尝试恢复操作前的运行参数。"
+        exit 1
+    fi
+    chmod 644 "$tmp" && mv -f "$tmp" "$NET_TUNE_CONF" || {
+        sysctl -w "net.ipv4.tcp_congestion_control=$cc" >/dev/null 2>&1 || true
+        sysctl -w "net.core.default_qdisc=$qdisc" >/dev/null 2>&1 || true
+        echo "[错误] BBR 持久化失败；已尝试恢复运行参数。"
+        exit 1
+    }
+    if [[ "$legacy" == owned ]]; then
+        rm -f "$NET_TUNE_LEGACY_CONF" || {
+            echo "[错误] 无法清理旧版 BBR 文件，新版已生效但迁移未完成。"
+            exit 1
+        }
+    fi
+    echo -e "${GREEN}✔ 已启用原生 BBR + fq；持久化归新版网络调优模块管理。${PLAIN}"
+)
+
+network_tuning_restore() (
+    local cc qdisc legacy old_cc old_qdisc tmp=""
+    [[ -f "$NET_TUNE_SNAPSHOT" ]] || { echo "[提示] 没有可恢复的初始快照。"; exit 1; }
+    command -v jq >/dev/null 2>&1 || exit 1
+    network_tuning_assert_safe || exit 1
+    jq -e '.schema==1 and (.baseline.congestion|type=="string") and
+           (.baseline.qdisc|type=="string") and
+           (.legacy_bbr=="absent" or .legacy_bbr=="owned")' \
+        "$NET_TUNE_SNAPSHOT" >/dev/null 2>&1 || {
+        echo "[保护] 快照内容无效，拒绝恢复。"
+        exit 1
+    }
+    cc=$(jq -r '.baseline.congestion' "$NET_TUNE_SNAPSHOT")
+    qdisc=$(jq -r '.baseline.qdisc' "$NET_TUNE_SNAPSHOT")
+    legacy=$(jq -r '.legacy_bbr' "$NET_TUNE_SNAPSHOT")
+    [[ "$cc" =~ ^[a-zA-Z0-9_]+$ && "$qdisc" =~ ^[a-zA-Z0-9_]+$ ]] || exit 1
+    if [[ "$legacy" == absent && "$(network_tuning_legacy_status)" != absent ]]; then
+        echo "[保护] 恢复目标原来不存在旧 BBR 文件，但现在出现了新的同名文件。"
+        exit 1
+    fi
+    old_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) || exit 1
+    old_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null) || exit 1
+    if [[ "$legacy" == owned && ! -e "$NET_TUNE_LEGACY_CONF" ]]; then
+        umask 077
+        tmp=$(mktemp "$NET_TUNE_SYSCTL_DIR/.ss2022-bbr-restore.XXXXXXXX") || exit 1
+        trap 'rm -f "$tmp"' EXIT
+        printf '%s\n' 'net.core.default_qdisc=fq' \
+            'net.ipv4.tcp_congestion_control=bbr' > "$tmp" || exit 1
+    fi
+    if ! sysctl -w "net.ipv4.tcp_congestion_control=$cc" >/dev/null 2>&1 ||
+       ! sysctl -w "net.core.default_qdisc=$qdisc" >/dev/null 2>&1; then
+        sysctl -w "net.ipv4.tcp_congestion_control=$old_cc" >/dev/null 2>&1 || true
+        sysctl -w "net.core.default_qdisc=$old_qdisc" >/dev/null 2>&1 || true
+        echo "[错误] 恢复运行参数失败，保留原配置文件和快照。"
+        exit 1
+    fi
+    if [[ -n "$tmp" ]]; then
+        chmod 644 "$tmp" && mv "$tmp" "$NET_TUNE_LEGACY_CONF" || {
+            sysctl -w "net.ipv4.tcp_congestion_control=$old_cc" >/dev/null 2>&1 || true
+            sysctl -w "net.core.default_qdisc=$old_qdisc" >/dev/null 2>&1 || true
+            echo "[错误] 恢复旧版 BBR 持久化文件失败。"
+            exit 1
+        }
+    fi
+    if [[ -e "$NET_TUNE_CONF" ]] && ! rm -f "$NET_TUNE_CONF"; then
+        echo "[错误] 无法移除新版 BBR 配置，保留初始快照供修复。"
+        exit 1
+    fi
+    echo -e "${GREEN}✔ 已恢复首次调优前的 BBR/fq 运行参数及旧版配置状态。${PLAIN}"
+    echo "原始快照仍保留，便于核对；没有修改路由、网卡根 qdisc 或 SSH。"
+)
+
+network_tuning_management() {
+    local c answer
     while true; do
         clear
-        echo -e "${CYAN}════════════════════ BBR 管理 ════════════════════${PLAIN}"
-        server_tool_bbr_status
+        network_tuning_status
         echo ""
-        echo "  1. 启用当前内核原生 BBR"
-        echo "  2. 移除本脚本 BBR 配置"
+        echo "  1. 刷新网络状态（只读）"
+        echo "  2. 保存首次网络状态快照"
+        echo "  3. 启用当前内核 BBR + fq"
+        echo "  4. 恢复首次调优前的 BBR/fq 配置"
         echo "  0. 返回"
-        read -rp "请选择 [0-2]: " c
+        read -rp "请选择 [0-4]: " c
         case "$c" in
-            1) server_tool_bbr_enable; pause ;;
-            2) server_tool_bbr_disable; pause ;;
+            1) pause ;;
+            2) network_tuning_snapshot; pause ;;
+            3) network_tuning_enable_bbr; pause ;;
+            4)
+                echo "说明：将恢复首次快照中的拥塞算法和默认 qdisc。"
+                read -rp "确认恢复？[y/N]: " answer
+                if [[ "$answer" =~ ^[Yy]$ ]]; then network_tuning_restore; fi
+                pause ;;
             0) return ;;
             *) sleep 1 ;;
         esac
@@ -10785,7 +11014,7 @@ server_management_tools() {
         echo "  3. TG-BOT 流量监控 / 预警 / 自动关机"
         echo "  4. 系统更新 / 清理"
         echo "  5. Swap 虚拟内存"
-        echo "  6. BBR 加速"
+        echo "  6. 网络调优（v1.10.0-dev1）"
         echo "  7. DNS 管理"
         echo "  8. IPv4 / IPv6 管理"
         echo "  9. 系统时区"
@@ -10800,7 +11029,7 @@ server_management_tools() {
             3) server_tool_tg_monitor_management ;;
             4) server_tool_system_update ;;
             5) server_tool_swap_management ;;
-            6) server_tool_bbr_management ;;
+            6) network_tuning_management ;;
             7) server_tool_dns_management ;;
             8) server_tool_ip_family_management ;;
             9) server_tool_timezone_management ;;
