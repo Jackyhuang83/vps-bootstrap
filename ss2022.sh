@@ -10387,7 +10387,7 @@ network_tuning_htb_baseline() {
     jq -nc --arg iface "$iface" --arg idx "$index" --arg root "$root" \
         --argjson args "$argjson" \
         '{schema:1,mode:"htb_ephemeral_trial",iface:$iface,ifindex:$idx,
-          original_root:$root,restore_args:$args,permanent:false}'
+          original_root:$root,restore_kind:"fq_codel",restore_args:$args,permanent:false}'
 }
 
 network_tuning_htb_trial() (
@@ -10485,7 +10485,12 @@ if grep -Eq '^qdisc htb 1: root' <<< "$root"; then
     ((restored == 1)) || { echo restore_failed > "$trial/result"; exit 1; }
     echo rolled_back_live > "$trial/result"
 elif grep -Eq '^qdisc fq_codel [^ ]+ root' <<< "$root"; then
-    echo already_original > "$trial/result"
+    expected=$(jq -r .original_root "$snapshot")
+    if [[ "$root" == "$expected" ]]; then
+        echo baseline_unchanged > "$trial/result"
+    else
+        echo external_root_conflict > "$trial/result"; exit 1
+    fi
 else
     echo external_root_conflict > "$trial/result"; exit 1
 fi
