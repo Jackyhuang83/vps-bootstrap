@@ -10,6 +10,7 @@ on:
       - "tests/network-throughput-smoke.sh"
       - "tests/network-qoe-smoke.sh"
       - "tests/network-candidate-smoke.sh"
+      - "tests/network-scan-smoke.sh"
       - "README.md"
       - ".github/workflows/ci.yml"
       - ".github/workflows/promote-ss2022.yml"
@@ -24,6 +25,7 @@ on:
       - "tests/network-throughput-smoke.sh"
       - "tests/network-qoe-smoke.sh"
       - "tests/network-candidate-smoke.sh"
+      - "tests/network-scan-smoke.sh"
       - "README.md"
       - ".github/workflows/ci.yml"
 
@@ -73,6 +75,12 @@ jobs:
         run: |
           bash -n tests/network-candidate-smoke.sh
           bash tests/network-candidate-smoke.sh
+
+      - name: Network tuning dev5 bounded scan regression
+        shell: bash
+        run: |
+          bash -n tests/network-scan-smoke.sh
+          bash tests/network-scan-smoke.sh
 
       - name: Check script version
         run: |

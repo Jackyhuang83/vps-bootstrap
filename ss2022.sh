@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
-# 当前版本: v1.10.0-dev4
+# 当前版本: v1.10.0-dev5
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,10 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.10.0-dev5:
+#   - 可信 iperf3 三档 × 双轮 QoE 采样，独立单次 watchdog/聚合流量预算
+#   - 自动将 6 份实测样本输出为私有 JSON 并交给 dev4 只读候选评估，不应用整形
 #
 # v1.10.0-dev4:
 #   - 3档速率×2轮完整数据重复验证，只有可重复吞吐拐点加带载时延增长才计算候选速率
@@ -651,7 +655,7 @@
 # 注意: v1.9.0 为稳定正式版；Alpine 3.21 上 Snell v5 与 Cloudflare WARP 仍受官方组件兼容性限制。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.10.0-dev4"
+SCRIPT_VERSION="v1.10.0-dev5"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -7907,7 +7911,7 @@ realm_service_management() {
         echo "  6. 启动服务"
         echo "  7. 卸载 Realm 转发组件"
         echo "  0. 返回"
-        read -rp "请选择 [0-7]: " c
+        read -rp "请选择 [0-8]: " c
         case "$c" in
             1)
                 if install_realm_core; then
@@ -9761,7 +9765,7 @@ NET_TUNE_QOE_BUDGET_MIB=96
 
 network_tuning_qoe_ping() {
     # IPv4/IPv6 per-target ICMP on the same route as the iperf peer.
-    ping "-$1" -n -c "$3" -i 0.5 -W 1 "$2"
+    ping "-$1" -n -c "$3" -i "${4:-0.5}" -W 1 "$2"
 }
 
 network_tuning_qoe_samples() {
@@ -10051,6 +10055,175 @@ network_tuning_candidate_menu() {
     echo "dev4 仅给候选及风险提示，不修改 qdisc、路由或 sysctl。"
 }
 
+
+# ==============================================================================
+# [12E] v1.10.0-dev5: bounded 3-rate x 2-round evidence collection
+# ==============================================================================
+# An explicit RUN and a trusted iperf3 peer are mandatory. NO network writes.
+NET_TUNE_SCAN_DURATION=6
+NET_TUNE_SCAN_TOTAL_MAX_MIB=2560
+NET_TUNE_SCAN_PER_PROBE_MAX_MIB=768
+
+network_tuning_scan_plan() {
+    local tier="$1" low mid high rate estimate budget total=0
+    local -a budgets=()
+    network_tuning_profile "$tier" >/dev/null || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    low=$((tier * 40 / 100))
+    mid=$((tier * 80 / 100))
+    high="$tier"
+    for rate in "$low" "$mid" "$high"; do
+        estimate=$((rate * 1000000 * NET_TUNE_SCAN_DURATION / 8))
+        # Each probe needs a 30% headroom above its computed TCP payload.
+        budget=$(((estimate * 10 + 7 * 1048576 - 1) / (7 * 1048576)))
+        (( budget >= 1 && budget <= NET_TUNE_SCAN_PER_PROBE_MAX_MIB )) || return 1
+        budgets+=("$budget")
+        total=$((total + 2 * budget))
+    done
+    (( total <= NET_TUNE_SCAN_TOTAL_MAX_MIB )) || return 1
+    jq -nc --argjson tier "$tier" --argjson duration "$NET_TUNE_SCAN_DURATION" \
+        --argjson total "$total" --argjson cap "$NET_TUNE_SCAN_TOTAL_MAX_MIB" \
+        --argjson low "$low" --argjson mid "$mid" --argjson high "$high" \
+        --argjson lb "${budgets[0]}" --argjson mb "${budgets[1]}" \
+        --argjson hb "${budgets[2]}" \
+        '{schema:1,tier_mbps:$tier,duration_sec:$duration,rounds:2,
+          rate_mbps:[$low,$mid,$high],budget_mib:[$lb,$mb,$hb],
+          aggregate_budget_mib:$total,aggregate_cap_mib:$cap,auto_apply:false}'
+}
+
+network_tuning_scan_run() (
+    local tier="$1" family="$2" peer="$3" port="$4"
+    local plan target iface baseline checked audit answer rate budget round i
+    local ping_pid=0 work="" report="" now summary tool counter
+    local -a rates budgets
+    network_tuning_profile "$tier" >/dev/null || exit 1
+    [[ "$family" == 4 || "$family" == 6 ]] || exit 1
+    [[ "$port" =~ ^[1-9][0-9]*$ ]] && ((port >= 1 && port <= 65535)) || exit 1
+    for tool in ip iperf3 jq ping tc flock; do
+        command -v "$tool" >/dev/null 2>&1 || { echo "[错误] 缺少：$tool"; exit 1; }
+    done
+    plan=$(network_tuning_scan_plan "$tier") || exit 1
+    mapfile -t rates < <(jq -r '.rate_mbps[]' <<< "$plan")
+    mapfile -t budgets < <(jq -r '.budget_mib[]' <<< "$plan")
+    # Scoped to this subshell; existing dev2 100Mbps/256MiB caps are unchanged.
+    NET_TUNE_PROBE_MAX_MBPS=500
+    NET_TUNE_PROBE_MAX_BUDGET_MIB="$NET_TUNE_SCAN_PER_PROBE_MAX_MIB"
+    target=$(network_tuning_probe_resolve "$family" "$peer") || exit 1
+    checked=$(network_tuning_probe_check "$family" "$target" "${rates[0]}" \
+        "$NET_TUNE_SCAN_DURATION" "${budgets[0]}") || {
+        echo "$checked"; exit 1;
+    }
+    IFS='|' read -r _ iface _ <<< "$checked"
+    counter="$NET_TUNE_PROBE_SYSFS/$iface/statistics/tx_bytes"
+    baseline=$(cat "$counter" 2>/dev/null) || exit 1
+    [[ "$baseline" =~ ^[0-9]+$ ]] || exit 1
+    audit=$(network_tuning_qdisc_audit "$iface") || true
+    echo "套餐：${tier}Mbps；对端：$target:$port；IPv${family} 出口：$iface"
+    echo "每档两轮、每轮 ${NET_TUNE_SCAN_DURATION}s；速率：${rates[*]} Mbps"
+    echo "累计网卡发送预算：$(jq -r .aggregate_budget_mib <<< "$plan")MiB（≤${NET_TUNE_SCAN_TOTAL_MAX_MIB}MiB）"
+    echo "qdisc 预检：$audit（只读，不授予更改权限）"
+    echo "警告：本测试可能占满线路，影响视频和聊天；仅建议低峰期手动执行。"
+    echo "永不应用 tc 整形或修改 sysctl。"
+    read -rp "确认六次网络采样？请输入 RUN: " answer
+    [[ "$answer" == RUN ]] || { echo "已取消。"; exit 0; }
+
+    [[ ! -L "$NET_TUNE_DIR" ]] || { echo "[保护] 工作目录为链接。"; exit 1; }
+    if [[ ! -e "$NET_TUNE_DIR" ]]; then
+        ( umask 077; mkdir -m 700 -p "$NET_TUNE_DIR" ) || exit 1
+    fi
+    [[ -d "$NET_TUNE_DIR" && ! -L "$NET_TUNE_DIR" ]] || exit 1
+    [[ "$(stat -c %u "$NET_TUNE_DIR")" == "$(id -u)" ]] || {
+        echo "[保护] 工作目录不属于当前用户。"; exit 1;
+    }
+    [[ ! -L "$NET_TUNE_DIR/.scan.lock" ]] || exit 1
+    umask 077
+    exec 9>>"$NET_TUNE_DIR/.scan.lock" || exit 1
+    flock -n 9 || { echo "[保护] 已有扫描正在进行。"; exit 1; }
+    work=$(mktemp -d "$NET_TUNE_DIR/.scan.XXXXXXXX") || exit 1
+    network_tuning_scan_cleanup() {
+        (( ping_pid > 0 )) && kill -TERM "$ping_pid" 2>/dev/null || true
+        [[ -n "$work" && -d "$work" ]] && rm -rf "$work"
+        [[ -n "$report" ]] && rm -f "$report"
+        return 0
+    }
+    trap 'exit 130' INT TERM HUP
+    trap network_tuning_scan_cleanup EXIT
+    : > "$work/samples.jsonl"
+    for round in 1 2; do
+        for i in 0 1 2; do
+            rate="${rates[i]}"; budget="${budgets[i]}"
+            checked=$(network_tuning_probe_check "$family" "$target" "$rate" \
+                "$NET_TUNE_SCAN_DURATION" "$budget") || exit 1
+            [[ "$checked" == "$target|$iface|"* ]] || {
+                echo "[保护] 扫描期间出口路由变化，停止。"; exit 1;
+            }
+            now=$(cat "$counter" 2>/dev/null) || exit 1
+            [[ "$now" =~ ^[0-9]+$ ]] && ((now >= baseline)) || exit 1
+            ((now - baseline < NET_TUNE_SCAN_TOTAL_MAX_MIB * 1048576)) || exit 1
+            echo "=== 第 $round/2 轮，${rate}Mbps ==="
+            network_tuning_qoe_ping "$family" "$target" "$NET_TUNE_QOE_IDLE_COUNT" \
+                > "$work/idle.log" 2>&1 || true
+            network_tuning_qoe_samples "$work/idle.log" > "$work/idle.jsonl"
+            ( sleep 0.2; network_tuning_qoe_ping "$family" "$target" \
+                "$NET_TUNE_QOE_LOADED_COUNT" 0.4 ) > "$work/loaded.log" 2>&1 &
+            ping_pid=$!
+            if ! network_tuning_probe_run "$family" "$target" "$port" "$rate" \
+                "$NET_TUNE_SCAN_DURATION" "$budget" "$work/probe.json" <<< "RUN"; then
+                echo "[保护] 测速失败或超预算，不生成完整证据。"; exit 1
+            fi
+            wait "$ping_pid" 2>/dev/null || true
+            ping_pid=0
+            network_tuning_qoe_samples "$work/loaded.log" > "$work/loaded.jsonl"
+            network_tuning_qoe_evaluate "$work/idle.jsonl" "$work/loaded.jsonl" \
+                "$work/probe.json" > "$work/eval.json" || exit 1
+            if ! jq -e --argjson idle "$NET_TUNE_QOE_IDLE_COUNT" \
+                --argjson loaded "$NET_TUNE_QOE_LOADED_COUNT" \
+                '.verdict!="inconclusive" and .idle_samples==$idle and
+                  .loaded_samples==$loaded and .loss_percent==0' \
+                "$work/eval.json" >/dev/null; then
+                echo "[保护] RTT/ICMP 样本不完整；停止扫描。"; exit 1
+            fi
+            jq -nc --argjson rate "$rate" --argjson round "$round" \
+                --slurpfile p "$work/probe.json" --slurpfile q "$work/eval.json" \
+                '{rate_mbps:$rate,round:$round,sender_mbps:$p[0].sender_mbps,
+                  received_mbps:$p[0].received_mbps,
+                  idle_p95_ms:$q[0].idle_p95_ms,
+                  loaded_p95_ms:$q[0].loaded_p95_ms,
+                  retransmits:$p[0].retransmits}' >> "$work/samples.jsonl" || exit 1
+            now=$(cat "$counter" 2>/dev/null) || exit 1
+            [[ "$now" =~ ^[0-9]+$ ]] && ((now >= baseline)) || exit 1
+            ((now - baseline < NET_TUNE_SCAN_TOTAL_MAX_MIB * 1048576)) || exit 1
+            sleep 2
+        done
+    done
+    report=$(mktemp "$NET_TUNE_DIR/scan-XXXXXXXX.json") || exit 1
+    jq -n --argjson tier "$tier" --slurpfile samples "$work/samples.jsonl" \
+        '{schema:1,tier_mbps:$tier,samples:$samples}' > "$report" || exit 1
+    [[ "$(jq -r '.samples|length' "$report")" == 6 ]] || exit 1
+    summary=$(network_tuning_candidate_assess "$tier" "$report") || exit 1
+    echo "只读判定：$(jq -r '.status + " / " + .reason' <<< "$summary")"
+    echo "候选结果：$(jq -r 'if .candidate_kbps then
+        (.candidate_kbps|tostring)+"Kbps（需 A/B 复验，未应用）"
+        else "无可靠候选，保持原配置" end' <<< "$summary")"
+    echo "本机六样本证据：$report（600 权限）"
+    report=""
+)
+
+network_tuning_scan_menu() {
+    local tier family peer port plan
+    echo "开发预览：六轮实时测速可能占满线路。"
+    read -rp "真实线路套餐 Mbps [30]: " tier
+    tier="${tier:-30}"
+    plan=$(network_tuning_scan_plan "$tier") || return 1
+    echo "自动三档：$(jq -r '.rate_mbps|join(" / ")' <<< "$plan") Mbps；"
+    echo "总发送预算：$(jq -r .aggregate_budget_mib <<< "$plan") MiB。"
+    read -rp "地址族 4/6 [4]: " family
+    read -rp "可信 iperf3 服务端域名或 IP: " peer
+    [[ -n "$peer" ]] || { echo "已取消。"; return 0; }
+    read -rp "服务端端口 [5201]: " port
+    network_tuning_scan_run "$tier" "${family:-4}" "$peer" "${port:-5201}"
+}
+
 network_tuning_management() {
     local c answer
     while true; do
@@ -10064,6 +10237,7 @@ network_tuning_management() {
         echo "  5. 安全测速（iperf3 / IPv4 / IPv6）"
         echo "  6. 视频 / 网页 / 聊天体验诊断（dev3）"
         echo "  7. 只读候选整形值与 tc 安全预检（dev4）"
+        echo "  8. 六样本自动诊断（dev5，开发预览）"
         echo "  0. 返回"
         read -rp "请选择 [0-7]: " c
         case "$c" in
@@ -10078,6 +10252,7 @@ network_tuning_management() {
             5) network_tuning_probe_menu; pause ;;
             6) network_tuning_qoe_menu; pause ;;
             7) network_tuning_candidate_menu; pause ;;
+            8) network_tuning_scan_menu; pause ;;
             0) return ;;
             *) sleep 1 ;;
         esac
