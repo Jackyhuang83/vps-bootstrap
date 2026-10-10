@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Dev8: synthetic A/B evidence. The production evaluator is READ-ONLY.
 set -euo pipefail
-set -x
 export SS2022_LIB_ONLY=1
 # shellcheck disable=SC1091
 source ./ss2022.sh
@@ -23,7 +22,7 @@ make_json 2 330 180 > "$tmp/ok.json"
 ok=$(network_tuning_ab_assess 30 "$tmp/ok.json")
 [[ "$(jq -r .verdict <<< "$ok")" == candidate_for_further_field_validation ]]
 [[ "$(jq -r .auto_apply <<< "$ok")" == false ]]
-make_json 0 395 180 > "$tmp/neutral.json"
+make_json 0 395 180 | jq '.samples |= map(.video_buffer_s=0)' > "$tmp/neutral.json"
 [[ "$(network_tuning_ab_assess 30 "$tmp/neutral.json" | jq -r .verdict)" == keep_baseline ]]
 make_json 2 330 500 > "$tmp/chat.json"
 [[ "$(network_tuning_ab_assess 30 "$tmp/chat.json" | jq -r .verdict)" == keep_baseline ]]
