@@ -93,4 +93,26 @@ fi
 [[ "$(cat "$trial/result")" == external_root_conflict ]]
 [[ -f "$tmp/worker/.htb-active" ]]
 [[ ! -e "$FAKE_TC_ARGS" ]]
-echo 'Network tuning dev7 HTB preflight and rollback worker smoke passed.'
+# If timer fires while the launcher is still applying HTB, the worker
+# must block on the shared phase lock, not overwrite an in-progress setup.
+echo 'qdisc htb 1: root refcnt 2' > "$FAKE_TC_STATE"
+printf '%s\n' "$trial" > "$tmp/worker/.htb-active"
+rm -f "$trial/result" "$FAKE_TC_ARGS"
+exec 7>"$trial/phase.lock"
+flock -x 7
+PATH="$fakebin:$PATH" bash "$tmp/restore.sh" "$trial" > "$tmp/locked.log" 2>&1 &
+worker_pid=$!
+sleep 0.2
+[[ ! -e "$trial/result" && ! -e "$FAKE_TC_ARGS" ]] || {
+    echo "FAIL: watchdog wrote while launcher held phase lock" >&2
+    flock -u 7
+    wait "$worker_pid" || true
+    exit 1
+}
+flock -u 7
+wait "$worker_pid"
+[[ "$(cat "$trial/result")" == rolled_back_live ]]
+[[ ! -e "$tmp/worker/.htb-active" ]]
+grep -Fq 'limit 10240' "$FAKE_TC_ARGS"
+
+echo 'Network tuning dev7 HTB preflight, conflict and timer-race smoke passed.'
