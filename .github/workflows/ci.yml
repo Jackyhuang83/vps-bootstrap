@@ -7,6 +7,7 @@ on:
     paths:
       - "ss2022.sh"
       - "tests/network-tuning-smoke.sh"
+      - "tests/network-throughput-smoke.sh"
       - "README.md"
       - ".github/workflows/ci.yml"
       - ".github/workflows/promote-ss2022.yml"
@@ -18,6 +19,7 @@ on:
     paths:
       - "ss2022.sh"
       - "tests/network-tuning-smoke.sh"
+      - "tests/network-throughput-smoke.sh"
       - "README.md"
       - ".github/workflows/ci.yml"
 
@@ -49,6 +51,12 @@ jobs:
         run: |
           bash -n tests/network-tuning-smoke.sh
           bash tests/network-tuning-smoke.sh
+
+      - name: Network tuning dev2 throughput regression
+        shell: bash
+        run: |
+          bash -n tests/network-throughput-smoke.sh
+          bash tests/network-throughput-smoke.sh
 
       - name: Check script version
         run: |
