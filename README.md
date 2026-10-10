@@ -4,9 +4,23 @@
 
 当前正式版本：**v1.9.0**
 
+当前开发版本：**v1.10.0-dev1**（独立开发分支，未发布，v1.9.0 正式版不变）
+
 项目以单一交互式 Bash 脚本 `ss2022.sh` 为入口，整合 **SS2022、SS2022 + ShadowTLS v3、VLESS Reality、Snell v5**，并提供 WARP 出口、链式落地、规则分流、Realm L4 端口转发、组件管理、服务器工具、服务器测试与脚本自更新。
 
 > v1.9.0 为当前稳定正式版。Debian / Ubuntu + systemd 正式支持；Alpine 3.21 + OpenRC 正式支持 SS2022、ShadowTLS v3、VLESS Reality、Realm 以及服务器管理/测试。Snell v5 与 Cloudflare WARP 在 Alpine 暂不开放。
+
+---
+
+## 网络调优（v1.10.0-dev1 开发预览）
+
+入口：**服务器管理工具 → 6. 网络调优**。
+
+本阶段实现：只读查看 IPv4/IPv6 实际出站设备、拥塞控制算法与 qdisc；保存首次网络状态快照；在内核支持时启用 BBR + fq；识别官方旧版 `99-ss2022-bbr.conf` 并安全迁移；基于首次快照恢复 BBR/fq 和旧版配置状态。首次快照永久保存在 `/var/lib/ss2022-network-tuning/original.json`（权限 600），不在完全卸载时删除，避免“保留 BBR、丢失恢复依据”。
+
+**安全边界：**遇到修改过的旧 BBR 文件、管理员已有同名 sysctl 项、新版管理文件遭修改，拒绝接管；不替换内核、不改 SSH/DNS/路由、不修改已有活动根 qdisc。当前阶段不包含 iperf3 测速、HTB 整形、initcwnd 或 TCP 缓冲区更改。后续测速模块另行加入流量硬预算和异常退出恢复保护。
+
+**升级提醒：**开发分支尚未合并到 `main`，一键安装仍使用稳定正式版。旧版主动启用过 BBR 的 VPS，首次快照保存的是**当前**状态，无法推断更早之前的未知内核参数。
 
 ---
 
