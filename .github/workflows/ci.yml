@@ -11,6 +11,7 @@ on:
       - "tests/network-qoe-smoke.sh"
       - "tests/network-candidate-smoke.sh"
       - "tests/network-scan-smoke.sh"
+      - "tests/network-rollback-smoke.sh"
       - "README.md"
       - ".github/workflows/ci.yml"
       - ".github/workflows/promote-ss2022.yml"
@@ -26,6 +27,7 @@ on:
       - "tests/network-qoe-smoke.sh"
       - "tests/network-candidate-smoke.sh"
       - "tests/network-scan-smoke.sh"
+      - "tests/network-rollback-smoke.sh"
       - "README.md"
       - ".github/workflows/ci.yml"
 
@@ -81,6 +83,12 @@ jobs:
         run: |
           bash -n tests/network-scan-smoke.sh
           bash tests/network-scan-smoke.sh
+
+      - name: Network tuning dev6 watchdog regression
+        shell: bash
+        run: |
+          bash -n tests/network-rollback-smoke.sh
+          bash tests/network-rollback-smoke.sh
 
       - name: Check script version
         run: |

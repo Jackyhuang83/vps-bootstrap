@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
-# 当前版本: v1.10.0-dev5
+# 当前版本: v1.10.0-dev6
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,10 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.10.0-dev6:
+#   - 独立 watchdog 模拟恢复演练（支持启动 shell SIGKILL）、顺序就绪保护
+#   - 严格 dry-run：仅撤销私有文件标记，不触及活动网卡、HTB/qdisc/sysctl
 #
 # v1.10.0-dev5:
 #   - 可信 iperf3 三档 × 双轮 QoE 采样，独立单次 watchdog/聚合流量预算
@@ -655,7 +659,7 @@
 # 注意: v1.9.0 为稳定正式版；Alpine 3.21 上 Snell v5 与 Cloudflare WARP 仍受官方组件兼容性限制。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.10.0-dev5"
+SCRIPT_VERSION="v1.10.0-dev6"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -7960,7 +7964,7 @@ forwarding_management() {
         echo "  7. Realm 服务管理"
         echo "  0. 返回"
         echo -e "${CYAN}═════════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0-7]: " c
+        read -rp "请选择 [0-10]: " c
         case "$c" in
             1) forwarding_add_single ;;
             2) forwarding_add_range ;;
@@ -10224,6 +10228,108 @@ network_tuning_scan_menu() {
     network_tuning_scan_run "$tier" "${family:-4}" "$peer" "${port:-5201}"
 }
 
+
+# ==============================================================================
+# [12F] v1.10.0-dev6: independently running rollback watchdog (file-only demo)
+# ==============================================================================
+# WARNING: no production qdisc/HTB changes or recovery are enabled here.
+NET_TUNE_ROLLBACK_TRIALS_DIR="$NET_TUNE_DIR/rollback-rehearsals"
+
+network_tuning_rollback_dir_safe() {
+    [[ -d "$1" && ! -L "$1" ]] &&
+    [[ "$(stat -c %u "$1" 2>/dev/null)" == "$(id -u)" ]] &&
+    [[ "$(stat -c %a "$1" 2>/dev/null)" == 700 ]]
+}
+
+network_tuning_rollback_rehearsal() (
+    local ttl="$1" confirm="$2" root="$NET_TUNE_ROLLBACK_TRIALS_DIR"
+    local trial="" started=0 pid i
+    [[ "$ttl" =~ ^[1-9][0-9]*$ ]] && ((ttl>=3 && ttl<=30)) || {
+        echo "[保护] 仅允许 3-30 秒的模拟回滚。" >&2; exit 1;
+    }
+    for i in setsid nohup stat mktemp; do
+        command -v "$i" >/dev/null 2>&1 || { echo "[保护] 缺少 $i。"; exit 1; }
+    done
+    if [[ "$confirm" != RUN ]]; then
+        read -rp "仅演练回滚文件标记，不动网卡。输入 RUN 确认: " confirm
+        [[ "$confirm" == RUN ]] || { echo "已取消。"; exit 0; }
+    fi
+    umask 077
+    [[ ! -L "$NET_TUNE_DIR" && ! -L "$root" ]] || exit 1
+    if [[ ! -e "$NET_TUNE_DIR" ]]; then mkdir -m 700 "$NET_TUNE_DIR" || exit 1; fi
+    network_tuning_rollback_dir_safe "$NET_TUNE_DIR" || {
+        echo "[保护] 数据目录不是本用户拥有的 700 私有目录。" >&2; exit 1;
+    }
+    if [[ ! -e "$root" ]]; then mkdir -m 700 "$root" || exit 1; fi
+    network_tuning_rollback_dir_safe "$root" || exit 1
+    trial=$(mktemp -d "$root/trial-XXXXXXXX") || exit 1
+    printf '%s\n' '{"schema":1,"mode":"dry_run","auto_apply":false}' > "$trial/plan.json"
+    printf '%s\n' ARMED > "$trial/armed"
+    cat > "$trial/watchdog.sh" <<'WATCHDOG_EOF'
+#!/usr/bin/env bash
+# Standalone watchdog: private test-marker cleanup ONLY.
+set -euo pipefail
+umask 077
+trial="$1"
+ttl="$2"
+[[ "$ttl" =~ ^[1-9][0-9]*$ ]] && ((ttl>=3 && ttl<=30)) || exit 1
+[[ -d "$trial" && ! -L "$trial" ]] || exit 1
+[[ "$(stat -c %u "$trial")" == "$(id -u)" ]] || exit 1
+[[ "$(stat -c %a "$trial")" == 700 ]] || exit 1
+[[ "$(cat "$trial/plan.json")" == '{"schema":1,"mode":"dry_run","auto_apply":false}' ]] || exit 1
+[[ "$(cat "$trial/armed")" == ARMED ]] || exit 1
+printf '%s\n' READY > "$trial/ready"
+deadline=$((SECONDS+ttl))
+while ((SECONDS<deadline)); do sleep 1; done
+[[ ! -L "$trial/canary.active" ]] || {
+    echo blocked_symlink > "$trial/result"; exit 1;
+}
+rm -f -- "$trial/canary.active"
+echo rolled_back_simulated > "$trial/result"
+WATCHDOG_EOF
+    chmod 700 "$trial/watchdog.sh" || exit 1
+    nohup setsid bash "$trial/watchdog.sh" "$trial" "$ttl" \
+        </dev/null >"$trial/worker.log" 2>&1 &
+    pid=$!
+    for ((i=0;i<40;i++)); do
+        if [[ "$(cat "$trial/ready" 2>/dev/null || true)" == READY ]]; then
+            started=1; break
+        fi
+        sleep 0.1
+    done
+    if ((started!=1)); then
+        kill -TERM "$pid" 2>/dev/null || true
+        echo "[保护] 看门狗未就绪，拒绝开始模拟变更。" >&2
+        exit 1
+    fi
+    printf '%s\n' DRY_RUN_ONLY > "$trial/canary.active" || exit 1
+    echo "Dev6 看门狗已脱离当前 Shell；不修改真实网络。"
+    echo "演练事务：$trial"
+    echo "结果文件：$trial/result"
+)
+
+network_tuning_rollback_rehearsal_status() {
+    local root="$NET_TUNE_ROLLBACK_TRIALS_DIR" d result shown=0
+    network_tuning_rollback_dir_safe "$root" || { echo "暂无演练记录。"; return 0; }
+    for d in "$root"/trial-*; do
+        [[ -d "$d" && ! -L "$d" ]] || continue
+        result=$(cat "$d/result" 2>/dev/null || true)
+        [[ -n "$result" ]] || result=pending
+        echo "$(basename "$d"): $result"
+        shown=$((shown+1))
+        ((shown<20)) || break
+    done
+    ((shown>0)) || echo "暂无演练记录。"
+}
+
+network_tuning_rollback_rehearsal_menu() {
+    local ttl
+    echo "Dev6 仅演练独立超时清理模拟状态，不支持生产 HTB/qdisc 恢复。"
+    read -rp "模拟回滚秒数 [5]: " ttl
+    [[ -n "$ttl" ]] || ttl=5
+    network_tuning_rollback_rehearsal "$ttl" ""
+}
+
 network_tuning_management() {
     local c answer
     while true; do
@@ -10238,6 +10344,8 @@ network_tuning_management() {
         echo "  6. 视频 / 网页 / 聊天体验诊断（dev3）"
         echo "  7. 只读候选整形值与 tc 安全预检（dev4）"
         echo "  8. 六样本自动诊断（dev5，开发预览）"
+        echo "  9. 独立回滚演练（dev6，仅模拟）"
+        echo "  10. 查看回滚演练记录（dev6）"
         echo "  0. 返回"
         read -rp "请选择 [0-7]: " c
         case "$c" in
@@ -10253,6 +10361,8 @@ network_tuning_management() {
             6) network_tuning_qoe_menu; pause ;;
             7) network_tuning_candidate_menu; pause ;;
             8) network_tuning_scan_menu; pause ;;
+            9) network_tuning_rollback_rehearsal_menu; pause ;;
+            10) network_tuning_rollback_rehearsal_status; pause ;;
             0) return ;;
             *) sleep 1 ;;
         esac
