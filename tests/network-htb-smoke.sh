@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Dev7: qdisc restoration contract, worker success/conflict, no real tc writes.
 set -euo pipefail
+set -x
 export SS2022_LIB_ONLY=1
 # shellcheck disable=SC1091
 source ./ss2022.sh
