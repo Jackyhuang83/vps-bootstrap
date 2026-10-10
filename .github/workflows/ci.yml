@@ -13,6 +13,8 @@ on:
       - "tests/network-scan-smoke.sh"
       - "tests/network-rollback-smoke.sh"
       - "tests/network-htb-smoke.sh"
+      - "tests/network-ab-smoke.sh"
+      - "tests/network-htb-veth-integration.sh"
       - "README.md"
       - ".github/workflows/ci.yml"
       - ".github/workflows/promote-ss2022.yml"
@@ -30,6 +32,8 @@ on:
       - "tests/network-scan-smoke.sh"
       - "tests/network-rollback-smoke.sh"
       - "tests/network-htb-smoke.sh"
+      - "tests/network-ab-smoke.sh"
+      - "tests/network-htb-veth-integration.sh"
       - "README.md"
       - ".github/workflows/ci.yml"
 
@@ -97,6 +101,18 @@ jobs:
         run: |
           bash -n tests/network-htb-smoke.sh
           bash tests/network-htb-smoke.sh
+
+      - name: Dev8 video-first A/B safety gate
+        shell: bash
+        run: |
+          bash -n tests/network-ab-smoke.sh
+          bash tests/network-ab-smoke.sh
+
+      - name: Dev8 actual Linux kernel isolated veth regression
+        shell: bash
+        run: |
+          bash -n tests/network-htb-veth-integration.sh
+          sudo bash tests/network-htb-veth-integration.sh
 
       - name: Check script version
         run: |

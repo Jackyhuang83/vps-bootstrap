@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
-# 当前版本: v1.10.0-dev7
+# 当前版本: v1.10.0-dev8
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,11 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.10.0-dev8:
+#   - 使用无公网路由的虚拟 veth 测试真实 Linux 内核 qdisc 恢复及冲突保护
+#   - 视频优先、网页其次、聊天稳定：同终端双轮 A/B 证据只读审核
+#   - 未完成真实 VPS 验收，候选值不自动应用也不持久化
 #
 # v1.10.0-dev7:
 #   - 临时 60 秒、显式 TRIAL 的 HTB 出口整形实验；仅接受可信 scan 证据和可恢复独占 fq_codel
@@ -664,7 +669,7 @@
 # 注意: v1.9.0 为稳定正式版；Alpine 3.21 上 Snell v5 与 Cloudflare WARP 仍受官方组件兼容性限制。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.10.0-dev7"
+SCRIPT_VERSION="v1.10.0-dev8"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -9342,7 +9347,7 @@ network_tuning_status() {
     conflict=$(network_tuning_conflict_file) && echo "外部 sysctl    : $conflict"
     echo ""
     echo "说明：网卡识别仅使用路由查询，不主动发包；"
-    echo "      新版本暂不进行 iperf3 测速、HTB 整形或 initcwnd 修改。"
+    echo "      iperf3 测速/临时 HTB 均须显式授权；initcwnd 不修改。"
 }
 
 network_tuning_snapshot() (
@@ -10567,6 +10572,97 @@ network_tuning_htb_restore_now() {
     /usr/bin/bash "$trial/restore.sh" "$trial"
 }
 
+
+# ==============================================================================
+# [12H] Dev8: video-first client A/B evidence (read-only, not field-verified)
+# ==============================================================================
+network_tuning_ab_assess() {
+    local tier="$1" path="$2" size
+    network_tuning_profile "$tier" >/dev/null || return 1
+    [[ -f "$path" && ! -L "$path" && -r "$path" ]] || return 1
+    size=$(wc -c < "$path") || return 1
+    ((size >= 16 && size <= 32768)) || return 1
+    jq -nc --slurpfile evidence "$path" --argjson tier "$tier" '
+      def invalid($why): {verdict:"inconclusive",reason:$why,
+                          auto_apply:false,field_verified:false};
+      def original($why): {verdict:"keep_baseline",reason:$why,
+                           auto_apply:false,field_verified:false};
+      ($evidence[0] // {}) as $d |
+      if $d.schema != 1 or $d.tier_mbps != $tier or
+         ($d.video_source|type)!="string" or
+         ($d.video_source|length)<5 or ($d.video_source|length)>120 or
+         ($d.video_resolution|type)!="string" or
+         ($d.video_resolution|length)<2 or ($d.video_resolution|length)>40 or
+         ($d.samples|type)!="array" or ($d.samples|length)!=4 then
+        invalid("invalid_schema_tier_video_or_sample_count")
+      elif ([ $d.samples[] |
+        (type=="object" and
+         (.phase=="baseline" or .phase=="trial") and
+         (.round==1 or .round==2) and
+         (.duration_s|type)=="number" and .duration_s>=300 and .duration_s<=1800 and
+         (.video_stalls|type)=="number" and .video_stalls>=0 and
+          (.video_stalls|floor)==.video_stalls and .video_stalls<=120 and
+         (.video_buffer_s|type)=="number" and .video_buffer_s>=0 and .video_buffer_s<=1800 and
+         (.video_dropped_frames|type)=="number" and .video_dropped_frames>=0 and
+          (.video_dropped_frames|floor)==.video_dropped_frames and .video_dropped_frames<=100000 and
+         (.web_p95_ms|type)=="number" and .web_p95_ms>0 and .web_p95_ms<=10000 and
+         (.chat_p95_ms|type)=="number" and .chat_p95_ms>0 and .chat_p95_ms<=10000 and
+         (.ping_p95_ms|type)=="number" and .ping_p95_ms>0 and .ping_p95_ms<=10000 and
+         (.loss_pct|type)=="number" and .loss_pct>=0 and .loss_pct<=100)
+        ] | all | not) then
+        invalid("incomplete_or_implausible_manual_measurements")
+      elif ([ $d.samples[] | select(.phase=="baseline") | .round ] | sort)!=[1,2] or
+           ([ $d.samples[] | select(.phase=="trial") | .round ] | sort)!=[1,2] then
+        invalid("missing_duplicate_or_mismatched_ab_rounds")
+      else
+        ([ range(1;3) as $r |
+          {b:([$d.samples[]|select(.phase=="baseline" and .round==$r)][0]),
+           t:([$d.samples[]|select(.phase=="trial" and .round==$r)][0])}
+        ]) as $pairs |
+        ([ $pairs[] |
+          (.t.video_stalls<=.b.video_stalls and
+           .t.video_buffer_s<=.b.video_buffer_s+0.5 and
+           .t.video_dropped_frames<=.b.video_dropped_frames+2)
+        ]|all) as $video_safe |
+        ([ $pairs[] |
+          (.t.chat_p95_ms<=.b.chat_p95_ms*1.10+15 and
+           .t.loss_pct<=.b.loss_pct+0.3 and .t.loss_pct<=1 and
+           .t.ping_p95_ms<=.b.ping_p95_ms*1.15+20)
+        ]|all) as $chat_safe |
+        ([ $pairs[] | .t.web_p95_ms<=.b.web_p95_ms*1.10+15 ]|all) as $web_safe |
+        ([ $pairs[] |
+          ((.b.video_stalls>=1 and .t.video_stalls<.b.video_stalls) or
+           (.b.video_buffer_s>=5 and .t.video_buffer_s<=.b.video_buffer_s*0.65))
+        ]|all) as $video_gain |
+        ([ $pairs[] | .t.web_p95_ms<=.b.web_p95_ms*0.85 ]|all) as $web_gain |
+        if ($video_safe|not) then original("video_regressed")
+        elif ($chat_safe|not) then original("chat_or_packet_loss_regressed")
+        elif ($web_safe|not) then original("web_regressed")
+        elif $video_gain or $web_gain then
+          {verdict:"candidate_for_further_field_validation",
+           reason:(if $video_gain then "repeatable_video_improvement"
+                   else "video_preserved_and_repeatable_web_improvement" end),
+           auto_apply:false,field_verified:false,
+           note:"manual_client_observations_not_independent_proof"}
+        else original("no_repeatable_useful_improvement")
+        end
+      end
+    '
+}
+
+network_tuning_ab_menu() {
+    local tier path result
+    echo "Dev8：只读比对视频、网页、聊天 A/B 体验，任何结果均不自动整形。"
+    echo "同一视频、清晰度、终端；基线/临时试验各两轮，每轮 >=5 分钟。"
+    read -rp "线路套餐 Mbps [30]: " tier
+    read -rp "A/B JSON 完整路径（空取消）: " path
+    [[ -n "$path" ]] || return 0
+    [[ -n "$tier" ]] || tier=30
+    result=$(network_tuning_ab_assess "$tier" "$path") || return 1
+    jq . <<< "$result"
+    echo "注：人工采样结果不代表已经通过真实 VPS 验收。"
+}
+
 network_tuning_management() {
     local c answer
     while true; do
@@ -10586,8 +10682,9 @@ network_tuning_management() {
         echo "  11. 临时 HTB 60 秒试验（dev7，实验）"
         echo "  12. 查看 HTB 试验状态"
         echo "  13. 立即恢复 HTB 试验"
+        echo "  14. A/B 视频网页聊天体验审核（dev8，只读）"
         echo "  0. 返回"
-        read -rp "请选择 [0-13]: " c
+        read -rp "请选择 [0-14]: " c
         case "$c" in
             1) pause ;;
             2) network_tuning_snapshot; pause ;;
@@ -10606,6 +10703,7 @@ network_tuning_management() {
             11) network_tuning_htb_trial_menu; pause ;;
             12) network_tuning_htb_trial_status; pause ;;
             13) network_tuning_htb_restore_now; pause ;;
+            14) network_tuning_ab_menu; pause ;;
             0) return ;;
             *) sleep 1 ;;
         esac
