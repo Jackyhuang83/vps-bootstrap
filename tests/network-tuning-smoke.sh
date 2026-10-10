@@ -67,7 +67,9 @@ network_tuning_snapshot
 [[ "$(sha256sum "$NET_TUNE_SNAPSHOT" | awk '{print $1}')" == "$original_hash" ]]
 assert_kernel cubic fq_codel
 
+set -x
 network_tuning_enable_bbr
+set +x
 assert_kernel bbr fq
 network_tuning_conf_is_owned
 [[ -f "$NET_TUNE_CONF" ]]
