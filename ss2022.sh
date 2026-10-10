@@ -9686,10 +9686,10 @@ network_tuning_probe_menu() {
     read -rp "对端域名或 IP（端口另填）: " peer
     [[ -n "$peer" ]] || return 0
     read -rp "服务端端口 [5201]: " port
-    read -rp "单流速率 Mbps [20]: " rate
-    read -rp "测试秒数 [10]: " duration
-    read -rp "流量预算 MiB [64]: " budget
-    network_tuning_probe_run "${family:-4}" "$peer" "${port:-5201}" "${rate:-20}" "${duration:-10}" "${budget:-64}"
+    read -rp "单流速率 Mbps [5]: " rate
+    read -rp "测试秒数 [8]: " duration
+    read -rp "流量预算 MiB [32]: " budget
+    network_tuning_probe_run "${family:-4}" "$peer" "${port:-5201}" "${rate:-5}" "${duration:-8}" "${budget:-32}"
 }
 
 network_tuning_management() {
