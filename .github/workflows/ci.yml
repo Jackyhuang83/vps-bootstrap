@@ -6,6 +6,15 @@ on:
       - main
     paths:
       - "ss2022.sh"
+      - "tests/network-tuning-smoke.sh"
+      - "tests/network-throughput-smoke.sh"
+      - "tests/network-qoe-smoke.sh"
+      - "tests/network-candidate-smoke.sh"
+      - "tests/network-scan-smoke.sh"
+      - "tests/network-rollback-smoke.sh"
+      - "tests/network-htb-smoke.sh"
+      - "tests/network-ab-smoke.sh"
+      - "tests/network-htb-veth-integration.sh"
       - "README.md"
       - ".github/workflows/ci.yml"
       - ".github/workflows/promote-ss2022.yml"
@@ -16,6 +25,15 @@ on:
       - main
     paths:
       - "ss2022.sh"
+      - "tests/network-tuning-smoke.sh"
+      - "tests/network-throughput-smoke.sh"
+      - "tests/network-qoe-smoke.sh"
+      - "tests/network-candidate-smoke.sh"
+      - "tests/network-scan-smoke.sh"
+      - "tests/network-rollback-smoke.sh"
+      - "tests/network-htb-smoke.sh"
+      - "tests/network-ab-smoke.sh"
+      - "tests/network-htb-veth-integration.sh"
       - "README.md"
       - ".github/workflows/ci.yml"
 
@@ -41,6 +59,60 @@ jobs:
         run: |
           shellcheck --version
           shellcheck --severity=error -x ss2022.sh
+
+      - name: Network tuning transactional regression
+        shell: bash
+        run: |
+          bash -n tests/network-tuning-smoke.sh
+          bash tests/network-tuning-smoke.sh
+
+      - name: Network tuning dev2 throughput regression
+        shell: bash
+        run: |
+          bash -n tests/network-throughput-smoke.sh
+          bash tests/network-throughput-smoke.sh
+
+      - name: Network tuning dev3 QoE regression
+        shell: bash
+        run: |
+          bash -n tests/network-qoe-smoke.sh
+          bash tests/network-qoe-smoke.sh
+
+      - name: Network tuning dev4 candidate regression
+        shell: bash
+        run: |
+          bash -n tests/network-candidate-smoke.sh
+          bash tests/network-candidate-smoke.sh
+
+      - name: Network tuning dev5 bounded scan regression
+        shell: bash
+        run: |
+          bash -n tests/network-scan-smoke.sh
+          bash tests/network-scan-smoke.sh
+
+      - name: Network tuning dev6 watchdog regression
+        shell: bash
+        run: |
+          bash -n tests/network-rollback-smoke.sh
+          bash tests/network-rollback-smoke.sh
+
+      - name: Network tuning dev7 HTB safety regression
+        shell: bash
+        run: |
+          bash -n tests/network-htb-smoke.sh
+          bash tests/network-htb-smoke.sh
+
+      - name: Dev8 video-first A/B safety gate
+        shell: bash
+        run: |
+          bash -n tests/network-ab-smoke.sh
+          bash tests/network-ab-smoke.sh
+
+      - name: Dev8 actual Linux kernel isolated veth regression
+        shell: bash
+        run: |
+          bash -n tests/network-htb-veth-integration.sh
+          sudo bash tests/network-htb-veth-integration.sh
 
       - name: Check script version
         run: |

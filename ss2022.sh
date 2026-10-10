@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
-# 当前版本: v1.9.0
+# 当前版本: v1.10.0-dev8
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,43 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.10.0-dev8:
+#   - 使用无公网路由的虚拟 veth 测试真实 Linux 内核 qdisc 恢复及冲突保护
+#   - 视频优先、网页其次、聊天稳定：同终端双轮 A/B 证据只读审核
+#   - 未完成真实 VPS 验收，候选值不自动应用也不持久化
+#
+# v1.10.0-dev7:
+#   - 临时 60 秒、显式 TRIAL 的 HTB 出口整形实验；仅接受可信 scan 证据和可恢复独占 fq_codel
+#   - systemd 预注册独立恢复 timer、前后配置再次校验、故障拒绝覆盖外部网络配置
+#   - 非持久化、未经过真实 VPS 验证；禁止将开发试验当作已上线网络优化
+#
+# v1.10.0-dev6:
+#   - 独立 watchdog 模拟恢复演练（支持启动 shell SIGKILL）、顺序就绪保护
+#   - 严格 dry-run：仅撤销私有文件标记，不触及活动网卡、HTB/qdisc/sysctl
+#
+# v1.10.0-dev5:
+#   - 可信 iperf3 三档 × 双轮 QoE 采样，独立单次 watchdog/聚合流量预算
+#   - 自动将 6 份实测样本输出为私有 JSON 并交给 dev4 只读候选评估，不应用整形
+#
+# v1.10.0-dev4:
+#   - 3档速率×2轮完整数据重复验证，只有可重复吞吐拐点加带载时延增长才计算候选速率
+#   - 只读检查 tc qdisc/classes/filters，发现外部 mq/clsact 等配置即拒绝接管
+#   - 本阶段永不自动写入候选值，不修改 SSH/路由/网卡 qdisc
+#
+# v1.10.0-dev3:
+#   - 双轮 QoE 诊断：空闲/带载 P95 RTT、往返延迟波动、ICMP 响应缺失、TCP 有效吞吐
+#   - 两轮一致才标注疑似排队或响应缺失；没有可重复信号则不建议整形
+#   - 诊断只读；不改变路由、根队列或 TCP 内核参数
+#
+# v1.10.0-dev2:
+#   - 新增 IPv4/IPv6 安全测速（指定 iperf3 对端、路由出口核验、速率/时长/流量预算三重约束）
+#   - 独立 watchdog 监控网卡发送总流量，使用 JSON 结果和异常数据审查；不改 sysctl、路由、qdisc
+#
+# v1.10.0-dev1:
+#   - 网络调优第一阶段：只读网络诊断、原始状态快照、原生 BBR/fq 安全迁移与恢复
+#   - 拒绝接管管理员自定义 sysctl 和修改过的旧 BBR 配置；默认不触及 HTB、测速和路由
+#   - 快照保存在 /var/lib/ss2022-network-tuning；完全卸载保留 BBR 与快照
 #
 # v1.9.0 Release:
 #   - 正式支持 Debian / Ubuntu + systemd，并将 Alpine 3.21 + OpenRC 纳入稳定支持范围
@@ -632,7 +669,7 @@
 # 注意: v1.9.0 为稳定正式版；Alpine 3.21 上 Snell v5 与 Cloudflare WARP 仍受官方组件兼容性限制。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0"
+SCRIPT_VERSION="v1.10.0-dev8"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -1915,7 +1952,7 @@ node_name_management() {
         fi
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0-4]: " c
+        read -rp "请选择 [0-6]: " c
         case "$c" in
             1) rename_node_name "ss" "SS2022"; pause ;;
             2) rename_node_name "shadowtls" "SS2022 + ShadowTLS v3"; pause ;;
@@ -7888,7 +7925,7 @@ realm_service_management() {
         echo "  6. 启动服务"
         echo "  7. 卸载 Realm 转发组件"
         echo "  0. 返回"
-        read -rp "请选择 [0-7]: " c
+        read -rp "请选择 [0-8]: " c
         case "$c" in
             1)
                 if install_realm_core; then
@@ -7937,7 +7974,7 @@ forwarding_management() {
         echo "  7. Realm 服务管理"
         echo "  0. 返回"
         echo -e "${CYAN}═════════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0-7]: " c
+        read -rp "请选择 [0-10]: " c
         case "$c" in
             1) forwarding_add_single ;;
             2) forwarding_add_range ;;
@@ -9197,74 +9234,1477 @@ server_tool_swap_management() {
     done
 }
 
-server_tool_bbr_status() {
-    local available current qdisc
-    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
-    current=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
-    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || true)
-    echo "当前算法 : ${current:-未知}"
-    echo "可用算法 : ${available:-未知}"
-    echo "当前 qdisc: ${qdisc:-未知}"
+# ==============================================================================
+# [12A] 网络调优 v1.10.0-dev1：只读诊断 / 初始快照 / BBR 最小事务
+# ==============================================================================
+# 禁止把网络调优状态存进 STATE_DIR：完全卸载默认保留用户主动网络设置，
+# 必须同时保留恢复所需的 baseline，避免留下无法回滚的 sysctl 配置。
+NET_TUNE_DIR="/var/lib/ss2022-network-tuning"
+NET_TUNE_SNAPSHOT="${NET_TUNE_DIR}/original.json"
+NET_TUNE_CONF="/etc/sysctl.d/99-ss2022-network-tuning.conf"
+NET_TUNE_LEGACY_CONF="/etc/sysctl.d/99-ss2022-bbr.conf"
+NET_TUNE_SYSCTL_DIR="/etc/sysctl.d"
+NET_TUNE_SYSTEM_SYSCTL_CONF="/etc/sysctl.conf"
+
+network_tuning_legacy_status() {
+    if [[ ! -e "$NET_TUNE_LEGACY_CONF" && ! -L "$NET_TUNE_LEGACY_CONF" ]]; then
+        printf 'absent'
+    elif [[ -f "$NET_TUNE_LEGACY_CONF" && ! -L "$NET_TUNE_LEGACY_CONF" ]] &&
+         [[ "$(cat "$NET_TUNE_LEGACY_CONF")" == $'net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr' ]]; then
+        printf 'owned'
+    else
+        printf 'modified'
+    fi
 }
 
-server_tool_bbr_enable() {
-    local available
-    modprobe tcp_bbr >/dev/null 2>&1 || true
-    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+network_tuning_conf_is_owned() {
+    [[ -f "$NET_TUNE_CONF" && ! -L "$NET_TUNE_CONF" ]] || return 1
+    [[ "$(cat "$NET_TUNE_CONF")" == $'# vps-bootstrap network tuning: BBR/fq (managed by ss2022.sh)\nnet.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr' ]]
+}
 
-    if ! grep -qw bbr <<<"$available"; then
-        echo -e "${RED}[错误] 当前内核没有提供 BBR。${PLAIN}"
-        echo -e "${YELLOW}本脚本不会为了 BBR 自动替换 VPS 内核。${PLAIN}"
-        return 1
-    fi
-
-    mkdir -p /etc/sysctl.d
-    cat > /etc/sysctl.d/99-ss2022-bbr.conf <<'EOF'
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-EOF
-
-    sysctl -p /etc/sysctl.d/99-ss2022-bbr.conf >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1 || return 1
-
-    if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]]; then
-        echo -e "${GREEN}✔ BBR 已启用。${PLAIN}"
-        return 0
-    fi
-
-    echo -e "${RED}[错误] BBR 参数写入后未生效。${PLAIN}"
+network_tuning_conflict_file() {
+    local f
+    # 操作系统原生 /usr/lib/sysctl.d 属发行版默认值；本模块仅拒绝覆盖管理员
+    # 在 /etc/sysctl.conf、/etc/sysctl.d 手工维护的相同键。
+    for f in "$NET_TUNE_SYSTEM_SYSCTL_CONF" "$NET_TUNE_SYSCTL_DIR"/*.conf; do
+        [[ -f "$f" ]] || continue
+        [[ "$f" == "$NET_TUNE_CONF" || "$f" == "$NET_TUNE_LEGACY_CONF" ]] && continue
+        if awk '/^[[:space:]]*(net\.core\.default_qdisc|net\.ipv4\.tcp_congestion_control)[[:space:]]*=/{found=1} END{exit !found}' "$f"; then
+            printf '%s\n' "$f"
+            return 0
+        fi
+    done
     return 1
 }
 
-server_tool_bbr_disable() {
-    local available fallback="cubic"
-    rm -f /etc/sysctl.d/99-ss2022-bbr.conf
-    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
-    grep -qw cubic <<<"$available" || fallback=$(awk '{print $1}' <<<"$available")
-    [[ -n "$fallback" ]] || fallback="reno"
-
-    sysctl -w "net.ipv4.tcp_congestion_control=${fallback}" >/dev/null 2>&1 || true
-    if grep -qw fq_codel <<<"$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"; then
-        :
-    else
-        sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1 || true
+network_tuning_assert_safe() {
+    local legacy conflict
+    legacy=$(network_tuning_legacy_status)
+    if [[ "$legacy" == modified ]]; then
+        echo "[保护] 检测到非官方内容的旧 BBR 文件，拒绝接管：$NET_TUNE_LEGACY_CONF"
+        return 1
     fi
-    echo -e "${GREEN}✔ 已移除本脚本 BBR 持久化配置；当前算法: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 未知)${PLAIN}"
+    if [[ -e "$NET_TUNE_CONF" || -L "$NET_TUNE_CONF" ]] && ! network_tuning_conf_is_owned; then
+        echo "[保护] 新版网络调优文件内容已被修改，拒绝覆盖：$NET_TUNE_CONF"
+        return 1
+    fi
+    conflict=$(network_tuning_conflict_file) && {
+        echo "[保护] 管理员已有相同 sysctl 键配置，拒绝覆盖：$conflict"
+        return 1
+    }
+    return 0
 }
 
-server_tool_bbr_management() {
-    local c
+network_tuning_get_iface() {
+    local family="$1" target="$2" route line prev="" field
+    command -v ip >/dev/null 2>&1 || return 1
+    route=$(ip "-${family}" route get "$target" 2>/dev/null) || return 1
+    # 不使用 ip | grep -q；在 pipefail + 单核/多网卡环境中会误判 SIGPIPE。
+    line=${route%%$'\n'*}
+    for field in $line; do
+        if [[ "$prev" == dev ]]; then printf '%s\n' "$field"; return 0; fi
+        prev="$field"
+    done
+    return 1
+}
+
+network_tuning_status() {
+    local cc available qdisc v4 v6 iface active legacy snapshot_note conflict
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || true)
+    v4=$(network_tuning_get_iface 4 1.1.1.1 || true)
+    v6=$(network_tuning_get_iface 6 2606:4700:4700::1111 || true)
+    iface=${v4:-$v6}
+    active="未检测"
+    if [[ -n "$iface" ]] && command -v tc >/dev/null 2>&1; then
+        active=$(tc qdisc show dev "$iface" 2>/dev/null | awk '$1=="qdisc" && $0 ~ / root / {print $2; exit}')
+        [[ -n "$active" ]] || active="系统默认/未显示根队列"
+    fi
+    legacy=$(network_tuning_legacy_status)
+    snapshot_note="未建立"
+    [[ -f "$NET_TUNE_SNAPSHOT" ]] && snapshot_note="已保存"
+    echo -e "${CYAN}══════════════════ 网络状态 ══════════════════${PLAIN}"
+    echo "拥塞算法       : ${cc:-未知}"
+    echo "内核可用算法   : ${available:-未知}"
+    echo "默认 qdisc     : ${qdisc:-未知}"
+    echo "当前出口 qdisc : $active"
+    echo "IPv4 出口设备  : ${v4:-不可用/未识别}"
+    echo "IPv6 出口设备  : ${v6:-不可用/未识别}"
+    echo "旧版 BBR 配置  : $legacy"
+    echo "初始快照       : $snapshot_note"
+    if [[ -e "$NET_TUNE_CONF" || -L "$NET_TUNE_CONF" ]]; then
+        if network_tuning_conf_is_owned; then
+            echo "BBR 持久化     : v1.10.0 管理"
+        else
+            echo "BBR 持久化     : 文件已修改，拒绝接管"
+        fi
+    elif [[ "$legacy" == owned ]]; then
+        echo "BBR 持久化     : v1.9.0 管理（尚未迁移）"
+    else
+        echo "BBR 持久化     : 无本模块配置"
+    fi
+    conflict=$(network_tuning_conflict_file) && echo "外部 sysctl    : $conflict"
+    echo ""
+    echo "说明：网卡识别仅使用路由查询，不主动发包；"
+    echo "      iperf3 测速/临时 HTB 均须显式授权；initcwnd 不修改。"
+}
+
+network_tuning_snapshot() (
+    local cc qdisc legacy tmp key value
+    command -v jq >/dev/null 2>&1 || { echo "[错误] 缺少 jq，无法创建可信快照。"; return 1; }
+    network_tuning_assert_safe || return 1
+    if [[ -f "$NET_TUNE_SNAPSHOT" ]]; then
+        jq -e '.schema == 1 and (.baseline.congestion|type=="string") and (.baseline.qdisc|type=="string")' \
+            "$NET_TUNE_SNAPSHOT" >/dev/null 2>&1 || {
+            echo "[保护] 已有快照格式异常，拒绝覆盖。"
+            return 1
+        }
+        echo "原始快照已存在，保留首次记录：$NET_TUNE_SNAPSHOT"
+        return 0
+    fi
+    if [[ -e "$NET_TUNE_CONF" || -L "$NET_TUNE_CONF" ]]; then
+        echo "[保护] 已有新模块配置但没有初始快照，不得把调优后的状态冒充基线。"
+        return 1
+    fi
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) || return 1
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null) || return 1
+    [[ "$cc" =~ ^[a-zA-Z0-9_]+$ && "$qdisc" =~ ^[a-zA-Z0-9_]+$ ]] || return 1
+    legacy=$(network_tuning_legacy_status)
+    # 未来 BDP 调优也需要最初的四项 buffer 值，首版就完整保存，避免以后无法回滚。
+    local rmem_max wmem_max tcp_rmem tcp_wmem
+    rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null) || return 1
+    wmem_max=$(sysctl -n net.core.wmem_max 2>/dev/null) || return 1
+    tcp_rmem=$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null) || return 1
+    tcp_wmem=$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null) || return 1
+    umask 077
+    mkdir -p "$NET_TUNE_DIR" || return 1
+    chmod 700 "$NET_TUNE_DIR" || return 1
+    tmp=$(mktemp "$NET_TUNE_DIR/.original.XXXXXXXX") || return 1
+    if ! jq -n \
+        --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg cc "$cc" --arg q "$qdisc" --arg legacy "$legacy" \
+        --arg rmax "$rmem_max" --arg wmax "$wmem_max" \
+        --arg tr "$tcp_rmem" --arg tw "$tcp_wmem" \
+        '{schema:1,created_at:$at,legacy_bbr:$legacy,baseline:{
+           congestion:$cc,qdisc:$q,rmem_max:$rmax,wmem_max:$wmax,tcp_rmem:$tr,tcp_wmem:$tw
+         }}' > "$tmp" ||
+       ! jq -e '.schema == 1 and .baseline.congestion != "" and .baseline.qdisc != "" and
+                .baseline.rmem_max != "" and .baseline.wmem_max != "" and
+                .baseline.tcp_rmem != "" and .baseline.tcp_wmem != ""' "$tmp" >/dev/null; then
+        rm -f "$tmp"
+        echo "[错误] 快照写入或校验失败，未修改网络。"
+        return 1
+    fi
+    if [[ -e "$NET_TUNE_SNAPSHOT" ]]; then
+        rm -f "$tmp"
+        echo "[保护] 快照由另一会话创建，保留现有版本。"
+        return 1
+    fi
+    chmod 600 "$tmp" && ln "$tmp" "$NET_TUNE_SNAPSHOT" && rm -f "$tmp" || {
+        rm -f "$tmp"
+        echo "[错误] 无法原子保存快照，未修改网络。"
+        return 1
+    }
+    echo -e "${GREEN}✔ 原始快照已保存：$NET_TUNE_SNAPSHOT${PLAIN}"
+    echo "  旧版 BBR 的当前值如已生效，将被视为这次迁移的基线。"
+)
+
+network_tuning_enable_bbr() (
+    local cc qdisc available tmp="" legacy
+    network_tuning_assert_safe || exit 1
+    network_tuning_snapshot || exit 1
+    modprobe tcp_bbr >/dev/null 2>&1 || true
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+    if [[ " $available " != *" bbr "* ]]; then
+        echo "[错误] 当前内核不提供 BBR；不会自动更换内核。"
+        exit 1
+    fi
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) || exit 1
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null) || exit 1
+    legacy=$(network_tuning_legacy_status)
+    umask 077
+    mkdir -p "$NET_TUNE_SYSCTL_DIR" || exit 1
+    tmp=$(mktemp "$NET_TUNE_SYSCTL_DIR/.ss2022-network-tuning.XXXXXXXX") || exit 1
+    trap 'rm -f "$tmp"' EXIT
+    printf '%s\n' \
+        '# vps-bootstrap network tuning: BBR/fq (managed by ss2022.sh)' \
+        'net.core.default_qdisc=fq' \
+        'net.ipv4.tcp_congestion_control=bbr' > "$tmp" || exit 1
+    if ! sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 ||
+       ! sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 ||
+       [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" != bbr ]]; then
+        sysctl -w "net.ipv4.tcp_congestion_control=$cc" >/dev/null 2>&1 || true
+        sysctl -w "net.core.default_qdisc=$qdisc" >/dev/null 2>&1 || true
+        echo "[错误] BBR/fq 未能完全生效，已尝试恢复操作前的运行参数。"
+        exit 1
+    fi
+    chmod 644 "$tmp" && mv -f "$tmp" "$NET_TUNE_CONF" || {
+        sysctl -w "net.ipv4.tcp_congestion_control=$cc" >/dev/null 2>&1 || true
+        sysctl -w "net.core.default_qdisc=$qdisc" >/dev/null 2>&1 || true
+        echo "[错误] BBR 持久化失败；已尝试恢复运行参数。"
+        exit 1
+    }
+    if [[ "$legacy" == owned ]]; then
+        rm -f "$NET_TUNE_LEGACY_CONF" || {
+            echo "[错误] 无法清理旧版 BBR 文件，新版已生效但迁移未完成。"
+            exit 1
+        }
+    fi
+    echo -e "${GREEN}✔ 已启用原生 BBR + fq；持久化归新版网络调优模块管理。${PLAIN}"
+)
+
+network_tuning_restore() (
+    local cc qdisc legacy old_cc old_qdisc tmp=""
+    [[ -f "$NET_TUNE_SNAPSHOT" ]] || { echo "[提示] 没有可恢复的初始快照。"; exit 1; }
+    command -v jq >/dev/null 2>&1 || exit 1
+    network_tuning_assert_safe || exit 1
+    jq -e '.schema==1 and (.baseline.congestion|type=="string") and
+           (.baseline.qdisc|type=="string") and
+           (.legacy_bbr=="absent" or .legacy_bbr=="owned")' \
+        "$NET_TUNE_SNAPSHOT" >/dev/null 2>&1 || {
+        echo "[保护] 快照内容无效，拒绝恢复。"
+        exit 1
+    }
+    cc=$(jq -r '.baseline.congestion' "$NET_TUNE_SNAPSHOT")
+    qdisc=$(jq -r '.baseline.qdisc' "$NET_TUNE_SNAPSHOT")
+    legacy=$(jq -r '.legacy_bbr' "$NET_TUNE_SNAPSHOT")
+    [[ "$cc" =~ ^[a-zA-Z0-9_]+$ && "$qdisc" =~ ^[a-zA-Z0-9_]+$ ]] || exit 1
+    if [[ "$legacy" == absent && "$(network_tuning_legacy_status)" != absent ]]; then
+        echo "[保护] 恢复目标原来不存在旧 BBR 文件，但现在出现了新的同名文件。"
+        exit 1
+    fi
+    old_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) || exit 1
+    old_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null) || exit 1
+    if [[ "$legacy" == owned && ! -e "$NET_TUNE_LEGACY_CONF" ]]; then
+        umask 077
+        tmp=$(mktemp "$NET_TUNE_SYSCTL_DIR/.ss2022-bbr-restore.XXXXXXXX") || exit 1
+        trap 'rm -f "$tmp"' EXIT
+        printf '%s\n' 'net.core.default_qdisc=fq' \
+            'net.ipv4.tcp_congestion_control=bbr' > "$tmp" || exit 1
+    fi
+    if ! sysctl -w "net.ipv4.tcp_congestion_control=$cc" >/dev/null 2>&1 ||
+       ! sysctl -w "net.core.default_qdisc=$qdisc" >/dev/null 2>&1; then
+        sysctl -w "net.ipv4.tcp_congestion_control=$old_cc" >/dev/null 2>&1 || true
+        sysctl -w "net.core.default_qdisc=$old_qdisc" >/dev/null 2>&1 || true
+        echo "[错误] 恢复运行参数失败，保留原配置文件和快照。"
+        exit 1
+    fi
+    if [[ -n "$tmp" ]]; then
+        chmod 644 "$tmp" && mv "$tmp" "$NET_TUNE_LEGACY_CONF" || {
+            sysctl -w "net.ipv4.tcp_congestion_control=$old_cc" >/dev/null 2>&1 || true
+            sysctl -w "net.core.default_qdisc=$old_qdisc" >/dev/null 2>&1 || true
+            echo "[错误] 恢复旧版 BBR 持久化文件失败。"
+            exit 1
+        }
+    fi
+    if [[ -e "$NET_TUNE_CONF" ]] && ! rm -f "$NET_TUNE_CONF"; then
+        echo "[错误] 无法移除新版 BBR 配置，保留初始快照供修复。"
+        exit 1
+    fi
+    echo -e "${GREEN}✔ 已恢复首次调优前的 BBR/fq 运行参数及旧版配置状态。${PLAIN}"
+    echo "原始快照仍保留，便于核对；没有修改路由、网卡根 qdisc 或 SSH。"
+)
+
+# ==============================================================================
+# [12B] v1.10.0-dev2：低流量非侵入式 iperf3 诊断
+# ==============================================================================
+# dev2 不调用 tc qdisc / sysctl -w / ip route replace。高带宽扫描另行实现。
+# 用户线路机的正式支持范围：只允许这些实际套餐档位参与未来的自动检测。
+# 1Gbps 及以上不进行自动整形；不能根据 NIC 1000/10000Mbps 链路速度猜套餐。
+NET_TUNE_SUPPORTED_MAX_MBPS=500
+NET_TUNE_SUPPORTED_TIERS="10 20 30 100 200 300 500"
+
+network_tuning_profile() {
+    # 返回：套餐Mbps 初筛Mbps 粗扫步长Kbps 细扫步长Kbps 单次秒数
+    # 只描述未来 dev3 自动扫描的策略，不执行测速、写 sysctl 或安装 HTB。
+    local tier="${1:-}"
+    case "$tier" in
+        10)  printf '10 5 1000 100 6\n' ;;
+        20)  printf '20 8 2000 200 6\n' ;;
+        30)  printf '30 10 2000 250 6\n' ;;
+        100) printf '100 20 5000 500 6\n' ;;
+        200) printf '200 30 10000 1000 6\n' ;;
+        300) printf '300 40 15000 1000 6\n' ;;
+        500) printf '500 50 20000 2000 6\n' ;;
+        *)
+            echo "[保护] 不支持的线路套餐：${tier:-未指定}Mbps；仅支持 $NET_TUNE_SUPPORTED_TIERS Mbps。" >&2
+            return 1 ;;
+    esac
+}
+
+network_tuning_profile_upper_kbps() {
+    # 最大允许的扫描档位：1.2 x 套餐速率与 500 Mbps 中较小者。
+    # 这是扫描计划的绝对上界，不是最终整形速率，任何结果都不得超过 500Mbps。
+    local tier="${1:-}" cap
+    network_tuning_profile "$tier" >/dev/null || return 1
+    cap=$((tier * 1200))
+    (( cap <= NET_TUNE_SUPPORTED_MAX_MBPS * 1000 )) || cap=$((NET_TUNE_SUPPORTED_MAX_MBPS * 1000))
+    printf '%s\n' "$cap"
+}
+
+network_tuning_profile_print() {
+    local tier="$1" info upper
+    info=$(network_tuning_profile "$tier") || return 1
+    upper=$(network_tuning_profile_upper_kbps "$tier") || return 1
+    local plan first coarse fine duration
+    read -r plan first coarse fine duration <<< "$info"
+    echo "套餐：${plan}Mbps；初筛上限：${first}Mbps；单次测速：${duration}秒"
+    echo "粗扫步长：${coarse}Kbps；细扫步长：${fine}Kbps；扫描上限：${upper}Kbps"
+    echo "这是策略预览，不代表已测速或建议实际出口整形。"
+}
+
+NET_TUNE_PROBE_SYSFS="/sys/class/net"
+NET_TUNE_PROBE_MAX_MBPS=100
+NET_TUNE_PROBE_MAX_SECS=20
+NET_TUNE_PROBE_MAX_BUDGET_MIB=256
+
+network_tuning_probe_resolve() {
+    local family="$1" host="$2" line="" address rest
+    [[ "$host" =~ ^[A-Za-z0-9_.:-]{1,253}$ && "$host" != -* ]] || return 1
+    if [[ "$host" == *:* ]]; then
+        [[ "$family" == 6 && "$host" != ::ffff:* && "$host" != ::FFFF:* ]] || return 1
+        printf '%s\n' "$host"
+        return 0
+    fi
+    if [[ "$host" =~ ^[0-9.]+$ ]]; then
+        [[ "$family" == 4 ]] || return 1
+        printf '%s\n' "$host"
+        return 0
+    fi
+    command -v getent >/dev/null 2>&1 || return 1
+    if [[ "$family" == 4 ]]; then
+        line=$(getent ahostsv4 "$host" 2>/dev/null || true)
+    else
+        line=$(getent ahostsv6 "$host" 2>/dev/null || true)
+    fi
+    [[ -n "$line" ]] || line=$(getent hosts "$host" 2>/dev/null || true)
+    while read -r address rest; do
+        if [[ "$family" == 4 && "$address" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
+            printf '%s\n' "$address"
+            return 0
+        fi
+        if [[ "$family" == 6 && "$address" == *:* && "$address" != ::ffff:* &&
+              "$address" != ::FFFF:* && "$address" != *%* ]]; then
+            printf '%s\n' "$address"
+            return 0
+        fi
+    done <<< "$line"
+    return 1
+}
+
+network_tuning_probe_iface_guard() {
+    local iface="$1" route="$2"
+    [[ "$iface" =~ ^[a-zA-Z0-9_.:-]+$ ]] || return 1
+    case "$iface" in
+        lo|wg*|tun*|tap*|tailscale*|zt*|docker*|br-*|veth*|virbr*|ifb*)
+            return 1 ;;
+    esac
+    case " $route " in
+        *" blackhole "*|*" unreachable "*|*" prohibit "*) return 1 ;;
+    esac
+    [[ -r "$NET_TUNE_PROBE_SYSFS/$iface/statistics/tx_bytes" ]]
+}
+
+network_tuning_probe_check() {
+    # family peer rate Mbps duration seconds budget MiB
+    local family="$1" peer="$2" rate="$3" duration="$4" budget="$5"
+    local target route iface estimated allowance
+    [[ "$family" == 4 || "$family" == 6 ]] || { echo "[错误] IPv4/IPv6 参数不正确。"; return 1; }
+    [[ "$rate" =~ ^[1-9][0-9]*$ && "$duration" =~ ^[1-9][0-9]*$ && "$budget" =~ ^[1-9][0-9]*$ ]] || {
+        echo "[错误] 速率、时长和流量预算必须是整数。"; return 1;
+    }
+    (( rate >= 1 && rate <= NET_TUNE_PROBE_MAX_MBPS &&
+       duration >= 3 && duration <= NET_TUNE_PROBE_MAX_SECS &&
+       budget >= 1 && budget <= NET_TUNE_PROBE_MAX_BUDGET_MIB )) || {
+        echo "[保护] dev2 限额：1-100Mbps、3-20秒、1-256MiB。"; return 1;
+    }
+    target=$(network_tuning_probe_resolve "$family" "$peer") || {
+        echo "[错误] 测试对端无法解析到指定 IPv${family}。"; return 1;
+    }
+    # 将单流 TCP 预估载荷限制在预算的 70%，留出协议开销/监控余量。
+    estimated=$((rate * 1000000 * duration / 8))
+    allowance=$((budget * 1048576 * 70 / 100))
+    (( estimated <= allowance )) || {
+        echo "[保护] 预计发送量超过预算的 70%，请调整速率/时长/预算。"; return 1;
+    }
+    route=$(ip "-${family}" route get "$target" 2>/dev/null) || {
+        echo "[错误] 无法获取 IPv${family} 真实出口路由。"; return 1;
+    }
+    iface=$(network_tuning_get_iface "$family" "$target") || {
+        echo "[错误] 无法解析测速出口设备。"; return 1;
+    }
+    network_tuning_probe_iface_guard "$iface" "$route" || {
+        echo "[保护] $iface 为隧道/容器/不可计量设备，不进行自动测速。"; return 1;
+    }
+    printf '%s|%s|%s\n' "$target" "$iface" "$estimated"
+}
+
+network_tuning_probe_result_json() {
+    jq -e -c '
+      if (.error // "") != "" or
+         (.end.sum_sent.bits_per_second | type) != "number" or
+         (.end.sum_received.bits_per_second | type) != "number" or
+         (.end.sum_sent.bytes | type) != "number" or
+         (.end.sum_received.bytes | type) != "number"
+      then empty
+      else
+        {sender_mbps:(.end.sum_sent.bits_per_second / 1000000 * 100 | round / 100),
+         received_mbps:(.end.sum_received.bits_per_second / 1000000 * 100 | round / 100),
+         sender_bytes:.end.sum_sent.bytes,
+         received_bytes:.end.sum_received.bytes,
+         retransmits:(.end.sum_sent.retransmits // 0)}
+      end
+    ' "$1" 2>/dev/null
+}
+
+network_tuning_probe_watchdog() {
+    # 监控进程独立于主脚本运行；就算主脚本被 SIGKILL，也继续监控 iperf3。
+    local pid="$1" txfile="$2" before="$3" budget_bytes="$4" deadline="$5" reasonfile="$6"
+    local now start="$SECONDS"
+    while kill -0 "$pid" 2>/dev/null; do
+        now=$(cat "$txfile" 2>/dev/null || true)
+        if [[ ! "$now" =~ ^[0-9]+$ ]] || (( now < before )); then
+            printf 'counter_unavailable\n' > "$reasonfile"
+        elif (( now - before >= budget_bytes )); then
+            printf 'budget_exceeded\n' > "$reasonfile"
+        elif (( SECONDS - start >= deadline )); then
+            printf 'timeout\n' > "$reasonfile"
+        else
+            sleep 0.25
+            continue
+        fi
+        kill -TERM "$pid" 2>/dev/null || true
+        sleep 2
+        kill -KILL "$pid" 2>/dev/null || true
+        return 1
+    done
+}
+
+network_tuning_probe_run() (
+    local family="$1" peer="$2" port="$3" rate="$4" duration="$5" budget="$6" result_path="${7:-}"
+    local checked target iface estimated txfile before after usage limit answer result reason code=1
+    local tmp="" pid=0 watcher=0
+    [[ "$port" =~ ^[1-9][0-9]*$ ]] && ((port >= 1 && port <= 65535)) || {
+        echo "[错误] 端口必须为 1-65535。"; exit 1;
+    }
+    command -v iperf3 >/dev/null 2>&1 || {
+        echo "[错误] 缺少 iperf3，请先安装系统包 iperf3。"; exit 1;
+    }
+    command -v jq >/dev/null 2>&1 || { echo "[错误] 缺少 jq。"; exit 1; }
+    checked=$(network_tuning_probe_check "$family" "$peer" "$rate" "$duration" "$budget") || {
+        echo "$checked"; exit 1;
+    }
+    IFS='|' read -r target iface estimated <<< "$checked"
+    txfile="$NET_TUNE_PROBE_SYSFS/$iface/statistics/tx_bytes"
+    before=$(cat "$txfile" 2>/dev/null) || exit 1
+    [[ "$before" =~ ^[0-9]+$ ]] || exit 1
+    limit=$((budget * 1048576))
+    echo "对端：$target:$port；IPv${family} 出口：$iface"
+    echo "单流发送：${rate}Mbps × ${duration}s；预估载荷约 $(((estimated+1048575)/1048576))MiB"
+    echo "网卡发送预算：${budget}MiB（包含其他业务流量，超过预算会终止测试）"
+    echo "不更改 qdisc、路由或 sysctl；不自动执行整形。"
+    read -rp "确认开始？请输入 RUN: " answer
+    [[ "$answer" == RUN ]] || { echo "已取消。"; exit 0; }
+    umask 077
+    tmp=$(mktemp -d /tmp/ss2022-netprobe.XXXXXXXX) || exit 1
+    network_tuning_probe_cleanup() {
+        (( pid > 0 )) && kill -TERM "$pid" 2>/dev/null || true
+        (( watcher > 0 )) && kill -TERM "$watcher" 2>/dev/null || true
+        [[ -d "$tmp" ]] && rm -rf "$tmp"
+    }
+    trap 'exit 130' INT TERM HUP
+    trap network_tuning_probe_cleanup EXIT
+    iperf3 "-${family}" -c "$target" -p "$port" -t "$duration" -P 1 -b "${rate}M" -J \
+        > "$tmp/out.json" 2>"$tmp/err.log" </dev/null &
+    pid=$!
+    network_tuning_probe_watchdog "$pid" "$txfile" "$before" "$limit" "$((duration+8))" "$tmp/reason" &
+    watcher=$!
+    wait "$pid" && code=0 || code=$?
+    kill -TERM "$watcher" 2>/dev/null || true
+    wait "$watcher" 2>/dev/null || true
+    watcher=0
+    pid=0
+    reason=$(cat "$tmp/reason" 2>/dev/null || true)
+    after=$(cat "$txfile" 2>/dev/null || true)
+    [[ "$after" =~ ^[0-9]+$ ]] && ((after >= before)) || {
+        echo "[错误] 网卡计数异常，结果无效。"; exit 1;
+    }
+    usage=$((after-before))
+    echo "网卡总发送增量：$(((usage+1048575)/1048576))MiB"
+    if [[ -n "$reason" || "$code" -ne 0 ]] || (( usage >= limit )); then
+        echo "[保护] 测速失败/超时/超流量预算，结果不可信。${reason:+ 原因：$reason}"
+        exit 1
+    fi
+    result=$(network_tuning_probe_result_json "$tmp/out.json") || {
+        echo "[错误] iperf3 JSON 无有效 TCP sender/receiver 信息。"; exit 1;
+    }
+    jq -r '"发送吞吐：\(.sender_mbps)Mbps；有效接收：\(.received_mbps)Mbps；重传：\(.retransmits)次"' <<< "$result"
+    if ! jq -e --argjson r "$rate" '
+        .sender_mbps > 0 and .received_mbps > 0 and
+        .sender_mbps <= ($r * 1.5) and
+        .received_mbps >= (.sender_mbps * 0.7) and .retransmits >= 0
+    ' <<< "$result" >/dev/null; then
+        echo "[提示] 单次样本异常/链路波动/对端性能不足，结果不确定，不用于整形。"
+        exit 1
+    fi
+    if [[ -n "$result_path" ]]; then
+        # 仅供 dev3 私有临时目录使用；不得从失败的 iperf3 测试输出任何数据。
+        [[ "$result_path" == /* ]] || { echo "[错误] 输出路径必须为绝对路径。"; exit 1; }
+        ( umask 077; printf '%s\n' "$result" > "$result_path" ) || exit 1
+    fi
+    echo -e "${GREEN}✔ 安全测速完成；仅供诊断，不修改服务器网络设置。${PLAIN}"
+)
+
+network_tuning_probe_menu() {
+    local family peer port rate duration budget
+    echo "需要可信的 iperf3 服务端；dev2 不自动选择公共节点，也不执行大带宽拐点扫描。"
+    read -rp "地址族 4/6 [4]: " family
+    read -rp "对端域名或 IP（端口另填）: " peer
+    [[ -n "$peer" ]] || return 0
+    read -rp "服务端端口 [5201]: " port
+    read -rp "单流速率 Mbps [5]: " rate
+    read -rp "测试秒数 [8]: " duration
+    read -rp "流量预算 MiB [32]: " budget
+    network_tuning_probe_run "${family:-4}" "$peer" "${port:-5201}" "${rate:-5}" "${duration:-8}" "${budget:-32}"
+}
+
+# ==============================================================================
+# [12C] v1.10.0-dev3：视频、网页、聊天 QoE 双轮诊断（只读）
+# ==============================================================================
+NET_TUNE_QOE_IDLE_COUNT=6
+NET_TUNE_QOE_LOADED_COUNT=12
+NET_TUNE_QOE_SECONDS=8
+NET_TUNE_QOE_BUDGET_MIB=96
+
+network_tuning_qoe_ping() {
+    # IPv4/IPv6 per-target ICMP on the same route as the iperf peer.
+    ping "-$1" -n -c "$3" -i "${4:-0.5}" -W 1 "$2"
+}
+
+network_tuning_qoe_samples() {
+    # Extract valid received ICMP RTT in ms, one JSON number per line.
+    # Ignore vendor-specific ping summary output.
+    awk '
+      /time[=<][[:space:]]*[0-9]+([.][0-9]+)?/ {
+        if (match($0, /time[=<][[:space:]]*[0-9]+([.][0-9]+)?/)) {
+          value=substr($0,RSTART,RLENGTH)
+          sub(/^time[=<][[:space:]]*/, "", value)
+          if (value+0>=0 && value+0<100000) printf "%.3f\n", value+0
+        }
+      }
+    ' "$1"
+}
+
+network_tuning_qoe_evaluate() {
+    # Files: idle JSONL, loaded JSONL, validated iperf3 summary JSON.
+    jq -n -c --slurpfile idle "$1" --slurpfile loaded "$2" --slurpfile throughput "$3" '
+      def perc($arr;$fraction):
+        ($arr|sort) as $sorted |
+        if ($sorted|length)==0 then 0
+        else $sorted[((($sorted|length)-1)*$fraction|ceil)] end;
+      def jitter($arr):
+        if ($arr|length)<2 then 0
+        else ([range(1;($arr|length)) as $i | (($arr[$i]-$arr[$i-1])|abs)]|add)/(($arr|length)-1) end;
+      def round2: .*100 | round / 100;
+      ($idle|map(select(type=="number" and .>=0 and .<100000))) as $i |
+      ($loaded|map(select(type=="number" and .>=0 and .<100000))) as $l |
+      ($throughput[0] // {}) as $t |
+      (perc($i;0.95)) as $ip95 |
+      (perc($l;0.95)) as $lp95 |
+      ($lp95 - $ip95) as $delta |
+      ((12-($l|length))*100/12) as $loss |
+      (if ($i|length)<5 or ($l|length)<9 or
+          ($t.sender_mbps // 0)<=0 or ($t.received_mbps // 0)<=0 or
+          $t.received_mbps < $t.sender_mbps*0.7 then "inconclusive"
+        elif $loss>=15 then "possible_loss"
+        elif $delta>=100 and $lp95 >= $ip95*1.8 then "possible_queueing"
+        else "no_clear_issue_at_sampled_rate" end) as $verdict |
+      {verdict:$verdict,idle_samples:($i|length),loaded_samples:($l|length),
+       idle_p95_ms:($ip95|round2),loaded_p95_ms:($lp95|round2),
+       idle_p50_ms:(perc($i;0.5)|round2),loaded_p50_ms:(perc($l;0.5)|round2),
+       loaded_jitter_ms:(jitter($l)|round2),loss_percent:($loss|round2),
+       p95_increase_ms:($delta|round2),received_mbps:($t.received_mbps // 0),
+       tcp_retransmits:($t.retransmits // 0)}
+    '
+}
+
+network_tuning_qoe_combine() {
+    jq -s -c '
+      if length != 2 then {status:"inconclusive",reason:"missing_round"}
+      elif .[0].verdict=="inconclusive" or .[1].verdict=="inconclusive" then
+        {status:"inconclusive",reason:"insufficient_samples",rounds:.}
+      elif .[0].verdict != .[1].verdict then
+        {status:"inconclusive",reason:"inconsistent_rounds",rounds:.}
+      elif .[0].verdict=="possible_queueing" then
+        {status:"repeatable_queueing_signal",reason:"not_confirmed_policer",rounds:.}
+      elif .[0].verdict=="possible_loss" then
+        {status:"repeatable_loss_signal",reason:"icmp_loss_origin_unknown",rounds:.}
+      else
+        {status:"no_clear_issue_at_sampled_rate",reason:"sampled_load_only",rounds:.}
+      end
+    ' "$1" "$2"
+}
+
+network_tuning_qoe_run() (
+    local tier="$1" family="$2" peer="$3" port="$4" profile rate checked target
+    local answer dir="" ping_pid=0 round report status
+    profile=$(network_tuning_profile "$tier") || exit 1
+    [[ "$family" == 4 || "$family" == 6 ]] || { echo "[错误] 仅支持 IPv4/IPv6。"; exit 1; }
+    [[ "$port" =~ ^[1-9][0-9]*$ ]] && ((port >= 1 && port <= 65535)) || exit 1
+    for tool in ping jq iperf3; do
+        command -v "$tool" >/dev/null 2>&1 || { echo "[错误] 缺少 $tool。"; exit 1; }
+    done
+    read -r _ rate _ _ _ <<< "$profile"
+    checked=$(network_tuning_probe_check "$family" "$peer" "$rate" \
+      "$NET_TUNE_QOE_SECONDS" "$NET_TUNE_QOE_BUDGET_MIB") || {
+        echo "$checked"; exit 1;
+    }
+    target=${checked%%|*}
+    echo "套餐：${tier}Mbps；IPv${family}；iperf3 / ICMP 对端：$target:$port"
+    echo "自动执行两轮：空闲 RTT + 8s 有界 TCP 负载 + 带载 RTT。"
+    echo "每轮最大 96MiB 网卡发送预算，约 2×8s；不改变服务器网络参数。"
+    echo "ping 与 iperf3 的对端不等于真实播放 CDN 或客户端路径。"
+    read -rp "确认开始双轮体验诊断？请输入 RUN: " answer
+    [[ "$answer" == RUN ]] || { echo "已取消。"; exit 0; }
+    umask 077
+    dir=$(mktemp -d /tmp/ss2022-qoe.XXXXXXXX) || exit 1
+    network_tuning_qoe_cleanup() {
+        ((ping_pid > 0)) && kill -TERM "$ping_pid" 2>/dev/null || true
+        [[ -d "$dir" ]] && rm -rf "$dir"
+    }
+    trap 'exit 130' INT TERM HUP
+    trap network_tuning_qoe_cleanup EXIT
+    for round in 1 2; do
+        echo "=== 第 $round/2 轮 ==="
+        network_tuning_qoe_ping "$family" "$target" "$NET_TUNE_QOE_IDLE_COUNT" \
+          > "$dir/idle_$round.log" 2>&1 || true
+        network_tuning_qoe_samples "$dir/idle_$round.log" > "$dir/idle_$round.jsonl"
+        ( sleep 0.5; network_tuning_qoe_ping "$family" "$target" "$NET_TUNE_QOE_LOADED_COUNT" ) \
+          > "$dir/loaded_$round.log" 2>&1 &
+        ping_pid=$!
+        if ! network_tuning_probe_run "$family" "$target" "$port" "$rate" \
+          "$NET_TUNE_QOE_SECONDS" "$NET_TUNE_QOE_BUDGET_MIB" "$dir/probe_$round.json" <<< "RUN"; then
+            echo "[保护] 测试中断、超额或吞吐异常：拒绝生成 QoE 建议。"
+            exit 1
+        fi
+        wait "$ping_pid" 2>/dev/null || true
+        ping_pid=0
+        network_tuning_qoe_samples "$dir/loaded_$round.log" > "$dir/loaded_$round.jsonl"
+        network_tuning_qoe_evaluate "$dir/idle_$round.jsonl" \
+          "$dir/loaded_$round.jsonl" "$dir/probe_$round.json" > "$dir/eval_$round.json" || exit 1
+        jq -r --arg round "$round" \
+          '"第 \($round) 轮：空闲 P95 \(.idle_p95_ms)ms → 带载 P95 \(.loaded_p95_ms)ms；抖动 \(.loaded_jitter_ms)ms；收到 \(.received_mbps)Mbps；\(.verdict)"' \
+          "$dir/eval_$round.json"
+    done
+    report=$(network_tuning_qoe_combine "$dir/eval_1.json" "$dir/eval_2.json") || exit 1
+    status=$(jq -r '.status' <<< "$report") || exit 1
+    case "$status" in
+        repeatable_queueing_signal)
+            echo "[诊断] 两轮均有显著带载排队延迟，尚不能断定服务商限速器。" ;;
+        repeatable_loss_signal)
+            echo "[诊断] 两轮均有明显 ICMP 响应缺失，可能是 ICMP 限速/对端问题。" ;;
+        no_clear_issue_at_sampled_rate)
+            echo "[诊断] 本次采样速率未发现明显异常，不代表线路全速无问题。" ;;
+        *) echo "[诊断] 样本不足或两轮结论不一致，无法判断。" ;;
+    esac
+    echo "结果：$status（仅诊断，不提供 HTB 整形建议或更改网卡配置）。"
+)
+
+network_tuning_qoe_menu() {
+    local tier family peer port
+    echo "线路机支持档位：$NET_TUNE_SUPPORTED_TIERS Mbps；不含 1Gbps。"
+    read -rp "套餐 Mbps [30]: " tier
+    tier=${tier:-30}
+    network_tuning_profile "$tier" >/dev/null || return 1
+    read -rp "地址族 4/6 [4]: " family
+    read -rp "可信 iperf3 测速服务端的域名或 IP: " peer
+    [[ -n "$peer" ]] || { echo "已取消。"; return 0; }
+    read -rp "端口 [5201]: " port
+    network_tuning_qoe_run "$tier" "${family:-4}" "$peer" "${port:-5201}"
+}
+
+# ==============================================================================
+# [12D] v1.10.0-dev4: candidate calculation + existing tc ownership preflight
+# ==============================================================================
+# The candidate is NEVER auto-applied. No tc add/replace/delete calls here.
+network_tuning_candidate_assess() {
+    local tier="$1" path="$2" size max_kbps
+    network_tuning_profile "$tier" >/dev/null || return 1
+    [[ -f "$path" && ! -L "$path" && -r "$path" ]] || {
+        echo "[保护] 证据必须是可读的普通 JSON 文件。" >&2; return 1;
+    }
+    size=$(wc -c < "$path") || return 1
+    ((size >= 16 && size <= 262144)) || {
+        echo "[保护] 证据文件大小不可信。" >&2; return 1;
+    }
+    max_kbps=$(network_tuning_profile_upper_kbps "$tier") || return 1
+    jq -nc --slurpfile data "$path" --argjson tier "$tier" --argjson maximum "$max_kbps" '
+      def refuse($why): {status:"inconclusive", reason:$why,
+                          candidate_kbps:null,auto_apply:false};
+      def absent($why): {status:"no_confirmed_knee",reason:$why,
+                          candidate_kbps:null,auto_apply:false};
+      ($data[0] // {}) as $d |
+      if $d.schema != 1 or $d.tier_mbps != $tier or
+        ($d.samples|type)!="array" or ($d.samples|length)!=6 then
+        refuse("invalid_schema_or_tier")
+      elif ([ $d.samples[] | (type=="object" and
+        (.rate_mbps|type)=="number" and (.round|type)=="number" and
+        (.sender_mbps|type)=="number" and (.received_mbps|type)=="number" and
+        (.idle_p95_ms|type)=="number" and (.loaded_p95_ms|type)=="number" and
+        (.retransmits|type)=="number") ] | all | not) then
+        refuse("missing_or_invalid_metrics")
+      else
+        ($d.samples|sort_by(.rate_mbps,.round)) as $s |
+        ([$s[].rate_mbps]|unique) as $rates |
+        if ($rates|length)!=3 or
+           $rates[0] < $tier*0.25 or $rates[2] < $tier*0.80 or
+           $rates[2]*1000 > $maximum or
+           ($rates[1]-$rates[0]) < $tier*0.08 or
+           ($rates[2]-$rates[1]) < $tier*0.08 then
+          refuse("insufficient_rate_coverage")
+        elif ([ $rates[] as $r |
+          ([$s[]|select(.rate_mbps==$r)|.round]|sort)==[1,2]
+          ] | all | not) then
+          refuse("missing_repeat_at_rate")
+        elif ([ $s[] |
+          (.rate_mbps>0 and .sender_mbps>=.rate_mbps*0.80 and
+           .sender_mbps<=.rate_mbps*1.15 and .received_mbps>0 and
+           .received_mbps<=.sender_mbps*1.03 and
+           .idle_p95_ms>=0 and .loaded_p95_ms>=0 and
+           .idle_p95_ms<=10000 and .loaded_p95_ms<=10000 and
+           .retransmits>=0 and .retransmits<=100000)
+          ] | all | not) then
+          refuse("invalid_sample_range")
+        else
+          ([ $rates[] as $r |
+            ([$s[]|select(.rate_mbps==$r)]|sort_by(.round)) as $p |
+            {rate:$r,
+             rx:(($p[0].received_mbps+$p[1].received_mbps)/2),
+             stable:((($p[0].received_mbps-$p[1].received_mbps)|abs)
+                      <= ($p[0].received_mbps+$p[1].received_mbps)*0.09),
+             clean:([$p[]|
+               (.received_mbps>=.sender_mbps*0.91 and
+                .loaded_p95_ms<=.idle_p95_ms+85 and
+                .retransmits<=4)]|all),
+             stressed:([$p[]|
+               (.received_mbps<=.sender_mbps*0.90 and
+                .loaded_p95_ms>=.idle_p95_ms+100)]|all)}
+          ]) as $g |
+          if ([$g[].stable]|all|not) then refuse("inconsistent_repeats")
+          elif ($g[0].clean|not) or ($g[1].clean|not) then
+            absent("lower_rates_not_clean")
+          elif ($g[2].stressed|not) or
+               ($g[2].rx-$g[1].rx > ($g[2].rate-$g[1].rate)*0.30) then
+            absent("no_repeatable_plateau_and_queueing")
+          else
+            ($g[1].rate*950|floor) as $candidate |
+            if $candidate < $tier*500 or $candidate >= $tier*1000 then
+              absent("candidate_outside_safe_range")
+            else
+              {status:"candidate_for_validation",candidate_kbps:$candidate,
+               auto_apply:false,
+               reason:"independent_peer_and_a_b_qoe_testing_required",
+               evidence:{rates_mbps:$rates,mid_rx:$g[1].rx,high_rx:$g[2].rx}}
+            end
+          end
+        end
+      end
+    '
+}
+
+network_tuning_qdisc_audit() {
+    local iface="$1" qdisc classes filters root
+    command -v tc >/dev/null 2>&1 || {
+        echo "blocked|tc_unavailable"; return 1;
+    }
+    [[ "$iface" =~ ^[a-zA-Z0-9_.:-]+$ ]] || {
+        echo "blocked|invalid_interface"; return 1;
+    }
+    qdisc=$(tc qdisc show dev "$iface" 2>/dev/null) || {
+        echo "blocked|qdisc_unavailable"; return 1;
+    }
+    classes=$(tc class show dev "$iface" 2>/dev/null) || {
+        echo "blocked|class_unavailable"; return 1;
+    }
+    filters=$(tc filter show dev "$iface" 2>/dev/null) || {
+        echo "blocked|filter_unavailable"; return 1;
+    }
+    if [[ -n "$classes" || -n "$filters" ]]; then
+        echo "blocked|external_classes_or_filters"; return 1
+    fi
+    if [[ "$qdisc" == *" mq "* || "$qdisc" == *" clsact "* ||
+          "$qdisc" == *" ingress "* ]]; then
+        echo "blocked|mq_clsact_ingress"; return 1
+    fi
+    root=$(awk '$1=="qdisc" && $0 ~ / root / {print $2; exit}' <<< "$qdisc")
+    case "$root" in
+        fq|fq_codel|pfifo_fast) echo "inspect_only|known_root_but_restore_unverified" ;;
+        *) echo "blocked|unknown_root_qdisc"; return 1 ;;
+    esac
+}
+
+network_tuning_candidate_menu() {
+    local tier file payload iface family audit
+    echo "开发测试功能：离线分析 3 档×2 轮的完整数据，不执行 HTB。"
+    read -rp "套餐 Mbps [30]: " tier
+    tier="${tier:-30}"
+    network_tuning_profile "$tier" >/dev/null || return 1
+    read -rp "可信六样本 JSON 文件绝对路径（留空取消）: " file
+    [[ -n "$file" ]] || return 0
+    payload=$(network_tuning_candidate_assess "$tier" "$file") || return 1
+    jq -r 'if .candidate_kbps != null then
+        "仅供后续验证的候选：\(.candidate_kbps) Kbps（未应用）"
+        else "暂不建议整形：" + .reason end' <<< "$payload"
+    read -rp "出口地址族 4/6 [4]: " family
+    family="${family:-4}"
+    [[ "$family" == 4 || "$family" == 6 ]] || return 1
+    if [[ "$family" == 4 ]]; then
+        iface=$(network_tuning_get_iface 4 1.1.1.1) || return 1
+    else
+        iface=$(network_tuning_get_iface 6 2606:4700:4700::1111) || return 1
+    fi
+    audit=$(network_tuning_qdisc_audit "$iface") || true
+    echo "网卡 $iface 安全检查：$audit"
+    echo "dev4 仅给候选及风险提示，不修改 qdisc、路由或 sysctl。"
+}
+
+
+# ==============================================================================
+# [12E] v1.10.0-dev5: bounded 3-rate x 2-round evidence collection
+# ==============================================================================
+# An explicit RUN and a trusted iperf3 peer are mandatory. NO network writes.
+NET_TUNE_SCAN_DURATION=6
+NET_TUNE_SCAN_TOTAL_MAX_MIB=2560
+NET_TUNE_SCAN_PER_PROBE_MAX_MIB=768
+
+network_tuning_scan_plan() {
+    local tier="$1" low mid high rate estimate budget total=0
+    local -a budgets=()
+    network_tuning_profile "$tier" >/dev/null || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    low=$((tier * 40 / 100))
+    mid=$((tier * 80 / 100))
+    high="$tier"
+    for rate in "$low" "$mid" "$high"; do
+        estimate=$((rate * 1000000 * NET_TUNE_SCAN_DURATION / 8))
+        # Each probe needs a 30% headroom above its computed TCP payload.
+        budget=$(((estimate * 10 + 7 * 1048576 - 1) / (7 * 1048576)))
+        (( budget >= 1 && budget <= NET_TUNE_SCAN_PER_PROBE_MAX_MIB )) || return 1
+        budgets+=("$budget")
+        total=$((total + 2 * budget))
+    done
+    (( total <= NET_TUNE_SCAN_TOTAL_MAX_MIB )) || return 1
+    jq -nc --argjson tier "$tier" --argjson duration "$NET_TUNE_SCAN_DURATION" \
+        --argjson total "$total" --argjson cap "$NET_TUNE_SCAN_TOTAL_MAX_MIB" \
+        --argjson low "$low" --argjson mid "$mid" --argjson high "$high" \
+        --argjson lb "${budgets[0]}" --argjson mb "${budgets[1]}" \
+        --argjson hb "${budgets[2]}" \
+        '{schema:1,tier_mbps:$tier,duration_sec:$duration,rounds:2,
+          rate_mbps:[$low,$mid,$high],budget_mib:[$lb,$mb,$hb],
+          aggregate_budget_mib:$total,aggregate_cap_mib:$cap,auto_apply:false}'
+}
+
+network_tuning_scan_run() (
+    local tier="$1" family="$2" peer="$3" port="$4"
+    local plan target iface baseline checked audit answer rate budget round i
+    local ping_pid=0 work="" report="" now summary tool counter
+    local -a rates budgets
+    network_tuning_profile "$tier" >/dev/null || exit 1
+    [[ "$family" == 4 || "$family" == 6 ]] || exit 1
+    [[ "$port" =~ ^[1-9][0-9]*$ ]] && ((port >= 1 && port <= 65535)) || exit 1
+    for tool in ip iperf3 jq ping tc flock; do
+        command -v "$tool" >/dev/null 2>&1 || { echo "[错误] 缺少：$tool"; exit 1; }
+    done
+    plan=$(network_tuning_scan_plan "$tier") || exit 1
+    mapfile -t rates < <(jq -r '.rate_mbps[]' <<< "$plan")
+    mapfile -t budgets < <(jq -r '.budget_mib[]' <<< "$plan")
+    # Scoped to this subshell; existing dev2 100Mbps/256MiB caps are unchanged.
+    NET_TUNE_PROBE_MAX_MBPS=500
+    NET_TUNE_PROBE_MAX_BUDGET_MIB="$NET_TUNE_SCAN_PER_PROBE_MAX_MIB"
+    target=$(network_tuning_probe_resolve "$family" "$peer") || exit 1
+    checked=$(network_tuning_probe_check "$family" "$target" "${rates[0]}" \
+        "$NET_TUNE_SCAN_DURATION" "${budgets[0]}") || {
+        echo "$checked"; exit 1;
+    }
+    IFS='|' read -r _ iface _ <<< "$checked"
+    counter="$NET_TUNE_PROBE_SYSFS/$iface/statistics/tx_bytes"
+    baseline=$(cat "$counter" 2>/dev/null) || exit 1
+    [[ "$baseline" =~ ^[0-9]+$ ]] || exit 1
+    audit=$(network_tuning_qdisc_audit "$iface") || true
+    echo "套餐：${tier}Mbps；对端：$target:$port；IPv${family} 出口：$iface"
+    echo "每档两轮、每轮 ${NET_TUNE_SCAN_DURATION}s；速率：${rates[*]} Mbps"
+    echo "累计网卡发送预算：$(jq -r .aggregate_budget_mib <<< "$plan")MiB（≤${NET_TUNE_SCAN_TOTAL_MAX_MIB}MiB）"
+    echo "qdisc 预检：$audit（只读，不授予更改权限）"
+    echo "警告：本测试可能占满线路，影响视频和聊天；仅建议低峰期手动执行。"
+    echo "永不应用 tc 整形或修改 sysctl。"
+    read -rp "确认六次网络采样？请输入 RUN: " answer
+    [[ "$answer" == RUN ]] || { echo "已取消。"; exit 0; }
+
+    [[ ! -L "$NET_TUNE_DIR" ]] || { echo "[保护] 工作目录为链接。"; exit 1; }
+    if [[ ! -e "$NET_TUNE_DIR" ]]; then
+        ( umask 077; mkdir -m 700 -p "$NET_TUNE_DIR" ) || exit 1
+    fi
+    [[ -d "$NET_TUNE_DIR" && ! -L "$NET_TUNE_DIR" ]] || exit 1
+    [[ "$(stat -c %u "$NET_TUNE_DIR")" == "$(id -u)" ]] || {
+        echo "[保护] 工作目录不属于当前用户。"; exit 1;
+    }
+    [[ ! -L "$NET_TUNE_DIR/.scan.lock" ]] || exit 1
+    umask 077
+    exec 9>>"$NET_TUNE_DIR/.scan.lock" || exit 1
+    flock -n 9 || { echo "[保护] 已有扫描正在进行。"; exit 1; }
+    work=$(mktemp -d "$NET_TUNE_DIR/.scan.XXXXXXXX") || exit 1
+    network_tuning_scan_cleanup() {
+        (( ping_pid > 0 )) && kill -TERM "$ping_pid" 2>/dev/null || true
+        [[ -n "$work" && -d "$work" ]] && rm -rf "$work"
+        [[ -n "$report" ]] && rm -f "$report"
+        return 0
+    }
+    trap 'exit 130' INT TERM HUP
+    trap network_tuning_scan_cleanup EXIT
+    : > "$work/samples.jsonl"
+    for round in 1 2; do
+        for i in 0 1 2; do
+            rate="${rates[i]}"; budget="${budgets[i]}"
+            checked=$(network_tuning_probe_check "$family" "$target" "$rate" \
+                "$NET_TUNE_SCAN_DURATION" "$budget") || exit 1
+            [[ "$checked" == "$target|$iface|"* ]] || {
+                echo "[保护] 扫描期间出口路由变化，停止。"; exit 1;
+            }
+            now=$(cat "$counter" 2>/dev/null) || exit 1
+            [[ "$now" =~ ^[0-9]+$ ]] && ((now >= baseline)) || exit 1
+            ((now - baseline < NET_TUNE_SCAN_TOTAL_MAX_MIB * 1048576)) || exit 1
+            echo "=== 第 $round/2 轮，${rate}Mbps ==="
+            network_tuning_qoe_ping "$family" "$target" "$NET_TUNE_QOE_IDLE_COUNT" \
+                > "$work/idle.log" 2>&1 || true
+            network_tuning_qoe_samples "$work/idle.log" > "$work/idle.jsonl"
+            ( sleep 0.2; network_tuning_qoe_ping "$family" "$target" \
+                "$NET_TUNE_QOE_LOADED_COUNT" 0.4 ) > "$work/loaded.log" 2>&1 &
+            ping_pid=$!
+            if ! network_tuning_probe_run "$family" "$target" "$port" "$rate" \
+                "$NET_TUNE_SCAN_DURATION" "$budget" "$work/probe.json" <<< "RUN"; then
+                echo "[保护] 测速失败或超预算，不生成完整证据。"; exit 1
+            fi
+            wait "$ping_pid" 2>/dev/null || true
+            ping_pid=0
+            network_tuning_qoe_samples "$work/loaded.log" > "$work/loaded.jsonl"
+            network_tuning_qoe_evaluate "$work/idle.jsonl" "$work/loaded.jsonl" \
+                "$work/probe.json" > "$work/eval.json" || exit 1
+            if ! jq -e --argjson idle "$NET_TUNE_QOE_IDLE_COUNT" \
+                --argjson loaded "$NET_TUNE_QOE_LOADED_COUNT" \
+                '.verdict!="inconclusive" and .idle_samples==$idle and
+                  .loaded_samples==$loaded and .loss_percent==0' \
+                "$work/eval.json" >/dev/null; then
+                echo "[保护] RTT/ICMP 样本不完整；停止扫描。"; exit 1
+            fi
+            jq -nc --argjson rate "$rate" --argjson round "$round" \
+                --slurpfile p "$work/probe.json" --slurpfile q "$work/eval.json" \
+                '{rate_mbps:$rate,round:$round,sender_mbps:$p[0].sender_mbps,
+                  received_mbps:$p[0].received_mbps,
+                  idle_p95_ms:$q[0].idle_p95_ms,
+                  loaded_p95_ms:$q[0].loaded_p95_ms,
+                  retransmits:$p[0].retransmits}' >> "$work/samples.jsonl" || exit 1
+            now=$(cat "$counter" 2>/dev/null) || exit 1
+            [[ "$now" =~ ^[0-9]+$ ]] && ((now >= baseline)) || exit 1
+            ((now - baseline < NET_TUNE_SCAN_TOTAL_MAX_MIB * 1048576)) || exit 1
+            sleep 2
+        done
+    done
+    report=$(mktemp "$NET_TUNE_DIR/scan-XXXXXXXX.json") || exit 1
+    jq -n --argjson tier "$tier" --slurpfile samples "$work/samples.jsonl" \
+        '{schema:1,tier_mbps:$tier,samples:$samples}' > "$report" || exit 1
+    [[ "$(jq -r '.samples|length' "$report")" == 6 ]] || exit 1
+    summary=$(network_tuning_candidate_assess "$tier" "$report") || exit 1
+    echo "只读判定：$(jq -r '.status + " / " + .reason' <<< "$summary")"
+    echo "候选结果：$(jq -r 'if .candidate_kbps then
+        (.candidate_kbps|tostring)+"Kbps（需 A/B 复验，未应用）"
+        else "无可靠候选，保持原配置" end' <<< "$summary")"
+    echo "本机六样本证据：$report（600 权限）"
+    report=""
+)
+
+network_tuning_scan_menu() {
+    local tier family peer port plan
+    echo "开发预览：六轮实时测速可能占满线路。"
+    read -rp "真实线路套餐 Mbps [30]: " tier
+    tier="${tier:-30}"
+    plan=$(network_tuning_scan_plan "$tier") || return 1
+    echo "自动三档：$(jq -r '.rate_mbps|join(" / ")' <<< "$plan") Mbps；"
+    echo "总发送预算：$(jq -r .aggregate_budget_mib <<< "$plan") MiB。"
+    read -rp "地址族 4/6 [4]: " family
+    read -rp "可信 iperf3 服务端域名或 IP: " peer
+    [[ -n "$peer" ]] || { echo "已取消。"; return 0; }
+    read -rp "服务端端口 [5201]: " port
+    network_tuning_scan_run "$tier" "${family:-4}" "$peer" "${port:-5201}"
+}
+
+
+# ==============================================================================
+# [12F] v1.10.0-dev6: independently running rollback watchdog (file-only demo)
+# ==============================================================================
+# WARNING: no production qdisc/HTB changes or recovery are enabled here.
+NET_TUNE_ROLLBACK_TRIALS_DIR="$NET_TUNE_DIR/rollback-rehearsals"
+
+network_tuning_rollback_dir_safe() {
+    [[ -d "$1" && ! -L "$1" ]] &&
+    [[ "$(stat -c %u "$1" 2>/dev/null)" == "$(id -u)" ]] &&
+    [[ "$(stat -c %a "$1" 2>/dev/null)" == 700 ]]
+}
+
+network_tuning_rollback_rehearsal() (
+    local ttl="$1" confirm="$2" root="$NET_TUNE_ROLLBACK_TRIALS_DIR"
+    local trial="" started=0 pid i
+    [[ "$ttl" =~ ^[1-9][0-9]*$ ]] && ((ttl>=3 && ttl<=30)) || {
+        echo "[保护] 仅允许 3-30 秒的模拟回滚。" >&2; exit 1;
+    }
+    for i in setsid nohup stat mktemp; do
+        command -v "$i" >/dev/null 2>&1 || { echo "[保护] 缺少 $i。"; exit 1; }
+    done
+    if [[ "$confirm" != RUN ]]; then
+        read -rp "仅演练回滚文件标记，不动网卡。输入 RUN 确认: " confirm
+        [[ "$confirm" == RUN ]] || { echo "已取消。"; exit 0; }
+    fi
+    umask 077
+    [[ ! -L "$NET_TUNE_DIR" && ! -L "$root" ]] || exit 1
+    if [[ ! -e "$NET_TUNE_DIR" ]]; then mkdir -m 700 "$NET_TUNE_DIR" || exit 1; fi
+    network_tuning_rollback_dir_safe "$NET_TUNE_DIR" || {
+        echo "[保护] 数据目录不是本用户拥有的 700 私有目录。" >&2; exit 1;
+    }
+    if [[ ! -e "$root" ]]; then mkdir -m 700 "$root" || exit 1; fi
+    network_tuning_rollback_dir_safe "$root" || exit 1
+    trial=$(mktemp -d "$root/trial-XXXXXXXX") || exit 1
+    printf '%s\n' '{"schema":1,"mode":"dry_run","auto_apply":false}' > "$trial/plan.json"
+    printf '%s\n' ARMED > "$trial/armed"
+    cat > "$trial/watchdog.sh" <<'WATCHDOG_EOF'
+#!/usr/bin/env bash
+# Standalone watchdog: private test-marker cleanup ONLY.
+set -euo pipefail
+umask 077
+trial="$1"
+ttl="$2"
+[[ "$ttl" =~ ^[1-9][0-9]*$ ]] && ((ttl>=3 && ttl<=30)) || exit 1
+[[ -d "$trial" && ! -L "$trial" ]] || exit 1
+[[ "$(stat -c %u "$trial")" == "$(id -u)" ]] || exit 1
+[[ "$(stat -c %a "$trial")" == 700 ]] || exit 1
+[[ "$(cat "$trial/plan.json")" == '{"schema":1,"mode":"dry_run","auto_apply":false}' ]] || exit 1
+[[ "$(cat "$trial/armed")" == ARMED ]] || exit 1
+printf '%s\n' READY > "$trial/ready"
+deadline=$((SECONDS+ttl))
+while ((SECONDS<deadline)); do sleep 1; done
+[[ ! -L "$trial/canary.active" ]] || {
+    echo blocked_symlink > "$trial/result"; exit 1;
+}
+rm -f -- "$trial/canary.active"
+echo rolled_back_simulated > "$trial/result"
+WATCHDOG_EOF
+    chmod 700 "$trial/watchdog.sh" || exit 1
+    nohup setsid bash "$trial/watchdog.sh" "$trial" "$ttl" \
+        </dev/null >"$trial/worker.log" 2>&1 &
+    pid=$!
+    for ((i=0;i<40;i++)); do
+        if [[ "$(cat "$trial/ready" 2>/dev/null || true)" == READY ]]; then
+            started=1; break
+        fi
+        sleep 0.1
+    done
+    if ((started!=1)); then
+        kill -TERM "$pid" 2>/dev/null || true
+        echo "[保护] 看门狗未就绪，拒绝开始模拟变更。" >&2
+        exit 1
+    fi
+    printf '%s\n' DRY_RUN_ONLY > "$trial/canary.active" || exit 1
+    echo "Dev6 看门狗已脱离当前 Shell；不修改真实网络。"
+    echo "演练事务：$trial"
+    echo "结果文件：$trial/result"
+)
+
+network_tuning_rollback_rehearsal_status() {
+    local root="$NET_TUNE_ROLLBACK_TRIALS_DIR" d result shown=0
+    network_tuning_rollback_dir_safe "$root" || { echo "暂无演练记录。"; return 0; }
+    for d in "$root"/trial-*; do
+        [[ -d "$d" && ! -L "$d" ]] || continue
+        result=$(cat "$d/result" 2>/dev/null || true)
+        [[ -n "$result" ]] || result=pending
+        echo "$(basename "$d"): $result"
+        shown=$((shown+1))
+        ((shown<20)) || break
+    done
+    ((shown>0)) || echo "暂无演练记录。"
+}
+
+network_tuning_rollback_rehearsal_menu() {
+    local ttl
+    echo "Dev6 仅演练独立超时清理模拟状态，不支持生产 HTB/qdisc 恢复。"
+    read -rp "模拟回滚秒数 [5]: " ttl
+    [[ -n "$ttl" ]] || ttl=5
+    network_tuning_rollback_rehearsal "$ttl" ""
+}
+
+
+# ==============================================================================
+# [12G] v1.10.0-dev7: transient HTB trial and detached timed rollback
+# ==============================================================================
+# Never persistent. Enabled only on isolated fq_codel roots with verified
+# restore options. This path has not yet been tested on a real VPS.
+NET_TUNE_HTB_TRIAL_SECONDS=60
+
+network_tuning_htb_baseline() {
+    local iface="$1" root classes filters index i key value argjson
+    local -a tokens args
+    [[ "$iface" =~ ^[a-zA-Z0-9_.:-]+$ ]] || return 1
+    network_tuning_probe_iface_guard "$iface" "dev $iface" || return 1
+    [[ ! -L "$NET_TUNE_PROBE_SYSFS/$iface/master" ]] || return 1
+    index=$(cat "$NET_TUNE_PROBE_SYSFS/$iface/ifindex" 2>/dev/null) || return 1
+    [[ "$index" =~ ^[1-9][0-9]*$ ]] || return 1
+    root=$(tc qdisc show dev "$iface" 2>/dev/null) || return 1
+    [[ -n "$root" && "$root" != *$'\n'* ]] || return 1
+    classes=$(tc class show dev "$iface" 2>/dev/null) || return 1
+    filters=$(tc filter show dev "$iface" 2>/dev/null) || return 1
+    [[ -z "$classes" && -z "$filters" ]] || return 1
+    read -r -a tokens <<< "$root"
+    [[ "${tokens[0]:-}" == qdisc && "${tokens[1]:-}" == fq_codel &&
+       "${tokens[2]:-}" =~ ^[0-9a-fA-F]+:$ && "${tokens[3]:-}" == root ]] || return 1
+    i=4
+    if [[ "${tokens[i]:-}" == refcnt ]]; then
+        [[ "${tokens[i+1]:-}" =~ ^[1-9][0-9]*$ ]] || return 1
+        i=$((i+2))
+    fi
+    args=()
+    while ((i < ${#tokens[@]})); do
+        key="${tokens[i]}"
+        case "$key" in
+            ecn|noecn) args+=("$key"); i=$((i+1)) ;;
+            limit|flows|quantum|target|interval|memory_limit|drop_batch)
+                value="${tokens[i+1]:-}"
+                case "$key" in
+                    limit) [[ "$value" =~ ^[1-9][0-9]*p$ ]] || return 1 ;;
+                    flows|quantum|drop_batch) [[ "$value" =~ ^[1-9][0-9]*$ ]] || return 1 ;;
+                    target|interval) [[ "$value" =~ ^[1-9][0-9]*(us|ms|s)$ ]] || return 1 ;;
+                    memory_limit) [[ "$value" =~ ^[1-9][0-9]*(b|Kb|Mb|Gb)$ ]] || return 1 ;;
+                esac
+                if [[ "$key" == limit ]]; then value="${value%p}"; fi
+                args+=("$key" "$value"); i=$((i+2)) ;;
+            *) return 1 ;;
+        esac
+    done
+    argjson=$(printf '%s\n' "${args[@]}" |
+        jq -Rsc 'split("\n")|map(select(length>0))') || return 1
+    jq -nc --arg iface "$iface" --arg idx "$index" --arg root "$root" \
+        --argjson args "$argjson" \
+        '{schema:1,mode:"htb_ephemeral_trial",iface:$iface,ifindex:$idx,
+          original_root:$root,restore_kind:"fq_codel",restore_args:$args,permanent:false}'
+}
+
+network_tuning_htb_trial() (
+    local tier="$1" family="$2" report="$3" confirm="$4"
+    local iface peer baseline second status rate active trial unit cmd
+    [[ "$(id -u)" == 0 ]] || { echo "[保护] 仅支持 root 临时测试。" >&2; exit 1; }
+    [[ "$NET_TUNE_DIR" == /var/lib/ss2022-network-tuning &&
+       "$NET_TUNE_PROBE_SYSFS" == /sys/class/net ]] || exit 1
+    [[ "$family" == 4 || "$family" == 6 ]] || exit 1
+    network_tuning_profile "$tier" >/dev/null || exit 1
+    for cmd in ip tc jq stat flock systemd-run systemctl; do
+        command -v "$cmd" >/dev/null 2>&1 || return 1
+    done
+    case "$report" in "$NET_TUNE_DIR"/scan-*.json) ;; *) return 1 ;; esac
+    [[ -f "$report" && ! -L "$report" && -r "$report" ]] || exit 1
+    [[ "$(stat -c %u "$report")" == 0 &&
+       "$(stat -c %a "$report")" == 600 ]] || exit 1
+    status=$(network_tuning_candidate_assess "$tier" "$report") || exit 1
+    [[ "$(jq -r .status <<< "$status")" == candidate_for_validation ]] || exit 1
+    rate=$(jq -r .candidate_kbps <<< "$status")
+    [[ "$rate" =~ ^[1-9][0-9]*$ ]] || exit 1
+    ((rate >= tier * 500 && rate < tier * 1000 && rate <= 500000)) || exit 1
+    if [[ "$family" == 4 ]]; then peer=1.1.1.1; else peer=2606:4700:4700::1111; fi
+    iface=$(network_tuning_get_iface "$family" "$peer") || exit 1
+    baseline=$(network_tuning_htb_baseline "$iface") || {
+        echo "[保护] 根 qdisc 不是可完整重建的独占 fq_codel；拒绝操作。" >&2
+        exit 1
+    }
+    echo "实验：临时在 $iface 应用 $rate Kbps HTB，60 秒后尝试恢复原配置。"
+    echo "风险：可能短暂断流；没有真实 VPS A/B 验证；不会永久启用。"
+    if [[ "$confirm" != TRIAL ]]; then
+        read -rp "同意风险请输入 TRIAL: " confirm
+        [[ "$confirm" == TRIAL ]] || { echo "已取消。"; exit 0; }
+    fi
+    network_tuning_rollback_dir_safe "$NET_TUNE_DIR" || exit 1
+    [[ ! -L "$NET_TUNE_DIR/.htb.lock" ]] || exit 1
+    umask 077
+    exec 9>>"$NET_TUNE_DIR/.htb.lock" || exit 1
+    flock -n 9 || exit 1
+    active="$NET_TUNE_DIR/.htb-active"
+    [[ ! -e "$active" && ! -L "$active" ]] || {
+        echo "[保护] 已有活动试验或未处理的回滚失败。" >&2; exit 1;
+    }
+    trial=$(mktemp -d "$NET_TUNE_DIR/htb-XXXXXXXX") || exit 1
+    # Shared phase lock: a fired watchdog waits until all HTB writes end.
+    # A killed shell releases this lock, allowing independent recovery.
+    exec 8>"$trial/phase.lock" || exit 1
+    flock -x 8 || exit 1
+    jq --argjson rate "$rate" '. + {candidate_kbps:$rate}' \
+        <<< "$baseline" > "$trial/snapshot.json" || exit 1
+    cat > "$trial/restore.sh" <<'RESTORE_HTB_EOF'
+#!/usr/bin/env bash
+# Runs as an independent systemd timer service (no SSH dependency).
+set -euo pipefail
+umask 077
+trial="$1"
+[[ -d "$trial" && ! -L "$trial" && "$(stat -c %u "$trial")" == "$(id -u)" ]] || exit 1
+snapshot="$trial/snapshot.json"
+jq -e '.schema==1 and .mode=="htb_ephemeral_trial" and
+       (.restore_args|type)=="array"' "$snapshot" >/dev/null || exit 1
+iface=$(jq -r .iface "$snapshot")
+index=$(jq -r .ifindex "$snapshot")
+[[ "$iface" =~ ^[a-zA-Z0-9_.:-]+$ && "$index" =~ ^[1-9][0-9]*$ ]] || exit 1
+[[ "$(cat "/sys/class/net/$iface/ifindex" 2>/dev/null)" == "$index" ]] || {
+    echo interface_changed > "$trial/result"; exit 1;
+}
+active="$(dirname "$trial")/.htb-active"
+[[ -f "$active" && ! -L "$active" && "$(cat "$active")" == "$trial" ]] || exit 1
+exec 8>>"$trial/phase.lock"
+flock -x 8 || exit 1
+root=$(tc qdisc show dev "$iface") || exit 1
+if grep -Eq '^qdisc htb 1: root' <<< "$root"; then
+    while IFS= read -r qline; do
+        [[ -z "$qline" || "$qline" == "qdisc htb 1: root"* ||
+           "$qline" == "qdisc fq_codel 10: parent 1:10 "* ]] || {
+            echo external_qdisc_conflict > "$trial/result"; exit 1;
+        }
+    done <<< "$root"
+    [[ -z "$(tc filter show dev "$iface")" ]] || {
+        echo filter_conflict > "$trial/result"; exit 1;
+    }
+    classes=$(tc class show dev "$iface") || exit 1
+    while IFS= read -r class; do
+        [[ -z "$class" || "$class" == "class htb 1:10 "* ||
+           "$class" =~ ^class[[:space:]]fq_codel[[:space:]]10:[[:xdigit:]]+[[:space:]]parent[[:space:]]10:[[:space:]]*$ ]] || {
+            echo class_conflict > "$trial/result"; exit 1;
+        }
+    done <<< "$classes"
+    mapfile -t args < <(jq -r '.restore_args[]' "$snapshot")
+    restored=0
+    for attempt in 1 2 3; do
+        if tc qdisc replace dev "$iface" root fq_codel "${args[@]}"; then
+            check=$(tc qdisc show dev "$iface" 2>/dev/null || true)
+            if grep -Eq '^qdisc fq_codel [^ ]+ root' <<< "$check"; then
+                restored=1; break
+            fi
+        fi
+        sleep 1
+    done
+    ((restored == 1)) || { echo restore_failed > "$trial/result"; exit 1; }
+    echo rolled_back_live > "$trial/result"
+elif grep -Eq '^qdisc fq_codel [^ ]+ root' <<< "$root"; then
+    expected=$(jq -r .original_root "$snapshot")
+    if [[ "$root" == "$expected" ]]; then
+        echo baseline_unchanged > "$trial/result"
+    else
+        echo external_root_conflict > "$trial/result"; exit 1
+    fi
+else
+    echo external_root_conflict > "$trial/result"; exit 1
+fi
+[[ "$(cat "$active")" == "$trial" ]] && rm -f -- "$active"
+RESTORE_HTB_EOF
+    chmod 700 "$trial/restore.sh" || exit 1
+    ( set -C; printf '%s\n' "$trial" > "$active" ) || exit 1
+    unit="ss2022-htb-restore-$(basename "$trial")"
+    if ! systemd-run --unit="$unit" --on-active=60s \
+        --timer-property=AccuracySec=1s /usr/bin/bash \
+        "$trial/restore.sh" "$trial" >/dev/null; then
+        rm -f -- "$active"
+        echo "[保护] 独立 systemd 定时器不可用，未更改网络。" >&2; exit 1
+    fi
+    systemctl is-active --quiet "$unit.timer" || {
+        echo "[保护] 定时器未就绪，不触碰网络。" >&2; exit 1;
+    }
+    second=$(network_tuning_htb_baseline "$iface") || exit 1
+    [[ "$second" == "$baseline" ]] || {
+        echo "[保护] 配置准备期间发生变化，不触碰网络。" >&2; exit 1;
+    }
+    [[ -f "$active" && ! -L "$active" &&
+       "$(cat "$active")" == "$trial" ]] || {
+        echo "[保护] 活动事务标记变化，未执行 HTB。" >&2
+        exit 1
+    }
+    tc qdisc replace dev "$iface" root handle 1: htb default 10 || exit 1
+    if ! tc class add dev "$iface" parent 1: classid 1:10 htb \
+        rate "$rate"kbit ceil "$rate"kbit burst 32k cburst 32k ||
+       ! tc qdisc add dev "$iface" parent 1:10 handle 10: fq_codel; then
+        echo "[保护] 子队列失败，尝试立即恢复；定时器依然保留。" >&2
+        flock -u 8
+        flock -u 9
+        /usr/bin/bash "$trial/restore.sh" "$trial" || true
+        exit 1
+    fi
+    flock -u 8
+    echo "✔ 临时整形已启用，60 秒后自动恢复。"
+    echo "事务目录：$trial"
+    echo "回滚定时器：$unit.timer"
+)
+
+network_tuning_htb_trial_menu() {
+    local tier family report
+    echo "dev7 仅支持 systemd + 独占 fq_codel，且必须有 dev5 的完整证据。"
+    read -rp "套餐 Mbps [30]: " tier
+    read -rp "IPv4/IPv6 [4]: " family
+    read -rp "scan-*.json 文件绝对路径（空取消）: " report
+    [[ -n "$report" ]] || return 0
+    [[ -n "$tier" ]] || tier=30
+    [[ -n "$family" ]] || family=4
+    network_tuning_htb_trial "$tier" "$family" "$report" ""
+}
+
+network_tuning_htb_trial_status() {
+    local active="$NET_TUNE_DIR/.htb-active" trial
+    [[ -f "$active" && ! -L "$active" ]] || {
+        echo "当前没有活动 HTB 试验。"; return 0;
+    }
+    trial=$(cat "$active")
+    echo "活动试验：$trial"
+    echo "回滚状态：$(cat "$trial/result" 2>/dev/null || echo pending)"
+}
+
+network_tuning_htb_restore_now() {
+    local active="$NET_TUNE_DIR/.htb-active" trial
+    [[ -f "$active" && ! -L "$active" ]] || return 1
+    trial=$(cat "$active")
+    [[ "$trial" == "$NET_TUNE_DIR"/htb-* && -f "$trial/restore.sh" ]] || return 1
+    /usr/bin/bash "$trial/restore.sh" "$trial"
+}
+
+
+# ==============================================================================
+# [12H] Dev8: video-first client A/B evidence (read-only, not field-verified)
+# ==============================================================================
+network_tuning_ab_assess() {
+    local tier="$1" path="$2" size
+    network_tuning_profile "$tier" >/dev/null || return 1
+    [[ -f "$path" && ! -L "$path" && -r "$path" ]] || return 1
+    size=$(wc -c < "$path") || return 1
+    ((size >= 16 && size <= 32768)) || return 1
+    jq -nc --slurpfile evidence "$path" --argjson tier "$tier" '
+      def invalid($why): {verdict:"inconclusive",reason:$why,
+                          auto_apply:false,field_verified:false};
+      def original($why): {verdict:"keep_baseline",reason:$why,
+                           auto_apply:false,field_verified:false};
+      ($evidence[0] // {}) as $d |
+      if $d.schema != 1 or $d.tier_mbps != $tier or
+         ($d.video_source|type)!="string" or
+         ($d.video_source|length)<5 or ($d.video_source|length)>120 or
+         ($d.video_resolution|type)!="string" or
+         ($d.video_resolution|length)<2 or ($d.video_resolution|length)>40 or
+         ($d.samples|type)!="array" or ($d.samples|length)!=4 then
+        invalid("invalid_schema_tier_video_or_sample_count")
+      elif ([ $d.samples[] |
+        (type=="object" and
+         (.phase=="baseline" or .phase=="trial") and
+         (.round==1 or .round==2) and
+         (.duration_s|type)=="number" and .duration_s>=300 and .duration_s<=1800 and
+         (.video_stalls|type)=="number" and .video_stalls>=0 and
+          (.video_stalls|floor)==.video_stalls and .video_stalls<=120 and
+         (.video_buffer_s|type)=="number" and .video_buffer_s>=0 and .video_buffer_s<=1800 and
+         (.video_dropped_frames|type)=="number" and .video_dropped_frames>=0 and
+          (.video_dropped_frames|floor)==.video_dropped_frames and .video_dropped_frames<=100000 and
+         (.web_p95_ms|type)=="number" and .web_p95_ms>0 and .web_p95_ms<=10000 and
+         (.chat_p95_ms|type)=="number" and .chat_p95_ms>0 and .chat_p95_ms<=10000 and
+         (.ping_p95_ms|type)=="number" and .ping_p95_ms>0 and .ping_p95_ms<=10000 and
+         (.loss_pct|type)=="number" and .loss_pct>=0 and .loss_pct<=100)
+        ] | all | not) then
+        invalid("incomplete_or_implausible_manual_measurements")
+      elif ([ $d.samples[] | select(.phase=="baseline") | .round ] | sort)!=[1,2] or
+           ([ $d.samples[] | select(.phase=="trial") | .round ] | sort)!=[1,2] then
+        invalid("missing_duplicate_or_mismatched_ab_rounds")
+      else
+        ([ range(1;3) as $r |
+          {b:([$d.samples[]|select(.phase=="baseline" and .round==$r)][0]),
+           t:([$d.samples[]|select(.phase=="trial" and .round==$r)][0])}
+        ]) as $pairs |
+        ([ $pairs[] |
+          (.t.video_stalls<=.b.video_stalls and
+           .t.video_buffer_s<=.b.video_buffer_s+0.5 and
+           .t.video_dropped_frames<=.b.video_dropped_frames+2)
+        ]|all) as $video_safe |
+        ([ $pairs[] |
+          (.t.chat_p95_ms<=.b.chat_p95_ms*1.10+15 and
+           .t.loss_pct<=.b.loss_pct+0.3 and .t.loss_pct<=1 and
+           .t.ping_p95_ms<=.b.ping_p95_ms*1.15+20)
+        ]|all) as $chat_safe |
+        ([ $pairs[] | .t.web_p95_ms<=.b.web_p95_ms*1.10+15 ]|all) as $web_safe |
+        ([ $pairs[] |
+          ((.b.video_stalls>=1 and .t.video_stalls<.b.video_stalls) or
+           (.b.video_buffer_s>=5 and .t.video_buffer_s<=.b.video_buffer_s*0.65))
+        ]|all) as $video_gain |
+        ([ $pairs[] | .t.web_p95_ms<=.b.web_p95_ms*0.85 ]|all) as $web_gain |
+        if ($video_safe|not) then original("video_regressed")
+        elif ($chat_safe|not) then original("chat_or_packet_loss_regressed")
+        elif ($web_safe|not) then original("web_regressed")
+        elif $video_gain or $web_gain then
+          {verdict:"candidate_for_further_field_validation",
+           reason:(if $video_gain then "repeatable_video_improvement"
+                   else "video_preserved_and_repeatable_web_improvement" end),
+           auto_apply:false,field_verified:false,
+           note:"manual_client_observations_not_independent_proof"}
+        else original("no_repeatable_useful_improvement")
+        end
+      end
+    '
+}
+
+network_tuning_ab_menu() {
+    local tier path result
+    echo "Dev8：只读比对视频、网页、聊天 A/B 体验，任何结果均不自动整形。"
+    echo "同一视频、清晰度、终端；基线/临时试验各两轮，每轮 >=5 分钟。"
+    read -rp "线路套餐 Mbps [30]: " tier
+    read -rp "A/B JSON 完整路径（空取消）: " path
+    [[ -n "$path" ]] || return 0
+    [[ -n "$tier" ]] || tier=30
+    result=$(network_tuning_ab_assess "$tier" "$path") || return 1
+    jq . <<< "$result"
+    echo "注：人工采样结果不代表已经通过真实 VPS 验收。"
+}
+
+network_tuning_management() {
+    local c answer
     while true; do
         clear
-        echo -e "${CYAN}════════════════════ BBR 管理 ════════════════════${PLAIN}"
-        server_tool_bbr_status
+        network_tuning_status
         echo ""
-        echo "  1. 启用当前内核原生 BBR"
-        echo "  2. 移除本脚本 BBR 配置"
+        echo "  1. 刷新网络状态（只读）"
+        echo "  2. 保存首次网络状态快照"
+        echo "  3. 启用当前内核 BBR + fq"
+        echo "  4. 恢复首次调优前的 BBR/fq 配置"
+        echo "  5. 安全测速（iperf3 / IPv4 / IPv6）"
+        echo "  6. 视频 / 网页 / 聊天体验诊断（dev3）"
+        echo "  7. 只读候选整形值与 tc 安全预检（dev4）"
+        echo "  8. 六样本自动诊断（dev5，开发预览）"
+        echo "  9. 独立回滚演练（dev6，仅模拟）"
+        echo "  10. 查看回滚演练记录（dev6）"
+        echo "  11. 临时 HTB 60 秒试验（dev7，实验）"
+        echo "  12. 查看 HTB 试验状态"
+        echo "  13. 立即恢复 HTB 试验"
+        echo "  14. A/B 视频网页聊天体验审核（dev8，只读）"
         echo "  0. 返回"
-        read -rp "请选择 [0-2]: " c
+        read -rp "请选择 [0-14]: " c
         case "$c" in
-            1) server_tool_bbr_enable; pause ;;
-            2) server_tool_bbr_disable; pause ;;
+            1) pause ;;
+            2) network_tuning_snapshot; pause ;;
+            3) network_tuning_enable_bbr; pause ;;
+            4)
+                echo "说明：将恢复首次快照中的拥塞算法和默认 qdisc。"
+                read -rp "确认恢复？[y/N]: " answer
+                if [[ "$answer" =~ ^[Yy]$ ]]; then network_tuning_restore; fi
+                pause ;;
+            5) network_tuning_probe_menu; pause ;;
+            6) network_tuning_qoe_menu; pause ;;
+            7) network_tuning_candidate_menu; pause ;;
+            8) network_tuning_scan_menu; pause ;;
+            9) network_tuning_rollback_rehearsal_menu; pause ;;
+            10) network_tuning_rollback_rehearsal_status; pause ;;
+            11) network_tuning_htb_trial_menu; pause ;;
+            12) network_tuning_htb_trial_status; pause ;;
+            13) network_tuning_htb_restore_now; pause ;;
+            14) network_tuning_ab_menu; pause ;;
             0) return ;;
             *) sleep 1 ;;
         esac
@@ -10785,7 +12225,7 @@ server_management_tools() {
         echo "  3. TG-BOT 流量监控 / 预警 / 自动关机"
         echo "  4. 系统更新 / 清理"
         echo "  5. Swap 虚拟内存"
-        echo "  6. BBR 加速"
+        echo "  6. 网络调优（v1.10.0-dev4）"
         echo "  7. DNS 管理"
         echo "  8. IPv4 / IPv6 管理"
         echo "  9. 系统时区"
@@ -10800,7 +12240,7 @@ server_management_tools() {
             3) server_tool_tg_monitor_management ;;
             4) server_tool_system_update ;;
             5) server_tool_swap_management ;;
-            6) server_tool_bbr_management ;;
+            6) network_tuning_management ;;
             7) server_tool_dns_management ;;
             8) server_tool_ip_family_management ;;
             9) server_tool_timezone_management ;;
