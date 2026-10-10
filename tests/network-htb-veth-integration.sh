@@ -103,6 +103,12 @@ done
 if [[ "$(cat "$trial/result" 2>/dev/null)" != rolled_back_live ]]; then
     echo "FAIL: detached guardian did not restore after launcher SIGKILL" >&2
     cat "$work/guardian.log" >&2 || true
+    echo "Launcher log:" >&2
+    cat "$work/launcher.log" >&2 || true
+    echo "Qdisc state:" >&2
+    tc qdisc show dev "$name" >&2 || true
+    echo "Transaction files:" >&2
+    ls -la "$trial" >&2 || true
     kill "$guardian" 2>/dev/null || true
     exit 1
 fi
