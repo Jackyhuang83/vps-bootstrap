@@ -9212,6 +9212,7 @@ NET_TUNE_SNAPSHOT="${NET_TUNE_DIR}/original.json"
 NET_TUNE_CONF="/etc/sysctl.d/99-ss2022-network-tuning.conf"
 NET_TUNE_LEGACY_CONF="/etc/sysctl.d/99-ss2022-bbr.conf"
 NET_TUNE_SYSCTL_DIR="/etc/sysctl.d"
+NET_TUNE_SYSTEM_SYSCTL_CONF="/etc/sysctl.conf"
 
 network_tuning_legacy_status() {
     if [[ ! -e "$NET_TUNE_LEGACY_CONF" && ! -L "$NET_TUNE_LEGACY_CONF" ]]; then
@@ -9233,7 +9234,7 @@ network_tuning_conflict_file() {
     local f
     # 操作系统原生 /usr/lib/sysctl.d 属发行版默认值；本模块仅拒绝覆盖管理员
     # 在 /etc/sysctl.conf、/etc/sysctl.d 手工维护的相同键。
-    for f in /etc/sysctl.conf "$NET_TUNE_SYSCTL_DIR"/*.conf; do
+    for f in "$NET_TUNE_SYSTEM_SYSCTL_CONF" "$NET_TUNE_SYSCTL_DIR"/*.conf; do
         [[ -f "$f" ]] || continue
         [[ "$f" == "$NET_TUNE_CONF" || "$f" == "$NET_TUNE_LEGACY_CONF" ]] && continue
         if awk '/^[[:space:]]*(net\.core\.default_qdisc|net\.ipv4\.tcp_congestion_control)[[:space:]]*=/{found=1} END{exit !found}' "$f"; then
