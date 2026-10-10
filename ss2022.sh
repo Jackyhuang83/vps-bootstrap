@@ -10432,6 +10432,10 @@ network_tuning_htb_trial() (
         echo "[保护] 已有活动试验或未处理的回滚失败。" >&2; exit 1;
     }
     trial=$(mktemp -d "$NET_TUNE_DIR/htb-XXXXXXXX") || exit 1
+    # Shared phase lock: a fired watchdog waits until all HTB writes end.
+    # A killed shell releases this lock, allowing independent recovery.
+    exec 8>"$trial/phase.lock" || exit 1
+    flock -x 8 || exit 1
     jq --argjson rate "$rate" '. + {candidate_kbps:$rate}' \
         <<< "$baseline" > "$trial/snapshot.json" || exit 1
     cat > "$trial/restore.sh" <<'RESTORE_HTB_EOF'
@@ -10452,8 +10456,8 @@ index=$(jq -r .ifindex "$snapshot")
 }
 active="$(dirname "$trial")/.htb-active"
 [[ -f "$active" && ! -L "$active" && "$(cat "$active")" == "$trial" ]] || exit 1
-exec 8>"$trial/restore.lock"
-flock -n 8 || exit 1
+exec 8>>"$trial/phase.lock"
+flock -x 8 || exit 1
 root=$(tc qdisc show dev "$iface") || exit 1
 if grep -Eq '^qdisc htb 1: root' <<< "$root"; then
     while IFS= read -r qline; do
@@ -10512,15 +10516,22 @@ RESTORE_HTB_EOF
     [[ "$second" == "$baseline" ]] || {
         echo "[保护] 配置准备期间发生变化，不触碰网络。" >&2; exit 1;
     }
+    [[ -f "$active" && ! -L "$active" &&
+       "$(cat "$active")" == "$trial" ]] || {
+        echo "[保护] 活动事务标记变化，未执行 HTB。" >&2
+        exit 1
+    }
     tc qdisc replace dev "$iface" root handle 1: htb default 10 || exit 1
     if ! tc class add dev "$iface" parent 1: classid 1:10 htb \
         rate "$rate"kbit ceil "$rate"kbit burst 32k cburst 32k ||
        ! tc qdisc add dev "$iface" parent 1:10 handle 10: fq_codel; then
         echo "[保护] 子队列失败，尝试立即恢复；定时器依然保留。" >&2
+        flock -u 8
         flock -u 9
         /usr/bin/bash "$trial/restore.sh" "$trial" || true
         exit 1
     fi
+    flock -u 8
     echo "✔ 临时整形已启用，60 秒后自动恢复。"
     echo "事务目录：$trial"
     echo "回滚定时器：$unit.timer"
