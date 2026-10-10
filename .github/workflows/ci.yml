@@ -9,6 +9,7 @@ on:
       - "tests/network-tuning-smoke.sh"
       - "tests/network-throughput-smoke.sh"
       - "tests/network-qoe-smoke.sh"
+      - "tests/network-candidate-smoke.sh"
       - "README.md"
       - ".github/workflows/ci.yml"
       - ".github/workflows/promote-ss2022.yml"
@@ -22,6 +23,7 @@ on:
       - "tests/network-tuning-smoke.sh"
       - "tests/network-throughput-smoke.sh"
       - "tests/network-qoe-smoke.sh"
+      - "tests/network-candidate-smoke.sh"
       - "README.md"
       - ".github/workflows/ci.yml"
 
@@ -65,6 +67,12 @@ jobs:
         run: |
           bash -n tests/network-qoe-smoke.sh
           bash tests/network-qoe-smoke.sh
+
+      - name: Network tuning dev4 candidate regression
+        shell: bash
+        run: |
+          bash -n tests/network-candidate-smoke.sh
+          bash tests/network-candidate-smoke.sh
 
       - name: Check script version
         run: |
