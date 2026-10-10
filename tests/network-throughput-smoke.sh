@@ -121,4 +121,26 @@ for fn in network_tuning_probe_check network_tuning_probe_run network_tuning_pro
         exit 1
     fi
 done
+
+# Line VPS presets are intentionally discrete: no auto tuning >= 1Gbps.
+for tier in 10 20 30 100 200 300 500; do
+    spec=$(network_tuning_profile "$tier")
+    read -r package first coarse fine duration <<< "$spec"
+    [[ "$package" == "$tier" ]]
+    [[ "$first" -lt "$tier" && "$coarse" -gt "$fine" && "$fine" -gt 0 ]]
+    [[ "$duration" -ge 3 && "$duration" -le 20 ]]
+    ceiling=$(network_tuning_profile_upper_kbps "$tier")
+    [[ "$ceiling" -ge $((tier * 1000)) && "$ceiling" -le 500000 ]]
+    preview=$(network_tuning_profile_print "$tier")
+    [[ "$preview" == *"策略预览"* ]]
+done
+for rejected in 0 1 9 15 25 50 90 150 250 400 501 999 1000 10000 '-1' '10;id'; do
+    expect_denied network_tuning_profile "$rejected"
+    expect_denied network_tuning_profile_upper_kbps "$rejected"
+done
+[[ "$NET_TUNE_SUPPORTED_MAX_MBPS" == 500 ]]
+[[ "$(network_tuning_profile_upper_kbps 500)" == 500000 ]]
+[[ "$(network_tuning_profile_upper_kbps 30)" == 36000 ]]
+[[ "$(network_tuning_profile_upper_kbps 300)" == 360000 ]]
+
 echo "Network tuning dev2 throughput smoke passed."
