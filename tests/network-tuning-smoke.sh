@@ -38,7 +38,7 @@ sysctl() {
             key=${2%%=*}
             value=${2#*=}
             [[ -n "$key" && -n "$value" ]] || return 1
-            next=$(mktemp "$tmp/kernel.XXXXXXXX")
+            next=$(mktemp "${MOCK_KERNEL}.XXXXXXXX")
             jq --arg k "$key" --arg v "$value" '.[$k]=$v' "$MOCK_KERNEL" > "$next"
             mv "$next" "$MOCK_KERNEL"
             ;;
@@ -67,9 +67,7 @@ network_tuning_snapshot
 [[ "$(sha256sum "$NET_TUNE_SNAPSHOT" | awk '{print $1}')" == "$original_hash" ]]
 assert_kernel cubic fq_codel
 
-set -x
 network_tuning_enable_bbr
-set +x
 assert_kernel bbr fq
 network_tuning_conf_is_owned
 [[ -f "$NET_TUNE_CONF" ]]
