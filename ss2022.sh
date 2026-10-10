@@ -9704,7 +9704,7 @@ network_tuning_management() {
         echo "  4. 恢复首次调优前的 BBR/fq 配置"
         echo "  5. 安全测速（iperf3 / IPv4 / IPv6）"
         echo "  0. 返回"
-        read -rp "请选择 [0-4]: " c
+        read -rp "请选择 [0-5]: " c
         case "$c" in
             1) pause ;;
             2) network_tuning_snapshot; pause ;;
