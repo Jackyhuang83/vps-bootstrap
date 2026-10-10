@@ -9318,7 +9318,7 @@ network_tuning_status() {
     echo "      新版本暂不进行 iperf3 测速、HTB 整形或 initcwnd 修改。"
 }
 
-network_tuning_snapshot() {
+network_tuning_snapshot() (
     local cc qdisc legacy tmp key value
     command -v jq >/dev/null 2>&1 || { echo "[错误] 缺少 jq，无法创建可信快照。"; return 1; }
     network_tuning_assert_safe || return 1
@@ -9369,14 +9369,14 @@ network_tuning_snapshot() {
         echo "[保护] 快照由另一会话创建，保留现有版本。"
         return 1
     fi
-    chmod 600 "$tmp" && mv "$tmp" "$NET_TUNE_SNAPSHOT" || {
+    chmod 600 "$tmp" && ln "$tmp" "$NET_TUNE_SNAPSHOT" && rm -f "$tmp" || {
         rm -f "$tmp"
         echo "[错误] 无法原子保存快照，未修改网络。"
         return 1
     }
     echo -e "${GREEN}✔ 原始快照已保存：$NET_TUNE_SNAPSHOT${PLAIN}"
     echo "  旧版 BBR 的当前值如已生效，将被视为这次迁移的基线。"
-}
+)
 
 network_tuning_enable_bbr() (
     local cc qdisc available tmp="" legacy
