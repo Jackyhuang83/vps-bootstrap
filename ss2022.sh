@@ -9482,6 +9482,50 @@ network_tuning_restore() (
 # [12B] v1.10.0-dev2：低流量非侵入式 iperf3 诊断
 # ==============================================================================
 # dev2 不调用 tc qdisc / sysctl -w / ip route replace。高带宽扫描另行实现。
+# 用户线路机的正式支持范围：只允许这些实际套餐档位参与未来的自动检测。
+# 1Gbps 及以上不进行自动整形；不能根据 NIC 1000/10000Mbps 链路速度猜套餐。
+NET_TUNE_SUPPORTED_MAX_MBPS=500
+NET_TUNE_SUPPORTED_TIERS="10 20 30 100 200 300 500"
+
+network_tuning_profile() {
+    # 返回：套餐Mbps 初筛Mbps 粗扫步长Kbps 细扫步长Kbps 单次秒数
+    # 只描述未来 dev3 自动扫描的策略，不执行测速、写 sysctl 或安装 HTB。
+    local tier="${1:-}"
+    case "$tier" in
+        10)  printf '10 5 1000 100 6\n' ;;
+        20)  printf '20 8 2000 200 6\n' ;;
+        30)  printf '30 10 2000 250 6\n' ;;
+        100) printf '100 20 5000 500 6\n' ;;
+        200) printf '200 30 10000 1000 6\n' ;;
+        300) printf '300 40 15000 1000 6\n' ;;
+        500) printf '500 50 20000 2000 6\n' ;;
+        *)
+            echo "[保护] 不支持的线路套餐：${tier:-未指定}Mbps；仅支持 $NET_TUNE_SUPPORTED_TIERS Mbps。" >&2
+            return 1 ;;
+    esac
+}
+
+network_tuning_profile_upper_kbps() {
+    # 最大允许的扫描档位：1.2 x 套餐速率与 500 Mbps 中较小者。
+    # 这是扫描计划的绝对上界，不是最终整形速率，任何结果都不得超过 500Mbps。
+    local tier="${1:-}" cap
+    network_tuning_profile "$tier" >/dev/null || return 1
+    cap=$((tier * 1200))
+    (( cap <= NET_TUNE_SUPPORTED_MAX_MBPS * 1000 )) || cap=$((NET_TUNE_SUPPORTED_MAX_MBPS * 1000))
+    printf '%s\n' "$cap"
+}
+
+network_tuning_profile_print() {
+    local tier="$1" info upper
+    info=$(network_tuning_profile "$tier") || return 1
+    upper=$(network_tuning_profile_upper_kbps "$tier") || return 1
+    local plan first coarse fine duration
+    read -r plan first coarse fine duration <<< "$info"
+    echo "套餐：${plan}Mbps；初筛上限：${first}Mbps；单次测速：${duration}秒"
+    echo "粗扫步长：${coarse}Kbps；细扫步长：${fine}Kbps；扫描上限：${upper}Kbps"
+    echo "这是策略预览，不代表已测速或建议实际出口整形。"
+}
+
 NET_TUNE_PROBE_SYSFS="/sys/class/net"
 NET_TUNE_PROBE_MAX_MBPS=100
 NET_TUNE_PROBE_MAX_SECS=20
