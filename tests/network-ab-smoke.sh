@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Dev8: synthetic A/B evidence. The production evaluator is READ-ONLY.
 set -euo pipefail
+set -x
 export SS2022_LIB_ONLY=1
 # shellcheck disable=SC1091
 source ./ss2022.sh
