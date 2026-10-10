@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
-# 当前版本: v1.10.0-dev1
+# 当前版本: v1.10.0-dev2
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,10 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.10.0-dev2:
+#   - 新增 IPv4/IPv6 安全测速（指定 iperf3 对端、路由出口核验、速率/时长/流量预算三重约束）
+#   - 独立 watchdog 监控网卡发送总流量，使用 JSON 结果和异常数据审查；不改 sysctl、路由、qdisc
 #
 # v1.10.0-dev1:
 #   - 网络调优第一阶段：只读网络诊断、原始状态快照、原生 BBR/fq 安全迁移与恢复
@@ -637,7 +641,7 @@
 # 注意: v1.9.0 为稳定正式版；Alpine 3.21 上 Snell v5 与 Cloudflare WARP 仍受官方组件兼容性限制。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.10.0-dev1"
+SCRIPT_VERSION="v1.10.0-dev2"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -1920,7 +1924,7 @@ node_name_management() {
         fi
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0-4]: " c
+        read -rp "请选择 [0-5]: " c
         case "$c" in
             1) rename_node_name "ss" "SS2022"; pause ;;
             2) rename_node_name "shadowtls" "SS2022 + ShadowTLS v3"; pause ;;
@@ -9474,6 +9478,220 @@ network_tuning_restore() (
     echo "原始快照仍保留，便于核对；没有修改路由、网卡根 qdisc 或 SSH。"
 )
 
+# ==============================================================================
+# [12B] v1.10.0-dev2：低流量非侵入式 iperf3 诊断
+# ==============================================================================
+# dev2 不调用 tc qdisc / sysctl -w / ip route replace。高带宽扫描另行实现。
+NET_TUNE_PROBE_SYSFS="/sys/class/net"
+NET_TUNE_PROBE_MAX_MBPS=100
+NET_TUNE_PROBE_MAX_SECS=20
+NET_TUNE_PROBE_MAX_BUDGET_MIB=256
+
+network_tuning_probe_resolve() {
+    local family="$1" host="$2" line="" address rest
+    [[ "$host" =~ ^[A-Za-z0-9_.:-]{1,253}$ && "$host" != -* ]] || return 1
+    if [[ "$host" == *:* ]]; then
+        [[ "$family" == 6 && "$host" != ::ffff:* && "$host" != ::FFFF:* ]] || return 1
+        printf '%s\n' "$host"
+        return 0
+    fi
+    if [[ "$host" =~ ^[0-9.]+$ ]]; then
+        [[ "$family" == 4 ]] || return 1
+        printf '%s\n' "$host"
+        return 0
+    fi
+    command -v getent >/dev/null 2>&1 || return 1
+    if [[ "$family" == 4 ]]; then
+        line=$(getent ahostsv4 "$host" 2>/dev/null || true)
+    else
+        line=$(getent ahostsv6 "$host" 2>/dev/null || true)
+    fi
+    [[ -n "$line" ]] || line=$(getent hosts "$host" 2>/dev/null || true)
+    while read -r address rest; do
+        if [[ "$family" == 4 && "$address" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
+            printf '%s\n' "$address"
+            return 0
+        fi
+        if [[ "$family" == 6 && "$address" == *:* && "$address" != ::ffff:* &&
+              "$address" != ::FFFF:* && "$address" != *%* ]]; then
+            printf '%s\n' "$address"
+            return 0
+        fi
+    done <<< "$line"
+    return 1
+}
+
+network_tuning_probe_iface_guard() {
+    local iface="$1" route="$2"
+    [[ "$iface" =~ ^[a-zA-Z0-9_.:-]+$ ]] || return 1
+    case "$iface" in
+        lo|wg*|tun*|tap*|tailscale*|zt*|docker*|br-*|veth*|virbr*|ifb*)
+            return 1 ;;
+    esac
+    case " $route " in
+        *" blackhole "*|*" unreachable "*|*" prohibit "*) return 1 ;;
+    esac
+    [[ -r "$NET_TUNE_PROBE_SYSFS/$iface/statistics/tx_bytes" ]]
+}
+
+network_tuning_probe_check() {
+    # family peer rate Mbps duration seconds budget MiB
+    local family="$1" peer="$2" rate="$3" duration="$4" budget="$5"
+    local target route iface estimated allowance
+    [[ "$family" == 4 || "$family" == 6 ]] || { echo "[错误] IPv4/IPv6 参数不正确。"; return 1; }
+    [[ "$rate" =~ ^[0-9]+$ && "$duration" =~ ^[0-9]+$ && "$budget" =~ ^[0-9]+$ ]] || {
+        echo "[错误] 速率、时长和流量预算必须是整数。"; return 1;
+    }
+    (( rate >= 1 && rate <= NET_TUNE_PROBE_MAX_MBPS &&
+       duration >= 3 && duration <= NET_TUNE_PROBE_MAX_SECS &&
+       budget >= 1 && budget <= NET_TUNE_PROBE_MAX_BUDGET_MIB )) || {
+        echo "[保护] dev2 限额：1-100Mbps、3-20秒、1-256MiB。"; return 1;
+    }
+    target=$(network_tuning_probe_resolve "$family" "$peer") || {
+        echo "[错误] 测试对端无法解析到指定 IPv${family}。"; return 1;
+    }
+    # 将单流 TCP 预估载荷限制在预算的 70%，留出协议开销/监控余量。
+    estimated=$((rate * 1000000 * duration / 8))
+    allowance=$((budget * 1048576 * 70 / 100))
+    (( estimated <= allowance )) || {
+        echo "[保护] 预计发送量超过预算的 70%，请调整速率/时长/预算。"; return 1;
+    }
+    route=$(ip "-${family}" route get "$target" 2>/dev/null) || {
+        echo "[错误] 无法获取 IPv${family} 真实出口路由。"; return 1;
+    }
+    iface=$(network_tuning_get_iface "$family" "$target") || {
+        echo "[错误] 无法解析测速出口设备。"; return 1;
+    }
+    network_tuning_probe_iface_guard "$iface" "$route" || {
+        echo "[保护] $iface 为隧道/容器/不可计量设备，不进行自动测速。"; return 1;
+    }
+    printf '%s|%s|%s\n' "$target" "$iface" "$estimated"
+}
+
+network_tuning_probe_result_json() {
+    jq -e -c '
+      if (.error // "") != "" or
+         (.end.sum_sent.bits_per_second | type) != "number" or
+         (.end.sum_received.bits_per_second | type) != "number" or
+         (.end.sum_sent.bytes | type) != "number" or
+         (.end.sum_received.bytes | type) != "number"
+      then empty
+      else
+        {sender_mbps:(.end.sum_sent.bits_per_second / 1000000 * 100 | round / 100),
+         received_mbps:(.end.sum_received.bits_per_second / 1000000 * 100 | round / 100),
+         sender_bytes:.end.sum_sent.bytes,
+         received_bytes:.end.sum_received.bytes,
+         retransmits:(.end.sum_sent.retransmits // 0)}
+      end
+    ' "$1" 2>/dev/null
+}
+
+network_tuning_probe_watchdog() {
+    # 监控进程独立于主脚本运行；就算主脚本被 SIGKILL，也继续监控 iperf3。
+    local pid="$1" txfile="$2" before="$3" budget_bytes="$4" deadline="$5" reasonfile="$6"
+    local now start="$SECONDS"
+    while kill -0 "$pid" 2>/dev/null; do
+        now=$(cat "$txfile" 2>/dev/null || true)
+        if [[ ! "$now" =~ ^[0-9]+$ ]] || (( now < before )); then
+            printf 'counter_unavailable\n' > "$reasonfile"
+        elif (( now - before >= budget_bytes )); then
+            printf 'budget_exceeded\n' > "$reasonfile"
+        elif (( SECONDS - start >= deadline )); then
+            printf 'timeout\n' > "$reasonfile"
+        else
+            sleep 0.25
+            continue
+        fi
+        kill -TERM "$pid" 2>/dev/null || true
+        sleep 2
+        kill -KILL "$pid" 2>/dev/null || true
+        return 1
+    done
+}
+
+network_tuning_probe_run() (
+    local family="$1" peer="$2" port="$3" rate="$4" duration="$5" budget="$6"
+    local checked target iface estimated txfile before after usage limit answer result reason code=1
+    local tmp="" pid=0 watcher=0
+    [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)) || {
+        echo "[错误] 端口必须为 1-65535。"; exit 1;
+    }
+    command -v iperf3 >/dev/null 2>&1 || {
+        echo "[错误] 缺少 iperf3，请先安装系统包 iperf3。"; exit 1;
+    }
+    command -v jq >/dev/null 2>&1 || { echo "[错误] 缺少 jq。"; exit 1; }
+    checked=$(network_tuning_probe_check "$family" "$peer" "$rate" "$duration" "$budget") || {
+        echo "$checked"; exit 1;
+    }
+    IFS='|' read -r target iface estimated <<< "$checked"
+    txfile="$NET_TUNE_PROBE_SYSFS/$iface/statistics/tx_bytes"
+    before=$(cat "$txfile" 2>/dev/null) || exit 1
+    [[ "$before" =~ ^[0-9]+$ ]] || exit 1
+    limit=$((budget * 1048576))
+    echo "对端：$target:$port；IPv${family} 出口：$iface"
+    echo "单流发送：${rate}Mbps × ${duration}s；预估载荷约 $(((estimated+1048575)/1048576))MiB"
+    echo "网卡发送预算：${budget}MiB（包含其他业务流量，超过预算会终止测试）"
+    echo "不更改 qdisc、路由或 sysctl；不自动执行整形。"
+    read -rp "确认开始？请输入 RUN: " answer
+    [[ "$answer" == RUN ]] || { echo "已取消。"; exit 0; }
+    umask 077
+    tmp=$(mktemp -d /tmp/ss2022-netprobe.XXXXXXXX) || exit 1
+    network_tuning_probe_cleanup() {
+        (( pid > 0 )) && kill -TERM "$pid" 2>/dev/null || true
+        (( watcher > 0 )) && kill -TERM "$watcher" 2>/dev/null || true
+        [[ -d "$tmp" ]] && rm -rf "$tmp"
+    }
+    trap 'exit 130' INT TERM HUP
+    trap network_tuning_probe_cleanup EXIT
+    iperf3 "-${family}" -c "$target" -p "$port" -t "$duration" -P 1 -b "${rate}M" -J \
+        > "$tmp/out.json" 2>"$tmp/err.log" </dev/null &
+    pid=$!
+    network_tuning_probe_watchdog "$pid" "$txfile" "$before" "$limit" "$((duration+8))" "$tmp/reason" &
+    watcher=$!
+    wait "$pid" && code=0 || code=$?
+    kill -TERM "$watcher" 2>/dev/null || true
+    wait "$watcher" 2>/dev/null || true
+    watcher=0
+    pid=0
+    reason=$(cat "$tmp/reason" 2>/dev/null || true)
+    after=$(cat "$txfile" 2>/dev/null || true)
+    [[ "$after" =~ ^[0-9]+$ ]] && ((after >= before)) || {
+        echo "[错误] 网卡计数异常，结果无效。"; exit 1;
+    }
+    usage=$((after-before))
+    echo "网卡总发送增量：$(((usage+1048575)/1048576))MiB"
+    if [[ -n "$reason" || "$code" -ne 0 ]] || (( usage >= limit )); then
+        echo "[保护] 测速失败/超时/超流量预算，结果不可信。${reason:+ 原因：$reason}"
+        exit 1
+    fi
+    result=$(network_tuning_probe_result_json "$tmp/out.json") || {
+        echo "[错误] iperf3 JSON 无有效 TCP sender/receiver 信息。"; exit 1;
+    }
+    jq -r '"发送吞吐：\(.sender_mbps)Mbps；有效接收：\(.received_mbps)Mbps；重传：\(.retransmits)次"' <<< "$result"
+    if ! jq -e --argjson r "$rate" '
+        .sender_mbps > 0 and .received_mbps > 0 and
+        .sender_mbps <= ($r * 1.5) and
+        .received_mbps >= (.sender_mbps * 0.7) and .retransmits >= 0
+    ' <<< "$result" >/dev/null; then
+        echo "[提示] 单次样本异常/链路波动/对端性能不足，结果不确定，不用于整形。"
+        exit 1
+    fi
+    echo -e "${GREEN}✔ 安全测速完成；仅供诊断，不修改服务器网络设置。${PLAIN}"
+)
+
+network_tuning_probe_menu() {
+    local family peer port rate duration budget
+    echo "需要可信的 iperf3 服务端；dev2 不自动选择公共节点，也不执行大带宽拐点扫描。"
+    read -rp "地址族 4/6 [4]: " family
+    read -rp "对端域名或 IP（端口另填）: " peer
+    [[ -n "$peer" ]] || return 0
+    read -rp "服务端端口 [5201]: " port
+    read -rp "单流速率 Mbps [20]: " rate
+    read -rp "测试秒数 [10]: " duration
+    read -rp "流量预算 MiB [64]: " budget
+    network_tuning_probe_run "${family:-4}" "$peer" "${port:-5201}" "${rate:-20}" "${duration:-10}" "${budget:-64}"
+}
+
 network_tuning_management() {
     local c answer
     while true; do
@@ -9484,6 +9702,7 @@ network_tuning_management() {
         echo "  2. 保存首次网络状态快照"
         echo "  3. 启用当前内核 BBR + fq"
         echo "  4. 恢复首次调优前的 BBR/fq 配置"
+        echo "  5. 安全测速（iperf3 / IPv4 / IPv6）"
         echo "  0. 返回"
         read -rp "请选择 [0-4]: " c
         case "$c" in
@@ -9495,6 +9714,7 @@ network_tuning_management() {
                 read -rp "确认恢复？[y/N]: " answer
                 if [[ "$answer" =~ ^[Yy]$ ]]; then network_tuning_restore; fi
                 pause ;;
+            5) network_tuning_probe_menu; pause ;;
             0) return ;;
             *) sleep 1 ;;
         esac
@@ -11015,7 +11235,7 @@ server_management_tools() {
         echo "  3. TG-BOT 流量监控 / 预警 / 自动关机"
         echo "  4. 系统更新 / 清理"
         echo "  5. Swap 虚拟内存"
-        echo "  6. 网络调优（v1.10.0-dev1）"
+        echo "  6. 网络调优（v1.10.0-dev2）"
         echo "  7. DNS 管理"
         echo "  8. IPv4 / IPv6 管理"
         echo "  9. 系统时区"
