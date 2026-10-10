@@ -105,6 +105,11 @@ if [[ "$(cat "$trial/result" 2>/dev/null)" != rolled_back_live ]]; then
     cat "$work/guardian.log" >&2 || true
     echo "Launcher log:" >&2
     cat "$work/launcher.log" >&2 || true
+    echo "Result: $(cat "$trial/result" 2>/dev/null || true)" >&2
+    echo "Class state:" >&2
+    tc class show dev "$name" >&2 || true
+    echo "Filter state:" >&2
+    tc filter show dev "$name" >&2 || true
     echo "Qdisc state:" >&2
     tc qdisc show dev "$name" >&2 || true
     echo "Transaction files:" >&2
