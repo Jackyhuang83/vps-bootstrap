@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - "ss2022.sh"
+      - "tests/network-tuning-smoke.sh"
       - "README.md"
       - ".github/workflows/ci.yml"
       - ".github/workflows/promote-ss2022.yml"
@@ -16,6 +17,7 @@ on:
       - main
     paths:
       - "ss2022.sh"
+      - "tests/network-tuning-smoke.sh"
       - "README.md"
       - ".github/workflows/ci.yml"
 
@@ -41,6 +43,12 @@ jobs:
         run: |
           shellcheck --version
           shellcheck --severity=error -x ss2022.sh
+
+      - name: Network tuning transactional regression
+        shell: bash
+        run: |
+          bash -n tests/network-tuning-smoke.sh
+          bash tests/network-tuning-smoke.sh
 
       - name: Check script version
         run: |
