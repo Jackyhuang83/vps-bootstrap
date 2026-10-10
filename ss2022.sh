@@ -92,8 +92,9 @@
 #   - 与完全卸载的服务账号 ownership 规则保持一致
 #
 # v1.10.0-dev3:
-#   - 线路机 QoE 双轮诊断：空闲/带载 P95 RTT、抖动、ICMP 响应缺失、TCP 有效吞吐
-#   - 两轮信号一致才输出疑似排队或响应丢失；结果不可信时拒绝建议，仍无 HTB/路由修改
+#   - 双轮 QoE 诊断：空闲/带载 P95 RTT、往返延迟波动、ICMP 响应缺失、TCP 有效吞吐
+#   - 两轮一致才标注疑似排队或响应缺失；没有可重复信号则不建议整形
+#   - 诊断只读；不改变路由、根队列或 TCP 内核参数
 #
 # v1.10.0-dev2:
 #   - 新增 IPv4/IPv6 安全测速（指定 iperf3 对端、路由出口核验、速率/时长/流量预算三重约束）
@@ -1928,7 +1929,7 @@ node_name_management() {
         fi
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0-5]: " c
+        read -rp "请选择 [0-6]: " c
         case "$c" in
             1) rename_node_name "ss" "SS2022"; pause ;;
             2) rename_node_name "shadowtls" "SS2022 + ShadowTLS v3"; pause ;;
@@ -9725,84 +9726,178 @@ network_tuning_probe_run() (
         exit 1
     fi
     if [[ -n "$result_path" ]]; then
-        # The dev3 caller passes a private 0700 scratch dir; only validated results are exported.
-        [[ "$result_path" == /* ]] || { echo "请选择 IPv4 或 IPv6。"; exit 1; }
-    [[ "$port" =~ ^[1-9][0-9]*$ ]] && ((port>=1 && port<=65535)) || exit 1
-    command -v ping >/dev/null 2>&1 || { echo "[错误] 缺少 ping，无法诊断延迟。"; exit 1; }
-    command -v jq >/dev/null 2>&1 || { echo "[错误] 缺少 jq。"; exit 1; }
-    command -v iperf3 >/dev/null 2>&1 || { echo "[错误] 缺少 iperf3。"; exit 1; }
-    # Reuse dev2 verified destination route, NIC and traffic budget.
+        # 仅供 dev3 私有临时目录使用；不得从失败的 iperf3 测试输出任何数据。
+        [[ "$result_path" == /* ]] || { echo "[错误] 输出路径必须为绝对路径。"; exit 1; }
+        ( umask 077; printf '%s\n' "$result" > "$result_path" ) || exit 1
+    fi
+    echo -e "${GREEN}✔ 安全测速完成；仅供诊断，不修改服务器网络设置。${PLAIN}"
+)
+
+network_tuning_probe_menu() {
+    local family peer port rate duration budget
+    echo "需要可信的 iperf3 服务端；dev2 不自动选择公共节点，也不执行大带宽拐点扫描。"
+    read -rp "地址族 4/6 [4]: " family
+    read -rp "对端域名或 IP（端口另填）: " peer
+    [[ -n "$peer" ]] || return 0
+    read -rp "服务端端口 [5201]: " port
+    read -rp "单流速率 Mbps [5]: " rate
+    read -rp "测试秒数 [8]: " duration
+    read -rp "流量预算 MiB [32]: " budget
+    network_tuning_probe_run "${family:-4}" "$peer" "${port:-5201}" "${rate:-5}" "${duration:-8}" "${budget:-32}"
+}
+
+# ==============================================================================
+# [12C] v1.10.0-dev3：视频、网页、聊天 QoE 双轮诊断（只读）
+# ==============================================================================
+NET_TUNE_QOE_IDLE_COUNT=6
+NET_TUNE_QOE_LOADED_COUNT=12
+NET_TUNE_QOE_SECONDS=8
+NET_TUNE_QOE_BUDGET_MIB=96
+
+network_tuning_qoe_ping() {
+    # IPv4/IPv6 per-target ICMP on the same route as the iperf peer.
+    ping "-$1" -n -c "$3" -i 0.5 -W 1 "$2"
+}
+
+network_tuning_qoe_samples() {
+    # Extract valid received ICMP RTT in ms, one JSON number per line.
+    # Ignore vendor-specific ping summary output.
+    awk '
+      /time[=<][[:space:]]*[0-9]+([.][0-9]+)?/ {
+        if (match($0, /time[=<][[:space:]]*[0-9]+([.][0-9]+)?/)) {
+          value=substr($0,RSTART,RLENGTH)
+          sub(/^time[=<][[:space:]]*/, "", value)
+          if (value+0>=0 && value+0<100000) printf "%.3f\n", value+0
+        }
+      }
+    ' "$1"
+}
+
+network_tuning_qoe_evaluate() {
+    # Files: idle JSONL, loaded JSONL, validated iperf3 summary JSON.
+    jq -n -c --slurpfile idle "$1" --slurpfile loaded "$2" --slurpfile throughput "$3" '
+      def perc($arr;$fraction):
+        ($arr|sort) as $sorted |
+        if ($sorted|length)==0 then 0
+        else $sorted[((($sorted|length)-1)*$fraction|ceil)] end;
+      def jitter($arr):
+        if ($arr|length)<2 then 0
+        else ([range(1;($arr|length)) as $i | (($arr[$i]-$arr[$i-1])|abs)]|add)/(($arr|length)-1) end;
+      def round2: .*100 | round / 100;
+      ($idle|map(select(type=="number" and .>=0 and .<100000))) as $i |
+      ($loaded|map(select(type=="number" and .>=0 and .<100000))) as $l |
+      ($throughput[0] // {}) as $t |
+      (perc($i;0.95)) as $ip95 |
+      (perc($l;0.95)) as $lp95 |
+      ($lp95 - $ip95) as $delta |
+      ((12-($l|length))*100/12) as $loss |
+      (if ($i|length)<5 or ($l|length)<9 or
+          ($t.sender_mbps // 0)<=0 or ($t.received_mbps // 0)<=0 or
+          $t.received_mbps < $t.sender_mbps*0.7 then "inconclusive"
+        elif $loss>=15 then "possible_loss"
+        elif $delta>=100 and $lp95 >= $ip95*1.8 then "possible_queueing"
+        else "no_clear_issue_at_sampled_rate" end) as $verdict |
+      {verdict:$verdict,idle_samples:($i|length),loaded_samples:($l|length),
+       idle_p95_ms:($ip95|round2),loaded_p95_ms:($lp95|round2),
+       idle_p50_ms:(perc($i;0.5)|round2),loaded_p50_ms:(perc($l;0.5)|round2),
+       loaded_jitter_ms:(jitter($l)|round2),loss_percent:($loss|round2),
+       p95_increase_ms:($delta|round2),received_mbps:($t.received_mbps // 0),
+       tcp_retransmits:($t.retransmits // 0)}
+    '
+}
+
+network_tuning_qoe_combine() {
+    jq -s -c '
+      if length != 2 then {status:"inconclusive",reason:"missing_round"}
+      elif .[0].verdict=="inconclusive" or .[1].verdict=="inconclusive" then
+        {status:"inconclusive",reason:"insufficient_samples",rounds:.}
+      elif .[0].verdict != .[1].verdict then
+        {status:"inconclusive",reason:"inconsistent_rounds",rounds:.}
+      elif .[0].verdict=="possible_queueing" then
+        {status:"repeatable_queueing_signal",reason:"not_confirmed_policer",rounds:.}
+      elif .[0].verdict=="possible_loss" then
+        {status:"repeatable_loss_signal",reason:"icmp_loss_origin_unknown",rounds:.}
+      else
+        {status:"no_clear_issue_at_sampled_rate",reason:"sampled_load_only",rounds:.}
+      end
+    ' "$1" "$2"
+}
+
+network_tuning_qoe_run() (
+    local tier="$1" family="$2" peer="$3" port="$4" profile rate checked target
+    local answer dir="" ping_pid=0 round report status
+    profile=$(network_tuning_profile "$tier") || exit 1
+    [[ "$family" == 4 || "$family" == 6 ]] || { echo "[错误] 仅支持 IPv4/IPv6。"; exit 1; }
+    [[ "$port" =~ ^[1-9][0-9]*$ ]] && ((port >= 1 && port <= 65535)) || exit 1
+    for tool in ping jq iperf3; do
+        command -v "$tool" >/dev/null 2>&1 || { echo "[错误] 缺少 $tool。"; exit 1; }
+    done
     read -r _ rate _ _ _ <<< "$profile"
-    checked=$(network_tuning_probe_check "$family" "$peer" "$rate" "$NET_TUNE_QOE_SECONDS" "$NET_TUNE_QOE_BUDGET_MIB") || {
+    checked=$(network_tuning_probe_check "$family" "$peer" "$rate" \
+      "$NET_TUNE_QOE_SECONDS" "$NET_TUNE_QOE_BUDGET_MIB") || {
         echo "$checked"; exit 1;
     }
-    target="${checked%%|*}"
-    echo "体验诊断：套餐 ${tier}Mbps / IPv${family} / 对端 $target:$port"
-    echo "每轮 TCP ${rate}Mbps × ${NET_TUNE_QOE_SECONDS}s，共 2 轮，"
-    echo "每轮出口字节预算 ${NET_TUNE_QOE_BUDGET_MIB}MiB；总计最多执行两轮。"
-    echo "ping 目的地是所填的 iperf3 对端，不代表真实视频 CDN 或聊天路径。"
-    echo "全程不应用 HTB，不修改活动网卡 qdisc。"
-    read -rp "确认开始两轮诊断？请输入 RUN: " answer
+    target=${checked%%|*}
+    echo "套餐：${tier}Mbps；IPv${family}；iperf3 / ICMP 对端：$target:$port"
+    echo "自动执行两轮：空闲 RTT + 8s 有界 TCP 负载 + 带载 RTT。"
+    echo "每轮最大 96MiB 网卡发送预算，约 2×8s；不改变服务器网络参数。"
+    echo "ping 与 iperf3 的对端不等于真实播放 CDN 或客户端路径。"
+    read -rp "确认开始双轮体验诊断？请输入 RUN: " answer
     [[ "$answer" == RUN ]] || { echo "已取消。"; exit 0; }
     umask 077
-    scratch=$(mktemp -d /tmp/ss2022-qoe.XXXXXXXX) || exit 1
+    dir=$(mktemp -d /tmp/ss2022-qoe.XXXXXXXX) || exit 1
     network_tuning_qoe_cleanup() {
-        ((ping_pid>0)) && kill -TERM "$ping_pid" 2>/dev/null || true
-        [[ -n "$scratch" && -d "$scratch" ]] && rm -rf "$scratch"
+        ((ping_pid > 0)) && kill -TERM "$ping_pid" 2>/dev/null || true
+        [[ -d "$dir" ]] && rm -rf "$dir"
     }
     trap 'exit 130' INT TERM HUP
     trap network_tuning_qoe_cleanup EXIT
     for round in 1 2; do
-        echo "=== 第 $round/2 轮：空闲 RTT → 有载 RTT + 有界 TCP ==="
+        echo "=== 第 $round/2 轮 ==="
         network_tuning_qoe_ping "$family" "$target" "$NET_TUNE_QOE_IDLE_COUNT" \
-            > "$scratch/idle_$round.log" 2>&1 || true
-        network_tuning_qoe_samples "$scratch/idle_$round.log" > "$scratch/idle_$round.jsonl"
-        # Wait ~0.5s after TCP start to avoid classifying pre-load replies as loaded.
+          > "$dir/idle_$round.log" 2>&1 || true
+        network_tuning_qoe_samples "$dir/idle_$round.log" > "$dir/idle_$round.jsonl"
         ( sleep 0.5; network_tuning_qoe_ping "$family" "$target" "$NET_TUNE_QOE_LOADED_COUNT" ) \
-            > "$scratch/loaded_$round.log" 2>&1 &
+          > "$dir/loaded_$round.log" 2>&1 &
         ping_pid=$!
         if ! network_tuning_probe_run "$family" "$target" "$port" "$rate" \
-            "$NET_TUNE_QOE_SECONDS" "$NET_TUNE_QOE_BUDGET_MIB" "$scratch/probe_$round.json" <<< "RUN"; then
-            echo "[保护] 测速执行失败或触发流量保护，放弃本次 QoE 结论。"
+          "$NET_TUNE_QOE_SECONDS" "$NET_TUNE_QOE_BUDGET_MIB" "$dir/probe_$round.json" <<< "RUN"; then
+            echo "[保护] 测试中断、超额或吞吐异常：拒绝生成 QoE 建议。"
             exit 1
         fi
         wait "$ping_pid" 2>/dev/null || true
         ping_pid=0
-        network_tuning_qoe_samples "$scratch/loaded_$round.log" > "$scratch/loaded_$round.jsonl"
-        if ! network_tuning_qoe_evaluate "$scratch/idle_$round.jsonl" \
-            "$scratch/loaded_$round.jsonl" "$scratch/probe_$round.json" \
-            > "$scratch/eval_$round.json"; then
-            echo "[保护] RTT 或吞吐数据格式异常，拒绝生成调优建议。"
-            exit 1
-        fi
-        jq -r '"第 \($round) 轮: 空闲 P95 \(.idle_p95_ms)ms → 带载 P95 \(.loaded_p95_ms)ms，抖动 \(.loaded_jitter_ms)ms；接收 \(.throughput_mbps)Mbps；疑似信号 \(.verdict)"' \
-            --arg round "$round" "$scratch/eval_$round.json"
+        network_tuning_qoe_samples "$dir/loaded_$round.log" > "$dir/loaded_$round.jsonl"
+        network_tuning_qoe_evaluate "$dir/idle_$round.jsonl" \
+          "$dir/loaded_$round.jsonl" "$dir/probe_$round.json" > "$dir/eval_$round.json" || exit 1
+        jq -r --arg round "$round" \
+          '"第 \($round) 轮：空闲 P95 \(.idle_p95_ms)ms → 带载 P95 \(.loaded_p95_ms)ms；抖动 \(.loaded_jitter_ms)ms；收到 \(.received_mbps)Mbps；\(.verdict)"' \
+          "$dir/eval_$round.json"
     done
-    result=$(network_tuning_qoe_combine "$scratch/eval_1.json" "$scratch/eval_2.json") || exit 1
-    status=$(jq -r '.status' <<< "$result") || exit 1
+    report=$(network_tuning_qoe_combine "$dir/eval_1.json" "$dir/eval_2.json") || exit 1
+    status=$(jq -r '.status' <<< "$report") || exit 1
     case "$status" in
         repeatable_queueing_signal)
-            echo "[诊断] 两轮均出现明显带载排队延迟，需要进一步定位，不等于已确认限速器。" ;;
+            echo "[诊断] 两轮均有显著带载排队延迟，尚不能断定服务商限速器。" ;;
         repeatable_loss_signal)
-            echo "[诊断] 两轮均出现明显 ICMP 响应丢失，仍需排除 ICMP 限速及对端问题。" ;;
+            echo "[诊断] 两轮均有明显 ICMP 响应缺失，可能是 ICMP 限速/对端问题。" ;;
         no_clear_issue_at_sampled_rate)
-            echo "[诊断] 在本次低流量采样速率下未发现明确异常，不能证明全速无问题。" ;;
-        *)
-            echo "[诊断] 样本缺失、两轮不一致或对端受限，结论不确定。" ;;
+            echo "[诊断] 本次采样速率未发现明显异常，不代表线路全速无问题。" ;;
+        *) echo "[诊断] 样本不足或两轮结论不一致，无法判断。" ;;
     esac
-    echo "结论：$status。dev3 只做诊断；没有任何整形值，也不会修改网络。"
+    echo "结果：$status（仅诊断，不提供 HTB 整形建议或更改网卡配置）。"
 )
 
 network_tuning_qoe_menu() {
     local tier family peer port
-    echo "仅支持真实线路套餐：$NET_TUNE_SUPPORTED_TIERS Mbps；不含 1Gbps。"
-    read -rp "请选择套餐 Mbps [30]: " tier
-    tier="${tier:-30}"
+    echo "线路机支持档位：$NET_TUNE_SUPPORTED_TIERS Mbps；不含 1Gbps。"
+    read -rp "套餐 Mbps [30]: " tier
+    tier=${tier:-30}
     network_tuning_profile "$tier" >/dev/null || return 1
     read -rp "地址族 4/6 [4]: " family
-    read -rp "可信 iperf3 对端域名或 IP: " peer
+    read -rp "可信 iperf3 测速服务端的域名或 IP: " peer
     [[ -n "$peer" ]] || { echo "已取消。"; return 0; }
-    read -rp "服务端端口 [5201]: " port
+    read -rp "端口 [5201]: " port
     network_tuning_qoe_run "$tier" "${family:-4}" "$peer" "${port:-5201}"
 }
 
@@ -9819,7 +9914,7 @@ network_tuning_management() {
         echo "  5. 安全测速（iperf3 / IPv4 / IPv6）"
         echo "  6. 视频 / 网页 / 聊天体验诊断（dev3）"
         echo "  0. 返回"
-        read -rp "请选择 [0-6]: " c
+        read -rp "请选择 [0-5]: " c
         case "$c" in
             1) pause ;;
             2) network_tuning_snapshot; pause ;;
@@ -11351,7 +11446,7 @@ server_management_tools() {
         echo "  3. TG-BOT 流量监控 / 预警 / 自动关机"
         echo "  4. 系统更新 / 清理"
         echo "  5. Swap 虚拟内存"
-        echo "  6. 网络调优（v1.10.0-dev2）"
+        echo "  6. 网络调优（v1.10.0-dev3）"
         echo "  7. DNS 管理"
         echo "  8. IPv4 / IPv6 管理"
         echo "  9. 系统时区"
