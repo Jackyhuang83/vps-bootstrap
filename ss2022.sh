@@ -9539,7 +9539,7 @@ network_tuning_probe_check() {
     local family="$1" peer="$2" rate="$3" duration="$4" budget="$5"
     local target route iface estimated allowance
     [[ "$family" == 4 || "$family" == 6 ]] || { echo "[错误] IPv4/IPv6 参数不正确。"; return 1; }
-    [[ "$rate" =~ ^[0-9]+$ && "$duration" =~ ^[0-9]+$ && "$budget" =~ ^[0-9]+$ ]] || {
+    [[ "$rate" =~ ^[1-9][0-9]*$ && "$duration" =~ ^[1-9][0-9]*$ && "$budget" =~ ^[1-9][0-9]*$ ]] || {
         echo "[错误] 速率、时长和流量预算必须是整数。"; return 1;
     }
     (( rate >= 1 && rate <= NET_TUNE_PROBE_MAX_MBPS &&
@@ -9613,7 +9613,7 @@ network_tuning_probe_run() (
     local family="$1" peer="$2" port="$3" rate="$4" duration="$5" budget="$6"
     local checked target iface estimated txfile before after usage limit answer result reason code=1
     local tmp="" pid=0 watcher=0
-    [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535)) || {
+    [[ "$port" =~ ^[1-9][0-9]*$ ]] && ((port >= 1 && port <= 65535)) || {
         echo "[错误] 端口必须为 1-65535。"; exit 1;
     }
     command -v iperf3 >/dev/null 2>&1 || {
