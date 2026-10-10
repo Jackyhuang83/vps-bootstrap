@@ -10476,7 +10476,8 @@ if grep -Eq '^qdisc htb 1: root' <<< "$root"; then
     }
     classes=$(tc class show dev "$iface") || exit 1
     while IFS= read -r class; do
-        [[ -z "$class" || "$class" == "class htb 1:10 "* ]] || {
+        [[ -z "$class" || "$class" == "class htb 1:10 "* ||
+           "$class" =~ ^class[[:space:]]fq_codel[[:space:]]10:[[:xdigit:]]+[[:space:]]parent[[:space:]]10:[[:space:]]*$ ]] || {
             echo class_conflict > "$trial/result"; exit 1;
         }
     done <<< "$classes"
