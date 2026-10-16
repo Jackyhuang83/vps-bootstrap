@@ -1,11 +1,11 @@
 /* SPDX-License-Identifier: MIT
- * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.7
+ * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.8
  * Runs locally in Surge. No MITM, policy mutations, credentials or uploads.
  */
 (function () {
   "use strict";
 
-  const VERSION = "0.1.0-beta.7";
+  const VERSION = "0.1.0-beta.8";
   const SETTINGS_URL = "http://surge-node-health.invalid/";
   const SETTINGS_KEY = "VB_HEALTH_SELECTED_GROUP_V1";
   const TITLES = { ip: "IP 纯净度", unlock: "平台解锁检测", latency: "广州三网延迟" };
@@ -193,7 +193,6 @@
     return /^[A-Z]{2}$/.test(code || "") ? String.fromCodePoint(127397 + code.charCodeAt(0), 127397 + code.charCodeAt(1)) + " " : "";
   }
   function compactFinding(result) {
-    const icons = { pass: "✅", partial: "◐", blocked: "🚫", unknown: "❔" };
     let text = result.summary.replace(/，待验证对话|，待登录验证|，播放待验证/g, "")
       .replace("网页功能标志已启用", "网页可达").replace("页面地区检查通过", "地区通过")
       .replace("香港地区检查通过", "地区通过").replace("地区检查通过", "地区通过")
@@ -202,7 +201,7 @@
       .replace("页面证据不足，未知", "未知").replace("接口格式变化，未知", "未知")
       .replace(/接口异常 HTTP \d{3}/g, "服务异常").replace("接口需认证，待验证", "需登录验证").replace("页面跳转，待验证", "需登录或确认")
       .replace("检测尚未完成（总时限）", "检测超时");
-    return icons[result.state] + " " + result.name + "：" + text +
+    return result.name + "：" + text +
       (result.region ? " · " + (result.name === "ChatGPT" ? "边缘 " : "") + result.region : "");
   }
   function traceFields(response) {
@@ -611,19 +610,19 @@
       "逐次：" + samples.map(function (s) { return s.error || "HTTP " + s.status + " · " + s.ms + " ms" + (validSample(s) ? "" : "（测点响应异常）"); }).join(" / ")];
     if (!replies.length) {
       const reason = samples.every(function (s) { return s.error === "超时"; }) ? "检测超时" : samples.some(function (s) { return s.status === 403 || s.status === 429; }) ? "测点拒绝" : "测点不可用";
-      return { line: "❔ " + target.name + "：" + reason, details: details.join("\n") };
+      return { line: target.name + "：" + reason, details: details.join("\n") };
     }
     const values = replies.map(function (s) { return s.ms; });
     const changes = [];
     samples.forEach(function (s, i) { if (i && validSample(s) && validSample(samples[i - 1])) changes.push(Math.abs(s.ms - samples[i - 1].ms)); });
     const fluctuation = changes.length ? Math.round(changes.reduce(function (a, b) { return a + b; }, 0) / changes.length) + " ms" : "样本不足";
     details.push("中位数 " + median(values) + " ms · 有效 " + replies.length + "/5 · 范围 " + Math.min.apply(null, values) + "–" + Math.max.apply(null, values) + " ms · HTTP 波动 " + fluctuation);
-    return { line: (replies.length === 5 ? "✅ " : "◐ ") + target.name + "：" + median(values) + " ms" + (replies.length < 5 ? " · " + replies.length + "/5" : ""), details: details.join("\n") };
+    return { line: target.name + "：" + median(values) + " ms" + (replies.length < 5 ? " · " + replies.length + "/5" : ""), details: details.join("\n") };
   }
   async function latencyPanel(context) {
     const directory = await guangzhouServers(context);
     const results = await Promise.all(TARGETS.map(function (target, i) { return directory.servers[i] ? latencyTarget(context, directory.servers[i]) :
-      { line: "❔ " + target.name + "：暂无可用测点", details: target.name + "：目录未取得合格广州测点；未改用其他城市或全国网站。" }; }));
+      { line: target.name + "：暂无可用测点", details: target.name + "：目录未取得合格广州测点；未改用其他城市或全国网站。" }; }));
     finish([preamble(context)].concat(results.map(function (r) { return r.line; }), ["手机 → 节点 → 广州 · HTTP 往返"]).join("\n"), "info",
       [preamble(context), directory.source].concat(results.map(function (r) { return r.details; }),
         ["HTTP 波动：相邻有效样本耗时差绝对值均值；不跨失败样本计算。", "测量包含手机到节点及站点响应；不是节点端逐跳回程、ICMP 或线路等级判定。"]).join("\n"),

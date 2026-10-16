@@ -180,12 +180,12 @@ test('Guangzhou latency uses validated small replies and never counts denial pag
   assert.equal(requests.length, 16);
   assert.equal(requests.filter(r=>r.url.includes('/speedtest/latency.txt')).length,15);
   assert.ok(requests.every(r => r.method === 'get'));
-  assert.match(result.content, /广州电信：300 ms/);
+  assert.match(result.content, /^广州电信：300 ms$/m);
   assert.match(result.diagnosticContent, /HTTP 412/);
-  assert.match(result.content, /广州联通：350 ms · 4\/5/);
+  assert.match(result.content, /^广州联通：350 ms · 4\/5$/m);
   assert.match(result.diagnosticContent, /范围 100–500 ms · HTTP 波动 100 ms/);
   assert.match(result.diagnosticContent, /HTTP 412 · 100 ms（测点响应异常）/);
-  assert.match(result.content, /广州移动：测点不可用/);
+  assert.match(result.content, /^广州移动：测点不可用$/m);
   assert.match(result.diagnosticContent, /不是节点端逐跳回程/);
   assert.doesNotMatch(result.diagnosticContent, /丢包/);
 });
@@ -229,7 +229,7 @@ test('all nine platform labels appear with bounded unknown results for generic H
     assert.ok(result.diagnosticContent.includes(platform + '：'), platform);
   }
   assert.doesNotMatch(result.diagnosticContent, /检查通过|搜索结果可达|网页地区 [A-Z]|完整解锁/);
-  assert.match(result.content, /v0\.1\.0-beta\.7/);
+  assert.match(result.content, /v0\.1\.0-beta\.8/);
 });
 
 test('Claude identifies the documented regional redirect without following external hosts', async () => {
@@ -480,7 +480,8 @@ test('native cards are compact while evidence remains available in the local rep
   const platforms=await run({mode:'unlock',reply:()=>({body:'<html>ChatGPT Gemini Claude</html>'})});
   assert.equal(platforms.result.icon,'play.tv.fill');
   assert.equal(platforms.result['icon-color'],'#FF2D55');
-  assert.equal((platforms.result.content.match(/^(✅|◐|🚫|❔) /gm)||[]).length,9);
+  assert.equal((platforms.result.content.match(/^(?:ChatGPT|Gemini|Claude|Google|Netflix|Disney\+|YouTube Premium|myTV SUPER|TikTok)：/gm)||[]).length,9);
+  assert.doesNotMatch(platforms.result.content, /✅|◐|🚫|❔/);
   assert.ok(platforms.result.content.split('\n').length<=12);
   assert.doesNotMatch(platforms.result.content,/HTTP |OpenAI API|App 入口|逐次：|inSupportedLocation/);
   assert.match(platforms.result.diagnosticContent,/OpenAI API：HTTP 200/);
