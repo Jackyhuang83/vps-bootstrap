@@ -1,11 +1,13 @@
 /* SPDX-License-Identifier: MIT
- * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.2
+ * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.3
  * Runs locally in Surge. No MITM, policy mutations, credentials or uploads.
  */
 (function () {
   "use strict";
 
-  const VERSION = "0.1.0-beta.2";
+  const VERSION = "0.1.0-beta.3";
+  const SETTINGS_URL = "http://surge-node-health.invalid/";
+  const SETTINGS_KEY = "VB_HEALTH_SELECTED_GROUP_V1";
   const TITLES = { ip: "IP 纯净度", unlock: "平台解锁初检", latency: "三网站点 HTTP 耗时" };
   const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
   const TARGETS = [
@@ -24,11 +26,20 @@
 
   function parseArgument(raw) {
     // Policy is last: node/group names may contain &, =, + or literal %.
-    const match = String(raw || "").match(/^mode=(ip|unlock|latency)&showIP=(true|false)&policy=([\s\S]*)$/);
+    const match = String(raw || "").match(/^mode=(ip|unlock|latency)&showIP=(true|false)(?:&policy=([\s\S]*))?$/);
     if (!match) throw new Error("模块参数不完整，请重新安装模块。");
-    const policy = match[3].trim();
-    if (!policy || /[\r\n]/.test(policy) || /填写|\{\{\{/.test(policy)) {
-      throw new Error("请在模块参数 POLICY 填写平时切换节点的手动策略组名称。");
+    mode = match[1];
+    let selected = "";
+    if (typeof $persistentStore !== "undefined") {
+      try {
+        const saved = JSON.parse($persistentStore.read(SETTINGS_KEY) || "null");
+        if (saved && saved.version === 1 && typeof saved.group === "string") selected = saved.group;
+      } catch (_) { /* Corrupt settings must require re-selection, not a guessed group. */ }
+    }
+    // Preserve exact stored names. Legacy argument remains readable for Beta 1/2.
+    const policy = selected || String(match[3] || "").trim();
+    if (!policy || /[\r\n]/.test(policy) || (!selected && /填写|\{\{\{/.test(policy))) {
+      throw new Error("请先打开 " + SETTINGS_URL + " 点选检测策略组，无需输入名称。");
     }
     return { mode: match[1], showIP: match[2] === "true", policy: policy };
   }
@@ -74,14 +85,14 @@
       throw new Error("请选择具体节点；当前选择为 " + current + "。");
     }
     const external = (policies["external-policies"] || []).filter(function (p) {
-      return p.name === current && (!seen.length || seen.indexOf(p.group) !== -1);
+      return (p.name === current || p.identifier === current) && (!seen.length || seen.indexOf(p.group) !== -1);
     });
     if (policies.proxies.indexOf(current) !== -1) return { policy: current, label: current };
-    if (external.length === 1 && external[0].identifier) return { policy: external[0].identifier, label: current };
+    if (external.length === 1 && external[0].identifier) return { policy: external[0].identifier, label: external[0].name || current };
     if (policies["policy-groups"].indexOf(current) !== -1) {
       throw new Error("请填写具体节点或手动选择组；自动测速、故障转移等组无法固定本次检测节点。");
     }
-    throw new Error("找不到检测节点「" + current + "」，请核对 POLICY 参数与节点名称。");
+    throw new Error("找不到检测节点「" + current + "」，请在 " + SETTINGS_URL + " 重新选组。");
   }
 
   function request(context, url, options) {
@@ -385,3 +396,4 @@
     } catch (error) { finish(clean(error.message || error), "alert"); }
   })();
 })();
+

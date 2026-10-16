@@ -5,6 +5,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '..', 'node-health.js'), 'utf8');
+const settingsSource = fs.readFileSync(path.join(__dirname, '..', 'settings.js'), 'utf8');
+const SETTINGS_KEY = 'VB_HEALTH_SELECTED_GROUP_V1';
 
 async function run(options = {}) {
   let clock = 0;
@@ -13,6 +15,7 @@ async function run(options = {}) {
   let sequence = 0;
   const timers = [];
   const requests = [];
+  const storage = options.storage || {};
   const schedule = (fn, delay = 0) => timers.push({ fn, at: clock + delay, id: ++sequence });
   class Clock extends Date { constructor(...args) { super(...(args.length ? args : [1792123200000 + clock])); } static now() { return clock; } }
   const env = {
@@ -20,6 +23,7 @@ async function run(options = {}) {
     setTimeout: schedule,
     $argument: options.argument || `mode=${options.mode || 'ip'}&showIP=false&policy=Group`,
     $done: value => { result = value; doneCount++; },
+    $persistentStore: { read: key => Object.hasOwn(storage, key) ? storage[key] : null },
     $surge: { selectGroupDetails: () => ({ decisions: options.decisions || { Group: 'Tokyo' } }) },
     $httpAPI: (method, url, body, callback) => {
       assert.equal(method, 'GET');
@@ -209,7 +213,7 @@ test('all nine platform labels appear with bounded unknown results for generic H
     assert.ok(result.content.includes(platform + '：'), platform);
   }
   assert.doesNotMatch(result.content, /检查通过|搜索结果可达|网页地区 [A-Z]|完整解锁/);
-  assert.match(result.content, /v0\.1\.0-beta\.2/);
+  assert.match(result.content, /v0\.1\.0-beta\.3/);
 });
 
 test('Claude identifies the documented regional redirect without following external hosts', async () => {
@@ -280,10 +284,157 @@ test('new services retain rate-limit, auth and challenge states rather than clai
   }
 });
 
-test('module contains only scripts and panels; no capture, MITM, rule or automatic timers', () => {
+test('module adds only local settings interception, host and panels; no capture, MITM or rules', () => {
   const moduleText = fs.readFileSync(path.join(__dirname, '..', 'node-health.sgmodule'), 'utf8');
-  assert.deepEqual([...moduleText.matchAll(/^\[([^\]]+)\]/gm)].map(m => m[1]), ['Panel', 'Script']);
+  assert.deepEqual([...moduleText.matchAll(/^\[([^\]]+)\]/gm)].map(m => m[1]), ['Panel', 'Script', 'Host']);
   assert.equal((moduleText.match(/update-interval=-1/g) || []).length, 3);
   assert.equal((moduleText.match(/type=generic/g) || []).length, 3);
+  assert.equal((moduleText.match(/type=http-request/g) || []).length, 1);
+  assert.match(moduleText, /pattern=\^http:\/\/surge-node-health\\\.invalid/);
+  assert.match(moduleText, /surge-node-health\.invalid = 192\.0\.2\.1/);
+  assert.doesNotMatch(moduleText, /\{\{\{POLICY\}\}\}|#!arguments=POLICY/);
   assert.doesNotMatch(moduleText, /type=cron|type=event|insecure=true/);
 });
+
+function settings(options = {}) {
+  const storage = options.storage || {};
+  let result;
+  let writes = 0;
+  let done = 0;
+  const groups = options.groups || { Group: ['Tokyo', 'Other'], '🚀 常用节点': ['Other'] };
+  const decisions = options.decisions || { Group: 'Tokyo', '🚀 常用节点': 'Other' };
+  const headers = options.headers === undefined ? { Origin: 'http://surge-node-health.invalid', 'X-VB-Health-Settings': '1', 'Content-Type': 'application/json' } : options.headers;
+  vm.runInNewContext(settingsSource, {
+    $request: { url: options.url || 'http://surge-node-health.invalid' + (options.path || '/'), method: options.method || 'GET', headers, body: options.body || '' },
+    $surge: { selectGroupDetails: () => options.badDetails ? {} : ({ groups, decisions }), setSelectGroupPolicy: () => { throw new Error('Must not change selected node'); } },
+    $persistentStore: { read: key => Object.hasOwn(storage, key) ? storage[key] : null, write: (value, key) => { writes++; if(options.writeFail) return false; storage[key] = value; return true; } },
+    $done: value => { result = value; done++; }
+  }, { timeout: 1000 });
+  assert.equal(done, 1);
+  assert.ok(result);
+  return { result, storage, writes, value: result.response && result.response.headers['Content-Type'].startsWith('application/json') ? JSON.parse(result.response.body) : undefined };
+}
+
+test('local picker lists existing manual groups and current choices, preserving exact names', () => {
+  const { result, value } = settings({ path: '/api/groups', groups: { '🚀 常用&节点=50%+': ['Tokyo'], Empty: [], Auto: ['Other'] }, decisions: { '🚀 常用&节点=50%+': 'Tokyo' } });
+  assert.equal(result.response.status, 200);
+  assert.deepEqual(value.groups, [{ name: '🚀 常用&节点=50%+', selected: 'Tokyo' }]);
+  assert.equal(result.response.headers['Cache-Control'], 'no-store');
+  assert.equal(result.response.headers['Access-Control-Allow-Origin'], undefined);
+});
+
+test('selecting an existing group saves it locally; each panel follows its current node', async () => {
+  const { value, storage } = settings({ path: '/api/select', method: 'POST', body: JSON.stringify({ group: '🚀 常用节点' }) });
+  assert.equal(value.saved, true);
+  assert.equal(JSON.parse(storage[SETTINGS_KEY]).group, '🚀 常用节点');
+  for (const mode of ['ip', 'unlock', 'latency']) {
+    const { result, requests } = await run({ storage, argument: `mode=${mode}&showIP=false`, decisions: { '🚀 常用节点': 'Other' }, expectedPolicy: 'Other' });
+    assert.match(result.content, /节点：Other/);
+    assert.ok(requests.length > 0);
+  }
+  const changed = await run({ storage, argument: 'mode=ip&showIP=false', decisions: { '🚀 常用节点': 'Tokyo' } });
+  assert.match(changed.result.content, /节点：Tokyo/);
+});
+
+test('picker selection takes priority over old manual parameters', async () => {
+  const storage = { [SETTINGS_KEY]: JSON.stringify({ version: 1, group: 'Saved' }) };
+  const { result } = await run({ storage, argument: 'mode=ip&showIP=false&policy=Group', decisions: { Saved: 'Other', Group: 'Tokyo' }, expectedPolicy: 'Other' });
+  assert.match(result.content, /节点：Other/);
+});
+
+test('missing, corrupt and stale selection never use guessed or direct routes', async () => {
+  for (const stored of [undefined, 'broken', JSON.stringify({ version: 1, group: 'Deleted' })]) {
+    const storage = stored === undefined ? {} : { [SETTINGS_KEY]: stored };
+    const { result, requests } = await run({ storage, argument: 'mode=ip&showIP=false' });
+    assert.equal(requests.length, 0);
+    assert.equal(result.style, 'alert');
+    assert.match(result.content, /surge-node-health\.invalid/);
+  }
+});
+
+test('picker writes require same origin JSON and custom header; GET never saves', () => {
+  const valid = { Origin: 'http://surge-node-health.invalid', 'X-VB-Health-Settings': '1', 'Content-Type': 'application/json' };
+  const badHeaders = [{}, { ...valid, Origin: 'https://example.com' }, { ...valid, Origin: 'null' }, { ...valid, 'Content-Type': 'text/plain' }, { Origin: valid.Origin, 'Content-Type': valid['Content-Type'] }];
+  for (const headers of badHeaders) {
+    const { result, writes } = settings({ path: '/api/select', method: 'POST', headers, body: '{"group":"Group"}' });
+    assert.equal(result.response.status, 403);
+    assert.equal(writes, 0);
+  }
+  for (const method of ['GET', 'OPTIONS', 'PUT']) {
+    const { result, writes } = settings({ path: '/api/select', method, body: '{"group":"Group"}' });
+    assert.ok(result.response.status >= 400);
+    assert.equal(writes, 0);
+  }
+});
+
+test('removed group, malformed input and failed persistence do not report saved', () => {
+  for (const body of ['{', 'null', '{"group":"Missing"}']) {
+    const { result, writes } = settings({ path: '/api/select', method: 'POST', body });
+    assert.equal(result.response.status, 400);
+    assert.equal(writes, 0);
+  }
+  const failed = settings({ path: '/api/select', method: 'POST', body: '{"group":"Group"}', writeFail: true });
+  assert.equal(failed.result.response.status, 500);
+  assert.equal(failed.value.saved, undefined);
+});
+
+test('picker returns self-contained HTML and fails closed on unrelated hosts', () => {
+  const { result } = settings();
+  assert.equal(result.response.status, 200);
+  assert.match(result.response.body, /选择检测策略组/);
+  assert.doesNotMatch(result.response.body, /<script[^>]+src=|innerHTML/);
+  const scripts = [...result.response.body.matchAll(/<script>([\s\S]*?)<\/script>/g)];
+  assert.equal(scripts.length, 1);
+  new vm.Script(scripts[0][1]);
+  assert.equal(settings({ url: 'http://surge-node-health.invalid.evil.com/' }).result.abort, true);
+  assert.equal(settings({ path: '/api/groups', badDetails: true }).result.response.status, 500);
+});
+
+test('picker page runs list, save and reload interactions without typing group names', async () => {
+  // Execute the actual inline UI against the actual handler. The minimal DOM
+  // supplies browser element methods; this does not simulate Surge interception.
+  const storage = {};
+  const unsafe = '<img src=x onerror="window.injected=1">';
+  const groups = { '🚀 常用节点': ['Tokyo'], [unsafe]: ['Other'] };
+  const decisions = { '🚀 常用节点': 'Tokyo', [unsafe]: 'Other' };
+  const html = settings().result.response.body;
+  const script = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)][0][1];
+  const elementsCreated = [];
+  class Element {
+    constructor(tag) { this.tagName=tag; this.children=[]; this.events={}; this.attributes={}; this.className=''; this.disabled=false; this.text=''; this.classList={ toggle: (name,on) => { const names=this.className.split(' ').filter(n=>n && n!==name);if(on)names.push(name);this.className=names.join(' '); } }; }
+    set textContent(value) { this.text=String(value);this.children=[]; }
+    get textContent() { return this.text+this.children.map(c=>c.textContent).join(''); }
+    get firstElementChild() { return this.children[0]; }
+    set innerHTML(_) { throw new Error('Unsafe HTML insertion'); }
+    append(...children) { this.children.push(...children); }
+    replaceChildren() { this.children=[];this.text=''; }
+    setAttribute(key,value) { this.attributes[key]=value; }
+    addEventListener(name,fn) { this.events[name]=fn; }
+  }
+  async function loadUI() {
+    const nodes={ groups:new Element('div'),status:new Element('div'),retry:new Element('button') };
+    vm.runInNewContext(script, {
+      document:{ getElementById:id=>nodes[id], createElement:tag=>{ elementsCreated.push(tag);return new Element(tag); } },
+      fetch:async (path,options={})=>{
+        const result=settings({ path,method:options.method||'GET',headers:{ Origin:'http://surge-node-health.invalid',...(options.headers||{}) },body:options.body,storage,groups,decisions });
+        return { ok:result.result.response.status===200,json:async ()=>result.value };
+      }
+    });
+    await new Promise(resolve=>setImmediate(resolve));
+    return nodes;
+  }
+  let ui=await loadUI();
+  assert.equal(ui.groups.children.length,2);
+  assert.equal(ui.groups.children[1].firstElementChild.textContent,unsafe);
+  ui.groups.children[0].events.click();
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.match(ui.status.textContent,/已绑定：🚀 常用节点/);
+  assert.equal(JSON.parse(storage[SETTINGS_KEY]).group,'🚀 常用节点');
+  ui=await loadUI();
+  assert.equal(ui.groups.children[0].attributes['aria-pressed'],'true');
+  ui.groups.children[1].events.click();
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(JSON.parse(storage[SETTINGS_KEY]).group,unsafe);
+  assert.ok(elementsCreated.every(tag=>['button','strong','small'].includes(tag)));
+});
+
