@@ -1,11 +1,11 @@
 /* SPDX-License-Identifier: MIT
- * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.8
+ * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.9
  * Runs locally in Surge. No MITM, policy mutations, credentials or uploads.
  */
 (function () {
   "use strict";
 
-  const VERSION = "0.1.0-beta.8";
+  const VERSION = "0.1.0-beta.9";
   const SETTINGS_URL = "http://surge-node-health.invalid/";
   const SETTINGS_KEY = "VB_HEALTH_SELECTED_GROUP_V1";
   const TITLES = { ip: "IP 纯净度", unlock: "平台解锁检测", latency: "广州三网延迟" };
@@ -25,7 +25,7 @@
     return String(value || "").replace(/(?:\d{1,3}\.){3}\d{1,3}/g, function (ip) { return validIP(ip) ? masked(ip, false) : ip; })
       .replace(/[0-9a-f:]{3,}/gi, function (ip) { return ip.indexOf(":") >= 0 && validIP(ip) ? masked(ip, false) : ip; }).slice(0, 24000);
   }
-  function finish(content, style, details, visual) {
+  function finish(content, style, details, visual, footer) {
     if (completed) return;
     completed = true;
     try {
@@ -34,7 +34,7 @@
           summary: reportText(content), details: reportText(details || content) }), REPORT_KEY + mode);
       }
     } catch (_) { /* Diagnostic storage never prevents a panel result. */ }
-    $done(Object.assign({ title: TITLES[mode] || "节点体检", content: content + "\n" + time() + " · v" + VERSION }, visual || { style: style || "info" }));
+    $done(Object.assign({ title: TITLES[mode] || "节点体检", content: content + "\n\n" + (footer || "更新") + " · " + time() }, visual || { style: style || "info" }));
   }
 
   function parseArgument(raw) {
@@ -287,13 +287,14 @@
     });
     if (unique.length === 1 && countries.length > 1) lines.push("地区库差异：" + countries.join(" / ") + "（IP 一致，地区资料不同）");
     lines.push("主信息来源 " + primary.name + "；风险分仅来自 IPPure · " + time(), "第三方评分，仅供参考");
-    const summary = [preamble(context), (ipv6 ? "IPv6：" : "IPv4：") + masked(data.ip, showIP),
-      "位置：" + flag(country(data.countryCode || data.country_code || data.loc)) + (location || "未知"),
+    const summary = [preamble(context), "", (ipv6 ? "IPv6：" : "IPv4：") + masked(data.ip, showIP),
       "ASN：" + (/^\d+$/.test(String(data.asn || "")) ? "AS" : "") + clean(data.asn || "未知") + " " + clean(data.asOrganization || data.asn_organization || data.organization || ""),
-      "类型：" + (types.join(" · ") || "未知"),
-      score === null ? "纯净度：未知" + (ipv6 ? "（IPv6 无评分）" : "") : "纯净度：" + (100 - score) + "/100 · 风险 " + score + "/100（" + risk + "）",
-      "出口核对：" + (valid.length < 2 ? "单来源有效" : unique.length === 1 ? valid.length + " 源一致" : "多站出口不同")];
-    if (warp.indexOf("已启用") === 0) summary.push("WARP：" + warp);
+      "位置：" + flag(country(data.countryCode || data.country_code || data.loc)) + (location || "未知"),
+      "类型：" + (types.join(" · ") || "未知") + (warp.indexOf("已启用") === 0 ? " · WARP" + (trace.warp === "plus" ? " Plus" : "") : ""),
+      score === null ? "风险分：未知" + (ipv6 ? "（IPv6 无评分）" : "") : "风险分：" + score + "/100 · " + risk + "风险"];
+    if (unique.length > 1) summary.push("注意：多站出口不同");
+    else if (valid.length < 2) summary.push("核对：仅一个来源有效");
+    else if (countries.length > 1) summary.push("注意：地区库存在差异");
     const color = unique.length > 1 ? "#FF9500" : score === null ? "#8E8E93" : score <= 25 ? "#34C759" : score <= 50 ? "#FFCC00" : score <= 70 ? "#FF9500" : "#FF3B30";
     finish(summary.join("\n"), "info", lines.join("\n"), { icon: score !== null && score <= 50 && unique.length === 1 ? "checkmark.seal.fill" : "exclamationmark.triangle.fill", "icon-color": color });
   }
@@ -539,8 +540,9 @@
       results.forEach(function (r) { counts[r.state] += 1; });
       const details = [preamble(context), "通过 " + counts.pass + " · 部分 " + counts.partial + " · 限制 " + counts.blocked + " · 未知 " + counts.unknown]
         .concat(results.map(function (r) { return r.text; }), ["未登录，实际播放/对话未测", "API 认证响应仅证明入口可达，不等于调用通过"]).join("\n");
-      finish([preamble(context)].concat(results.map(compactFinding), ["网页/地区检查 · 播放与对话未测"]).join("\n"), "info", details,
-        { icon: "play.tv.fill", "icon-color": "#FF2D55" });
+      const rows = results.map(compactFinding);
+      finish([preamble(context), ""].concat(rows.slice(0, 4), [""], rows.slice(4)).join("\n"), "info", details,
+        { icon: "play.tv.fill", "icon-color": "#FF2D55" }, "播放/对话未测");
     }
     deadlineResult = render;
     await Promise.all(checks.map(async function (entry, index) {
@@ -623,10 +625,10 @@
     const directory = await guangzhouServers(context);
     const results = await Promise.all(TARGETS.map(function (target, i) { return directory.servers[i] ? latencyTarget(context, directory.servers[i]) :
       { line: target.name + "：暂无可用测点", details: target.name + "：目录未取得合格广州测点；未改用其他城市或全国网站。" }; }));
-    finish([preamble(context)].concat(results.map(function (r) { return r.line; }), ["手机 → 节点 → 广州 · HTTP 往返"]).join("\n"), "info",
+    finish([preamble(context), ""].concat(results.map(function (r) { return r.line; })).join("\n"), "info",
       [preamble(context), directory.source].concat(results.map(function (r) { return r.details; }),
         ["HTTP 波动：相邻有效样本耗时差绝对值均值；不跨失败样本计算。", "测量包含手机到节点及站点响应；不是节点端逐跳回程、ICMP 或线路等级判定。"]).join("\n"),
-      { icon: "antenna.radiowaves.left.and.right", "icon-color": "#007AFF" });
+      { icon: "antenna.radiowaves.left.and.right", "icon-color": "#007AFF" }, "手机经节点到广州 · HTTP 往返");
   }
 
   (async function () {

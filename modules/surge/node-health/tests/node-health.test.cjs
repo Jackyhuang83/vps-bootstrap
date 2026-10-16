@@ -229,7 +229,7 @@ test('all nine platform labels appear with bounded unknown results for generic H
     assert.ok(result.diagnosticContent.includes(platform + '：'), platform);
   }
   assert.doesNotMatch(result.diagnosticContent, /检查通过|搜索结果可达|网页地区 [A-Z]|完整解锁/);
-  assert.match(result.content, /v0\.1\.0-beta\.8/);
+  assert.match(result.content, /播放\/对话未测 · \d{2}:\d{2}:\d{2}$/);
 });
 
 test('Claude identifies the documented regional redirect without following external hosts', async () => {
@@ -475,6 +475,8 @@ test('native cards are compact while evidence remains available in the local rep
   assert.ok(ip.result.content.split('\n').length<=9);
   assert.equal(ip.result.icon,'checkmark.seal.fill');
   assert.equal(ip.result.style,undefined);
+  assert.match(ip.result.content,/^风险分：25\/100 · 低风险$/m);
+  assert.doesNotMatch(ip.result.content,/纯净度：|v0\.1\.0|源一致/);
   assert.doesNotMatch(ip.result.content,/HTTP |IP\.SB：|主信息来源|asOrganization/);
   assert.match(ip.result.diagnosticContent,/IPPure：HTTP 200/);
   const platforms=await run({mode:'unlock',reply:()=>({body:'<html>ChatGPT Gemini Claude</html>'})});
@@ -482,7 +484,9 @@ test('native cards are compact while evidence remains available in the local rep
   assert.equal(platforms.result['icon-color'],'#FF2D55');
   assert.equal((platforms.result.content.match(/^(?:ChatGPT|Gemini|Claude|Google|Netflix|Disney\+|YouTube Premium|myTV SUPER|TikTok)：/gm)||[]).length,9);
   assert.doesNotMatch(platforms.result.content, /✅|◐|🚫|❔/);
-  assert.ok(platforms.result.content.split('\n').length<=12);
+  assert.ok(platforms.result.content.split('\n').length<=14);
+  assert.match(platforms.result.content,/Google：[^\n]+\n\nNetflix：/);
+  assert.doesNotMatch(platforms.result.content,/v0\.1\.0/);
   assert.doesNotMatch(platforms.result.content,/HTTP |OpenAI API|App 入口|逐次：|inSupportedLocation/);
   assert.match(platforms.result.diagnosticContent,/OpenAI API：HTTP 200/);
 });
@@ -551,7 +555,7 @@ test('directory timeout does not fall back to national carrier websites', async 
 
 test('report write failure does not prevent the native panel from completing', async () => {
   const {result,storage}=await run({writeFail:true});
-  assert.match(result.content,/纯净度：75\/100/);
+  assert.match(result.content,/风险分：25\/100 · 低风险/);
   assert.equal(storage.VB_HEALTH_REPORT_V1_ip,undefined);
 });
 
@@ -589,10 +593,11 @@ test('panel taps cycle existing groups, save exact names and wrap without notifi
   for (const [name, node, index] of [['Group','Tokyo',1],['🚀 常用节点','Other',2],['Group','Tokyo',1]]) {
     const { result, notifications, writes } = settings({ panel:true, trigger:'button', storage, noNotifications:true });
     assert.equal(result.title,'检测设置');
-    assert.ok(result.content.includes('已绑定：'+name));
-    assert.ok(result.content.includes('当前选择：'+node));
-    assert.ok(result.content.includes('第 '+index+'/2 组'));
-    assert.match(result.content,/再点切换到/);
+    assert.ok(result.content.includes('策略组：'+name));
+    assert.ok(result.content.includes('当前节点：'+node));
+    assert.ok(result.content.includes('点按切组 · '+index+'/2'));
+    assert.ok(result.content.split('\n').length<=4);
+    assert.equal(result.style,undefined);
     assert.match(result.content,/http:\/\/surge-node-health\.invalid\//);
     assert.equal(JSON.parse(storage[SETTINGS_KEY]).group,name);
     assert.equal(notifications.length,0);
@@ -607,7 +612,7 @@ test('non-button settings refresh never chooses or advances a detection group', 
       const before = JSON.stringify(storage);
       const { result, notifications, writes } = settings({panel:true,trigger,storage});
       if(binding===undefined) assert.match(result.content,/尚未选择/);
-      if(binding==='🚀 常用节点') assert.match(result.content,/当前选择：Other/);
+      if(binding==='🚀 常用节点') assert.match(result.content,/当前节点：Other/);
       if(binding==='Deleted') assert.match(result.content,/原检测组已不存在/);
       assert.equal(JSON.stringify(storage),before);
       assert.equal(notifications.length,0);
@@ -636,7 +641,7 @@ test('binding persistence failure keeps previous selection and reports no succes
     const { result, notifications } = settings({panel:true,trigger:'button',storage,writeFail:true});
     assert.equal(result.style,'alert');
     assert.match(result.content,/未能保存选择/);
-    assert.doesNotMatch(result.content,/已绑定：🚀 常用节点/);
+    assert.doesNotMatch(result.content,/策略组：🚀 常用节点/);
     assert.equal(JSON.stringify(storage),before);
     assert.equal(notifications.length,0);
   }
@@ -658,10 +663,10 @@ test('single group and stale binding select correctly without redundant writes',
   const first = settings(options);
   assert.equal(first.writes,1);
   assert.equal(JSON.parse(storage[SETTINGS_KEY]).group,name);
-  assert.match(first.result.content,/第 1\/1 组/);
+  assert.match(first.result.content,/仅有 1 个手动组/);
   const second = settings(options);
   assert.equal(second.writes,0);
-  assert.match(second.result.content,/仅有这 1 个/);
+  assert.match(second.result.content,/仅有 1 个手动组/);
 });
 
 test('local picker lists existing manual groups and current choices, preserving exact names', () => {
