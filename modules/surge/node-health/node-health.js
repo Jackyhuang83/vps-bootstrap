@@ -1,11 +1,11 @@
 /* SPDX-License-Identifier: MIT
- * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.4
+ * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.5
  * Runs locally in Surge. No MITM, policy mutations, credentials or uploads.
  */
 (function () {
   "use strict";
 
-  const VERSION = "0.1.0-beta.4";
+  const VERSION = "0.1.0-beta.5";
   const SETTINGS_URL = "http://surge-node-health.invalid/";
   const SETTINGS_KEY = "VB_HEALTH_SELECTED_GROUP_V1";
   const TITLES = { ip: "IP 纯净度", unlock: "平台解锁初检", latency: "三网站点 HTTP 耗时" };
@@ -39,7 +39,7 @@
     // Preserve exact stored names. Legacy argument remains readable for Beta 1/2.
     const policy = selected || String(match[3] || "").trim();
     if (!policy || /[\r\n]/.test(policy) || (!selected && /填写|\{\{\{/.test(policy))) {
-      throw new Error("请点击「检测设置」面板打开设置页，点选策略组。地址：" + SETTINGS_URL);
+      throw new Error("请点击「检测设置」面板切换到要检测的策略组。也可网页点选：" + SETTINGS_URL);
     }
     return { mode: match[1], showIP: match[2] === "true", policy: policy };
   }
@@ -90,9 +90,9 @@
     if (policies.proxies.indexOf(current) !== -1) return { policy: current, label: current };
     if (external.length === 1 && external[0].identifier) return { policy: external[0].identifier, label: external[0].name || current };
     if (policies["policy-groups"].indexOf(current) !== -1) {
-      throw new Error("请填写具体节点或手动选择组；自动测速、故障转移等组无法固定本次检测节点。");
+      throw new Error("请在检测组内选择具体节点，或用「检测设置」切换手动组；自动测速、故障转移等组无法固定本次检测节点。");
     }
-    throw new Error("找不到检测节点「" + current + "」，请在 " + SETTINGS_URL + " 重新选组。");
+    throw new Error("找不到检测节点「" + current + "」，请点击「检测设置」重新选组。网页选组：" + SETTINGS_URL);
   }
 
   function request(context, url, options) {

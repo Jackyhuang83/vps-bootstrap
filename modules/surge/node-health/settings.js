@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: MIT
- * Surge 节点体检 v0.1.0-beta.4 — local-only group picker.
+ * Surge 节点体检 v0.1.0-beta.5 — local-only group picker.
  * The request is answered by Surge; no socket, remote API or credentials.
  */
 (function () {
@@ -41,23 +41,43 @@
       return value && value.version === 1 && typeof value.group === "string" ? value.group : "";
     } catch (_) { return ""; }
   }
+  function saveGroup(group) {
+    if (typeof $persistentStore === "undefined" || !$persistentStore.write(JSON.stringify({ version: 1, group: group }), KEY)) {
+      throw new Error("未能保存选择，请重试。");
+    }
+  }
+  function label(value) { return String(value || "").replace(/[\r\n\t]+/g, " "); }
 
   if (typeof $request === "undefined") {
-    const group = saved().replace(/[\r\n\t]+/g, " ");
-    let message = "点击本面板，再点 Surge 通知即可打开设置页。";
+    let group = saved();
+    let message = "";
     let style = "info";
-    // Refreshing the panel on view entry must never send a notification.
-    if (typeof $trigger !== "undefined" && $trigger === "button") {
-      try {
-        if (typeof $notification === "undefined" || typeof $notification.post !== "function") throw new Error("Notifications unavailable");
-        $notification.post("节点体检 · 检测设置", "点击此通知打开策略组选择页", ORIGIN + "/", {
-          action: "open-url", url: ORIGIN + "/", sound: false, "auto-dismiss": false
-        });
-        message = "已发送打开通知，请点通知进入设置页。\n若未看到通知，请允许 Surge 发送通知。";
-      } catch (_) { message = "通知不可用，请从模块说明复制下方地址到 Safari。"; style = "alert"; }
+    try {
+      const groups = groupList(details());
+      if (!groups.length) throw new Error("未找到手动选择组，请先在 Surge 中确认策略组。");
+      let index = groups.findIndex(function (g) { return g.name === group; });
+      // Only an explicit panel tap changes the local detection binding.
+      // View entry, editor evaluation and API/intent runs are read-only.
+      if (typeof $trigger !== "undefined" && $trigger === "button") {
+        const next = (index + 1) % groups.length;
+        if (group !== groups[next].name) saveGroup(groups[next].name);
+        group = groups[next].name;
+        index = next;
+      }
+      if (index >= 0) {
+        message = "当前选择：" + label(groups[index].selected) + "\n第 " + (index + 1) + "/" + groups.length + " 组\n" +
+          (groups.length > 1 ? "再点切换到：" + label(groups[(index + 1) % groups.length].name) : "仅有这 1 个手动选择组。") +
+          "\n选好后，在该组内切换节点并刷新检测面板。";
+      } else {
+        if (group) { message = "原检测组已不存在。\n"; style = "alert"; }
+        message += "点击本面板选择：" + label(groups[0].name) + "\n共 " + groups.length + " 组；每点一次切换到下一组。";
+      }
+    } catch (error) {
+      message = error.message || "无法读取策略组，请更新 Surge 后重试。";
+      style = "alert";
     }
     completed = true;
-    $done({ title: "检测设置", content: (group ? "已绑定：" + group : "尚未选择检测策略组") + "\n" + message + "\n" + ORIGIN + "/\nv0.1.0-beta.4", style: style });
+    $done({ title: "检测设置", content: (group ? "已绑定：" + label(group) : "尚未选择检测策略组") + "\n" + message + "\n网页选组：" + ORIGIN + "/\nv0.1.0-beta.5", style: style });
     return;
   }
 
@@ -83,7 +103,7 @@
       if (!input || typeof input.group !== "string" || !groupList(details()).some(function (g) { return g.name === input.group; })) {
         respond(400, { error: "该策略组已不存在，请重新加载列表。" }); return;
       }
-      if (typeof $persistentStore === "undefined" || !$persistentStore.write(JSON.stringify({ version: 1, group: input.group }), KEY)) {
+      try { saveGroup(input.group); } catch (_) {
         respond(500, { error: "未能保存选择，请重试。" }); return;
       }
       respond(200, { saved: true, group: input.group });
@@ -98,7 +118,7 @@
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>选择检测策略组</title>
 <style>
 :root{color-scheme:light dark;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f4f6fa;color:#17243d}body{margin:0}main{max-width:560px;margin:auto;padding:38px 20px 48px}header small{color:#60718a;font-size:13px}h1{font-size:27px;letter-spacing:-.6px;margin:12px 0}p{line-height:1.65;color:#5d6a7e}.list{display:grid;gap:10px;margin:22px 0}button.group{display:block;text-align:left;appearance:none;border:1px solid #dce2ec;background:white;color:#17243d;border-radius:15px;padding:17px 18px;width:100%;cursor:pointer}button.group strong{display:block;font-size:17px;overflow-wrap:anywhere}button.group small{display:block;font-size:13px;color:#60718a;margin-top:7px;overflow-wrap:anywhere}button.group.selected{border:2px solid #2870ed;background:#f0f5ff;padding:16px 17px}button:disabled{opacity:.55}#status{border-radius:12px;padding:13px 15px;background:#e8eef9;color:#24466f;overflow-wrap:anywhere}#status.error{background:#fff0ee;color:#973a2c}#retry{border:0;color:#2563d6;background:transparent;padding:12px 0;font-size:15px;cursor:pointer}footer{color:#778399;font-size:12px;line-height:1.7;margin-top:24px}@media(prefers-color-scheme:dark){:root{background:#111824;color:#f1f4fa}p{color:#adb9ce}button.group{background:#1c2739;color:#f1f4fa;border-color:#334058}button.group.selected{background:#172d50;border-color:#6b9fff}button.group small,header small{color:#b0bfd5}#status{background:#1d304a;color:#cbdefa}#status.error{background:#482927;color:#ffcdc8}#retry{color:#8bb6ff}}
-</style></head><body><main><header><small>节点体检 · 本地设置</small><h1>选择检测策略组</h1><p>点选你平时用来切换节点的那一组。保存一次，以后在 Surge 中选哪个节点，就检测哪个节点。</p></header><div id="status" role="status" aria-live="polite">正在读取 Surge 策略组…</div><div id="groups" class="list"></div><button id="retry" type="button">重新加载列表</button><footer>选择后，返回 Surge，选好节点并点击检测面板刷新。<br>此页面在本机运行，仅保存检测组选择。v0.1.0-beta.4</footer></main>
+</style></head><body><main><header><small>节点体检 · 本地设置</small><h1>选择检测策略组</h1><p>点选你平时用来切换节点的那一组。保存一次，以后在 Surge 中选哪个节点，就检测哪个节点。</p></header><div id="status" role="status" aria-live="polite">正在读取 Surge 策略组…</div><div id="groups" class="list"></div><button id="retry" type="button">重新加载列表</button><footer>选择后，返回 Surge，选好节点并点击检测面板刷新。<br>此页面在本机运行，仅保存检测组选择。v0.1.0-beta.5</footer></main>
 <script>
 "use strict";
 var list=document.getElementById("groups"),statusBox=document.getElementById("status"),retry=document.getElementById("retry"),busy=false;

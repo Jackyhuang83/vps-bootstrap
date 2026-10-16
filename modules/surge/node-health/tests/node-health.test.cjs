@@ -213,7 +213,7 @@ test('all nine platform labels appear with bounded unknown results for generic H
     assert.ok(result.content.includes(platform + '：'), platform);
   }
   assert.doesNotMatch(result.content, /检查通过|搜索结果可达|网页地区 [A-Z]|完整解锁/);
-  assert.match(result.content, /v0\.1\.0-beta\.4/);
+  assert.match(result.content, /v0\.1\.0-beta\.5/);
 });
 
 test('Claude identifies the documented regional redirect without following external hosts', async () => {
@@ -319,33 +319,84 @@ function settings(options = {}) {
   return { result, storage, writes, notifications, value: result.response && result.response.headers['Content-Type'].startsWith('application/json') ? JSON.parse(result.response.body) : undefined };
 }
 
-test('settings entry tap posts one notification with the local settings URL', () => {
-  const { result, notifications, writes } = settings({ panel:true, trigger:'button', storage:{ [SETTINGS_KEY]:JSON.stringify({version:1,group:'🚀 常用节点'}) } });
-  assert.equal(result.title,'检测设置');
-  assert.match(result.content,/已绑定：🚀 常用节点/);
-  assert.match(result.content,/http:\/\/surge-node-health\.invalid\//);
-  assert.equal(notifications.length,1);
-  assert.equal(notifications[0][3].action,'open-url');
-  assert.equal(notifications[0][3].url,'http://surge-node-health.invalid/');
-  assert.equal(writes,0);
-});
-
-test('automatic settings entry refresh never sends notifications or changes binding', () => {
-  for(const trigger of ['auto-interval',undefined,'editor']) {
-    const { result, notifications, writes } = settings({panel:true,trigger});
-    assert.match(result.content,/尚未选择/);
+test('panel taps cycle existing groups, save exact names and wrap without notifications', () => {
+  const storage = {};
+  for (const [name, node, index] of [['Group','Tokyo',1],['🚀 常用节点','Other',2],['Group','Tokyo',1]]) {
+    const { result, notifications, writes } = settings({ panel:true, trigger:'button', storage, noNotifications:true });
+    assert.equal(result.title,'检测设置');
+    assert.ok(result.content.includes('已绑定：'+name));
+    assert.ok(result.content.includes('当前选择：'+node));
+    assert.ok(result.content.includes('第 '+index+'/2 组'));
+    assert.match(result.content,/再点切换到/);
+    assert.match(result.content,/http:\/\/surge-node-health\.invalid\//);
+    assert.equal(JSON.parse(storage[SETTINGS_KEY]).group,name);
     assert.equal(notifications.length,0);
-    assert.equal(writes,0);
+    assert.equal(writes,1);
   }
 });
 
-test('notification failure preserves a visible settings address', () => {
-  for(const options of [{noNotifications:true},{notificationThrows:true}]) {
-    const { result } = settings({panel:true,trigger:'button',...options});
+test('non-button settings refresh never chooses or advances a detection group', () => {
+  for(const trigger of ['auto-interval',undefined,'editor','http-api','intent']) {
+    for(const binding of [undefined,'🚀 常用节点','Deleted']) {
+      const storage = binding === undefined ? {} : { [SETTINGS_KEY]:JSON.stringify({version:1,group:binding}) };
+      const before = JSON.stringify(storage);
+      const { result, notifications, writes } = settings({panel:true,trigger,storage});
+      if(binding===undefined) assert.match(result.content,/尚未选择/);
+      if(binding==='🚀 常用节点') assert.match(result.content,/当前选择：Other/);
+      if(binding==='Deleted') assert.match(result.content,/原检测组已不存在/);
+      assert.equal(JSON.stringify(storage),before);
+      assert.equal(notifications.length,0);
+      assert.equal(writes,0);
+    }
+  }
+});
+
+test('button-selected group is followed by all checks and tracks its selected node', async () => {
+  const storage = {};
+  settings({ panel:true, trigger:'button', storage });
+  settings({ panel:true, trigger:'button', storage });
+  for(const mode of ['ip','unlock','latency']) {
+    const { result, requests } = await run({storage,argument:`mode=${mode}&showIP=false`,decisions:{'🚀 常用节点':'Other'},expectedPolicy:'Other'});
+    assert.match(result.content,/节点：Other/);
+    assert.ok(requests.length>0);
+  }
+  const { result } = await run({storage,argument:'mode=ip&showIP=false',decisions:{'🚀 常用节点':'Tokyo'}});
+  assert.match(result.content,/节点：Tokyo/);
+});
+
+test('binding persistence failure keeps previous selection and reports no success', () => {
+  for(const initial of [undefined,'Group']) {
+    const storage = initial ? {[SETTINGS_KEY]:JSON.stringify({version:1,group:initial})} : {};
+    const before = JSON.stringify(storage);
+    const { result, notifications } = settings({panel:true,trigger:'button',storage,writeFail:true});
     assert.equal(result.style,'alert');
-    assert.match(result.content,/通知不可用/);
+    assert.match(result.content,/未能保存选择/);
+    assert.doesNotMatch(result.content,/已绑定：🚀 常用节点/);
+    assert.equal(JSON.stringify(storage),before);
+    assert.equal(notifications.length,0);
+  }
+});
+
+test('missing groups or runtime details never alter the binding', () => {
+  for(const options of [{groups:{},decisions:{}},{badDetails:true}]) {
+    const { result, writes } = settings({panel:true,trigger:'button',...options});
+    assert.equal(result.style,'alert');
+    assert.equal(writes,0);
     assert.match(result.content,/http:\/\/surge-node-health\.invalid\//);
   }
+});
+
+test('single group and stale binding select correctly without redundant writes', () => {
+  const storage = {[SETTINGS_KEY]:JSON.stringify({version:1,group:'Deleted'})};
+  const name = '🚀 常用&节点=50%+';
+  const options = {panel:true,trigger:'button',storage,groups:{[name]:['Tokyo']},decisions:{[name]:'Tokyo'}};
+  const first = settings(options);
+  assert.equal(first.writes,1);
+  assert.equal(JSON.parse(storage[SETTINGS_KEY]).group,name);
+  assert.match(first.result.content,/第 1\/1 组/);
+  const second = settings(options);
+  assert.equal(second.writes,0);
+  assert.match(second.result.content,/仅有这 1 个/);
 });
 
 test('local picker lists existing manual groups and current choices, preserving exact names', () => {
