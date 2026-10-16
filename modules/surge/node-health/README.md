@@ -1,4 +1,4 @@
-# Surge 节点体检 · v0.1.0-beta.5
+# Surge 节点体检 · v0.1.0-beta.6
 
 一个模块，三个检测面板（IP 纯净度、平台解锁初检、三网站点 HTTP 耗时）和一个固定的「检测设置」入口。面向 Surge iOS，建议使用当前版本；依赖脚本 `$httpAPI`、`$surge.selectGroupDetails()` 和 `$httpClient`。macOS 尚未实机验证。
 
@@ -30,7 +30,7 @@ http://surge-node-health.invalid/
 
 请保留地址中的 **`http://`**，无需 HTTPS 或证书。这是由 Surge HTTP 请求脚本直接返回的本地页面，不是真实外部站点。模块只为这个保留域名增加一条指向文档地址的 Host 映射，以便浏览器解析；正常启用时请求在发往外部之前即得到本地响应。
 
-已安装 Beta 1/2/3/4：使用原安装地址更新模块（或重新添加），确认「检测设置」面板显示“每点一次切换”，脚本地址带 `?v=0.1.0-beta.5`。新的模块不再要求填写 `POLICY`；旧参数仍可兼容读取，但面板或网页保存的组优先。刷新后的面板末尾应显示 `v0.1.0-beta.5`。
+已安装 Beta 1/2/3/4/5：使用原安装地址更新模块（或重新添加），确认「检测设置」面板显示“每点一次切换”，脚本地址带 `?v=0.1.0-beta.6`。新的模块不再要求填写 `POLICY`；旧参数仍可兼容读取，但面板或网页保存的组优先。刷新后的面板末尾应显示 `v0.1.0-beta.6`。
 
 本地设置页无法打开时，先确认 Surge 正在运行、模块已启用、脚本功能已开启，且地址没有被浏览器改成 `https://`。若你的配置对该域名或文档地址设有绕过、拒绝或其他优先请求脚本，也可能导致页面无法进入 Surge 的 HTTP 引擎。请反馈页面报错，无需开放任何监听端口。
 
@@ -44,27 +44,36 @@ http://surge-node-health.invalid/
 
 ### IP 纯净度
 
-- 显示本次访问 IPPure 接口的出口 IP、国家/地区、ASN/组织和接口明确提供的类型。
+- 并行访问 IPPure、IP.SB GeoIP、Cloudflare Trace，逐个显示响应状态、耗时及遮蔽后的出口 IP。至少两个来源有效时核对是否一致，IPv6 不同文本写法先规范化比较。
+- 主信息优先使用 IPPure；失败时依次使用 IP.SB、Cloudflare 显示仍能取得的出口信息。备用来源不提供 IPPure 风险分，不混用分数。
+- 显示国家/地区、ASN/组织、明确提供的住宅/机房分类、Cloudflare 接入点和 WARP 状态。住宅、机房、广播与原生属性分别处理；原生属性未独立验证。
 - IPPure 风险分为 0–100，越低越好。为方便阅读，同时显示 `100 − 风险分`，标为“纯净度参考”，不是安全概率或账号保证。
 - 没有分数、返回 HTML、限流、字段异常都显示未知。接口返回 `false` 或不含类型时，不反推“机房”或“原生”。
 - IPPure 官方说明不评估 IPv6，因此 IPv6 即使伴随风险字段也不生成纯净度分。
-- 本面板只显示这一次连接选中的地址族，不代表已同时检测 IPv4 和 IPv6。
+- 不同检测站返回不同 IP 时明确提示，保留每站结果。可能是节点按目标站分流或不同地址族，不直接判为泄漏。默认遮蔽每个来源的 IP。
+- 各接口使用自己的连接选择地址族；没有强制 IPv4/IPv6 探测，不能据此宣称双栈均已验证。
 
 ### 平台解锁初检
 
 | 平台 | 检测内容 | 不能据此确认 |
 | --- | --- | --- |
-| Netflix | 两部样本的片库页标识；能取得时显示地区 | 完整片库、DRM、账号、实际视频 CDN 能否播放 |
+| Netflix | 两个授权样本及一个自制样本的片库页；分别显示结果与地区；另查 Fast.com 分配的 CDN 并发起一次 HEAD | 完整片库、DRM、账号、真实视频播放及持续带宽 |
 | Disney+ | 匿名设备会话返回的 `inSupportedLocation` 和地区 | 账号权益、DRM、实际播放 |
-| YouTube Premium | Premium 页面中的地区与内容标识 | 账号可购买、所有视频可播或实际 CDN 质量 |
-| ChatGPT | 网页返回、明确的地区拒绝提示，以及其边缘 trace 地区 | 登录、发送消息、App 或 API 可用性；trace 地区不等于服务授权 |
-| Gemini | 网页返回及明确的地区拒绝提示 | 登录后的账号可用性、对话、API |
-| Claude | 网页返回、明确的地区拒绝页面或跳转 | 登录、对话、Claude Code 或 API 可用性 |
+| YouTube Premium | Premium 页面地区与 ad-free 内容标识；独立读取 Googlevideo CDN 调度标识 | 账号可购买、视频可播或实际 CDN 带宽；调度标识不是视频下载测试 |
+| ChatGPT | Web、iOS App 入口、OpenAI API 模型入口、ChatGPT 边缘 Trace 分别显示结果 | 登录、发送消息、App 内会话及 API 调用成功；边缘地区不等于服务授权 |
+| Gemini | Web、自身页面地区/功能标志、Gemini API 模型入口 | 登录后的账号可用性、对话、API 调用；没有页面标志不判定不支持 |
+| Claude | Web、明确地区拒绝页或跳转、Claude API 模型入口 | 登录、对话、Claude Code 或 API 调用成功 |
 | Google | 实际搜索结果标识、验证码、页面地区（能明确取得时） | 持续免验证码、所有 Google 服务可用；取不到地区就显示未知 |
 | myTV SUPER | 匿名会话明确返回的 `country_code`，检查是否为香港 | 频道账号权限、DRM、实际播放；非香港结果也不代表所有内容都不可用 |
 | TikTok | 网页内应用上下文的地区，兼容两种公开网页数据结构 | App 地区、推荐内容、账号及实际视频播放 |
 
 平台面板按 ChatGPT、Gemini、Claude、Google、Netflix、Disney+、YouTube Premium、myTV SUPER、TikTok 的顺序展示，共 9 项。Google 每次仅发起一个小型搜索查询，不设置强制国家参数；只有页面明确的页脚地区标签才显示地区。TikTok 不从用户资料或任意 `region` 文本猜测访问地区。
+
+每个平台显示独立分项、HTTP 状态和耗时；同源跳转的耗时累计全部跳转。以 ✅ 通过、◐ 部分、⛔ 限制、❔ 未知标记本行检测范围内的结论，汇总计数不代表完整播放/对话能力。达到总时限时保留已完成的平台，仅将未完成项标为未知。
+
+三大 AI 的 API 探测均不发送用户 Key、不生成对话。只有平台特定的结构化认证错误才标为“入口可达，需 API Key”；通用 401/403 页面不能据此通过。API 地区限制和 Web 结果单独保留。Gemini 页面启用标志缺失可能来自页面改版、账号或实验，不反推地区不支持；参考项目已有此类误判反馈。
+
+Netflix 的两个区域样本为 `81280792`、`70143836`，自制样本为 `80018499`。只有两个区域样本均明确不可见且自制样本可见时，显示“仅自制片样本可见”，结论限于这三个样本。CDN 探测只接受 Fast.com 返回的 HTTPS `*.nflxvideo.net` 地址并发 HEAD，不下载测速文件、不跟随跳转，也不显示带参数的临时 URL。CDN 有响应与片库结果分别报告，不据 403 直接宣称整个 Netflix 封锁。
 
 HTTP 200 本身不算完整解锁。人机验证、认证失败、限流、跨站登录跳转、接口字段变化均单独显示。无法取到地区就不猜测 US，不把 IPPure 的地区套给其他平台。
 
@@ -80,19 +89,20 @@ HTTP 200 本身不算完整解锁。人机验证、认证失败、限流、跨�
 | 联通 | `https://iservice.10010.com/favicon.ico` |
 | 移动 | `https://www.10086.cn/favicon.ico` |
 
-每站串行发出 3 次 HTTPS HEAD 请求；三站并行。显示有响应样本的中位数、最小/最大耗时、响应次数和原始 HTTP 状态。每个请求超时 4 秒，整次脚本有 20 秒保护时限。
+每站串行发出 5 次 HTTPS HEAD 请求；三站并行，共 15 次。显示中位数、最小/最大耗时、响应次数、每次耗时与 HTTP 状态，以及 HTTP 波动。波动值是相邻有效样本耗时差绝对值的均值；不会跨越失败样本计算，不是网络包抖动。DNS、TLS/证书、连接被拒、超时分别标记。每个请求超时 4 秒，整次脚本有 25 秒保护时限，模块脚本超时为 30 秒。
 
 这不是 ICMP Ping，也不是 VPS 回程、三网骨干测评或运营商固定机房探针。耗时可能包括 DNS、节点连接、TLS 与站点处理；连接可能复用。运营商网站也可能使用 CDN 或调度到不同位置，因此不能据此判定 CN2、CMIN2、CUII 或三网跨境线路等级。
 
-`HTTP 403/405/412` 表示站点有响应但拒绝当前请求；耗时仍保留，同时展示状态码。`响应 2/3` 只是这三次 HTTP 请求中两次收到响应，不能换算为网络丢包率。测试不自动跟随跳转，避免更换测量目标。
+`HTTP 403/405/412` 表示站点有响应但拒绝当前请求；耗时仍保留并提示站点拒绝。`响应 4/5` 只是这五次 HTTP 请求中四次收到响应，不能换算为网络丢包率。测试不自动跟随跳转，避免更换测量目标。
 
 ## 安装后的验收步骤
 
 1. 保持 Surge 通知关闭，点击「检测设置」面板，逐次切换到常用的手动策略组；核对组名、当前选择及下一组提示。返回或重新进入策略选择页，确认绑定不变。选一个确认能上网的节点，刷新 IP 面板，核对节点名和出口 IP 是否合理；截图前建议保留 `SHOW_IP=false`。
 2. 在同一个组里切换为另一个出口不同的节点并刷新，确认节点名和 IP 同步变化。无需修改模块参数。
-3. 刷新三网面板，核对三个域名、响应 `x/3`、HTTP 状态和毫秒数。超时或拒绝请保留原样反馈，不直接视为节点断网。
+3. 刷新三网面板，核对三个域名、响应 `x/5`、五次原始结果、范围和波动。超时或拒绝请保留原样反馈，不直接视为节点断网。
 4. 刷新平台面板，确认 9 个平台均有结果，再用同一节点手动打开你有账号的平台，播放视频或发送一条消息，对照实际结果。Google 的“地区未知”不等于搜索失败，myTV SUPER 的香港检查通过不等于所有频道可播，TikTok 网页地区不等于 App 解锁。初检不等于实际播放/对话通过。
 5. 试着从设置面板轮换到另一组，再刷新检测，确认跟随新组。网页选组后，设置面板也应显示同一绑定。若已绑定的组被删除，自动刷新应提示重新选组，只有点击设置面板后才选第一组；不应自动改测其他组或本地直连 IP。保存失败必须显示错误并保留旧绑定。
+6. IP 面板应出现三个来源各自的状态；若 IPPure 失败，其他来源仍应能显示出口，风险分保持未知。平台面板应分别展示 AI Web/App/API、Netflix 三个样本及 CDN、YouTube CDN 调度。核对来源、节点和时间后，再与官方客户端的实际使用对照。
 
 切换节点后，各面板保留的是其上次刷新结果。需要分别点击刷新，并核对每张面板的节点名和时间；面板缓存不代表持续实时监测。
 
@@ -110,6 +120,10 @@ node --test modules/surge/node-health/tests/node-health.test.cjs
 
 测试以模拟 Surge 运行时覆盖缺失/异常风险分、IPv6、节点解析、策略组循环、外部节点标识、认证/人机验证/限流、保守解锁判定、同源跳转、三网抽样及超时，并验证面板轮换与回到首组、非点按触发不改绑定、关闭通知仍可选组、保存失败、单组/失效组处理、网页点选、切换节点后跟随及跨站写入拦截。它们不替代真实 Surge 对模块语法、本地页面拦截、面板布局、站点可达性和节点路由的验收。
 
+Beta 6 增加三源一致性/降级、IPv6 规范化、三种 API 认证响应、API 与 Web 分离、Gemini 标志缺失、Netflix CDN 地址限制及临时参数隐藏、CDN 调度隐私、网络错误分类、累计跳转耗时、限流优先及总超时保留结果测试。模拟运行时检查并发请求不超过 Surge 上限，结束后不再新发请求。
+
+当前执行环境对外部检测地址的直接连接超时，尚未得到真实 Surge / 用户节点的线上返回；模拟测试通过不能当作解锁验收通过。新探测接口仍需手机实测，错误时应保留其分项状态再调整兼容。
+
 ## 参考
 
 - [Surge 脚本 API](https://manual.nssurge.com/scripting/api.html)
@@ -118,8 +132,14 @@ node --test modules/surge/node-health/tests/node-health.test.cjs
 - [Surge HTTP API / 外部节点标识](https://manual.nssurge.com/tools/http-api.html)
 - [IPPure 官方接口说明](https://ippure.com/en/MyIP-Info-API)
 - [IPPure 评分与 IPv6 说明](https://ippure.com/faq)
+- [IP.SB 自身 IP / GeoIP API](https://ip.sb/api/)
+- [Cloudflare Trace 说明](https://developers.cloudflare.com/fundamentals/reference/cdn-cgi-endpoint/)
+- [OpenAI API 错误说明](https://developers.openai.com/api/docs/guides/error-codes)
+- [Gemini 模型接口](https://ai.google.dev/api/models)
+- [Claude 模型接口](https://platform.claude.com/docs/en/api/models/list)
 - [Rabbit-Spec/Surge 流媒体面板](https://github.com/Rabbit-Spec/Surge/tree/Master/Module/Panel/Stream-All)（检测思路参考；未直接打包其脚本）
-- [RegionRestrictionCheck](https://github.com/lmc999/RegionRestrictionCheck)（Claude 地区拒绝与 myTV SUPER 匿名会话检测思路）
+- [RegionRestrictionCheck](https://github.com/lmc999/RegionRestrictionCheck)（平台入口、地区样本与 CDN 调度检测参考；独立实现解析与判断）
+- [Gemini 误判反馈 #177](https://github.com/lmc999/RegionRestrictionCheck/issues/177)
 - [TikTokCheck](https://github.com/lmc999/TikTokCheck)（网页地区检测思路；本实现限定为应用上下文数据）
 
 代码按仓库 MIT 许可证分发。

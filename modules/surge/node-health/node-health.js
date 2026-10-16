@@ -1,11 +1,11 @@
 /* SPDX-License-Identifier: MIT
- * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.5
+ * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.6
  * Runs locally in Surge. No MITM, policy mutations, credentials or uploads.
  */
 (function () {
   "use strict";
 
-  const VERSION = "0.1.0-beta.5";
+  const VERSION = "0.1.0-beta.6";
   const SETTINGS_URL = "http://surge-node-health.invalid/";
   const SETTINGS_KEY = "VB_HEALTH_SELECTED_GROUP_V1";
   const TITLES = { ip: "IP 纯净度", unlock: "平台解锁初检", latency: "三网站点 HTTP 耗时" };
@@ -17,6 +17,7 @@
   ];
   let completed = false;
   let mode = "ip";
+  let deadlineResult = null;
 
   function finish(content, style) {
     if (completed) return;
@@ -98,13 +99,14 @@
   function request(context, url, options) {
     const config = options || {};
     const seconds = config.timeout || 6;
+    if (completed) return Promise.resolve({ error: "检测已结束", status: 0, headers: {}, body: "", ms: 0 });
     return new Promise(function (resolve) {
       const start = Date.now();
       let settled = false;
       function settle(error, response, data) {
         if (settled) return;
         settled = true;
-        resolve({ error: error ? (/timed?\s*out|timeout|超时/i.test(String(error)) ? "超时" : "连接失败") : "",
+        resolve({ error: error ? networkError(error) : "",
           status: Number(response && response.status) || 0,
           headers: (response && response.headers) || {},
           body: typeof data === "string" ? data : "", ms: Math.max(0, Date.now() - start) });
@@ -120,13 +122,25 @@
   }
 
   function json(body) { try { return JSON.parse(body); } catch (_) { return null; } }
+  function networkError(error) {
+    const value = String(error);
+    if (/timed?\s*out|timeout|超时/i.test(value)) return "超时";
+    if (/dns|resolve|name.*found|nodename|主机名|解析/i.test(value)) return "DNS 解析失败";
+    if (/ssl|tls|certificate|证书/i.test(value)) return "TLS/证书失败";
+    if (/refused|拒绝连接/i.test(value)) return "连接被拒绝";
+    return "连接失败";
+  }
   async function page(context, url) {
     // Follow at most two same-origin redirects, pinning the same node each time.
     // JSC does not guarantee the browser URL API, so restrict to simple paths.
     const origin = url.match(/^https:\/\/[^/]+/)[0];
     let current = url;
+    let elapsed = 0;
     for (let hop = 0; hop <= 2; hop += 1) {
       const response = await request(context, current, { timeout: 5 });
+      elapsed += response.ms;
+      response.ms = elapsed;
+      response.redirects = hop;
       if (response.error || [301, 302, 303, 307, 308].indexOf(response.status) === -1 || hop === 2) return response;
       const location = header(response, "location");
       if (!location || /[\s\\]/.test(location)) return response;
@@ -155,6 +169,23 @@
     if (response.status !== 200) return "接口异常 HTTP " + response.status;
     return "";
   }
+  function evidence(label, response, note) {
+    return label + "：" + (response.error || "HTTP " + response.status) + " · " + response.ms + " ms" +
+      (response.redirects ? " · 跳转 " + response.redirects + " 次" : "") + (note ? " · " + note : "");
+  }
+  function finding(name, state, summary, region, details) {
+    return { name: name, state: state, text: name + "：" + summary + suffix(region) +
+      (details && details.length ? "\n  " + details.join("\n  ") : "") };
+  }
+  function traceFields(response) {
+    if (problem(response)) return {};
+    const fields = {};
+    response.body.split(/\r?\n/).forEach(function (line) {
+      const match = line.match(/^(ip|loc|colo|warp)=([^\s=]+)$/);
+      if (match) fields[match[1]] = fields[match[1]] && fields[match[1]] !== match[2] ? "?" : match[2];
+    });
+    return fields;
+  }
   function time() { return new Date().toLocaleTimeString("zh-CN", { hour12: false }); }
   function preamble(context) { return "节点：" + clean(context.label); }
   function masked(ip, show) {
@@ -168,33 +199,68 @@
     if (!/^[0-9a-f:]+$/i.test(ip) || ip.length > 39) return false;
     const compressed = ip.split("::");
     if (compressed.length > 2) return false;
-    const groups = ip.split(":").filter(Boolean);
+    const halves = compressed.map(function (half) { return half ? half.split(":") : []; });
+    const groups = [].concat.apply([], halves);
     if (!groups.every(function (s) { return /^[0-9a-f]{1,4}$/i.test(s); })) return false;
+    if (compressed.length === 1 && (ip.charAt(0) === ":" || ip.charAt(ip.length - 1) === ":")) return false;
     return compressed.length === 2 ? groups.length < 8 : groups.length === 8;
+  }
+  function ipKey(ip) {
+    if (ip.indexOf(":") < 0) return ip.split(".").map(Number).join(".");
+    const sides = ip.toLowerCase().split("::");
+    const left = sides[0] ? sides[0].split(":") : [];
+    const right = sides.length > 1 && sides[1] ? sides[1].split(":") : [];
+    const groups = sides.length > 1 ? left.concat(Array(8 - left.length - right.length).fill("0"), right) : left;
+    return groups.map(function (v) { return parseInt(v, 16).toString(16); }).join(":");
   }
 
   async function ipPanel(context, showIP) {
-    const response = await request(context, "https://my.ippure.com/v1/info");
+    const responses = await Promise.all([request(context, "https://my.ippure.com/v1/info"),
+      request(context, "https://api.ip.sb/geoip"), request(context, "https://www.cloudflare.com/cdn-cgi/trace")]);
+    const response = responses[0];
     const issue = problem(response);
-    if (issue) return finish(preamble(context) + "\nIPPure：" + issue + "\n风险分未知；点击面板重新检测。", "alert");
-    const data = json(response.body);
-    if (!data || !validIP(data.ip)) return finish(preamble(context) + "\nIPPure 返回格式未知；未生成纯净度分数。", "alert");
+    const pure = !issue && json(response.body);
+    const geo = !problem(responses[1]) && json(responses[1].body);
+    const trace = traceFields(responses[2]);
+    const sources = [{ name: "IPPure", data: pure, response: response }, { name: "IP.SB", data: geo, response: responses[1] },
+      { name: "Cloudflare", data: trace, response: responses[2] }];
+    const valid = sources.filter(function (s) { return s.data && validIP(s.data.ip); });
+    if (!valid.length) return finish([preamble(context), "出口 IP 未取得；未生成纯净度分数。"].concat(sources.map(function (s) {
+      return evidence(s.name, s.response, problem(s.response) || "数据格式未知");
+    })).join("\n"), "alert");
+    const primary = valid[0];
+    const data = primary.data;
     const ipv6 = data.ip.indexOf(":") !== -1;
-    const rawScore = data.fraudScore;
+    const rawScore = primary.name === "IPPure" ? data.fraudScore : null;
     const score = !ipv6 && typeof rawScore === "number" && Number.isFinite(rawScore) && rawScore >= 0 && rawScore <= 100 ? rawScore : null;
     const risk = score === null ? "未知" : score <= 25 ? "低" : score <= 50 ? "轻度" : score <= 70 ? "中度" : "高";
     const types = [];
     if (data.isResidential === true) types.push("住宅");
     if (data.isDataCenter === true) types.push("机房");
     if (typeof data.isBroadcast === "boolean") types.push(data.isBroadcast ? "广播" : "非广播");
-    const location = [data.country || country(data.countryCode), data.region, data.city].filter(Boolean).map(clean).filter(function (v, i, a) { return a.indexOf(v) === i; }).join(" · ");
+    const location = [data.country || country(data.countryCode || data.country_code || data.loc), data.region, data.city].filter(Boolean).map(clean).filter(function (v, i, a) { return a.indexOf(v) === i; }).join(" · ");
+    const unique = valid.map(function (s) { return ipKey(s.data.ip); }).filter(function (v, i, a) { return a.indexOf(v) === i; });
+    const comparison = valid.length < 2 ? "出口核对：仅一个来源有效，无法交叉核对" : unique.length === 1 ? "出口核对：" + valid.length + " 个来源 IP 一致" : "出口核对：不同站点出口不一致（可能分站出口或地址族不同）";
+    const countries = valid.map(function (s) { return country(s.data.countryCode || s.data.country_code || s.data.loc); }).filter(Boolean)
+      .filter(function (v, i, a) { return a.indexOf(v) === i; });
+    const classifications = ["住宅：" + (typeof data.isResidential === "boolean" ? data.isResidential ? "是" : "否" : "未知"),
+      "机房：" + (typeof data.isDataCenter === "boolean" ? data.isDataCenter ? "是" : "否" : "未知")];
+    const warp = trace.warp === "on" || trace.warp === "plus" ? "已启用" + (trace.warp === "plus" ? " Plus" : "") : trace.warp === "off" ? "未启用" : "未知";
     const lines = [preamble(context), "出口：" + masked(data.ip, showIP) + (ipv6 ? "（IPv6）" : "（IPv4）"), location || "地区未知",
       score === null ? "纯净度：未知" + (ipv6 ? "（IPPure 不评估 IPv6）" : "（无有效风险分）") : "纯净度参考：" + (100 - score) + "/100 · 风险" + risk,
       "IPPure 风险分：" + (score === null ? "未知" : score + "/100（越低越好）"),
       "类型：" + (types.join(" · ") || "未知"),
-      "ASN：" + clean(data.asn || "未知") + " · " + clean(data.asOrganization || "未知"),
-      "来源 IPPure · " + time() + "\n第三方评分，仅供参考"];
-    finish(lines.join("\n"), score === null || score > 50 ? "alert" : "info");
+      classifications.join(" · ") + " · 原生属性：未验证",
+      "ASN：" + clean(data.asn || "未知") + " · " + clean(data.asOrganization || data.asn_organization || data.organization || "未知"), comparison,
+      "Cloudflare：地区 " + (country(trace.loc) || "未知") + " · 接入点 " + (/^[A-Z]{3}$/.test(trace.colo || "") ? trace.colo : "未知") + " · WARP " + warp];
+    sources.forEach(function (s) {
+      const value = s.data && validIP(s.data.ip) ? masked(s.data.ip, showIP) : problem(s.response) || "数据格式未知";
+      const region = s.data && validIP(s.data.ip) && country(s.data.countryCode || s.data.country_code || s.data.loc);
+      lines.push(evidence(s.name, s.response, value + (region ? " · " + region : "")));
+    });
+    if (unique.length === 1 && countries.length > 1) lines.push("地区库差异：" + countries.join(" / ") + "（IP 一致，地区资料不同）");
+    lines.push("主信息来源 " + primary.name + "；风险分仅来自 IPPure · " + time(), "第三方评分，仅供参考");
+    finish(lines.join("\n"), score === null || score > 50 || unique.length > 1 ? "alert" : "info");
   }
 
   function netflixSample(response, id) {
@@ -210,12 +276,37 @@
     return path ? country(path[1]) : "";
   }
   async function netflix(context) {
-    const results = await Promise.all(["81280792", "80018499"].map(function (id) { return page(context, "https://www.netflix.com/title/" + id); }));
-    if (netflixSample(results[0], "81280792")) return "Netflix：授权片样本可见" + suffix(netflixRegion(results[0]));
-    if (results[0].status === 404 && netflixSample(results[1], "80018499")) return "Netflix：仅自制片样本可见" + suffix(netflixRegion(results[1]));
-    const regionBlock = results.some(function (r) { return /Netflix is not available in your country|not yet available in your (?:country|region)/i.test(r.body); });
-    if (regionBlock) return "Netflix：地区受限";
-    return "Netflix：" + (problem(results[0]) || "未取得有效片库证据");
+    const ids = ["81280792", "70143836", "80018499"];
+    const all = await Promise.all([Promise.all(ids.map(function (id) { return page(context, "https://www.netflix.com/title/" + id); })), netflixCDN(context)]);
+    const results = all[0];
+    const visible = results.map(function (r, i) { return netflixSample(r, ids[i]); });
+    const regions = results.map(netflixRegion).filter(Boolean).filter(function (v, i, a) { return a.indexOf(v) === i; });
+    const region = regions.length === 1 ? regions[0] : "";
+    const details = results.map(function (r, i) { return evidence((i < 2 ? "授权样本 " : "自制样本 ") + ids[i], r,
+      visible[i] ? "片库可见" : r.status === 404 && !r.error && !challenge(r.body) ? "片库不可见" : problem(r) || "未取得片库证据"); });
+    details.push("片库地区：" + (region || (regions.length > 1 ? "结果冲突" : "未知")));
+    details.push.apply(details, all[1]);
+    const regionBlock = results.some(function (r) { return regionEvidence(r) && /Netflix is not available in your country|not yet available in your (?:country|region)/i.test(r.body); });
+    if (regionBlock) return finding("Netflix", "blocked", "地区受限", region, details);
+    if (visible[0] || visible[1]) return finding("Netflix", "pass", "授权片样本可见（" + visible.slice(0, 2).filter(Boolean).length + "/2）", region, details);
+    if (visible[2] && results.slice(0, 2).every(function (r) { return !r.error && !challenge(r.body) && (r.status === 404 || (r.status === 200 && /Oh no!|title (?:is )?not available/i.test(r.body))); })) {
+      return finding("Netflix", "partial", "仅自制片样本可见（两个授权样本不可见）", region, details);
+    }
+    return finding("Netflix", "unknown", problem(results[0]) || "未取得有效片库证据", region, details);
+  }
+  async function netflixCDN(context) {
+    // Public fast.com application identifier. Fetch metadata, never a speed test.
+    const response = await request(context, "https://api.fast.com/netflix/speedtest/v2?https=true&token=YXNkZmFzZGxmbnNkYWZoYXNkZmhrYWxm&urlCount=1");
+    const issue = problem(response);
+    const data = !issue && json(response.body);
+    const targets = data && Array.isArray(data.targets) ? data.targets : Array.isArray(data) ? data : [];
+    const target = targets.find(function (t) { return t && typeof t.url === "string" && !/[\s\\]/.test(t.url) && /^https:\/\/[a-z0-9.-]+\.nflxvideo\.net(?::443)?\/[^\s\\]*$/i.test(t.url); });
+    if (!target) return [evidence("CDN 分配", response, issue || "未取得有效 Netflix CDN 地址")];
+    const host = target.url.match(/^https:\/\/([^/]+)/i)[1];
+    const location = target.location || {};
+    const head = await request(context, target.url, { method: "head", timeout: 4 });
+    return [evidence("CDN 分配", response, clean(host) + (country(location.country) ? " · " + country(location.country) : "") + (location.city ? " · " + clean(location.city) : "")),
+      evidence("CDN 连接", head, !head.error && (head.status === 200 || head.status === 206) ? "HEAD 响应通过；未下载视频" : problem(head) || "响应待确认")];
   }
 
   async function disney(context) {
@@ -225,67 +316,114 @@
       method: "post", headers: { Authorization: client, "Content-Type": "application/json" },
       body: JSON.stringify({ query: "mutation registerDevice($input: RegisterDeviceInput!) { registerDevice(registerDevice: $input) { grant { grantType assertion } } }",
         variables: { input: { applicationRuntime: "chrome", attributes: { browserName: "chrome", browserVersion: "131.0.0", manufacturer: "apple", model: null, operatingSystem: "macintosh", operatingSystemVersion: "10.15.7", osDeviceIds: [] }, deviceFamily: "browser", deviceLanguage: "en", deviceProfile: "macosx" } } }) });
-    if (!response.error && !challenge(response.body) && /forbidden-location|unsupported-location/i.test(response.body)) return "Disney+：地区受限";
+    const details = [evidence("匿名设备会话", response)];
+    if (regionEvidence(response) && /forbidden-location|unsupported-location/i.test(response.body)) return finding("Disney+", "blocked", "地区受限", "", details);
     const issue = problem(response);
-    if (issue) return "Disney+：" + issue;
+    if (issue) return finding("Disney+", "unknown", issue, "", details);
     const data = json(response.body);
     const session = data && data.extensions && data.extensions.sdk && data.extensions.sdk.session;
-    if (!data || (Array.isArray(data.errors) && data.errors.length) || !session) return "Disney+：接口格式变化，未知";
+    if (!data || (Array.isArray(data.errors) && data.errors.length) || !session) return finding("Disney+", "unknown", "接口格式变化，未知", "", details);
     const region = country(session.location && session.location.countryCode);
-    if (session.inSupportedLocation === true) return "Disney+：地区检查通过" + suffix(region);
-    if (session.inSupportedLocation === false) return "Disney+：地区不支持" + suffix(region);
-    return "Disney+：地区状态未知";
+    details.push("会话地区支持：" + (typeof session.inSupportedLocation === "boolean" ? session.inSupportedLocation ? "是" : "否" : "未提供"));
+    if (session.inSupportedLocation === true) return finding("Disney+", "pass", "地区检查通过", region, details);
+    if (session.inSupportedLocation === false) return finding("Disney+", "blocked", "地区不支持", region, details);
+    return finding("Disney+", "unknown", "地区状态未知", region, details);
   }
 
   async function youtube(context) {
-    const response = await page(context, "https://www.youtube.com/premium");
+    const responses = await Promise.all([page(context, "https://www.youtube.com/premium"),
+      request(context, "https://redirector.googlevideo.com/report_mapping")]);
+    const response = responses[0];
+    const mapping = !problem(responses[1]) && responses[1].body.match(/=>\s*([a-z0-9][a-z0-9.-]{1,180})(?:\s|$)/i);
+    const details = [evidence("Premium 页面", response), evidence("CDN 调度", responses[1], mapping ? "标识 " + clean(mapping[1]) : problem(responses[1]) || "调度标识未知")];
     const issue = problem(response);
-    if (issue) return "YouTube Premium：" + issue;
+    if (issue) return finding("YouTube Premium", "unknown", issue, "", details);
     const body = response.body;
     const match = body.match(/"INNERTUBE_CONTEXT_GL"\s*:\s*"([A-Z]{2})"/) || body.match(/"countryCode"\s*:\s*"([A-Z]{2})"/);
     const region = match ? country(match[1]) : "";
-    if (/Premium is not available in your country/i.test(body)) return "YouTube Premium：地区不支持" + suffix(region);
-    if (region && /ad-free|YouTube Premium/i.test(body) && /ytInitialData|ytcfg\.set/.test(body)) return "YouTube Premium：页面地区检查通过" + suffix(region);
-    return "YouTube Premium：页面证据不足，未知";
+    if (/Premium is not available in your country/i.test(body)) return finding("YouTube Premium", "blocked", "地区不支持", region, details);
+    if (region && /ad-free/i.test(body) && /ytInitialData|ytcfg\.set/.test(body)) return finding("YouTube Premium", "pass", "页面地区检查通过", region, details);
+    return finding("YouTube Premium", "unknown", "页面证据不足，未知", region, details);
   }
 
+  function regionEvidence(response) {
+    return !response.error && [200, 400, 403, 451].indexOf(response.status) !== -1 && !challenge(response.body);
+  }
+  function regionRejected(response) {
+    if (!regionEvidence(response)) return false;
+    const data = json(response.body);
+    const error = data && data.error;
+    const code = error && typeof error === "object" ? error.code || error.type : typeof error === "string" ? error : data && data.code;
+    return /^(unsupported_country|unsupported_country_region_territory|country_not_supported|forbidden-location|unsupported-location)$/i.test(String(code || "")) ||
+      /not available in your country|country, region, or territory not supported/i.test(response.body);
+  }
+  function apiAccess(provider, response) {
+    if (regionRejected(response)) return "地区受限";
+    if (response.error || challenge(response.body) || response.status === 429) return problem(response);
+    const data = json(response.body);
+    const error = data && data.error;
+    if (provider === "OpenAI" && response.status === 401 && error && typeof error === "object" &&
+      (/^(invalid_api_key|missing_api_key)$/.test(error.code || "") ||
+       (error.type === "invalid_request_error" && /missing|didn.t provide|must provide|no api key/i.test(error.message || "")))) return "入口可达，需 API Key（未测试调用）";
+    if (provider === "Claude" && response.status === 401 && data && data.type === "error" && error && error.type === "authentication_error") return "入口可达，需 API Key（未测试调用）";
+    if (provider === "Gemini" && response.status === 403 && error && error.status === "PERMISSION_DENIED" && Array.isArray(error.details) && error.details.some(function (d) {
+      return d && /^(CREDENTIALS_MISSING|API_KEY_INVALID)$/.test(d.reason || "") && d.metadata && d.metadata.service === "generativelanguage.googleapis.com";
+    })) return "入口可达，需 API Key（未测试调用）";
+    return problem(response) || "未取得有效 API 证据";
+  }
   async function chatgpt(context) {
-    const responses = await Promise.all([page(context, "https://chatgpt.com/"), request(context, "https://chatgpt.com/cdn-cgi/trace")]);
+    const responses = await Promise.all([page(context, "https://chatgpt.com/"), request(context, "https://chatgpt.com/cdn-cgi/trace"),
+      request(context, "https://ios.chat.openai.com/"), request(context, "https://api.openai.com/v1/models")]);
     const home = responses[0];
-    let region = "";
-    if (!problem(responses[1])) {
-      const match = responses[1].body.match(/^loc=([A-Z]{2})$/m);
-      region = match ? country(match[1]) : "";
-    }
-    if (!home.error && !challenge(home.body) && /unsupported_country|not available in your country|country, region, or territory not supported/i.test(home.body)) return "ChatGPT：地区受限" + suffix(region);
+    const trace = traceFields(responses[1]);
+    const region = country(trace.loc);
+    const app = responses[2];
+    const appRedirect = /^https:\/\/(?:chatgpt\.com|(?:auth|chat)\.openai\.com)(?:\/|$)/i.test(header(app, "location"));
+    const appNote = regionRejected(app) || (regionEvidence(app) && /(?:disable|turn off|blocked|disallowed)[^<>\n]{0,100}\bVPN\b/i.test(app.body)) ? "入口明确拒绝当前地区/网络" :
+      !app.error && app.status >= 300 && app.status < 400 && appRedirect ? "转到官方登录入口" :
+      !problem(app) && /ChatGPT|OpenAI/.test(app.body) && /<html|<!doctype/i.test(app.body) ? "入口网页可达" : problem(app) || "入口证据不足";
+    const details = [evidence("Web", home, problem(home) || "首页已响应"), evidence("App 入口", app, appNote),
+      evidence("OpenAI API", responses[3], apiAccess("OpenAI", responses[3])),
+      evidence("边缘地区", responses[1], (region || "未知") + (trace.colo && /^[A-Z]{3}$/.test(trace.colo) ? " · " + trace.colo : "") + "（不是服务授权地区）")];
+    if (regionRejected(home)) return finding("ChatGPT", "blocked", "地区受限", region, details);
     const issue = problem(home);
-    if (issue) return "ChatGPT：" + issue + suffix(region);
-    if (/ChatGPT/.test(home.body) && /<html|<!doctype/i.test(home.body)) return "ChatGPT：网页可达，待验证对话" + suffix(region);
-    return "ChatGPT：页面证据不足，未知";
+    if (issue) return finding("ChatGPT", "unknown", issue, region, details);
+    if (/ChatGPT/.test(home.body) && /<html|<!doctype/i.test(home.body)) return finding("ChatGPT", "partial", "网页可达，待验证对话", region, details);
+    return finding("ChatGPT", "unknown", "页面证据不足，未知", region, details);
   }
 
   async function gemini(context) {
-    const response = await page(context, "https://gemini.google.com/");
+    const responses = await Promise.all([page(context, "https://gemini.google.com/"), request(context, "https://generativelanguage.googleapis.com/v1beta/models")]);
+    const response = responses[0];
+    const codes = Array.from(response.body.matchAll(/,2,1,200,"([A-Z]{3})"/g)).map(function (m) { return m[1]; }).filter(function (v, i, a) { return a.indexOf(v) === i; });
+    const region = codes.length === 1 ? codes[0] : "";
+    const enabled = /\b45631641,null,true\b/.test(response.body);
+    const details = [evidence("Web", response, problem(response) || "首页已响应"), "页面地区：" + (region || (codes.length > 1 ? "结果冲突" : "未知")),
+      "页面功能标志：" + (enabled ? "已出现启用标志（账号可用性另测）" : "未取得；不能据此判定不支持"),
+      evidence("Gemini API", responses[1], apiAccess("Gemini", responses[1]))];
+    if (regionEvidence(response) && /Gemini (?:isn.t|is not|is currently not) (?:supported|available) in your country|not supported in your (?:country|region)/i.test(response.body)) return finding("Gemini", "blocked", "地区受限", region, details);
     const issue = problem(response);
-    if (issue) return "Gemini：" + issue;
-    if (/Gemini (?:isn.t|is not|is currently not) (?:supported|available) in your country|not supported in your (?:country|region)/i.test(response.body)) return "Gemini：地区受限";
-    if (/Gemini/.test(response.body) && /<html|<!doctype/i.test(response.body)) return "Gemini：网页可达，待登录验证";
-    return "Gemini：页面证据不足，未知";
+    if (issue) return finding("Gemini", "unknown", issue, region, details);
+    if (/Gemini/.test(response.body) && /<html|<!doctype/i.test(response.body)) return finding("Gemini", "partial", enabled ? "网页功能标志已启用，待登录验证" : "网页可达，待登录验证", region, details);
+    return finding("Gemini", "unknown", "页面证据不足，未知", region, details);
   }
 
   async function claude(context) {
-    const response = await page(context, "https://claude.ai/");
+    const responses = await Promise.all([page(context, "https://claude.ai/"),
+      request(context, "https://api.anthropic.com/v1/models", { headers: { "anthropic-version": "2023-06-01" } })]);
+    const response = responses[0];
+    const details = [evidence("Web", response, problem(response) || "首页已响应"), evidence("Claude API", responses[1], apiAccess("Claude", responses[1]))];
     const location = header(response, "location");
     // Known regional rejection may be an external redirect: inspect, do not follow.
     const regionRedirect = /^https:\/\/(?:www\.)?anthropic\.com\/app-unavailable-in-region(?:[/?#]|$)/i.test(location);
     if (!response.error && !challenge(response.body) && (
       (response.status >= 300 && response.status < 400 && regionRedirect) ||
-      /<title[^>]*>\s*App unavailable in region|Claude (?:is not|isn't|is currently not) available in your (?:country|region)/i.test(response.body)
-    )) return "Claude：地区受限";
+      (regionEvidence(response) && /<title[^>]*>\s*App unavailable in region|Claude (?:is not|isn't|is currently not) available in your (?:country|region)/i.test(response.body))
+    )) return finding("Claude", "blocked", "地区受限", "", details);
     const issue = problem(response);
-    if (issue) return "Claude：" + issue;
-    if (/Claude/.test(response.body) && /<html|<!doctype/i.test(response.body)) return "Claude：网页可达，待验证对话";
-    return "Claude：页面证据不足，未知";
+    if (issue) return finding("Claude", "unknown", issue, "", details);
+    if (/Claude/.test(response.body) && /<html|<!doctype/i.test(response.body)) return finding("Claude", "partial", "网页可达，待验证对话", "", details);
+    return finding("Claude", "unknown", "页面证据不足，未知", "", details);
   }
 
   function googleLocation(body) {
@@ -301,31 +439,34 @@
   async function google(context) {
     // One small search; do not force a country via gl/cr parameters.
     const response = await page(context, "https://www.google.com/search?q=surge%20network%20check&hl=en&num=1");
+    const details = [evidence("搜索请求", response)];
     const location = header(response, "location");
     const captchaRedirect = /^\/(?!\/)sorry(?:[/?#]|$)/i.test(location) || /^https:\/\/(?:(?:www|ipv4|ipv6)\.)?google\.com\/sorry(?:[/?#]|$)/i.test(location);
-    if (!response.error && (captchaRedirect || /our systems have detected unusual traffic|automated queries|id=["']captcha-form["']/i.test(response.body))) return "Google：需要验证码";
+    if (!response.error && (captchaRedirect || /our systems have detected unusual traffic|automated queries|id=["']captcha-form["']/i.test(response.body))) return finding("Google", "blocked", "需要验证码", "", details.concat(["本次搜索被风控；不是地区不支持"]));
     const issue = problem(response);
-    if (issue) return "Google：" + issue;
+    if (issue) return finding("Google", "unknown", issue, "", details);
     const region = googleLocation(response.body);
     const regionText = region ? " · 页面地区 " + region : " · 地区未知";
-    if (/id=["'](?:rso|search)["']/i.test(response.body) && /<h3\b/i.test(response.body)) return "Google：搜索结果可达" + regionText;
-    if (/Google/.test(response.body) && /<html|<!doctype/i.test(response.body)) return "Google：网页可达，搜索待验证" + regionText;
-    return "Google：页面证据不足，未知";
+    if (/id=["'](?:rso|search)["']/i.test(response.body) && /<h3\b/i.test(response.body)) return finding("Google", "pass", "搜索结果可达" + regionText, "", details.concat(["验证码：本次未触发；" + (region ? "地区取自 Google 页脚" : "页脚未提供可识别地区")]));
+    if (/Google/.test(response.body) && /<html|<!doctype/i.test(response.body)) return finding("Google", "partial", "网页可达，搜索待验证" + regionText, "", details.concat(["未取得搜索结果列表，不能判定免验证码"]));
+    return finding("Google", "unknown", "页面证据不足，未知", "", details);
   }
 
   async function mytvsuper(context) {
     const response = await request(context, "https://www.mytvsuper.com/api/auth/getSession/self/");
+    const details = [evidence("匿名会话", response)];
     const issue = problem(response);
-    if (issue) return "myTV SUPER：" + issue;
+    if (issue) return finding("myTV SUPER", "unknown", issue, "", details);
     const data = json(response.body);
     if (!data || data.error || data.success === false || data.status === false || data.status === "error" ||
-      (Array.isArray(data.errors) && data.errors.length) || (data.error_code !== undefined && data.error_code !== 0 && data.error_code !== "0")) return "myTV SUPER：会话证据不足，未知";
+      (Array.isArray(data.errors) && data.errors.length) || (data.error_code !== undefined && data.error_code !== 0 && data.error_code !== "0")) return finding("myTV SUPER", "unknown", "会话证据不足，未知", "", details);
     const containers = [data, data.data, data.content, data.session];
     const regions = containers.filter(function (v) { return v && typeof v === "object" && !Array.isArray(v); })
       .map(function (v) { return country(v.country_code); }).filter(Boolean)
       .filter(function (v, i, a) { return a.indexOf(v) === i; });
-    if (regions.length !== 1) return "myTV SUPER：地区未知";
-    return regions[0] === "HK" ? "myTV SUPER：香港地区检查通过 · HK" : "myTV SUPER：非香港地区 · " + regions[0];
+    if (regions.length !== 1) return finding("myTV SUPER", "unknown", "地区未知", "", details.concat([regions.length > 1 ? "会话国家字段冲突" : "会话未提供 country_code"]));
+    details.push("平台识别地区：" + regions[0], "频道权益、DRM 和实际播放：未检测");
+    return finding("myTV SUPER", regions[0] === "HK" ? "pass" : "blocked", regions[0] === "HK" ? "香港地区检查通过" : "非香港地区", regions[0], details);
   }
 
   function embeddedJSON(body, id) {
@@ -335,10 +476,11 @@
   }
   async function tiktok(context) {
     const response = await page(context, "https://www.tiktok.com/");
+    const details = [evidence("Web", response)];
     const issue = problem(response);
-    if (issue) return "TikTok：" + issue;
-    if (/id=["'](?:captcha-verify-container|verify-container|tiktok-verify-page)["']/i.test(response.body)) return "TikTok：需要人机验证";
-    if (/TikTok (?:is not|isn't|is currently not) available in (?:your|this) (?:country|region)/i.test(response.body)) return "TikTok：地区受限";
+    if (issue) return finding("TikTok", "unknown", issue, "", details);
+    if (/id=["'](?:captcha-verify-container|verify-container|tiktok-verify-page)["']/i.test(response.body)) return finding("TikTok", "unknown", "需要人机验证", "", details);
+    if (/TikTok (?:is not|isn't|is currently not) available in (?:your|this) (?:country|region)/i.test(response.body)) return finding("TikTok", "blocked", "地区受限", "", details);
     const modern = embeddedJSON(response.body, "__UNIVERSAL_DATA_FOR_REHYDRATION__");
     const scope = modern && modern.__DEFAULT_SCOPE__;
     const contextData = scope && scope["webapp.app-context"];
@@ -346,19 +488,30 @@
     const legacyContext = legacy && legacy.AppContext && legacy.AppContext.appContext;
     const regions = [contextData, legacyContext].filter(Boolean).map(function (v) { return country(v.region); })
       .filter(Boolean).filter(function (v, i, a) { return a.indexOf(v) === i; });
-    if (regions.length === 1) return "TikTok：网页地区 " + regions[0] + "，播放待验证";
-    if (regions.length > 1) return "TikTok：页面地区冲突，未知";
-    if (/TikTok/.test(response.body) && /<html|<!doctype/i.test(response.body)) return "TikTok：网页可达，地区未知";
-    return "TikTok：页面证据不足，未知";
+    if (regions.length === 1) return finding("TikTok", "partial", "网页地区 " + regions[0] + "，播放待验证", "", details.concat([
+      "地区来源：" + (contextData ? "webapp.app-context" : "SIGI_STATE AppContext"), "App 地区和视频播放：未检测"]));
+    if (regions.length > 1) return finding("TikTok", "unknown", "页面地区冲突，未知", "", details);
+    if (/TikTok/.test(response.body) && /<html|<!doctype/i.test(response.body)) return finding("TikTok", "partial", "网页可达，地区未知", "", details);
+    return finding("TikTok", "unknown", "页面证据不足，未知", "", details);
   }
 
   async function unlockPanel(context) {
     const checks = [["ChatGPT", chatgpt], ["Gemini", gemini], ["Claude", claude], ["Google", google],
       ["Netflix", netflix], ["Disney+", disney], ["YouTube Premium", youtube], ["myTV SUPER", mytvsuper], ["TikTok", tiktok]];
-    const results = await Promise.all(checks.map(async function (entry) {
-      try { return await entry[1](context); } catch (_) { return entry[0] + "：检测异常，待重试"; }
+    const results = checks.map(function (entry) { return finding(entry[0], "unknown", "检测尚未完成（总时限）", "", []); });
+    function render() {
+      const counts = { pass: 0, partial: 0, blocked: 0, unknown: 0 };
+      const icons = { pass: "✅", partial: "◐", blocked: "⛔", unknown: "❔" };
+      results.forEach(function (r) { counts[r.state] += 1; });
+      finish([preamble(context), "通过 " + counts.pass + " · 部分 " + counts.partial + " · 限制 " + counts.blocked + " · 未知 " + counts.unknown]
+        .concat(results.map(function (r) { return icons[r.state] + " " + r.text; }),
+          ["以上为各分项结论；未登录，实际播放/对话未测", "API 认证响应仅证明入口可达，不等于调用通过", "点击刷新 · " + time()]).join("\n"), counts.blocked || counts.unknown ? "alert" : "info");
+    }
+    deadlineResult = render;
+    await Promise.all(checks.map(async function (entry, index) {
+      try { results[index] = await entry[1](context); } catch (_) { results[index] = finding(entry[0], "unknown", "检测异常，待重试", "", []); }
     }));
-    finish([preamble(context)].concat(results, ["未登录初检；实际播放/对话待实测", "点击刷新 · " + time()]).join("\n"));
+    render();
   }
 
   function median(values) {
@@ -368,27 +521,38 @@
   }
   async function latencyTarget(context, target) {
     const samples = [];
-    for (let i = 0; i < 3 && !completed; i += 1) {
+    for (let i = 0; i < 5 && !completed; i += 1) {
       samples.push(await request(context, target.url + "?vb_probe=" + Date.now() + "_" + i,
         { method: "head", timeout: 4, headers: { "Cache-Control": "no-cache, no-store" } }));
     }
     const replies = samples.filter(function (s) { return !s.error && s.status >= 100 && s.status <= 599; });
-    if (!replies.length) return target.name + "：无响应 0/3（" + (samples.some(function (s) { return s.error === "超时"; }) ? "超时" : "连接失败") + "）\n" + target.host;
+    if (!replies.length) return target.name + "：无响应 0/5\n" + target.host + "\n逐次：" + samples.map(function (s) { return s.error || "无有效响应"; }).join(" / ");
     const values = replies.map(function (s) { return s.ms; });
     const codes = replies.map(function (s) { return s.status; }).filter(function (v, i, a) { return a.indexOf(v) === i; }).join("/");
-    return target.name + "：" + median(values) + " ms · 响应 " + replies.length + "/3\n" + target.host + " · HTTP " + codes + "\n范围 " + Math.min.apply(null, values) + "–" + Math.max.apply(null, values) + " ms";
+    const changes = [];
+    samples.forEach(function (s, i) { if (i && !s.error && s.status >= 100 && s.status <= 599 && !samples[i - 1].error && samples[i - 1].status >= 100 && samples[i - 1].status <= 599) changes.push(Math.abs(s.ms - samples[i - 1].ms)); });
+    const fluctuation = changes.length ? Math.round(changes.reduce(function (a, b) { return a + b; }, 0) / changes.length) + " ms" : "样本不足";
+    const denied = replies.some(function (s) { return s.status === 403 || s.status === 405 || s.status === 412; });
+    return target.name + "：" + median(values) + " ms · 响应 " + replies.length + "/5\n" + target.host + " · HTTP " + codes +
+      "\n范围 " + Math.min.apply(null, values) + "–" + Math.max.apply(null, values) + " ms · HTTP 波动 " + fluctuation +
+      "\n逐次：" + samples.map(function (s) { return s.error || (s.status ? s.ms + "ms(" + s.status + ")" : "无有效响应"); }).join(" / ") +
+      (denied ? "\n站点拒绝当前请求，已保留响应耗时" : "");
   }
   async function latencyPanel(context) {
     const results = await Promise.all(TARGETS.map(function (target) { return latencyTarget(context, target); }));
     finish([preamble(context), "手机 → 节点 → 三网站点"].concat(results,
-      ["HTTP 含连接/站点响应；非 Ping", "站点可能使用 CDN · " + time()]).join("\n"));
+      ["每站 5 次；HTTP 波动为相邻有效样本耗时差均值", "HTTP 含连接/站点响应；非 Ping", "站点可能使用 CDN，连接可能复用 · " + time()]).join("\n"));
   }
 
   (async function () {
     try {
       const args = parseArgument(typeof $argument === "undefined" ? "" : $argument);
       mode = args.mode;
-      setTimeout(function () { finish("本次检测超过总时限，请点击面板重试。\n未生成本次检测结论。", "alert"); }, 20000);
+      setTimeout(function () {
+        if (completed) return;
+        if (deadlineResult) deadlineResult();
+        else finish("本次检测超过总时限，请点击面板重试。\n未生成本次检测结论。", "alert");
+      }, 25000);
       const context = await resolvePolicy(args.policy);
       if (mode === "ip") await ipPanel(context, args.showIP);
       else if (mode === "unlock") await unlockPanel(context);
