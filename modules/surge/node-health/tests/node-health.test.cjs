@@ -191,12 +191,92 @@ test('same-origin page redirects retain the node; external redirects are not fol
 
 test('redirect loops and malformed IP responses are bounded', async () => {
   const { requests, clock } = await run({ mode: 'unlock', reply: c => ({ status: 302, headers: { Location: c.url } }) });
-  assert.ok(requests.length <= 20);
+  // Two redirects per page, regardless of how many platforms are enabled.
+  const perUrl = {};
+  for (const r of requests) perUrl[r.url] = (perUrl[r.url] || 0) + 1;
+  assert.ok(Object.values(perUrl).every(count => count <= 3));
   assert.ok(clock < 20000);
   for (const ip of ['::::', 'xyz', '999.1.1.1', '2001:db8:12345::1']) {
     const { result } = await run({ reply: () => ({ body: JSON.stringify({ ip, fraudScore: 0 }) }) });
     assert.equal(result.style, 'alert');
     assert.doesNotMatch(result.content, /100\/100/);
+  }
+});
+
+test('all nine platform labels appear with bounded unknown results for generic HTTP 200', async () => {
+  const { result } = await run({ mode: 'unlock', reply: () => ({ body: '<html>Welcome</html>' }) });
+  for (const platform of ['ChatGPT', 'Gemini', 'Claude', 'Google', 'Netflix', 'Disney+', 'YouTube Premium', 'myTV SUPER', 'TikTok']) {
+    assert.ok(result.content.includes(platform + '：'), platform);
+  }
+  assert.doesNotMatch(result.content, /检查通过|搜索结果可达|网页地区 [A-Z]|完整解锁/);
+  assert.match(result.content, /v0\.1\.0-beta\.2/);
+});
+
+test('Claude identifies the documented regional redirect without following external hosts', async () => {
+  const { result, requests } = await run({ mode: 'unlock', reply: c => c.url.includes('claude.ai')
+    ? { status: 302, headers: { Location: 'https://www.anthropic.com/app-unavailable-in-region' } }
+    : { body: '<html></html>' } });
+  assert.match(result.content, /Claude：地区受限/);
+  assert.ok(requests.every(r => !r.url.includes('anthropic.com')));
+});
+
+test('Claude login page is web reachability, never dialogue or API success', async () => {
+  const { result } = await run({ mode: 'unlock', reply: c => ({ body: c.url.includes('claude.ai') ? '<html><title>Claude</title>Log in</html>' : '<html></html>' }) });
+  assert.match(result.content, /Claude：网页可达，待验证对话/);
+  assert.doesNotMatch(result.content, /Claude：.*解锁|Claude：.*对话成功/);
+});
+
+test('Google separates search results, CAPTCHA, JS shell and unknown region', async () => {
+  const cases = [
+    [{ body: '<html>Google<div id="search"><h3>result</h3></div><div id="fbar"><div class="uU7dJb">Japan</div></div></html>' }, /Google：搜索结果可达 · 页面地区 Japan/],
+    [{ body: '<html>Google<div id="search"><h3>result</h3></div></html>' }, /Google：搜索结果可达 · 地区未知/],
+    [{ body: '<html>Google Please enable JavaScript</html>' }, /Google：网页可达，搜索待验证 · 地区未知/],
+    [{ status: 302, headers: { Location: 'https://ipv4.google.com/sorry/index' } }, /Google：需要验证码/],
+    [{ body: '<html>Our systems have detected unusual traffic</html>' }, /Google：需要验证码/]
+  ];
+  for (const [reply, expected] of cases) {
+    const { result, requests } = await run({ mode: 'unlock', reply: c => c.url.includes('www.google.com') ? reply : { body: '<html></html>' } });
+    assert.match(result.content, expected);
+    assert.ok(requests.filter(r => r.url.includes('www.google.com')).every(r => !/[?&](gl|cr)=/.test(r.url)));
+  }
+});
+
+test('myTV SUPER requires one explicit session country; HK does not imply channels playable', async () => {
+  const cases = [
+    [{ country_code: 'HK', region: 1 }, /myTV SUPER：香港地区检查通过 · HK/],
+    [{ data: { country_code: 'JP' } }, /myTV SUPER：非香港地区 · JP/],
+    [{ region: 1 }, /myTV SUPER：地区未知/],
+    [{ country_code: 'HK', content: { country_code: 'JP' } }, /myTV SUPER：地区未知/],
+    [{ error_code: 123, country_code: 'HK' }, /myTV SUPER：会话证据不足/]
+  ];
+  for (const [body, expected] of cases) {
+    const { result } = await run({ mode: 'unlock', reply: c => c.url.includes('mytvsuper.com') ? { body: JSON.stringify(body) } : { body: '<html></html>' } });
+    assert.match(result.content, expected);
+    assert.doesNotMatch(result.content, /myTV SUPER：.*可播放|myTV SUPER：.*完整解锁/);
+  }
+});
+
+test('TikTok reads app context region, rejects generic user regions, conflicts and captcha', async () => {
+  const modern = region => `<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">${JSON.stringify({ __DEFAULT_SCOPE__: { 'webapp.app-context': { region } } })}</script>`;
+  const cases = [
+    [modern('JP'), /TikTok：网页地区 JP，播放待验证/],
+    ['<script id="SIGI_STATE">{"AppContext":{"appContext":{"region":"US"}}}</script>', /TikTok：网页地区 US，播放待验证/],
+    ['<html>TikTok {"user":{"region":"JP"}}</html>', /TikTok：网页可达，地区未知/],
+    [modern('JP') + '<script id="SIGI_STATE">{"AppContext":{"appContext":{"region":"US"}}}</script>', /TikTok：页面地区冲突，未知/],
+    [modern('JP') + '<div id="captcha-verify-container"></div>', /TikTok：需要人机验证/],
+    ['<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__">broken</script>', /TikTok：页面证据不足/]
+  ];
+  for (const [body, expected] of cases) {
+    const { result } = await run({ mode: 'unlock', reply: c => c.url.includes('tiktok.com') ? { body } : { body: '<html></html>' } });
+    assert.match(result.content, expected);
+  }
+});
+
+test('new services retain rate-limit, auth and challenge states rather than claiming unlocked', async () => {
+  for (const reply of [{ status: 429 }, { status: 401 }, { status: 403, body: '<title>Just a moment</title>cf-chl-' }, null]) {
+    const { result } = await run({ mode: 'unlock', reply: () => reply });
+    assert.doesNotMatch(result.content, /地区受限|地区检查通过|搜索结果可达|网页地区 [A-Z]/);
+    for (const platform of ['Claude', 'Google', 'myTV SUPER', 'TikTok']) assert.ok(result.content.includes(platform + '：'));
   }
 });
 

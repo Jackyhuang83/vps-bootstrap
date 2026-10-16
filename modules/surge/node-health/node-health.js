@@ -1,11 +1,11 @@
 /* SPDX-License-Identifier: MIT
- * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.1
+ * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.2
  * Runs locally in Surge. No MITM, policy mutations, credentials or uploads.
  */
 (function () {
   "use strict";
 
-  const VERSION = "0.1.0-beta.1";
+  const VERSION = "0.1.0-beta.2";
   const TITLES = { ip: "IP 纯净度", unlock: "平台解锁初检", latency: "三网站点 HTTP 耗时" };
   const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
   const TARGETS = [
@@ -19,7 +19,7 @@
   function finish(content, style) {
     if (completed) return;
     completed = true;
-    $done({ title: TITLES[mode] || "节点体检", content: content, style: style || "info" });
+    $done({ title: TITLES[mode] || "节点体检", content: content + "\nv" + VERSION, style: style || "info" });
   }
 
   function parseArgument(raw) {
@@ -28,7 +28,7 @@
     if (!match) throw new Error("模块参数不完整，请重新安装模块。");
     const policy = match[3].trim();
     if (!policy || /[\r\n]/.test(policy) || /填写|\{\{\{/.test(policy)) {
-      throw new Error("请在模块参数 POLICY 填写已有的节点或手动选择策略组名称。");
+      throw new Error("请在模块参数 POLICY 填写平时切换节点的手动策略组名称。");
     }
     return { mode: match[1], showIP: match[2] === "true", policy: policy };
   }
@@ -262,9 +262,90 @@
     return "Gemini：页面证据不足，未知";
   }
 
+  async function claude(context) {
+    const response = await page(context, "https://claude.ai/");
+    const location = header(response, "location");
+    // Known regional rejection may be an external redirect: inspect, do not follow.
+    const regionRedirect = /^https:\/\/(?:www\.)?anthropic\.com\/app-unavailable-in-region(?:[/?#]|$)/i.test(location);
+    if (!response.error && !challenge(response.body) && (
+      (response.status >= 300 && response.status < 400 && regionRedirect) ||
+      /<title[^>]*>\s*App unavailable in region|Claude (?:is not|isn't|is currently not) available in your (?:country|region)/i.test(response.body)
+    )) return "Claude：地区受限";
+    const issue = problem(response);
+    if (issue) return "Claude：" + issue;
+    if (/Claude/.test(response.body) && /<html|<!doctype/i.test(response.body)) return "Claude：网页可达，待验证对话";
+    return "Claude：页面证据不足，未知";
+  }
+
+  function googleLocation(body) {
+    // Accept only a country label scoped to Google's footer, never search hits,
+    // query parameters, another platform's GeoIP, or a guessed default country.
+    const start = body.search(/\bid=["']fbar["']|<footer\b/i);
+    if (start < 0) return "";
+    const footer = body.slice(start, start + 16000);
+    const match = footer.match(/class=["'][^"']*\buU7dJb\b[^"']*["'][^>]*>\s*([^<>]{2,60})\s*</i);
+    if (!match) return "";
+    return clean(match[1].replace(/&amp;/g, "&").replace(/&nbsp;/g, " ")).trim();
+  }
+  async function google(context) {
+    // One small search; do not force a country via gl/cr parameters.
+    const response = await page(context, "https://www.google.com/search?q=surge%20network%20check&hl=en&num=1");
+    const location = header(response, "location");
+    const captchaRedirect = /^\/(?!\/)sorry(?:[/?#]|$)/i.test(location) || /^https:\/\/(?:(?:www|ipv4|ipv6)\.)?google\.com\/sorry(?:[/?#]|$)/i.test(location);
+    if (!response.error && (captchaRedirect || /our systems have detected unusual traffic|automated queries|id=["']captcha-form["']/i.test(response.body))) return "Google：需要验证码";
+    const issue = problem(response);
+    if (issue) return "Google：" + issue;
+    const region = googleLocation(response.body);
+    const regionText = region ? " · 页面地区 " + region : " · 地区未知";
+    if (/id=["'](?:rso|search)["']/i.test(response.body) && /<h3\b/i.test(response.body)) return "Google：搜索结果可达" + regionText;
+    if (/Google/.test(response.body) && /<html|<!doctype/i.test(response.body)) return "Google：网页可达，搜索待验证" + regionText;
+    return "Google：页面证据不足，未知";
+  }
+
+  async function mytvsuper(context) {
+    const response = await request(context, "https://www.mytvsuper.com/api/auth/getSession/self/");
+    const issue = problem(response);
+    if (issue) return "myTV SUPER：" + issue;
+    const data = json(response.body);
+    if (!data || data.error || data.success === false || data.status === false || data.status === "error" ||
+      (Array.isArray(data.errors) && data.errors.length) || (data.error_code !== undefined && data.error_code !== 0 && data.error_code !== "0")) return "myTV SUPER：会话证据不足，未知";
+    const containers = [data, data.data, data.content, data.session];
+    const regions = containers.filter(function (v) { return v && typeof v === "object" && !Array.isArray(v); })
+      .map(function (v) { return country(v.country_code); }).filter(Boolean)
+      .filter(function (v, i, a) { return a.indexOf(v) === i; });
+    if (regions.length !== 1) return "myTV SUPER：地区未知";
+    return regions[0] === "HK" ? "myTV SUPER：香港地区检查通过 · HK" : "myTV SUPER：非香港地区 · " + regions[0];
+  }
+
+  function embeddedJSON(body, id) {
+    const pattern = new RegExp("<script\\b[^>]*\\bid=[\"']" + id + "[\"'][^>]*>([\\s\\S]*?)<\\/script\\s*>", "i");
+    const match = body.match(pattern);
+    return match ? json(match[1]) : null;
+  }
+  async function tiktok(context) {
+    const response = await page(context, "https://www.tiktok.com/");
+    const issue = problem(response);
+    if (issue) return "TikTok：" + issue;
+    if (/id=["'](?:captcha-verify-container|verify-container|tiktok-verify-page)["']/i.test(response.body)) return "TikTok：需要人机验证";
+    if (/TikTok (?:is not|isn't|is currently not) available in (?:your|this) (?:country|region)/i.test(response.body)) return "TikTok：地区受限";
+    const modern = embeddedJSON(response.body, "__UNIVERSAL_DATA_FOR_REHYDRATION__");
+    const scope = modern && modern.__DEFAULT_SCOPE__;
+    const contextData = scope && scope["webapp.app-context"];
+    const legacy = embeddedJSON(response.body, "SIGI_STATE");
+    const legacyContext = legacy && legacy.AppContext && legacy.AppContext.appContext;
+    const regions = [contextData, legacyContext].filter(Boolean).map(function (v) { return country(v.region); })
+      .filter(Boolean).filter(function (v, i, a) { return a.indexOf(v) === i; });
+    if (regions.length === 1) return "TikTok：网页地区 " + regions[0] + "，播放待验证";
+    if (regions.length > 1) return "TikTok：页面地区冲突，未知";
+    if (/TikTok/.test(response.body) && /<html|<!doctype/i.test(response.body)) return "TikTok：网页可达，地区未知";
+    return "TikTok：页面证据不足，未知";
+  }
+
   async function unlockPanel(context) {
-    const results = await Promise.all([netflix, disney, youtube, chatgpt, gemini].map(async function (check) {
-      try { return await check(context); } catch (_) { return "检测异常，待重试"; }
+    const checks = [["ChatGPT", chatgpt], ["Gemini", gemini], ["Claude", claude], ["Google", google],
+      ["Netflix", netflix], ["Disney+", disney], ["YouTube Premium", youtube], ["myTV SUPER", mytvsuper], ["TikTok", tiktok]];
+    const results = await Promise.all(checks.map(async function (entry) {
+      try { return await entry[1](context); } catch (_) { return entry[0] + "：检测异常，待重试"; }
     }));
     finish([preamble(context)].concat(results, ["未登录初检；实际播放/对话待实测", "点击刷新 · " + time()]).join("\n"));
   }
@@ -301,6 +382,6 @@
       if (mode === "ip") await ipPanel(context, args.showIP);
       else if (mode === "unlock") await unlockPanel(context);
       else await latencyPanel(context);
-    } catch (error) { finish(clean(error.message || error) + "\nv" + VERSION, "alert"); }
+    } catch (error) { finish(clean(error.message || error), "alert"); }
   })();
 })();

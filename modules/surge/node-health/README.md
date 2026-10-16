@@ -1,4 +1,4 @@
-# Surge 节点体检 · v0.1.0-beta.1
+# Surge 节点体检 · v0.1.0-beta.2
 
 一个模块，三个手动刷新面板：IP 纯净度、平台解锁初检、三网站点 HTTP 耗时。面向 Surge iOS，建议使用当前版本；依赖脚本 `$httpAPI`、`$surge.selectGroupDetails()` 和 `$httpClient`。macOS 尚未实机验证。
 
@@ -16,10 +16,12 @@ https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/feat/surge-node-hea
 
 | 参数 | 填写方法 |
 | --- | --- |
-| `POLICY` | 已有的具体节点名，或手动选择策略组的完整名称。包括空格和表情符号，必须一致。 |
+| `POLICY` | 首次填你平时切换节点的手动策略组完整名称。以后在该组中选哪个节点，就检测哪个。包括空格和表情符号，必须一致。也兼容直接填写具体节点名。 |
 | `SHOW_IP` | 默认 `false`，遮住部分出口 IP；填 `true` 显示完整 IP。 |
 
-例如：已有节点叫 `日本 Snell`，则 `POLICY` 填 `日本 Snell`。已有手动选择组叫 `节点选择`，也可以填写 `节点选择`，再在该组中选好节点。
+例如：你平时在 `节点选择` 组中切换日本、香港、美国节点，`POLICY` 就填 `节点选择`。以后正常切换节点，再点击面板刷新即可，无需逐个填写节点。
+
+已安装 Beta 1：更新模块（或使用原安装地址重新添加），确认三个脚本地址均带 `?v=0.1.0-beta.2`；新地址会区别旧脚本缓存。保留或重新填写 `POLICY` 策略组名，刷新后的面板末尾应显示 `v0.1.0-beta.2`。
 
 返回策略选择页，找到三个面板，点击对应面板刷新。若不显示，请先核对 Surge 的面板功能是否可用、模块是否启用、脚本是否已下载。模块本身不要求开启 MITM、安装证书、开放 HTTP API 监听端口或登录任何平台。
 
@@ -46,6 +48,12 @@ https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/feat/surge-node-hea
 | YouTube Premium | Premium 页面中的地区与内容标识 | 账号可购买、所有视频可播或实际 CDN 质量 |
 | ChatGPT | 网页返回、明确的地区拒绝提示，以及其边缘 trace 地区 | 登录、发送消息、App 或 API 可用性；trace 地区不等于服务授权 |
 | Gemini | 网页返回及明确的地区拒绝提示 | 登录后的账号可用性、对话、API |
+| Claude | 网页返回、明确的地区拒绝页面或跳转 | 登录、对话、Claude Code 或 API 可用性 |
+| Google | 实际搜索结果标识、验证码、页面地区（能明确取得时） | 持续免验证码、所有 Google 服务可用；取不到地区就显示未知 |
+| myTV SUPER | 匿名会话明确返回的 `country_code`，检查是否为香港 | 频道账号权限、DRM、实际播放；非香港结果也不代表所有内容都不可用 |
+| TikTok | 网页内应用上下文的地区，兼容两种公开网页数据结构 | App 地区、推荐内容、账号及实际视频播放 |
+
+平台面板按 ChatGPT、Gemini、Claude、Google、Netflix、Disney+、YouTube Premium、myTV SUPER、TikTok 的顺序展示，共 9 项。Google 每次仅发起一个小型搜索查询，不设置强制国家参数；只有页面明确的页脚地区标签才显示地区。TikTok 不从用户资料或任意 `region` 文本猜测访问地区。
 
 HTTP 200 本身不算完整解锁。人机验证、认证失败、限流、跨站登录跳转、接口字段变化均单独显示。无法取到地区就不猜测 US，不把 IPPure 的地区套给其他平台。
 
@@ -69,10 +77,10 @@ HTTP 200 本身不算完整解锁。人机验证、认证失败、限流、跨�
 
 ## 安装后的验收步骤
 
-1. `POLICY` 先填一个你确认能上网的具体节点。刷新 IP 面板，核对节点名和出口 IP 是否合理；截图前建议保留 `SHOW_IP=false`。
-2. 切换为另一个出口不同的节点并刷新，确认节点名和 IP 同步变化。策略组名称不需要修改；如果填写的是具体节点名，则要改 `POLICY`。
+1. `POLICY` 填你平时切换节点的手动策略组名称，在该组中选一个确认能上网的节点。刷新 IP 面板，核对节点名和出口 IP 是否合理；截图前建议保留 `SHOW_IP=false`。
+2. 在同一个组里切换为另一个出口不同的节点并刷新，确认节点名和 IP 同步变化。无需修改模块参数。
 3. 刷新三网面板，核对三个域名、响应 `x/3`、HTTP 状态和毫秒数。超时或拒绝请保留原样反馈，不直接视为节点断网。
-4. 刷新平台面板，再用同一节点手动打开你有账号的平台，播放视频或发送一条消息，对照实际结果。初检不等于实际播放/对话通过。
+4. 刷新平台面板，确认 9 个平台均有结果，再用同一节点手动打开你有账号的平台，播放视频或发送一条消息，对照实际结果。Google 的“地区未知”不等于搜索失败，myTV SUPER 的香港检查通过不等于所有频道可播，TikTok 网页地区不等于 App 解锁。初检不等于实际播放/对话通过。
 5. 故意把 `POLICY` 改成不存在的名字：应只提示找不到节点；不应显示本地直连 IP。
 
 切换节点后，各面板保留的是其上次刷新结果。需要分别点击刷新，并核对每张面板的节点名和时间；面板缓存不代表持续实时监测。
@@ -99,5 +107,7 @@ node --test modules/surge/node-health/tests/node-health.test.cjs
 - [IPPure 官方接口说明](https://ippure.com/en/MyIP-Info-API)
 - [IPPure 评分与 IPv6 说明](https://ippure.com/faq)
 - [Rabbit-Spec/Surge 流媒体面板](https://github.com/Rabbit-Spec/Surge/tree/Master/Module/Panel/Stream-All)（检测思路参考；未直接打包其脚本）
+- [RegionRestrictionCheck](https://github.com/lmc999/RegionRestrictionCheck)（Claude 地区拒绝与 myTV SUPER 匿名会话检测思路）
+- [TikTokCheck](https://github.com/lmc999/TikTokCheck)（网页地区检测思路；本实现限定为应用上下文数据）
 
 代码按仓库 MIT 许可证分发。
