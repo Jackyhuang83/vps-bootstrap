@@ -1,11 +1,11 @@
 /* SPDX-License-Identifier: MIT
- * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.3
+ * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.4
  * Runs locally in Surge. No MITM, policy mutations, credentials or uploads.
  */
 (function () {
   "use strict";
 
-  const VERSION = "0.1.0-beta.3";
+  const VERSION = "0.1.0-beta.4";
   const SETTINGS_URL = "http://surge-node-health.invalid/";
   const SETTINGS_KEY = "VB_HEALTH_SELECTED_GROUP_V1";
   const TITLES = { ip: "IP 纯净度", unlock: "平台解锁初检", latency: "三网站点 HTTP 耗时" };
@@ -39,7 +39,7 @@
     // Preserve exact stored names. Legacy argument remains readable for Beta 1/2.
     const policy = selected || String(match[3] || "").trim();
     if (!policy || /[\r\n]/.test(policy) || (!selected && /填写|\{\{\{/.test(policy))) {
-      throw new Error("请先打开 " + SETTINGS_URL + " 点选检测策略组，无需输入名称。");
+      throw new Error("请点击「检测设置」面板打开设置页，点选策略组。地址：" + SETTINGS_URL);
     }
     return { mode: match[1], showIP: match[2] === "true", policy: policy };
   }

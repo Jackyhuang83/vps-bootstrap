@@ -213,7 +213,7 @@ test('all nine platform labels appear with bounded unknown results for generic H
     assert.ok(result.content.includes(platform + '：'), platform);
   }
   assert.doesNotMatch(result.content, /检查通过|搜索结果可达|网页地区 [A-Z]|完整解锁/);
-  assert.match(result.content, /v0\.1\.0-beta\.3/);
+  assert.match(result.content, /v0\.1\.0-beta\.4/);
 });
 
 test('Claude identifies the documented regional redirect without following external hosts', async () => {
@@ -288,7 +288,8 @@ test('module adds only local settings interception, host and panels; no capture,
   const moduleText = fs.readFileSync(path.join(__dirname, '..', 'node-health.sgmodule'), 'utf8');
   assert.deepEqual([...moduleText.matchAll(/^\[([^\]]+)\]/gm)].map(m => m[1]), ['Panel', 'Script', 'Host']);
   assert.equal((moduleText.match(/update-interval=-1/g) || []).length, 3);
-  assert.equal((moduleText.match(/type=generic/g) || []).length, 3);
+  assert.equal((moduleText.match(/type=generic/g) || []).length, 4);
+  assert.match(moduleText, /VB-Health-Settings-Entry = script-name=VB-Health-Settings-Entry/);
   assert.equal((moduleText.match(/type=http-request/g) || []).length, 1);
   assert.match(moduleText, /pattern=\^http:\/\/surge-node-health\\\.invalid/);
   assert.match(moduleText, /surge-node-health\.invalid = 192\.0\.2\.1/);
@@ -301,19 +302,51 @@ function settings(options = {}) {
   let result;
   let writes = 0;
   let done = 0;
+  const notifications = [];
   const groups = options.groups || { Group: ['Tokyo', 'Other'], '🚀 常用节点': ['Other'] };
   const decisions = options.decisions || { Group: 'Tokyo', '🚀 常用节点': 'Other' };
   const headers = options.headers === undefined ? { Origin: 'http://surge-node-health.invalid', 'X-VB-Health-Settings': '1', 'Content-Type': 'application/json' } : options.headers;
   vm.runInNewContext(settingsSource, {
-    $request: { url: options.url || 'http://surge-node-health.invalid' + (options.path || '/'), method: options.method || 'GET', headers, body: options.body || '' },
+    $request: options.panel ? undefined : { url: options.url || 'http://surge-node-health.invalid' + (options.path || '/'), method: options.method || 'GET', headers, body: options.body || '' },
+    $trigger: options.trigger,
+    $notification: options.noNotifications ? undefined : { post: (...args) => { if(options.notificationThrows) throw new Error('Notification error'); notifications.push(args); } },
     $surge: { selectGroupDetails: () => options.badDetails ? {} : ({ groups, decisions }), setSelectGroupPolicy: () => { throw new Error('Must not change selected node'); } },
     $persistentStore: { read: key => Object.hasOwn(storage, key) ? storage[key] : null, write: (value, key) => { writes++; if(options.writeFail) return false; storage[key] = value; return true; } },
     $done: value => { result = value; done++; }
   }, { timeout: 1000 });
   assert.equal(done, 1);
   assert.ok(result);
-  return { result, storage, writes, value: result.response && result.response.headers['Content-Type'].startsWith('application/json') ? JSON.parse(result.response.body) : undefined };
+  return { result, storage, writes, notifications, value: result.response && result.response.headers['Content-Type'].startsWith('application/json') ? JSON.parse(result.response.body) : undefined };
 }
+
+test('settings entry tap posts one notification with the local settings URL', () => {
+  const { result, notifications, writes } = settings({ panel:true, trigger:'button', storage:{ [SETTINGS_KEY]:JSON.stringify({version:1,group:'🚀 常用节点'}) } });
+  assert.equal(result.title,'检测设置');
+  assert.match(result.content,/已绑定：🚀 常用节点/);
+  assert.match(result.content,/http:\/\/surge-node-health\.invalid\//);
+  assert.equal(notifications.length,1);
+  assert.equal(notifications[0][3].action,'open-url');
+  assert.equal(notifications[0][3].url,'http://surge-node-health.invalid/');
+  assert.equal(writes,0);
+});
+
+test('automatic settings entry refresh never sends notifications or changes binding', () => {
+  for(const trigger of ['auto-interval',undefined,'editor']) {
+    const { result, notifications, writes } = settings({panel:true,trigger});
+    assert.match(result.content,/尚未选择/);
+    assert.equal(notifications.length,0);
+    assert.equal(writes,0);
+  }
+});
+
+test('notification failure preserves a visible settings address', () => {
+  for(const options of [{noNotifications:true},{notificationThrows:true}]) {
+    const { result } = settings({panel:true,trigger:'button',...options});
+    assert.equal(result.style,'alert');
+    assert.match(result.content,/通知不可用/);
+    assert.match(result.content,/http:\/\/surge-node-health\.invalid\//);
+  }
+});
 
 test('local picker lists existing manual groups and current choices, preserving exact names', () => {
   const { result, value } = settings({ path: '/api/groups', groups: { '🚀 常用&节点=50%+': ['Tokyo'], Empty: [], Auto: ['Other'] }, decisions: { '🚀 常用&节点=50%+': 'Tokyo' } });
