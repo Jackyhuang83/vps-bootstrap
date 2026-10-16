@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: MIT
- * Surge 节点体检 v0.1.0-beta.6 — local-only group picker.
+ * Surge 节点体检 v0.1.0-beta.7 — local-only group picker.
  * The request is answered by Surge; no socket, remote API or credentials.
  */
 (function () {
@@ -65,9 +65,8 @@
         index = next;
       }
       if (index >= 0) {
-        message = "当前选择：" + label(groups[index].selected) + "\n第 " + (index + 1) + "/" + groups.length + " 组\n" +
-          (groups.length > 1 ? "再点切换到：" + label(groups[(index + 1) % groups.length].name) : "仅有这 1 个手动选择组。") +
-          "\n选好后，在该组内切换节点并刷新检测面板。";
+        message = "当前选择：" + label(groups[index].selected) + "\n第 " + (index + 1) + "/" + groups.length + " 组 · " +
+          (groups.length > 1 ? "再点切换到：" + label(groups[(index + 1) % groups.length].name) : "仅有这 1 个手动选择组。");
       } else {
         if (group) { message = "原检测组已不存在。\n"; style = "alert"; }
         message += "点击本面板选择：" + label(groups[0].name) + "\n共 " + groups.length + " 组；每点一次切换到下一组。";
@@ -77,7 +76,7 @@
       style = "alert";
     }
     completed = true;
-    $done({ title: "检测设置", content: (group ? "已绑定：" + label(group) : "尚未选择检测策略组") + "\n" + message + "\n网页选组：" + ORIGIN + "/\nv0.1.0-beta.6", style: style });
+    $done({ title: "检测设置", content: (group ? "已绑定：" + label(group) : "尚未选择检测策略组") + "\n" + message + "\n选组 / 详情：" + ORIGIN + "/\nv0.1.0-beta.7", style: style });
     return;
   }
 
@@ -87,6 +86,18 @@
     const path = (match[1] || "/").split("?")[0];
     const method = String($request.method || "GET").toUpperCase();
     if (method === "GET" && path === "/") { respond(200, pageHTML(), true); return; }
+    if (method === "GET" && path === "/reports") { respond(200, reportHTML(), true); return; }
+    if (method === "GET" && path === "/api/reports") {
+      const reports = ["ip", "unlock", "latency"].map(function (mode) {
+        try {
+          const value = JSON.parse($persistentStore.read("VB_HEALTH_REPORT_V1_" + mode) || "null");
+          return value && value.version === 1 && value.mode === mode && typeof value.details === "string" && value.details.length <= 24000 &&
+            typeof value.updatedAt === "number" && Number.isFinite(value.updatedAt) && value.updatedAt > 0 && typeof value.title === "string" && value.title.length <= 60 && typeof value.build === "string" && value.build.length <= 80 ?
+            { mode: mode, title: value.title, build: value.build, updatedAt: value.updatedAt, details: value.details } : null;
+        } catch (_) { return null; }
+      }).filter(Boolean);
+      respond(200, { reports: reports }); return;
+    }
     if (method === "GET" && path === "/api/groups") {
       const groups = groupList(details());
       respond(200, { groups: groups, saved: saved() });
@@ -113,12 +124,18 @@
   } catch (_) { respond(500, { error: "本地设置暂不可用，请确认 Surge 版本和脚本功能。" }); }
 
   // Never insert group/node names as HTML: all dynamic labels use textContent.
+  function reportHTML() {
+    return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>节点检测详情</title>
+<style>:root{color-scheme:light dark;font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#f4f6fa;color:#17243d}main{max-width:680px;margin:auto;padding:26px 16px}nav{display:flex;gap:20px;margin-bottom:26px}a{color:#2870ed}h1{font-size:26px}p,small{color:#697689;line-height:1.7}article{padding:18px;border-radius:14px;background:white;margin:18px 0}h2{font-size:19px;margin:0 0 8px}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:14px/1.8 -apple-system,BlinkMacSystemFont,sans-serif;margin:14px 0 0}button{border:0;border-radius:10px;padding:10px 16px;color:white;background:#2870ed;font-size:15px}@media(prefers-color-scheme:dark){:root{background:#111824;color:#f1f4fa}article{background:#1c2739}p,small{color:#adb9ce}}</style></head><body><main><nav><a href="/">选检测组</a><a href="/reports">检测详情</a></nav><h1>节点检测详情</h1><p>各项保留最近一次检测。先核对节点和时间；这里不会自动发起检测。</p><div id="reports" aria-live="polite"></div><button id="reload" type="button">刷新记录</button><p>详细记录仅保存在本机，IP 已打码。</p></main><script>
+"use strict";var box=document.getElementById("reports"),reload=document.getElementById("reload");async function load(){reload.disabled=true;box.replaceChildren();try{var response=await fetch("/api/reports",{cache:"no-store"});if(!response.ok)throw new Error("读取失败，请重试");var value=await response.json();if(!Array.isArray(value.reports)||!value.reports.length){box.textContent="还没有检测记录，请返回 Surge 刷新检测面板。";return;}value.reports.forEach(function(report){var card=document.createElement("article"),title=document.createElement("h2"),time=document.createElement("small"),text=document.createElement("pre");title.textContent=report.title;time.textContent=new Date(report.updatedAt).toLocaleString("zh-CN")+" · v"+report.build;text.textContent=report.details;card.append(title,time,text);box.append(card);});}catch(error){box.textContent=error.message;}finally{reload.disabled=false;}}reload.addEventListener("click",load);load();
+</script></body></html>`;
+  }
   function pageHTML() {
     return `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>选择检测策略组</title>
 <style>
 :root{color-scheme:light dark;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f4f6fa;color:#17243d}body{margin:0}main{max-width:560px;margin:auto;padding:38px 20px 48px}header small{color:#60718a;font-size:13px}h1{font-size:27px;letter-spacing:-.6px;margin:12px 0}p{line-height:1.65;color:#5d6a7e}.list{display:grid;gap:10px;margin:22px 0}button.group{display:block;text-align:left;appearance:none;border:1px solid #dce2ec;background:white;color:#17243d;border-radius:15px;padding:17px 18px;width:100%;cursor:pointer}button.group strong{display:block;font-size:17px;overflow-wrap:anywhere}button.group small{display:block;font-size:13px;color:#60718a;margin-top:7px;overflow-wrap:anywhere}button.group.selected{border:2px solid #2870ed;background:#f0f5ff;padding:16px 17px}button:disabled{opacity:.55}#status{border-radius:12px;padding:13px 15px;background:#e8eef9;color:#24466f;overflow-wrap:anywhere}#status.error{background:#fff0ee;color:#973a2c}#retry{border:0;color:#2563d6;background:transparent;padding:12px 0;font-size:15px;cursor:pointer}footer{color:#778399;font-size:12px;line-height:1.7;margin-top:24px}@media(prefers-color-scheme:dark){:root{background:#111824;color:#f1f4fa}p{color:#adb9ce}button.group{background:#1c2739;color:#f1f4fa;border-color:#334058}button.group.selected{background:#172d50;border-color:#6b9fff}button.group small,header small{color:#b0bfd5}#status{background:#1d304a;color:#cbdefa}#status.error{background:#482927;color:#ffcdc8}#retry{color:#8bb6ff}}
-</style></head><body><main><header><small>节点体检 · 本地设置</small><h1>选择检测策略组</h1><p>点选你平时用来切换节点的那一组。保存一次，以后在 Surge 中选哪个节点，就检测哪个节点。</p></header><div id="status" role="status" aria-live="polite">正在读取 Surge 策略组…</div><div id="groups" class="list"></div><button id="retry" type="button">重新加载列表</button><footer>选择后，返回 Surge，选好节点并点击检测面板刷新。<br>此页面在本机运行，仅保存检测组选择。v0.1.0-beta.6</footer></main>
+</style></head><body><main><nav style="display:flex;gap:20px;margin-bottom:24px"><a href="/" style="color:#2870ed">选检测组</a><a href="/reports" style="color:#2870ed">检测详情</a></nav><header><small>节点体检 · 本地设置</small><h1>选择检测策略组</h1><p>点选你平时用来切换节点的那一组。保存一次，以后在 Surge 中选哪个节点，就检测哪个节点。</p></header><div id="status" role="status" aria-live="polite">正在读取 Surge 策略组…</div><div id="groups" class="list"></div><button id="retry" type="button">重新加载列表</button><footer>选择后，返回 Surge，选好节点并点击检测面板刷新。<br>详细检测记录可在上方「检测详情」查看。v0.1.0-beta.7</footer></main>
 <script>
 "use strict";
 var list=document.getElementById("groups"),statusBox=document.getElementById("status"),retry=document.getElementById("retry"),busy=false;

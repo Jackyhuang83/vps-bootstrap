@@ -1,28 +1,40 @@
 /* SPDX-License-Identifier: MIT
- * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.6
+ * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.7
  * Runs locally in Surge. No MITM, policy mutations, credentials or uploads.
  */
 (function () {
   "use strict";
 
-  const VERSION = "0.1.0-beta.6";
+  const VERSION = "0.1.0-beta.7";
   const SETTINGS_URL = "http://surge-node-health.invalid/";
   const SETTINGS_KEY = "VB_HEALTH_SELECTED_GROUP_V1";
-  const TITLES = { ip: "IP 纯净度", unlock: "平台解锁初检", latency: "三网站点 HTTP 耗时" };
+  const TITLES = { ip: "IP 纯净度", unlock: "平台解锁检测", latency: "广州三网延迟" };
+  const REPORT_KEY = "VB_HEALTH_REPORT_V1_";
   const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
   const TARGETS = [
-    { name: "电信", host: "www.189.cn", url: "https://www.189.cn/favicon.ico" },
-    { name: "联通", host: "iservice.10010.com", url: "https://iservice.10010.com/favicon.ico" },
-    { name: "移动", host: "www.10086.cn", url: "https://www.10086.cn/favicon.ico" }
+    { name: "广州电信", carrier: /China\s*Telecom|Telecom-GZ|电信/i, preferred: "27594" },
+    { name: "广州联通", carrier: /Unicom|联通/i, preferred: "26678" },
+    { name: "广州移动", carrier: /China\s*Mobile|GZ-CMCC|CMCC|移动/i, preferred: "6611" }
   ];
+  const SERVER_DIRECTORY = "https://www.speedtest.net/api/js/servers?engine=js&limit=100&search=Guangzhou";
   let completed = false;
   let mode = "ip";
   let deadlineResult = null;
 
-  function finish(content, style) {
+  function reportText(value) {
+    return String(value || "").replace(/(?:\d{1,3}\.){3}\d{1,3}/g, function (ip) { return validIP(ip) ? masked(ip, false) : ip; })
+      .replace(/[0-9a-f:]{3,}/gi, function (ip) { return ip.indexOf(":") >= 0 && validIP(ip) ? masked(ip, false) : ip; }).slice(0, 24000);
+  }
+  function finish(content, style, details, visual) {
     if (completed) return;
     completed = true;
-    $done({ title: TITLES[mode] || "节点体检", content: content + "\nv" + VERSION, style: style || "info" });
+    try {
+      if (typeof $persistentStore !== "undefined" && typeof $persistentStore.write === "function") {
+        $persistentStore.write(JSON.stringify({ version: 1, build: VERSION, mode: mode, title: TITLES[mode], updatedAt: Date.now(),
+          summary: reportText(content), details: reportText(details || content) }), REPORT_KEY + mode);
+      }
+    } catch (_) { /* Diagnostic storage never prevents a panel result. */ }
+    $done(Object.assign({ title: TITLES[mode] || "节点体检", content: content + "\n" + time() + " · v" + VERSION }, visual || { style: style || "info" }));
   }
 
   function parseArgument(raw) {
@@ -174,8 +186,24 @@
       (response.redirects ? " · 跳转 " + response.redirects + " 次" : "") + (note ? " · " + note : "");
   }
   function finding(name, state, summary, region, details) {
-    return { name: name, state: state, text: name + "：" + summary + suffix(region) +
+    return { name: name, state: state, summary: summary, region: region || "", text: name + "：" + summary + suffix(region) +
       (details && details.length ? "\n  " + details.join("\n  ") : "") };
+  }
+  function flag(code) {
+    return /^[A-Z]{2}$/.test(code || "") ? String.fromCodePoint(127397 + code.charCodeAt(0), 127397 + code.charCodeAt(1)) + " " : "";
+  }
+  function compactFinding(result) {
+    const icons = { pass: "✅", partial: "◐", blocked: "🚫", unknown: "❔" };
+    let text = result.summary.replace(/，待验证对话|，待登录验证|，播放待验证/g, "")
+      .replace("网页功能标志已启用", "网页可达").replace("页面地区检查通过", "地区通过")
+      .replace("香港地区检查通过", "地区通过").replace("地区检查通过", "地区通过")
+      .replace("授权片样本可见", "片库样本可见").replace("仅自制片样本可见（两个授权样本不可见）", "仅自制样本可见")
+      .replace("搜索结果可达", "搜索正常").replace(" · 页面地区 ", " · ")
+      .replace("页面证据不足，未知", "未知").replace("接口格式变化，未知", "未知")
+      .replace(/接口异常 HTTP \d{3}/g, "服务异常").replace("接口需认证，待验证", "需登录验证").replace("页面跳转，待验证", "需登录或确认")
+      .replace("检测尚未完成（总时限）", "检测超时");
+    return icons[result.state] + " " + result.name + "：" + text +
+      (result.region ? " · " + (result.name === "ChatGPT" ? "边缘 " : "") + result.region : "");
   }
   function traceFields(response) {
     if (problem(response)) return {};
@@ -225,9 +253,9 @@
     const sources = [{ name: "IPPure", data: pure, response: response }, { name: "IP.SB", data: geo, response: responses[1] },
       { name: "Cloudflare", data: trace, response: responses[2] }];
     const valid = sources.filter(function (s) { return s.data && validIP(s.data.ip); });
-    if (!valid.length) return finish([preamble(context), "出口 IP 未取得；未生成纯净度分数。"].concat(sources.map(function (s) {
+    if (!valid.length) return finish([preamble(context), "出口查询失败，请稍后刷新"].join("\n"), "alert", [preamble(context), "出口 IP 未取得；未生成纯净度分数。"].concat(sources.map(function (s) {
       return evidence(s.name, s.response, problem(s.response) || "数据格式未知");
-    })).join("\n"), "alert");
+    })).join("\n"));
     const primary = valid[0];
     const data = primary.data;
     const ipv6 = data.ip.indexOf(":") !== -1;
@@ -260,7 +288,15 @@
     });
     if (unique.length === 1 && countries.length > 1) lines.push("地区库差异：" + countries.join(" / ") + "（IP 一致，地区资料不同）");
     lines.push("主信息来源 " + primary.name + "；风险分仅来自 IPPure · " + time(), "第三方评分，仅供参考");
-    finish(lines.join("\n"), score === null || score > 50 || unique.length > 1 ? "alert" : "info");
+    const summary = [preamble(context), (ipv6 ? "IPv6：" : "IPv4：") + masked(data.ip, showIP),
+      "位置：" + flag(country(data.countryCode || data.country_code || data.loc)) + (location || "未知"),
+      "ASN：" + (/^\d+$/.test(String(data.asn || "")) ? "AS" : "") + clean(data.asn || "未知") + " " + clean(data.asOrganization || data.asn_organization || data.organization || ""),
+      "类型：" + (types.join(" · ") || "未知"),
+      score === null ? "纯净度：未知" + (ipv6 ? "（IPv6 无评分）" : "") : "纯净度：" + (100 - score) + "/100 · 风险 " + score + "/100（" + risk + "）",
+      "出口核对：" + (valid.length < 2 ? "单来源有效" : unique.length === 1 ? valid.length + " 源一致" : "多站出口不同")];
+    if (warp.indexOf("已启用") === 0) summary.push("WARP：" + warp);
+    const color = unique.length > 1 ? "#FF9500" : score === null ? "#8E8E93" : score <= 25 ? "#34C759" : score <= 50 ? "#FFCC00" : score <= 70 ? "#FF9500" : "#FF3B30";
+    finish(summary.join("\n"), "info", lines.join("\n"), { icon: score !== null && score <= 50 && unique.length === 1 ? "checkmark.seal.fill" : "exclamationmark.triangle.fill", "icon-color": color });
   }
 
   function netflixSample(response, id) {
@@ -501,11 +537,11 @@
     const results = checks.map(function (entry) { return finding(entry[0], "unknown", "检测尚未完成（总时限）", "", []); });
     function render() {
       const counts = { pass: 0, partial: 0, blocked: 0, unknown: 0 };
-      const icons = { pass: "✅", partial: "◐", blocked: "⛔", unknown: "❔" };
       results.forEach(function (r) { counts[r.state] += 1; });
-      finish([preamble(context), "通过 " + counts.pass + " · 部分 " + counts.partial + " · 限制 " + counts.blocked + " · 未知 " + counts.unknown]
-        .concat(results.map(function (r) { return icons[r.state] + " " + r.text; }),
-          ["以上为各分项结论；未登录，实际播放/对话未测", "API 认证响应仅证明入口可达，不等于调用通过", "点击刷新 · " + time()]).join("\n"), counts.blocked || counts.unknown ? "alert" : "info");
+      const details = [preamble(context), "通过 " + counts.pass + " · 部分 " + counts.partial + " · 限制 " + counts.blocked + " · 未知 " + counts.unknown]
+        .concat(results.map(function (r) { return r.text; }), ["未登录，实际播放/对话未测", "API 认证响应仅证明入口可达，不等于调用通过"]).join("\n");
+      finish([preamble(context)].concat(results.map(compactFinding), ["网页/地区检查 · 播放与对话未测"]).join("\n"), "info", details,
+        { icon: "play.tv.fill", "icon-color": "#FF2D55" });
     }
     deadlineResult = render;
     await Promise.all(checks.map(async function (entry, index) {
@@ -519,29 +555,79 @@
     const middle = Math.floor(sorted.length / 2);
     return Math.round(sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2);
   }
+  function probeServer(record, target) {
+    if (!record || !/^(Guangzhou|Guang Zhou|广州|广州市)$/i.test(String(record.name || "").trim()) ||
+      !/^(China|CN|中国)$/i.test(String(record.country || record.cc || "")) || !/^\d{1,9}$/.test(String(record.id || ""))) return null;
+    const lat = Number(record.lat), lon = Number(record.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon) || lat < 22.4 || lat > 24 || lon < 112.8 || lon > 114.2) return null;
+    const sponsor = String(record.sponsor || "");
+    if (!target.carrier.test(sponsor) || TARGETS.filter(function (t) { return t.carrier.test(sponsor); }).length !== 1) return null;
+    const address = String(record.url || "");
+    const match = address.match(/^(https?):\/\/([a-z0-9.-]+)(?::(80|443|8080))?\//i);
+    if (!match || /[\s\\@]/.test(address)) return null;
+    const host = match[2].toLowerCase();
+    if (/^[\d.]+$/.test(host)) {
+      if (!validIP(host)) return null;
+      const p = host.split(".").map(Number);
+      if ([0, 10, 127].indexOf(p[0]) !== -1 || p[0] >= 224 || p[0] === 169 && p[1] === 254 || p[0] === 172 && p[1] >= 16 && p[1] <= 31 || p[0] === 192 && p[1] === 168 || p[0] === 100 && p[1] >= 64 && p[1] <= 127) return null;
+    } else if (!/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i.test(host) || /\.(local|localhost|invalid|internal|test|example)$/i.test(host)) return null;
+    const authority = host + (match[3] ? ":" + match[3] : "");
+    if (record.host && String(record.host).toLowerCase() !== authority) return null;
+    return { name: target.name, id: String(record.id), sponsor: clean(sponsor), host: authority,
+      url: match[1].toLowerCase() + "://" + authority + "/speedtest/latency.txt",
+      record: { id: String(record.id), name: "Guangzhou", country: "China", lat: lat, lon: lon, sponsor: clean(sponsor), host: authority,
+        url: match[1].toLowerCase() + "://" + authority + "/speedtest/upload.php" } };
+  }
+  async function guangzhouServers(context) {
+    const key = "VB_HEALTH_GZ_TARGETS_V1";
+    try {
+      const cache = json($persistentStore.read(key) || "");
+      if (cache && cache.version === 1 && typeof cache.updatedAt === "number" && cache.updatedAt <= Date.now() && Date.now() - cache.updatedAt < 1800000 && Array.isArray(cache.records) && cache.records.length === 3) {
+        const selected = TARGETS.map(function (t, i) { return probeServer(cache.records[i], t); });
+        if (selected.every(Boolean)) return { servers: selected, source: "广州目录快照（30 分钟内固定测点，便于比较节点）" };
+      }
+    } catch (_) { /* Missing, stale or invalid cache requires a fresh directory. */ }
+    const response = await request(context, SERVER_DIRECTORY, { headers: { Accept: "application/json", Referer: "https://www.speedtest.net/" } });
+    const list = !problem(response) && json(response.body);
+    const servers = TARGETS.map(function (target) {
+      const matches = Array.isArray(list) ? list.map(function (record) { return probeServer(record, target); }).filter(Boolean) : [];
+      matches.sort(function (a, b) { return (a.id === target.preferred ? -1 : b.id === target.preferred ? 1 : Number(a.id) - Number(b.id)); });
+      return matches[0] || null;
+    });
+    if (servers.every(Boolean)) {
+      try { $persistentStore.write(JSON.stringify({ version: 1, updatedAt: Date.now(), records: servers.map(function (s) { return s.record; }) }), key); } catch (_) { /* Still use the current validated directory. */ }
+    }
+    return { servers: servers, source: evidence("广州测速目录", response, Array.isArray(list) ? "仅采纳广州且运营商明确的记录" : problem(response) || "目录格式未知") };
+  }
   async function latencyTarget(context, target) {
     const samples = [];
     for (let i = 0; i < 5 && !completed; i += 1) {
       samples.push(await request(context, target.url + "?vb_probe=" + Date.now() + "_" + i,
-        { method: "head", timeout: 4, headers: { "Cache-Control": "no-cache, no-store" } }));
+        { method: "get", timeout: 3, headers: { "Cache-Control": "no-cache, no-store" } }));
     }
-    const replies = samples.filter(function (s) { return !s.error && s.status >= 100 && s.status <= 599; });
-    if (!replies.length) return target.name + "：无响应 0/5\n" + target.host + "\n逐次：" + samples.map(function (s) { return s.error || "无有效响应"; }).join(" / ");
+    function validSample(s) { return !s.error && s.status === 200 && s.body.trim() === "test=test"; }
+    const replies = samples.filter(validSample);
+    const details = [target.name + " · ID " + target.id + " · " + target.host + " · " + target.sponsor,
+      "逐次：" + samples.map(function (s) { return s.error || "HTTP " + s.status + " · " + s.ms + " ms" + (validSample(s) ? "" : "（测点响应异常）"); }).join(" / ")];
+    if (!replies.length) {
+      const reason = samples.every(function (s) { return s.error === "超时"; }) ? "检测超时" : samples.some(function (s) { return s.status === 403 || s.status === 429; }) ? "测点拒绝" : "测点不可用";
+      return { line: "❔ " + target.name + "：" + reason, details: details.join("\n") };
+    }
     const values = replies.map(function (s) { return s.ms; });
-    const codes = replies.map(function (s) { return s.status; }).filter(function (v, i, a) { return a.indexOf(v) === i; }).join("/");
     const changes = [];
-    samples.forEach(function (s, i) { if (i && !s.error && s.status >= 100 && s.status <= 599 && !samples[i - 1].error && samples[i - 1].status >= 100 && samples[i - 1].status <= 599) changes.push(Math.abs(s.ms - samples[i - 1].ms)); });
+    samples.forEach(function (s, i) { if (i && validSample(s) && validSample(samples[i - 1])) changes.push(Math.abs(s.ms - samples[i - 1].ms)); });
     const fluctuation = changes.length ? Math.round(changes.reduce(function (a, b) { return a + b; }, 0) / changes.length) + " ms" : "样本不足";
-    const denied = replies.some(function (s) { return s.status === 403 || s.status === 405 || s.status === 412; });
-    return target.name + "：" + median(values) + " ms · 响应 " + replies.length + "/5\n" + target.host + " · HTTP " + codes +
-      "\n范围 " + Math.min.apply(null, values) + "–" + Math.max.apply(null, values) + " ms · HTTP 波动 " + fluctuation +
-      "\n逐次：" + samples.map(function (s) { return s.error || (s.status ? s.ms + "ms(" + s.status + ")" : "无有效响应"); }).join(" / ") +
-      (denied ? "\n站点拒绝当前请求，已保留响应耗时" : "");
+    details.push("中位数 " + median(values) + " ms · 有效 " + replies.length + "/5 · 范围 " + Math.min.apply(null, values) + "–" + Math.max.apply(null, values) + " ms · HTTP 波动 " + fluctuation);
+    return { line: (replies.length === 5 ? "✅ " : "◐ ") + target.name + "：" + median(values) + " ms" + (replies.length < 5 ? " · " + replies.length + "/5" : ""), details: details.join("\n") };
   }
   async function latencyPanel(context) {
-    const results = await Promise.all(TARGETS.map(function (target) { return latencyTarget(context, target); }));
-    finish([preamble(context), "手机 → 节点 → 三网站点"].concat(results,
-      ["每站 5 次；HTTP 波动为相邻有效样本耗时差均值", "HTTP 含连接/站点响应；非 Ping", "站点可能使用 CDN，连接可能复用 · " + time()]).join("\n"));
+    const directory = await guangzhouServers(context);
+    const results = await Promise.all(TARGETS.map(function (target, i) { return directory.servers[i] ? latencyTarget(context, directory.servers[i]) :
+      { line: "❔ " + target.name + "：暂无可用测点", details: target.name + "：目录未取得合格广州测点；未改用其他城市或全国网站。" }; }));
+    finish([preamble(context)].concat(results.map(function (r) { return r.line; }), ["手机 → 节点 → 广州 · HTTP 往返"]).join("\n"), "info",
+      [preamble(context), directory.source].concat(results.map(function (r) { return r.details; }),
+        ["HTTP 波动：相邻有效样本耗时差绝对值均值；不跨失败样本计算。", "测量包含手机到节点及站点响应；不是节点端逐跳回程、ICMP 或线路等级判定。"]).join("\n"),
+      { icon: "antenna.radiowaves.left.and.right", "icon-color": "#007AFF" });
   }
 
   (async function () {

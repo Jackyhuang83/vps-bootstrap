@@ -7,6 +7,7 @@ const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '..', 'node-health.js'), 'utf8');
 const settingsSource = fs.readFileSync(path.join(__dirname, '..', 'settings.js'), 'utf8');
 const SETTINGS_KEY = 'VB_HEALTH_SELECTED_GROUP_V1';
+const gzDirectory = ['China Telecom', 'China Unicom', 'China Mobile'].map((sponsor,i)=>({id:['27594','26678','6611'][i],name:'Guangzhou',country:'China',lat:'23.1333',lon:'113.2667',sponsor,host:['ct.gzspeed.net:8080','cu.gzspeed.net:8080','cm.gzspeed.net:8080'][i],url:'http://'+['ct.gzspeed.net:8080','cu.gzspeed.net:8080','cm.gzspeed.net:8080'][i]+'/speedtest/upload.php'}));
 
 async function run(options = {}) {
   let clock = 0;
@@ -20,13 +21,13 @@ async function run(options = {}) {
   const requests = [];
   const storage = options.storage || {};
   const schedule = (fn, delay = 0) => timers.push({ fn, at: clock + delay, id: ++sequence });
-  class Clock extends Date { constructor(...args) { super(...(args.length ? args : [1792123200000 + clock])); } static now() { return clock; } }
+  class Clock extends Date { constructor(...args) { super(...(args.length ? args : [(options.epoch || 1792123200000) + clock])); } static now() { return (options.epoch || 1792123200000) + clock; } }
   const env = {
     Date: Clock,
     setTimeout: (fn, delay) => schedule(fn, delay === 25000 && options.deadlineMs ? options.deadlineMs : delay),
     $argument: options.argument || `mode=${options.mode || 'ip'}&showIP=false&policy=Group`,
     $done: value => { result = value; doneCount++; },
-    $persistentStore: { read: key => Object.hasOwn(storage, key) ? storage[key] : null },
+    $persistentStore: { read: key => Object.hasOwn(storage, key) ? storage[key] : null, write: (value,key) => { if(options.writeFail) return false; storage[key]=value; return true; } },
     $surge: { selectGroupDetails: () => ({ decisions: options.decisions || { Group: 'Tokyo' } }) },
     $httpAPI: (method, url, body, callback) => {
       assert.equal(method, 'GET');
@@ -40,7 +41,7 @@ async function run(options = {}) {
       peakRequests = Math.max(peakRequests, activeRequests);
       assert.ok(peakRequests <= 20, 'must remain within the Surge concurrent request limit');
       requests.push({ method, ...config });
-      const reply = options.reply ? options.reply(config, method, index) : { body: JSON.stringify({ ip: '203.0.113.7', fraudScore: 25, countryCode: 'JP', asn: 64496, isResidential: false }) };
+      const reply = config.url.startsWith('https://www.speedtest.net/api/js/servers?') ? (options.directoryReply === undefined ? {body:JSON.stringify(gzDirectory)} : options.directoryReply) : options.reply ? options.reply(config, method, index) : config.url.includes('/speedtest/latency.txt') ? {body:'test=test'} : { body: JSON.stringify({ ip: '203.0.113.7', fraudScore: 25, countryCode: 'JP', asn: 64496, isResidential: false }) };
       if (reply === null) return;
       schedule(() => { activeRequests--; callback(reply.error || null, reply.noResponse ? null : { status: reply.status || 200, headers: reply.headers || {} }, reply.body || ''); }, reply.delay || 100);
     }]))
@@ -68,37 +69,40 @@ async function run(options = {}) {
     assert.ok(r.timeout > 0 && r.timeout <= 6, 'timeouts use seconds');
     assert.equal(r.insecure, undefined);
   });
-  return { result, requests, clock, peakRequests };
+  // Probe assertions read the actual persisted diagnostics; compact UI is tested separately.
+  const report=storage['VB_HEALTH_REPORT_V1_'+(options.mode||(options.argument||'').match(/^mode=(\w+)/)?.[1]||'ip')];
+  result.diagnosticContent=report?JSON.parse(report).details:result.content;
+  return { result, requests, clock, peakRequests, storage };
 }
 
 test('zero fraud score stays zero; missing classification is unknown, IP masked', async () => {
   const { result } = await run({ reply: () => ({ body: JSON.stringify({ ip: '203.0.113.7', fraudScore: 0 }) }) });
-  assert.match(result.content, /100\/100/);
-  assert.match(result.content, /类型：未知/);
-  assert.match(result.content, /203\.0\.\*\.\*/);
-  assert.doesNotMatch(result.content, /203\.0\.113\.7|原生属性：是|机房：是/);
-  assert.match(result.content, /住宅：未知 · 机房：未知 · 原生属性：未验证/);
+  assert.match(result.diagnosticContent, /100\/100/);
+  assert.match(result.diagnosticContent, /类型：未知/);
+  assert.match(result.diagnosticContent, /203\.0\.\*\.\*/);
+  assert.doesNotMatch(result.diagnosticContent, /203\.0\.113\.7|原生属性：是|机房：是/);
+  assert.match(result.diagnosticContent, /住宅：未知 · 机房：未知 · 原生属性：未验证/);
 });
 
 test('missing, null, strings and out-of-range scores never become perfect purity', async () => {
   for (const fraudScore of [undefined, null, '', '0', false, -1, 101]) {
     const { result } = await run({ reply: () => ({ body: JSON.stringify({ ip: '203.0.113.7', fraudScore }) }) });
-    assert.match(result.content, /纯净度：未知/);
-    assert.doesNotMatch(result.content, /100\/100/);
+    assert.match(result.diagnosticContent, /纯净度：未知/);
+    assert.doesNotMatch(result.diagnosticContent, /100\/100/);
   }
 });
 
 test('IPv6 never receives IPPure score, even when the API sends one', async () => {
   const { result } = await run({ reply: () => ({ body: JSON.stringify({ ip: '2001:db8::1', fraudScore: 0 }) }) });
-  assert.match(result.content, /不评估 IPv6/);
-  assert.doesNotMatch(result.content, /100\/100/);
+  assert.match(result.diagnosticContent, /不评估 IPv6/);
+  assert.doesNotMatch(result.diagnosticContent, /100\/100/);
 });
 
 test('API HTML, rate limiting and absent response become actionable unknown', async () => {
   for (const reply of [{ body: '<html>error</html>' }, { status: 429 }, { error: 'network', noResponse: true }, null]) {
     const { result } = await run({ reply: () => reply });
     assert.equal(result.style, 'alert');
-    assert.doesNotMatch(result.content, /100\/100/);
+    assert.doesNotMatch(result.diagnosticContent, /100\/100/);
   }
 });
 
@@ -130,9 +134,9 @@ test('external nodes use Surge identifiers, never their ambiguous display name',
 
 test('unlock: generic HTTP 200 cannot become full unlock, US region, or dialogue success', async () => {
   const { result } = await run({ mode: 'unlock', reply: () => ({ body: '<html>Welcome</html>' }) });
-  assert.doesNotMatch(result.content, /完整解锁|US|检查通过|网页可达/);
-  assert.match(result.content, /未取得有效片库证据/);
-  assert.match(result.content, /接口格式变化/);
+  assert.doesNotMatch(result.diagnosticContent, /完整解锁|US|检查通过|网页可达/);
+  assert.match(result.diagnosticContent, /未取得有效片库证据/);
+  assert.match(result.diagnosticContent, /接口格式变化/);
 });
 
 test('unlock: exact Disney session boolean and catalogue markup give bounded conclusions', async () => {
@@ -143,52 +147,53 @@ test('unlock: exact Disney session boolean and catalogue markup give bounded con
     if (c.url.includes('trace')) return { body: 'loc=JP\nip=203.0.113.7' };
     return { body: '<html>ChatGPT Gemini</html>' };
   } });
-  assert.match(result.content, /Disney\+：地区检查通过 · JP/);
-  assert.match(result.content, /Netflix：授权片样本可见/);
-  assert.match(result.content, /ChatGPT：网页可达，待验证对话 · JP/);
-  assert.match(result.content, /Gemini：网页可达，待登录验证/);
-  assert.doesNotMatch(result.content, /完整解锁|203\.0\.113\.7/);
+  assert.match(result.diagnosticContent, /Disney\+：地区检查通过 · JP/);
+  assert.match(result.diagnosticContent, /Netflix：授权片样本可见/);
+  assert.match(result.diagnosticContent, /ChatGPT：网页可达，待验证对话 · JP/);
+  assert.match(result.diagnosticContent, /Gemini：网页可达，待登录验证/);
+  assert.doesNotMatch(result.diagnosticContent, /完整解锁|203\.0\.113\.7/);
 });
 
 test('unlock: false or missing Disney flags cannot pass', async () => {
   for (const flag of [false, undefined, 'true']) {
     const { result } = await run({ mode: 'unlock', reply: c => c.url.includes('bamgrid') ? { body: JSON.stringify({ extensions: { sdk: { session: { inSupportedLocation: flag } } } }) } : { body: '<html></html>' } });
-    assert.doesNotMatch(result.content, /Disney\+：地区检查通过/);
+    assert.doesNotMatch(result.diagnosticContent, /Disney\+：地区检查通过/);
   }
 });
 
 test('challenge and timeout are not reported as a regional ban', async () => {
   for (const reply of [{ status: 403, body: '<title>Just a moment</title>cf-chl-' }, null]) {
     const { result } = await run({ mode: 'unlock', reply: () => reply });
-    assert.doesNotMatch(result.content, /地区受限|地区不支持|检查通过/);
-    assert.match(result.content, /人机验证|超时/);
+    assert.doesNotMatch(result.diagnosticContent, /地区受限|地区不支持|检查通过/);
+    assert.match(result.diagnosticContent, /人机验证|超时/);
   }
 });
 
-test('latency makes fifteen HEAD probes, counts responses not packet loss, preserves HTTP errors', async () => {
+test('Guangzhou latency uses validated small replies and never counts denial pages as latency', async () => {
   const counts = {};
   const { result, requests } = await run({ mode: 'latency', reply: c => {
     const host = new URL(c.url).host;
     counts[host] = (counts[host] || 0) + 1;
-    if (host === 'iservice.10010.com' && counts[host] === 2) return null;
-    return { status: host === 'www.189.cn' ? 412 : 200, delay: counts[host] * 100 };
+    if (host === 'cu.gzspeed.net:8080' && counts[host] === 2) return null;
+    return { status: host === 'cm.gzspeed.net:8080' ? 412 : 200, body:'test=test', delay: counts[host] * 100 };
   } });
-  assert.equal(requests.length, 15);
-  assert.ok(requests.every(r => r.method === 'head'));
-  assert.match(result.content, /电信：300 ms · 响应 5\/5/);
-  assert.match(result.content, /HTTP 412/);
-  assert.match(result.content, /联通：350 ms · 响应 4\/5/);
-  assert.match(result.content, /范围 100–500 ms · HTTP 波动 100 ms/);
-  assert.match(result.content, /逐次：100ms\(412\) \/ 200ms\(412\)/);
-  assert.match(result.content, /站点拒绝当前请求，已保留响应耗时/);
-  assert.match(result.content, /非 Ping/);
-  assert.doesNotMatch(result.content, /丢包/);
+  assert.equal(requests.length, 16);
+  assert.equal(requests.filter(r=>r.url.includes('/speedtest/latency.txt')).length,15);
+  assert.ok(requests.every(r => r.method === 'get'));
+  assert.match(result.content, /广州电信：300 ms/);
+  assert.match(result.diagnosticContent, /HTTP 412/);
+  assert.match(result.content, /广州联通：350 ms · 4\/5/);
+  assert.match(result.diagnosticContent, /范围 100–500 ms · HTTP 波动 100 ms/);
+  assert.match(result.diagnosticContent, /HTTP 412 · 100 ms（测点响应异常）/);
+  assert.match(result.content, /广州移动：测点不可用/);
+  assert.match(result.diagnosticContent, /不是节点端逐跳回程/);
+  assert.doesNotMatch(result.diagnosticContent, /丢包/);
 });
 
 test('all latency targets timing out finish within the declared script budget', async () => {
   const { result, clock, requests } = await run({ mode: 'latency', reply: () => null });
-  assert.equal(requests.length, 15);
-  assert.match(result.content, /无响应 0\/5/);
+  assert.equal(requests.length, 16);
+  assert.equal((result.content.match(/检测超时/g)||[]).length,3);
   assert.ok(clock < 25000);
 });
 
@@ -199,7 +204,7 @@ test('same-origin page redirects retain the node; external redirects are not fol
     if (c.url.includes('netflix')) return { status: 302, headers: { Location: 'https://example.invalid/login' } };
     return { body: '<html></html>' };
   } });
-  assert.match(result.content, /Gemini：网页可达/);
+  assert.match(result.diagnosticContent, /Gemini：网页可达/);
   assert.ok(requests.some(r => r.url === 'https://gemini.google.com/app'));
   assert.ok(requests.every(r => !r.url.includes('example.invalid')));
 });
@@ -214,31 +219,31 @@ test('redirect loops and malformed IP responses are bounded', async () => {
   for (const ip of ['::::', ':::1', ':1:2:3:4:5:6:7:8', '1:2:3:4:5:6:7:8:', 'xyz', '999.1.1.1', '2001:db8:12345::1']) {
     const { result } = await run({ reply: () => ({ body: JSON.stringify({ ip, fraudScore: 0 }) }) });
     assert.equal(result.style, 'alert');
-    assert.doesNotMatch(result.content, /100\/100/);
+    assert.doesNotMatch(result.diagnosticContent, /100\/100/);
   }
 });
 
 test('all nine platform labels appear with bounded unknown results for generic HTTP 200', async () => {
   const { result } = await run({ mode: 'unlock', reply: () => ({ body: '<html>Welcome</html>' }) });
   for (const platform of ['ChatGPT', 'Gemini', 'Claude', 'Google', 'Netflix', 'Disney+', 'YouTube Premium', 'myTV SUPER', 'TikTok']) {
-    assert.ok(result.content.includes(platform + '：'), platform);
+    assert.ok(result.diagnosticContent.includes(platform + '：'), platform);
   }
-  assert.doesNotMatch(result.content, /检查通过|搜索结果可达|网页地区 [A-Z]|完整解锁/);
-  assert.match(result.content, /v0\.1\.0-beta\.6/);
+  assert.doesNotMatch(result.diagnosticContent, /检查通过|搜索结果可达|网页地区 [A-Z]|完整解锁/);
+  assert.match(result.content, /v0\.1\.0-beta\.7/);
 });
 
 test('Claude identifies the documented regional redirect without following external hosts', async () => {
   const { result, requests } = await run({ mode: 'unlock', reply: c => c.url.includes('claude.ai')
     ? { status: 302, headers: { Location: 'https://www.anthropic.com/app-unavailable-in-region' } }
     : { body: '<html></html>' } });
-  assert.match(result.content, /Claude：地区受限/);
+  assert.match(result.diagnosticContent, /Claude：地区受限/);
   assert.ok(requests.every(r => new URL(r.url).host !== 'www.anthropic.com'));
 });
 
 test('Claude login page is web reachability, never dialogue or API success', async () => {
   const { result } = await run({ mode: 'unlock', reply: c => ({ body: c.url.includes('claude.ai') ? '<html><title>Claude</title>Log in</html>' : '<html></html>' }) });
-  assert.match(result.content, /Claude：网页可达，待验证对话/);
-  assert.doesNotMatch(result.content, /Claude：.*解锁|Claude：.*对话成功/);
+  assert.match(result.diagnosticContent, /Claude：网页可达，待验证对话/);
+  assert.doesNotMatch(result.diagnosticContent, /Claude：.*解锁|Claude：.*对话成功/);
 });
 
 test('Google separates search results, CAPTCHA, JS shell and unknown region', async () => {
@@ -251,7 +256,7 @@ test('Google separates search results, CAPTCHA, JS shell and unknown region', as
   ];
   for (const [reply, expected] of cases) {
     const { result, requests } = await run({ mode: 'unlock', reply: c => c.url.includes('www.google.com') ? reply : { body: '<html></html>' } });
-    assert.match(result.content, expected);
+    assert.match(result.diagnosticContent, expected);
     assert.ok(requests.filter(r => r.url.includes('www.google.com')).every(r => !/[?&](gl|cr)=/.test(r.url)));
   }
 });
@@ -266,8 +271,8 @@ test('myTV SUPER requires one explicit session country; HK does not imply channe
   ];
   for (const [body, expected] of cases) {
     const { result } = await run({ mode: 'unlock', reply: c => c.url.includes('mytvsuper.com') ? { body: JSON.stringify(body) } : { body: '<html></html>' } });
-    assert.match(result.content, expected);
-    assert.doesNotMatch(result.content, /myTV SUPER：.*可播放|myTV SUPER：.*完整解锁/);
+    assert.match(result.diagnosticContent, expected);
+    assert.doesNotMatch(result.diagnosticContent, /myTV SUPER：.*可播放|myTV SUPER：.*完整解锁/);
   }
 });
 
@@ -283,15 +288,15 @@ test('TikTok reads app context region, rejects generic user regions, conflicts a
   ];
   for (const [body, expected] of cases) {
     const { result } = await run({ mode: 'unlock', reply: c => c.url.includes('tiktok.com') ? { body } : { body: '<html></html>' } });
-    assert.match(result.content, expected);
+    assert.match(result.diagnosticContent, expected);
   }
 });
 
 test('new services retain rate-limit, auth and challenge states rather than claiming unlocked', async () => {
   for (const reply of [{ status: 429 }, { status: 401 }, { status: 403, body: '<title>Just a moment</title>cf-chl-' }, null]) {
     const { result } = await run({ mode: 'unlock', reply: () => reply });
-    assert.doesNotMatch(result.content, /地区受限|地区检查通过|搜索结果可达|网页地区 [A-Z]/);
-    for (const platform of ['Claude', 'Google', 'myTV SUPER', 'TikTok']) assert.ok(result.content.includes(platform + '：'));
+    assert.doesNotMatch(result.diagnosticContent, /地区受限|地区检查通过|搜索结果可达|网页地区 [A-Z]/);
+    for (const platform of ['Claude', 'Google', 'myTV SUPER', 'TikTok']) assert.ok(result.diagnosticContent.includes(platform + '：'));
   }
 });
 
@@ -300,49 +305,49 @@ test('IP sources independently verify the exit and preserve default masking ever
     ? 'ip=203.0.113.7\nloc=JP\ncolo=NRT\nwarp=on'
     :JSON.stringify({ip:'203.0.113.7',fraudScore:15,country:'Japan',countryCode:'JP',isResidential:false,isDataCenter:true})}) });
   assert.equal(requests.length,3);
-  assert.match(result.content,/3 个来源 IP 一致/);
-  assert.match(result.content,/WARP 已启用/);
-  assert.match(result.content,/接入点 NRT/);
-  assert.match(result.content,/住宅：否 · 机房：是 · 原生属性：未验证/);
-  assert.doesNotMatch(result.content,/203\.0\.113\.7/);
-  assert.match(result.content,/IPPure：HTTP 200 · 100 ms/);
+  assert.match(result.diagnosticContent,/3 个来源 IP 一致/);
+  assert.match(result.diagnosticContent,/WARP 已启用/);
+  assert.match(result.diagnosticContent,/接入点 NRT/);
+  assert.match(result.diagnosticContent,/住宅：否 · 机房：是 · 原生属性：未验证/);
+  assert.doesNotMatch(result.diagnosticContent,/203\.0\.113\.7/);
+  assert.match(result.diagnosticContent,/IPPure：HTTP 200 · 100 ms/);
 });
 
 test('different destination exits are disclosed and scores stay attached to IPPure', async () => {
   const { result } = await run({ reply:c=>c.url.includes('ippure')?{body:JSON.stringify({ip:'203.0.113.7',fraudScore:10})}
     :c.url.includes('ip.sb')?{body:JSON.stringify({ip:'198.51.100.8',fraudScore:0})}:{body:'ip=2001:db8::1\nloc=JP\nwarp=off'} });
-  assert.equal(result.style,'alert');
-  assert.match(result.content,/不同站点出口不一致/);
-  assert.match(result.content,/纯净度参考：90\/100/);
-  assert.match(result.content,/IP\.SB：HTTP 200 · 100 ms · 198\.51\.\*\.\*/);
-  assert.doesNotMatch(result.content,/203\.0\.113\.7|198\.51\.100\.8|2001:db8::1|100\/100/);
+  assert.equal(result['icon-color'],'#FF9500');
+  assert.match(result.diagnosticContent,/不同站点出口不一致/);
+  assert.match(result.diagnosticContent,/纯净度参考：90\/100/);
+  assert.match(result.diagnosticContent,/IP\.SB：HTTP 200 · 100 ms · 198\.51\.\*\.\*/);
+  assert.doesNotMatch(result.diagnosticContent,/203\.0\.113\.7|198\.51\.100\.8|2001:db8::1|100\/100/);
 });
 
 test('IP lookup falls back to remaining sources without inventing a risk score', async () => {
   const { result } = await run({reply:c=>c.url.includes('ippure')?{status:429}:c.url.includes('ip.sb')
     ?{body:JSON.stringify({ip:'203.0.113.8',country:'Japan',asn:64496,asn_organization:'Example ISP',fraudScore:0})}
     :{body:'ip=203.0.113.8\nloc=JP\ncolo=NRT\nwarp=off'}});
-  assert.match(result.content,/主信息来源 IP\.SB/);
-  assert.match(result.content,/ASN：64496 · Example ISP/);
-  assert.match(result.content,/纯净度：未知/);
-  assert.match(result.content,/IPPure：HTTP 429/);
-  assert.doesNotMatch(result.content,/100\/100/);
+  assert.match(result.diagnosticContent,/主信息来源 IP\.SB/);
+  assert.match(result.diagnosticContent,/ASN：64496 · Example ISP/);
+  assert.match(result.diagnosticContent,/纯净度：未知/);
+  assert.match(result.diagnosticContent,/IPPure：HTTP 429/);
+  assert.doesNotMatch(result.diagnosticContent,/100\/100/);
 });
 
 test('equivalent IPv6 spellings agree without scoring or claiming dual-stack coverage', async () => {
   const { result }=await run({reply:c=>({body:c.url.includes('cloudflare')?'ip=2001:db8::1\nloc=JP'
     :JSON.stringify({ip:c.url.includes('ippure')?'2001:0db8:0:0:0:0:0:1':'2001:db8::1',fraudScore:0})})});
-  assert.match(result.content,/3 个来源 IP 一致/);
-  assert.match(result.content,/IPPure 不评估 IPv6/);
-  assert.doesNotMatch(result.content,/100\/100|双栈通过|出口不一致/);
+  assert.match(result.diagnosticContent,/3 个来源 IP 一致/);
+  assert.match(result.diagnosticContent,/IPPure 不评估 IPv6/);
+  assert.doesNotMatch(result.diagnosticContent,/100\/100|双栈通过|出口不一致/);
 });
 
 test('GeoIP country disagreements are distinguished from different exit IPs', async () => {
   const { result }=await run({reply:c=>({body:c.url.includes('cloudflare')?'ip=203.0.113.7\nloc=US'
     :JSON.stringify({ip:'203.0.113.7',countryCode:'JP',fraudScore:10})})});
-  assert.match(result.content,/3 个来源 IP 一致/);
-  assert.match(result.content,/地区库差异：JP \/ US（IP 一致，地区资料不同）/);
-  assert.doesNotMatch(result.content,/出口不一致/);
+  assert.match(result.diagnosticContent,/3 个来源 IP 一致/);
+  assert.match(result.diagnosticContent,/地区库差异：JP \/ US（IP 一致，地区资料不同）/);
+  assert.doesNotMatch(result.diagnosticContent,/出口不一致/);
 });
 
 test('AI probes distinguish structured authentication gates from a generic denial', async () => {
@@ -354,37 +359,37 @@ test('AI probes distinguish structured authentication gates from a generic denia
     if(c.url.includes('ios.chat.openai.com'))return {status:302,headers:{Location:'https://chatgpt.com/auth/login'}};
     return {body:'<html>ChatGPT Gemini Claude</html>'};
   }});
-  for(const name of ['OpenAI API','Claude API','Gemini API'])assert.match(result.content,new RegExp(name+'：HTTP (401|403) · 100 ms · 入口可达，需 API Key'));
-  assert.match(result.content,/App 入口：HTTP 302 · 100 ms · 转到官方登录入口/);
-  assert.match(result.content,/API 认证响应仅证明入口可达，不等于调用通过/);
+  for(const name of ['OpenAI API','Claude API','Gemini API'])assert.match(result.diagnosticContent,new RegExp(name+'：HTTP (401|403) · 100 ms · 入口可达，需 API Key'));
+  assert.match(result.diagnosticContent,/App 入口：HTTP 302 · 100 ms · 转到官方登录入口/);
+  assert.match(result.diagnosticContent,/API 认证响应仅证明入口可达，不等于调用通过/);
   assert.ok(requests.every(r=>!Object.keys(r.headers).some(h=>/authorization|x-api-key|cookie/i.test(h))||r.url.includes('bamgrid')));
   const denied=await run({mode:'unlock',reply:()=>({status:401,body:'<html>Denied</html>'})});
-  assert.doesNotMatch(denied.result.content,/入口可达，需 API Key/);
+  assert.doesNotMatch(denied.result.diagnosticContent,/入口可达，需 API Key/);
 });
 
 test('an API-only country rejection does not overwrite a reachable ChatGPT website', async () => {
   const { result }=await run({mode:'unlock',reply:c=>c.url.includes('api.openai.com')
     ?{status:403,body:JSON.stringify({error:{code:'unsupported_country_region_territory'}})}
     :{body:'<html>ChatGPT</html>'}});
-  assert.match(result.content,/ChatGPT：网页可达，待验证对话/);
-  assert.match(result.content,/OpenAI API：HTTP 403 · 100 ms · 地区受限/);
-  assert.doesNotMatch(result.content,/ChatGPT：地区受限/);
+  assert.match(result.diagnosticContent,/ChatGPT：网页可达，待验证对话/);
+  assert.match(result.diagnosticContent,/OpenAI API：HTTP 403 · 100 ms · 地区受限/);
+  assert.doesNotMatch(result.diagnosticContent,/ChatGPT：地区受限/);
 });
 
 test('Gemini records its own runtime region and absent flags remain inconclusive', async () => {
   const enabled=await run({mode:'unlock',reply:c=>({body:c.url.includes('gemini.google.com')
     ?'<html>Gemini [45631641,null,true] [0,2,1,200,"JPN"]</html>':'<html></html>'})});
-  assert.match(enabled.result.content,/Gemini：网页功能标志已启用，待登录验证 · JPN/);
+  assert.match(enabled.result.diagnosticContent,/Gemini：网页功能标志已启用，待登录验证 · JPN/);
   const absent=await run({mode:'unlock',reply:c=>({body:c.url.includes('gemini.google.com')?'<html>Gemini</html>':'<html></html>'})});
-  assert.match(absent.result.content,/Gemini：网页可达，待登录验证/);
-  assert.doesNotMatch(absent.result.content,/Gemini：地区受限|Gemini：地区不支持/);
+  assert.match(absent.result.diagnosticContent,/Gemini：网页可达，待登录验证/);
+  assert.doesNotMatch(absent.result.diagnosticContent,/Gemini：地区受限|Gemini：地区不支持/);
 });
 
 test('Gemini API auth classification requires a matching service, not any JSON 403', async () => {
   for(const metadata of [{service:'another.googleapis.com'},{}]) {
     const { result }=await run({mode:'unlock',reply:c=>c.url.includes('generativelanguage.googleapis.com')
       ?{status:403,body:JSON.stringify({error:{status:'PERMISSION_DENIED',details:[{reason:'CREDENTIALS_MISSING',metadata}]}})}:{body:'<html></html>'}});
-    assert.doesNotMatch(result.content,/Gemini API：[^\n]*入口可达/);
+    assert.doesNotMatch(result.diagnosticContent,/Gemini API：[^\n]*入口可达/);
   }
 });
 
@@ -392,10 +397,10 @@ test('Netflix separates two unavailable regional samples from its visible origin
   const { result }=await run({mode:'unlock',reply:c=>c.url.includes('netflix.com/title/')
     ?c.url.endsWith('80018499')?{body:'80018499 {"@type":"TVSeries","countryCode":"JP"}'}:{status:404}
     :{body:'<html></html>'}});
-  assert.match(result.content,/Netflix：仅自制片样本可见（两个授权样本不可见） · JP/);
-  assert.match(result.content,/授权样本 81280792：HTTP 404/);
-  assert.match(result.content,/授权样本 70143836：HTTP 404/);
-  assert.doesNotMatch(result.content,/完整解锁/);
+  assert.match(result.diagnosticContent,/Netflix：仅自制片样本可见（两个授权样本不可见） · JP/);
+  assert.match(result.diagnosticContent,/授权样本 81280792：HTTP 404/);
+  assert.match(result.diagnosticContent,/授权样本 70143836：HTTP 404/);
+  assert.doesNotMatch(result.diagnosticContent,/完整解锁/);
 });
 
 test('Netflix CDN checks only an allowlisted HTTPS target with HEAD and hides its query', async () => {
@@ -404,9 +409,9 @@ test('Netflix CDN checks only an allowlisted HTTPS target with HEAD and hides it
     ?{body:JSON.stringify({targets:[{url:target,location:{country:'JP',city:'Tokyo'}}]})}
     :{status:200,body:'<html></html>'}});
   assert.ok(requests.some(r=>r.url===target&&r.method==='head'&&r.policy==='Tokyo'));
-  assert.match(result.content,/CDN 连接：HTTP 200 · 100 ms · HEAD 响应通过/);
-  assert.match(result.content,/CDN 分配：HTTP 200.*nflxvideo.net · JP · Tokyo/);
-  assert.doesNotMatch(result.content,/ephemeral|secret=|Netflix：授权片样本可见/);
+  assert.match(result.diagnosticContent,/CDN 连接：HTTP 200 · 100 ms · HEAD 响应通过/);
+  assert.match(result.diagnosticContent,/CDN 分配：HTTP 200.*nflxvideo.net · JP · Tokyo/);
+  assert.doesNotMatch(result.diagnosticContent,/ephemeral|secret=|Netflix：授权片样本可见/);
   for(const url of ['http://x.nflxvideo.net/a','https://127.0.0.1/a','https://x.nflxvideo.net.evil.com/a','https://x.nflxvideo.net@evil.com/a','https://x.nflxvideo.net/a\n']) {
     const checked=await run({mode:'unlock',reply:c=>c.url.includes('api.fast.com')?{body:JSON.stringify({targets:[{url}]})}:{body:'<html></html>'}});
     assert.ok(checked.requests.every(r=>r.url!==url));
@@ -416,15 +421,15 @@ test('Netflix CDN checks only an allowlisted HTTPS target with HEAD and hides it
 test('YouTube CDN mapping adds routing evidence without exposing its source IP or proving playback', async () => {
   const { result }=await run({mode:'unlock',reply:c=>({body:c.url.includes('report_mapping')
     ?'203.0.113.7 => example-nrt1 (203.0.113.8)':'<html></html>'})});
-  assert.match(result.content,/CDN 调度：HTTP 200 · 100 ms · 标识 example-nrt1/);
-  assert.doesNotMatch(result.content,/203\.0\.113\.[78]|YouTube Premium：页面地区检查通过|视频播放通过/);
+  assert.match(result.diagnosticContent,/CDN 调度：HTTP 200 · 100 ms · 标识 example-nrt1/);
+  assert.doesNotMatch(result.diagnosticContent,/203\.0\.113\.[78]|YouTube Premium：页面地区检查通过|视频播放通过/);
 });
 
 test('DNS, TLS and connection refusal remain distinct in per-probe failures', async () => {
   for(const [error,label] of [['DNS lookup failed','DNS 解析失败'],['TLS certificate invalid','TLS/证书失败'],['connection refused','连接被拒绝']]) {
     const { result }=await run({mode:'unlock',reply:()=>({error,noResponse:true})});
-    assert.ok(result.content.includes(label));
-    assert.doesNotMatch(result.content,/地区受限|入口可达，需 API Key/);
+    assert.ok(result.diagnosticContent.includes(label));
+    assert.doesNotMatch(result.diagnosticContent,/地区受限|入口可达，需 API Key/);
   }
 });
 
@@ -432,16 +437,16 @@ test('deadline retains completed platforms while marking only pending checks unk
   const { result }=await run({mode:'unlock',deadlineMs:1000,reply:c=>c.url.includes('gemini.google.com')
     ?{status:302,headers:{Location:'/app'},delay:2000}
     :{body:c.url.includes('www.google.com')?'<html><div id="search"><h3>Result</h3></div></html>':'<html></html>'}});
-  assert.match(result.content,/Google：搜索结果可达/);
-  assert.match(result.content,/Gemini：检测尚未完成（总时限）/);
-  for(const platform of ['ChatGPT','Gemini','Claude','Google','Netflix','Disney+','YouTube Premium','myTV SUPER','TikTok'])assert.ok(result.content.includes(platform+'：'));
+  assert.match(result.diagnosticContent,/Google：搜索结果可达/);
+  assert.match(result.diagnosticContent,/Gemini：检测尚未完成（总时限）/);
+  for(const platform of ['ChatGPT','Gemini','Claude','Google','Netflix','Disney+','YouTube Premium','myTV SUPER','TikTok'])assert.ok(result.diagnosticContent.includes(platform+'：'));
 });
 
 test('rate-limit or server error pages cannot turn regional wording into a restriction verdict', async () => {
   for(const status of [429,503]) {
     const { result }=await run({mode:'unlock',reply:()=>({status,body:'<html>Gemini is not supported in your country. Netflix is not available in your country. Claude is not available in your country. forbidden-location</html>'})});
-    assert.doesNotMatch(result.content,/：地区受限|：地区不支持/);
-    assert.match(result.content,status===429?/请求限流/:/HTTP 503/);
+    assert.doesNotMatch(result.diagnosticContent,/：地区受限|：地区不支持/);
+    assert.match(result.diagnosticContent,status===429?/请求限流/:/HTTP 503/);
   }
 });
 
@@ -449,7 +454,7 @@ test('redirect evidence measures the complete same-origin path', async () => {
   const { result }=await run({mode:'unlock',reply:c=>c.url==='https://gemini.google.com/'
     ?{status:302,headers:{Location:'/app'},delay:150}:c.url==='https://gemini.google.com/app'
     ?{body:'<html>Gemini</html>',delay:250}:{body:'<html></html>'}});
-  assert.match(result.content,/Web：HTTP 200 · 400 ms · 跳转 1 次/);
+  assert.match(result.diagnosticContent,/Web：HTTP 200 · 400 ms · 跳转 1 次/);
 });
 
 test('module adds only local settings interception, host and panels; no capture, MITM or rules', () => {
@@ -463,6 +468,97 @@ test('module adds only local settings interception, host and panels; no capture,
   assert.match(moduleText, /surge-node-health\.invalid = 192\.0\.2\.1/);
   assert.doesNotMatch(moduleText, /\{\{\{POLICY\}\}\}|#!arguments=POLICY/);
   assert.doesNotMatch(moduleText, /type=cron|type=event|insecure=true/);
+});
+
+test('native cards are compact while evidence remains available in the local report', async () => {
+  const ip=await run();
+  assert.ok(ip.result.content.split('\n').length<=9);
+  assert.equal(ip.result.icon,'checkmark.seal.fill');
+  assert.equal(ip.result.style,undefined);
+  assert.doesNotMatch(ip.result.content,/HTTP |IP\.SB：|主信息来源|asOrganization/);
+  assert.match(ip.result.diagnosticContent,/IPPure：HTTP 200/);
+  const platforms=await run({mode:'unlock',reply:()=>({body:'<html>ChatGPT Gemini Claude</html>'})});
+  assert.equal(platforms.result.icon,'play.tv.fill');
+  assert.equal(platforms.result['icon-color'],'#FF2D55');
+  assert.equal((platforms.result.content.match(/^(✅|◐|🚫|❔) /gm)||[]).length,9);
+  assert.ok(platforms.result.content.split('\n').length<=12);
+  assert.doesNotMatch(platforms.result.content,/HTTP |OpenAI API|App 入口|逐次：|inSupportedLocation/);
+  assert.match(platforms.result.diagnosticContent,/OpenAI API：HTTP 200/);
+});
+
+test('full IP is shown only on the requested panel and stays masked in stored records', async () => {
+  const {result,storage}=await run({argument:'mode=ip&showIP=true&policy=Group',reply:()=>({body:JSON.stringify({ip:'2001:db8::abcd',fraudScore:0})})});
+  assert.match(result.content,/2001:db8::abcd/);
+  assert.doesNotMatch(storage.VB_HEALTH_REPORT_V1_ip,/2001:db8::abcd/);
+  assert.match(storage.VB_HEALTH_REPORT_V1_ip,/2001:db8:\*\*\*\*/);
+});
+
+test('Guangzhou discovery rejects other cities, wrong coordinates and ambiguous carriers', async () => {
+  const bad=gzDirectory.flatMap(r=>[{...r,name:'Shenzhen'},{...r,country:'Japan'},{...r,lat:'31.2',lon:'121.4'},{...r,sponsor:'China Telecom China Unicom'}]);
+  const {result,requests}=await run({mode:'latency',directoryReply:{body:JSON.stringify(bad)}});
+  assert.equal(requests.length,1);
+  assert.equal((result.content.match(/暂无可用测点/g)||[]).length,3);
+  assert.doesNotMatch(result.content,/广州(?:电信|联通|移动)：\d+ ms/);
+});
+
+test('Guangzhou discovery rejects private addresses and unsafe server URLs', async () => {
+  for(const url of ['http://127.0.0.1:8080/','http://192.168.1.1/','http://10.0.0.1/','http://100.64.0.1/','http://localhost:8080/','http://x.local/','http://user:pass@ct.gzspeed.net:8080/','file:///x','http://ct.gzspeed.net:22/']) {
+    const records=gzDirectory.map(r=>({...r,url,host:''}));
+    const {requests}=await run({mode:'latency',directoryReply:{body:JSON.stringify(records)}});
+    assert.equal(requests.length,1,url);
+  }
+});
+
+test('Guangzhou targets remain the same across selected nodes for a fresh local snapshot', async () => {
+  const storage={};
+  const extra={...gzDirectory[0],id:'99999',host:'other.gzspeed.net:8080',url:'http://other.gzspeed.net:8080/speedtest/upload.php'};
+  const first=await run({mode:'latency',storage,directoryReply:{body:JSON.stringify([extra,...gzDirectory].reverse())}});
+  assert.ok(first.requests.some(r=>r.url.startsWith('http://ct.gzspeed.net:8080/')));
+  assert.ok(first.requests.every(r=>!r.url.includes('other.gzspeed.net')));
+  const second=await run({mode:'latency',storage,epoch:1792123210000,decisions:{Group:'Other'},expectedPolicy:'Other',directoryReply:{status:503}});
+  assert.equal(second.requests.length,15);
+  assert.ok(second.requests.every(r=>r.url.includes('/speedtest/latency.txt')));
+  assert.match(second.result.diagnosticContent,/30 分钟内固定测点/);
+});
+
+test('expired snapshots are not reused when the current Guangzhou directory is unavailable', async () => {
+  const storage={};
+  await run({mode:'latency',storage});
+  const {result,requests}=await run({mode:'latency',storage,epoch:1792125100000,directoryReply:{status:503}});
+  assert.equal(requests.length,1);
+  assert.equal((result.content.match(/暂无可用测点/g)||[]).length,3);
+  assert.match(result.diagnosticContent,/HTTP 503/);
+});
+
+test('a generic HTTP 200 page or a denial response cannot generate a Guangzhou latency', async () => {
+  for(const reply of [{body:'<html>Welcome</html>'},{body:'test=test\nextra text'},{status:403,body:'test=test'}]) {
+    const {result,requests}=await run({mode:'latency',reply:()=>reply});
+    assert.equal(requests.length,16);
+    assert.doesNotMatch(result.content,/广州(?:电信|联通|移动)：\d+ ms/);
+    assert.match(result.diagnosticContent,/测点响应异常/);
+  }
+});
+
+test('directory timeout does not fall back to national carrier websites', async () => {
+  const {result,requests,clock}=await run({mode:'latency',directoryReply:null});
+  assert.equal(requests.length,1);
+  assert.ok(clock<25000);
+  assert.equal((result.content.match(/暂无可用测点/g)||[]).length,3);
+  assert.match(result.diagnosticContent,/超时/);
+  assert.doesNotMatch(source,/www\.189\.cn|iservice\.10010\.com|www\.10086\.cn/);
+});
+
+test('report write failure does not prevent the native panel from completing', async () => {
+  const {result,storage}=await run({writeFail:true});
+  assert.match(result.content,/纯净度：75\/100/);
+  assert.equal(storage.VB_HEALTH_REPORT_V1_ip,undefined);
+});
+
+test('native platform errors remain short while diagnostic HTTP status is retained', async () => {
+  const {result}=await run({mode:'unlock',reply:()=>({status:503})});
+  assert.doesNotMatch(result.content,/HTTP |逐次：|API Key/);
+  assert.match(result.content,/服务异常/);
+  assert.match(result.diagnosticContent,/HTTP 503/);
 });
 
 function settings(options = {}) {
@@ -688,5 +784,48 @@ test('picker page runs list, save and reload interactions without typing group n
   await new Promise(resolve=>setImmediate(resolve));
   assert.equal(JSON.parse(storage[SETTINGS_KEY]).group,unsafe);
   assert.ok(elementsCreated.every(tag=>['button','strong','small'].includes(tag)));
+});
+
+test('reports API returns actual locally saved probes without changing the selected group', async () => {
+  const {storage}=await run();
+  const before=JSON.stringify(storage);
+  const {value,writes,result}=settings({path:'/api/reports',storage});
+  assert.equal(value.reports.length,1);
+  assert.equal(value.reports[0].mode,'ip');
+  assert.match(value.reports[0].details,/IPPure：HTTP 200/);
+  assert.equal(result.response.headers['Cache-Control'],'no-store');
+  assert.equal(writes,0);
+  assert.equal(JSON.stringify(storage),before);
+  storage.VB_HEALTH_REPORT_V1_unlock='broken';
+  storage.VB_HEALTH_REPORT_V1_latency=JSON.stringify({version:1,mode:'latency',details:'x'.repeat(24001)});
+  assert.equal(settings({path:'/api/reports',storage}).value.reports.length,1);
+});
+
+test('details page renders cached diagnostics as plain text and refreshes without probing', async () => {
+  const {storage}=await run({policies:{proxies:['<img src=x onerror=alert(1)>'],'policy-groups':['Group']},decisions:{Group:'<img src=x onerror=alert(1)>'},expectedPolicy:'<img src=x onerror=alert(1)>'});
+  const html=settings({path:'/reports'}).result.response.body;
+  assert.match(html,/href="\/"/);
+  assert.doesNotMatch(html,/innerHTML|<script[^>]+src=/);
+  const script=[...html.matchAll(/<script>([\s\S]*?)<\/script>/g)][0][1];
+  const created=[];
+  class Element {
+    constructor(tag){this.tag=tag;this.children=[];this.events={};this.text='';}
+    set textContent(value){this.text=String(value);this.children=[];}
+    get textContent(){return this.text+this.children.map(c=>c.textContent).join('');}
+    set innerHTML(_){throw new Error('Unsafe HTML insertion');}
+    append(...children){this.children.push(...children);}
+    replaceChildren(){this.children=[];this.text='';}
+    addEventListener(name,fn){this.events[name]=fn;}
+  }
+  const nodes={reports:new Element('div'),reload:new Element('button')};
+  let reads=0;
+  vm.runInNewContext(script,{document:{getElementById:id=>nodes[id],createElement:tag=>{created.push(tag);return new Element(tag);}},
+    fetch:async path=>{assert.equal(path,'/api/reports');reads++;return {ok:true,json:async()=>settings({path,storage}).value};}});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.match(nodes.reports.textContent,/<img src=x onerror=alert\(1\)>/);
+  assert.match(nodes.reports.textContent,/IPPure：HTTP 200/);
+  await nodes.reload.events.click();
+  assert.equal(reads,2);
+  assert.ok(created.every(tag=>['article','h2','small','pre'].includes(tag)));
 });
 

@@ -1,116 +1,97 @@
-# Surge 节点体检 · v0.1.0-beta.6
+# Surge 节点体检 · v0.1.0-beta.7
 
-一个模块，三个检测面板（IP 纯净度、平台解锁初检、三网站点 HTTP 耗时）和一个固定的「检测设置」入口。面向 Surge iOS，建议使用当前版本；依赖脚本 `$httpAPI`、`$surge.selectGroupDetails()` 和 `$httpClient`。macOS 尚未实机验证。
+选定已有策略组后，在组内选哪个节点就检测哪个。默认面板参考网络信息 𝕏、Stream-All 和 IPPure 的紧凑布局：IP 信息几行、平台一项一行、广州三网各一行。详细诊断放在本地详情页。
 
-**当前是测试版：本地自动化验证通过，尚未在真实 Surge / 用户节点上完成接口和界面验收。**
+**当前为测试版，尚未完成真实 Surge、用户节点、广州测速目录及手机界面的验收。** 本地模拟测试不代表真实解锁或线路测试通过。
 
-## 安装
+## 安装与使用
 
-在 Surge 的模块管理中选择从 URL 安装，粘贴：
+Surge → 模块 → 从 URL 安装：
 
 ```text
 https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/feat/surge-node-health/modules/surge/node-health/node-health.sgmodule
 ```
 
-保持默认参数启用模块（`SHOW_IP=false` 会遮住部分出口 IP）。返回策略选择页，点击新增的 **「检测设置」面板**：第一次选择第一个已有手动策略组，之后每点一次切换到下一组，最后一组之后回到第一组。每次切换立即保存，面板显示已绑定的组名、当前选择、组序号和下次点击要切换到的组。**不需要通知权限、输入组名或打开网页。**
+1. 保持默认参数启用模块，点击「检测设置」面板。每点一次切到下一个已有手动选择组，立即保存；选到平时切节点的那一组即可停下。
+2. 在该组中选择节点，分别刷新「IP 纯净度」「平台解锁检测」「广州三网延迟」。每次检测固定到当前具体节点，不批量扫描其他节点。
+3. 下次检测同组里的其他节点，只需切节点、刷新检测面板。重新进入策略页只更新设置文字，不自动切组。
 
-停在你平时切换节点的那一组即可。然后在这组中正常选择节点，分别点击三个检测面板刷新。以后检测同一组内的其他节点，只需切节点和刷新检测面板。「检测设置」用于更换检测组，点它会继续切到下一组。
+不需要通知权限、输入组名、MITM、证书或 HTTP API 监听端口。`SHOW_IP=false` 默认打码；设为 `true` 只在 IP 面板显示完整出口，保存的详细记录仍会打码。
 
-进入策略选择页时，设置面板会更新当前选择文字，**不会自动切组**。它只更改本机检测绑定，不切换任何策略组内的节点，也不立即发出检测请求。Surge 官方脚本面板没有提供直接打开网页的返回字段；本版使用面板的点按触发完成本地选组。
+已有旧版时，用同一安装地址更新模块；脚本 URL 和面板末尾应显示 `v0.1.0-beta.7`。Beta 1/2 的旧 `policy` 参数仍可读，本机保存的组优先。
 
-如果已有策略组很多，仍可从模块说明复制下面的地址，在 Safari 打开网页列表，一次点选：
+需要当前 Surge 的脚本能力。外部订阅节点标识依赖官方标注的 iOS 5.24.0+ / Mac 6.11.0+；旧版无法识别时会提示，不回退直连。嵌套手动组可解析；自动测速、故障转移或负载均衡子组无法固定到具体节点时，会要求改选具体节点。
+
+## 默认面板
+
+- **IP 纯净度**：节点、出口、国旗/位置、ASN/组织、IP 类型、纯净度和风险分、出口核对。图标颜色反映评分状态；不同出口显示警示。
+- **平台解锁检测**：ChatGPT、Gemini、Claude、Google、Netflix、Disney+、YouTube Premium、myTV SUPER、TikTok 各一行，显示简短状态及有明确来源的地区。
+- **广州三网延迟**：广州电信、广州联通、广州移动各一行，显示有效样本的中位耗时。部分成功标注有效次数；没有有效结果则显示测点不可用或超时。
+- **检测设置**：已绑定的组、当前选择、下次点按切到的组，以及选组/详情地址。
+
+平台符号：✅ 本行范围通过，◐ 部分证据，🚫 明确限制，❔ 未知。网页可达、地区检查、样本片库可见均不等于账号权益、DRM、实际播放或对话通过。
+
+默认面板不展示接口列表、HTTP 状态、API 认证正文、样本编号、逐次耗时或诊断段落；这些内容在详情页查看。每张卡片保留上次刷新结果，切节点后需分别刷新并核对节点和时间。
+
+## 本地选组和检测详情
+
+保持 Surge 和模块启用，在 Safari 打开：
 
 ```text
 http://surge-node-health.invalid/
 ```
 
-页面会自动列出 Surge 已有的手动选择组及其当前节点。**点一下你平时切换节点的那一组，就会保存，不用输入组名。** 返回 Surge，在这组中正常切换节点，分别点击三个面板刷新即可。面板和网页共用同一个绑定。
+页面上方可切换「选检测组」「检测详情」。网页组列表点一下即保存，与设置面板共用同一绑定；策略组多时可以直接点选。Safari 分享 → 添加到主屏幕，可保存「节点体检设置」入口。
 
-想让网页入口也随时找得到：在 Safari 中打开后，点分享菜单 → **添加到主屏幕**，名称可设为「节点体检设置」。以后点击这个图标即可进入选组页；打开时需保持 Surge 和模块启用。完整网址也一直保留在设置面板与模块说明里。
+详情页按三张检测卡片保存最近一次结果，显示各自节点、时间和版本。刷新记录只读取本机缓存，不发起检测。可查看来源、分项 HTTP 状态、耗时、样本与失败原因。三个卡片可能来自不同节点或不同时刻，核对后再比较。
 
-请保留地址中的 **`http://`**，无需 HTTPS 或证书。这是由 Surge HTTP 请求脚本直接返回的本地页面，不是真实外部站点。模块只为这个保留域名增加一条指向文档地址的 Host 映射，以便浏览器解析；正常启用时请求在发往外部之前即得到本地响应。
+记录只保存在本机 Surge 脚本存储中，出口 IP 始终打码，不保存原始响应、用户 Cookie/Key 或 CDN 临时 URL 参数。名称和记录均按纯文本展示。设置写入校验来源、请求头及现有组列表；读取响应禁用缓存，不开放 CORS。
 
-已安装 Beta 1/2/3/4/5：使用原安装地址更新模块（或重新添加），确认「检测设置」面板显示“每点一次切换”，脚本地址带 `?v=0.1.0-beta.6`。新的模块不再要求填写 `POLICY`；旧参数仍可兼容读取，但面板或网页保存的组优先。刷新后的面板末尾应显示 `v0.1.0-beta.6`。
+保留地址的 `http://`。这是 HTTP 请求脚本返回的本地页面，模块为保留域名添加文档地址 Host 映射，正常启用时不会请求真实外部站点。若打不开，核对脚本是否已下载、Surge/模块是否启用，以及浏览器是否改成 HTTPS。配置中的绕过项、拒绝项或优先请求脚本也可能阻止本地拦截。无需开放端口。
 
-本地设置页无法打开时，先确认 Surge 正在运行、模块已启用、脚本功能已开启，且地址没有被浏览器改成 `https://`。若你的配置对该域名或文档地址设有绕过、拒绝或其他优先请求脚本，也可能导致页面无法进入 Surge 的 HTTP 引擎。请反馈页面报错，无需开放任何监听端口。
+## IP 与平台检测依据
 
-返回策略选择页，找到三个面板，点击对应面板刷新。若不显示，请先核对 Surge 的面板功能是否可用、模块是否启用、脚本是否已下载。模块本身不要求开启 MITM、安装证书、开放 HTTP API 监听端口或登录任何平台。
+IPPure、IP.SB GeoIP 和 Cloudflare Trace 并行读取自身出口。至少两个来源有效时核对 IP，IPv6 先规范化；不同 IP 和同 IP 的地区库差异分别提示。IPPure 失败时仍可显示备用来源信息，风险分保持未知。
 
-每次刷新先读取本机节点列表，把嵌套的手动选择组解析到具体节点。所有该次检测请求指定同一节点；组已删除、选择 DIRECT/REJECT 或无法固定节点时会停止，显示错误。本地设置页只列出手动选择组；如果其中当前选中的是自动测速、故障转移或负载均衡子组，请在 Surge 中改选具体节点，以便本次检测固定同一节点。
+纯净度参考为 `100 − IPPure 风险分`，不是安全概率。只接受 0–100 有限数值；缺失、异常、限流和 HTML 不评分。IPPure 不评估 IPv6，IPv6 不生成纯净度分。住宅、机房、广播字段独立处理，不推断原生属性。各来源可能连接不同地址族，不据此宣称双栈均已检测。
 
-外部订阅节点需要 Surge 能返回 `external-policies` 标识（官方文档标注 iOS 5.24.0+ / Mac 6.11.0+）。旧版无法识别外部节点时会提示找不到节点，请升级后再试。普通本地节点不依赖此扩展。
-
-## 三个面板怎么看
-
-### IP 纯净度
-
-- 并行访问 IPPure、IP.SB GeoIP、Cloudflare Trace，逐个显示响应状态、耗时及遮蔽后的出口 IP。至少两个来源有效时核对是否一致，IPv6 不同文本写法先规范化比较。
-- 主信息优先使用 IPPure；失败时依次使用 IP.SB、Cloudflare 显示仍能取得的出口信息。备用来源不提供 IPPure 风险分，不混用分数。
-- 显示国家/地区、ASN/组织、明确提供的住宅/机房分类、Cloudflare 接入点和 WARP 状态。住宅、机房、广播与原生属性分别处理；原生属性未独立验证。
-- IPPure 风险分为 0–100，越低越好。为方便阅读，同时显示 `100 − 风险分`，标为“纯净度参考”，不是安全概率或账号保证。
-- 没有分数、返回 HTML、限流、字段异常都显示未知。接口返回 `false` 或不含类型时，不反推“机房”或“原生”。
-- IPPure 官方说明不评估 IPv6，因此 IPv6 即使伴随风险字段也不生成纯净度分。
-- 不同检测站返回不同 IP 时明确提示，保留每站结果。可能是节点按目标站分流或不同地址族，不直接判为泄漏。默认遮蔽每个来源的 IP。
-- 各接口使用自己的连接选择地址族；没有强制 IPv4/IPv6 探测，不能据此宣称双栈均已验证。
-
-### 平台解锁初检
-
-| 平台 | 检测内容 | 不能据此确认 |
-| --- | --- | --- |
-| Netflix | 两个授权样本及一个自制样本的片库页；分别显示结果与地区；另查 Fast.com 分配的 CDN 并发起一次 HEAD | 完整片库、DRM、账号、真实视频播放及持续带宽 |
-| Disney+ | 匿名设备会话返回的 `inSupportedLocation` 和地区 | 账号权益、DRM、实际播放 |
-| YouTube Premium | Premium 页面地区与 ad-free 内容标识；独立读取 Googlevideo CDN 调度标识 | 账号可购买、视频可播或实际 CDN 带宽；调度标识不是视频下载测试 |
-| ChatGPT | Web、iOS App 入口、OpenAI API 模型入口、ChatGPT 边缘 Trace 分别显示结果 | 登录、发送消息、App 内会话及 API 调用成功；边缘地区不等于服务授权 |
-| Gemini | Web、自身页面地区/功能标志、Gemini API 模型入口 | 登录后的账号可用性、对话、API 调用；没有页面标志不判定不支持 |
-| Claude | Web、明确地区拒绝页或跳转、Claude API 模型入口 | 登录、对话、Claude Code 或 API 调用成功 |
-| Google | 实际搜索结果标识、验证码、页面地区（能明确取得时） | 持续免验证码、所有 Google 服务可用；取不到地区就显示未知 |
-| myTV SUPER | 匿名会话明确返回的 `country_code`，检查是否为香港 | 频道账号权限、DRM、实际播放；非香港结果也不代表所有内容都不可用 |
-| TikTok | 网页内应用上下文的地区，兼容两种公开网页数据结构 | App 地区、推荐内容、账号及实际视频播放 |
-
-平台面板按 ChatGPT、Gemini、Claude、Google、Netflix、Disney+、YouTube Premium、myTV SUPER、TikTok 的顺序展示，共 9 项。Google 每次仅发起一个小型搜索查询，不设置强制国家参数；只有页面明确的页脚地区标签才显示地区。TikTok 不从用户资料或任意 `region` 文本猜测访问地区。
-
-每个平台显示独立分项、HTTP 状态和耗时；同源跳转的耗时累计全部跳转。以 ✅ 通过、◐ 部分、⛔ 限制、❔ 未知标记本行检测范围内的结论，汇总计数不代表完整播放/对话能力。达到总时限时保留已完成的平台，仅将未完成项标为未知。
-
-三大 AI 的 API 探测均不发送用户 Key、不生成对话。只有平台特定的结构化认证错误才标为“入口可达，需 API Key”；通用 401/403 页面不能据此通过。API 地区限制和 Web 结果单独保留。Gemini 页面启用标志缺失可能来自页面改版、账号或实验，不反推地区不支持；参考项目已有此类误判反馈。
-
-Netflix 的两个区域样本为 `81280792`、`70143836`，自制样本为 `80018499`。只有两个区域样本均明确不可见且自制样本可见时，显示“仅自制片样本可见”，结论限于这三个样本。CDN 探测只接受 Fast.com 返回的 HTTPS `*.nflxvideo.net` 地址并发 HEAD，不下载测速文件、不跟随跳转，也不显示带参数的临时 URL。CDN 有响应与片库结果分别报告，不据 403 直接宣称整个 Netflix 封锁。
-
-HTTP 200 本身不算完整解锁。人机验证、认证失败、限流、跨站登录跳转、接口字段变化均单独显示。无法取到地区就不猜测 US，不把 IPPure 的地区套给其他平台。
-
-网页检测最多跟随两次同源跳转，每次仍指定相同节点。跨域登录/同意页面交给用户确认。Disney 的浏览器应用标识来自公开的浏览器检测实现，不是用户 Token；接口或应用标识失效会显示未知或认证错误。
-
-### 三网站点 HTTP 耗时
-
-测量范围：**手机 → 指定节点 → 国内运营商站点**。首版固定三个可识别的运营商站点：
-
-| 标签 | 地址 |
+| 平台 | 详情保留的检测证据 |
 | --- | --- |
-| 电信 | `https://www.189.cn/favicon.ico` |
-| 联通 | `https://iservice.10010.com/favicon.ico` |
-| 移动 | `https://www.10086.cn/favicon.ico` |
+| ChatGPT | Web、iOS App 入口、OpenAI API 模型入口、ChatGPT 边缘 Trace；边缘地区明确标注，不当作服务授权地区 |
+| Gemini | 自身网页地区/功能标志、Gemini API 模型入口；标志缺失不判地区不支持 |
+| Claude | Web、明确地区拒绝页/跳转、Claude API 模型入口 |
+| Google | 一次小型搜索的结果列表、验证码及可识别的页脚地区，不强制国家参数 |
+| Netflix | 两个区域样本 81280792/70143836、自制样本 80018499；Fast.com 分配 CDN 后对 HTTPS *.nflxvideo.net 发一次 HEAD |
+| Disney+ | 匿名设备会话的地区和严格布尔值 inSupportedLocation |
+| YouTube Premium | Premium 地区及 ad-free 内容标识；另读 Googlevideo CDN 调度标识 |
+| myTV SUPER | 匿名会话明确的 country_code；香港结果不代表频道可播 |
+| TikTok | 两种公开网页应用上下文的地区，不从任意用户资料 region 猜测 |
 
-每站串行发出 5 次 HTTPS HEAD 请求；三站并行，共 15 次。显示中位数、最小/最大耗时、响应次数、每次耗时与 HTTP 状态，以及 HTTP 波动。波动值是相邻有效样本耗时差绝对值的均值；不会跨越失败样本计算，不是网络包抖动。DNS、TLS/证书、连接被拒、超时分别标记。每个请求超时 4 秒，整次脚本有 25 秒保护时限，模块脚本超时为 30 秒。
+AI API 不发送用户 Key、不生成对话。仅平台特定结构化认证错误可标为“入口可达，需 Key”；通用 401/403 不通过。API 与 Web 结果分开保留。Netflix 样本结论限于所查样本，CDN HEAD 不代表视频播放；YouTube 调度标识不代表实际视频下载。人机验证、限流、地区拒绝、DNS、TLS、连接拒绝和超时分开记录。未知地区不默认 US，也不套用 IPPure 地区。
 
-这不是 ICMP Ping，也不是 VPS 回程、三网骨干测评或运营商固定机房探针。耗时可能包括 DNS、节点连接、TLS 与站点处理；连接可能复用。运营商网站也可能使用 CDN 或调度到不同位置，因此不能据此判定 CN2、CMIN2、CUII 或三网跨境线路等级。
+## 广州三网的测量范围
 
-`HTTP 403/405/412` 表示站点有响应但拒绝当前请求；耗时仍保留并提示站点拒绝。`响应 4/5` 只是这五次 HTTP 请求中四次收到响应，不能换算为网络丢包率。测试不自动跟随跳转，避免更换测量目标。
+**目标只取广州电信、广州联通、广州移动。** 首次通过选中节点请求 Ookla 当前测速目录，筛选城市名 Guangzhou/广州、中国、广州范围坐标和单一运营商字段；同运营商优先选择已知 ID，否则按 ID 稳定排序选择合格记录。位置与运营商归属以目录声明为依据，未独立测绘物理机房或回程路由。
 
-## 安装后的验收步骤
+三个测点齐全时在本机固定 30 分钟，切换节点继续测相同测点，减少目标变更带来的比较误差。过期后重新取得目录；目录失败、缺少某运营商、字段异常或目标不可用时明确显示未知，**不改用其他城市或全国官网，也不使用过期快照伪装当前可用测点**。服务器 ID、域名和目录状态保存在本地详情。
 
-1. 保持 Surge 通知关闭，点击「检测设置」面板，逐次切换到常用的手动策略组；核对组名、当前选择及下一组提示。返回或重新进入策略选择页，确认绑定不变。选一个确认能上网的节点，刷新 IP 面板，核对节点名和出口 IP 是否合理；截图前建议保留 `SHOW_IP=false`。
-2. 在同一个组里切换为另一个出口不同的节点并刷新，确认节点名和 IP 同步变化。无需修改模块参数。
-3. 刷新三网面板，核对三个域名、响应 `x/5`、五次原始结果、范围和波动。超时或拒绝请保留原样反馈，不直接视为节点断网。
-4. 刷新平台面板，确认 9 个平台均有结果，再用同一节点手动打开你有账号的平台，播放视频或发送一条消息，对照实际结果。Google 的“地区未知”不等于搜索失败，myTV SUPER 的香港检查通过不等于所有频道可播，TikTok 网页地区不等于 App 解锁。初检不等于实际播放/对话通过。
-5. 试着从设置面板轮换到另一组，再刷新检测，确认跟随新组。网页选组后，设置面板也应显示同一绑定。若已绑定的组被删除，自动刷新应提示重新选组，只有点击设置面板后才选第一组；不应自动改测其他组或本地直连 IP。保存失败必须显示错误并保留旧绑定。
-6. IP 面板应出现三个来源各自的状态；若 IPPure 失败，其他来源仍应能显示出口，风险分保持未知。平台面板应分别展示 AI Web/App/API、Netflix 三个样本及 CDN、YouTube CDN 调度。核对来源、节点和时间后，再与官方客户端的实际使用对照。
+每站串行 5 次 GET 小型 `latency.txt`，三站并行。只将 HTTP 200 且正文严格为 `test=test` 的正常测速响应计入中位数；验证码、403、限流、跳转、异常 HTML 不生成延迟。详情保存逐次结果、范围和相邻有效样本耗时差均值，不跨失败样本计算。单次 3 秒，总保护时限 25 秒，模块超时 30 秒；不下载测速大文件。
 
-切换节点后，各面板保留的是其上次刷新结果。需要分别点击刷新，并核对每张面板的节点名和时间；面板缓存不代表持续实时监测。
+**这里测量的是手机 → 所选节点 → 广州测速点的 HTTP 往返，包含手机到节点和服务器处理时间。** 它不是节点端逐跳回程、纯 ICMP/TCP Ping、丢包率或 CN2/CMIN2/CUII 等级。真正查看节点到广州每一跳，需要该节点端能运行 traceroute/NextTrace 或提供等价检测能力；纯 Surge 模块无法替代。
 
-不后台定时检测，不修改分流规则或当前全局节点，不读取账号 Cookie/Token，不向自建服务器上传检测结果，不发送通知。设置面板和本地设置页仅把所选组名保存在本机 Surge 的脚本存储中；网页保存操作校验请求来源与当前组列表，列表名称按纯文本展示。检测站会正常看到发起请求的出口 IP。脚本不输出响应正文、完整出口 IP或凭据到日志。
+## 手机验收
+
+1. 通知保持关闭，切换检测组，重新进入策略页后确认绑定不变。
+2. 在同组选择两个出口不同的节点分别刷新 IP，核对节点/IP 跟随，默认卡片是否保持简洁。
+3. 平台卡片应每平台一行；在详情页核对 AI/API、样本/CDN 等分项，并用同一节点实际登录、播放或对话对照。
+4. 广州卡片应只有三个广州目标。若提示暂无测点，查看目录状态，不将其解释为节点到国内断网；30 分钟内换节点时核对详情中的服务器 ID 一致。
+5. 检测详情应保留各卡片独立时间和版本，刷新记录不发起网络检测，完整 IP 开关也不应使保存的记录出现完整出口。
+
+当前执行环境无法连接外部探测站，未得到用户节点的真实接口返回；手机面板布局、本地页面拦截和广州目录/测速服务仍需实测。macOS 亦未实机验证。
 
 ## 开发验证
 
-无需第三方 npm 包：
+无第三方 npm 依赖：
 
 ```bash
 node --check modules/surge/node-health/node-health.js
@@ -118,29 +99,14 @@ node --check modules/surge/node-health/settings.js
 node --test modules/surge/node-health/tests/node-health.test.cjs
 ```
 
-测试以模拟 Surge 运行时覆盖缺失/异常风险分、IPv6、节点解析、策略组循环、外部节点标识、认证/人机验证/限流、保守解锁判定、同源跳转、三网抽样及超时，并验证面板轮换与回到首组、非点按触发不改绑定、关闭通知仍可选组、保存失败、单组/失效组处理、网页点选、切换节点后跟随及跨站写入拦截。它们不替代真实 Surge 对模块语法、本地页面拦截、面板布局、站点可达性和节点路由的验收。
-
-Beta 6 增加三源一致性/降级、IPv6 规范化、三种 API 认证响应、API 与 Web 分离、Gemini 标志缺失、Netflix CDN 地址限制及临时参数隐藏、CDN 调度隐私、网络错误分类、累计跳转耗时、限流优先及总超时保留结果测试。模拟运行时检查并发请求不超过 Surge 上限，结束后不再新发请求。
-
-当前执行环境对外部检测地址的直接连接超时，尚未得到真实 Surge / 用户节点的线上返回；模拟测试通过不能当作解锁验收通过。新探测接口仍需手机实测，错误时应保留其分项状态再调整兼容。
+模拟测试覆盖检测边界、指定节点、无直连回退、面板轮换、记录隐私、紧凑展示、网页纯文本呈现、广州筛选/快照/过期/异常响应及请求并发上限。它们不替代真实 Surge 和在线节点验收。CI 运行相同验证。
 
 ## 参考
 
-- [Surge 脚本 API](https://manual.nssurge.com/scripting/api.html)
-- [Surge 信息面板](https://manual.nssurge.com/tools/panel.html)
-- [Surge 模块参数](https://manual.nssurge.com/profile/module.html)
-- [Surge HTTP API / 外部节点标识](https://manual.nssurge.com/tools/http-api.html)
-- [IPPure 官方接口说明](https://ippure.com/en/MyIP-Info-API)
-- [IPPure 评分与 IPv6 说明](https://ippure.com/faq)
-- [IP.SB 自身 IP / GeoIP API](https://ip.sb/api/)
-- [Cloudflare Trace 说明](https://developers.cloudflare.com/fundamentals/reference/cdn-cgi-endpoint/)
-- [OpenAI API 错误说明](https://developers.openai.com/api/docs/guides/error-codes)
-- [Gemini 模型接口](https://ai.google.dev/api/models)
-- [Claude 模型接口](https://platform.claude.com/docs/en/api/models/list)
-- [Rabbit-Spec/Surge 流媒体面板](https://github.com/Rabbit-Spec/Surge/tree/Master/Module/Panel/Stream-All)（检测思路参考；未直接打包其脚本）
-- [RegionRestrictionCheck](https://github.com/lmc999/RegionRestrictionCheck)（平台入口、地区样本与 CDN 调度检测参考；独立实现解析与判断）
-- [Gemini 误判反馈 #177](https://github.com/lmc999/RegionRestrictionCheck/issues/177)
-- [TikTokCheck](https://github.com/lmc999/TikTokCheck)（网页地区检测思路；本实现限定为应用上下文数据）
+- [网络信息 𝕏](https://github.com/xream/scripts/tree/main/surge/modules/network-info)、[Stream-All](https://github.com/Rabbit-Spec/Surge/tree/Master/Module/Panel/Stream-All)、[IPPure 模块](https://github.com/Likhixang/Egerny/blob/main/sgmodule/IPPure.sgmodule)：信息布局参考，检测与选组逻辑独立实现。
+- [Surge 信息面板](https://manual.nssurge.com/tools/panel.html)、[脚本 API](https://manual.nssurge.com/scripting/api.html)、[HTTP API](https://manual.nssurge.com/tools/http-api.html)。
+- [IPPure API](https://ippure.com/en/MyIP-Info-API)、[IPv6/评分说明](https://ippure.com/faq)、[IP.SB API](https://ip.sb/api/)、[Cloudflare Trace](https://developers.cloudflare.com/fundamentals/reference/cdn-cgi-endpoint/)。
+- [RegionRestrictionCheck](https://github.com/lmc999/RegionRestrictionCheck)、[Gemini 误判反馈](https://github.com/lmc999/RegionRestrictionCheck/issues/177)、[TikTokCheck](https://github.com/lmc999/TikTokCheck)：检测入口及误判边界参考。
+- [Speedtest CLI](https://github.com/sivel/speedtest-cli/blob/master/speedtest.py)：小型延迟探测响应格式参考；[当前广州目录入口](https://www.speedtest.net/api/js/servers?engine=js&limit=100&search=Guangzhou)。
 
 代码按仓库 MIT 许可证分发。
-
