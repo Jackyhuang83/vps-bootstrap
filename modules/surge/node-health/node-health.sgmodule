@@ -1,0 +1,16 @@
+#!name=节点体检 Beta
+#!desc=IP纯净度、平台解锁初检、三网站点HTTP耗时。指定节点检测，点击各面板刷新。
+#!category=VPS Bootstrap
+#!arguments=POLICY:填写节点或手动选择组名称,SHOW_IP:false
+#!arguments-desc=POLICY：填写已有节点或手动选择策略组的完整名称。SHOW_IP：true 显示完整出口 IP，false 隐藏部分 IP。仅手动刷新；三个面板独立运行。三网为运营商站点 HTTP 耗时，可能受 CDN 影响。平台为未登录初检，实际播放和对话仍需验证。
+
+# v0.1.0-beta.1 — no MITM, no rule changes, no background schedule.
+[Panel]
+VB-Health-IP = script-name=VB-Health-IP,title="IP 纯净度",content="点击刷新；先设置模块 POLICY 参数",update-interval=-1
+VB-Health-Unlock = script-name=VB-Health-Unlock,title="平台解锁初检",content="点击刷新；未登录初检",update-interval=-1
+VB-Health-Latency = script-name=VB-Health-Latency,title="三网站点 HTTP 耗时",content="点击刷新；手机 → 节点 → 三网站点",update-interval=-1
+
+[Script]
+VB-Health-IP = type=generic,timeout=25,script-path=https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/feat/surge-node-health/modules/surge/node-health/node-health.js,argument="mode=ip&showIP={{{SHOW_IP}}}&policy={{{POLICY}}}"
+VB-Health-Unlock = type=generic,timeout=25,script-path=https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/feat/surge-node-health/modules/surge/node-health/node-health.js,argument="mode=unlock&showIP={{{SHOW_IP}}}&policy={{{POLICY}}}"
+VB-Health-Latency = type=generic,timeout=25,script-path=https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/feat/surge-node-health/modules/surge/node-health/node-health.js,argument="mode=latency&showIP={{{SHOW_IP}}}&policy={{{POLICY}}}"
