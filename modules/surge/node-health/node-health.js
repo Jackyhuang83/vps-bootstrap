@@ -1,11 +1,11 @@
 /* SPDX-License-Identifier: MIT
- * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.15
+ * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.16
  * Runs locally in Surge. No MITM, policy mutations, credentials or uploads.
  */
 (function () {
   "use strict";
 
-  const VERSION = "0.1.0-beta.15";
+  const VERSION = "0.1.0-beta.16";
   const SETTINGS_URL = "http://surge-node-health.invalid/";
   const SETTINGS_KEY = "VB_HEALTH_SELECTED_GROUP_V1";
   const TITLES = { ip: "IP 纯净度", unlock: "平台解锁检测", latency: "广州三网延迟", path: "入口落地查询" };
@@ -16,16 +16,17 @@
     { name: "广州联通", code: "CU", carrier: /Unicom|联通/i, preferred: "26678" },
     { name: "广州移动", code: "CM", carrier: /China\s*Mobile|GZ-CMCC|CMCC|移动/i, preferred: "60794" }
   ];
-  const SERVER_DIRECTORY = "https://www.speedtest.net/api/js/servers?engine=js&limit=100&search=Guangzhou";
+  const SERVER_DIRECTORIES = [
+    { name: "Ookla 英文目录", url: "https://www.speedtest.net/api/js/servers?engine=js&limit=100&search=Guangzhou" },
+    { name: "Ookla 中文目录", url: "https://www.speedtest.net/api/js/servers?engine=js&limit=100&search=%E5%B9%BF%E5%B7%9E" },
+    { name: "Ookla SDK 目录", url: "https://www.speedtest.net/api/js/config-sdk?engine=js&limit=1000&https_functional=true" }
+  ];
   // Candidate addresses, NOT a claim of current availability. Each run must validate latency.txt.
-  // Old CT/CU/CM records: xianren78/superspeed@a82bb127 (2020-04-07).
+  // Removed the three 2020 fallback hosts after actual device DNS failures.
   // New CM: xykt/NetQuality@b53a5b88 (2025-03-12), also present in
   // oneclickvirt/speedtest@286f8fd7 (2026-10-16, availability="candidate").
   const GZ_CANDIDATES = [
-    { id: "27594", name: "Guangzhou", country: "China", lat: 23.1333, lon: 113.2667, sponsor: "ChinaTelecom 5G", host: "www.gdspeedtest.com:8080", url: "http://www.gdspeedtest.com:8080/speedtest/upload.php", source: "GitHub 历史候选 · superspeed · 2020-04-07" },
-    { id: "26678", name: "Guangzhou", country: "China", lat: 23.1333, lon: 113.2667, sponsor: "Guangzhou Unicom 5G", host: "speedtest1.gzuni.com:8080", url: "http://speedtest1.gzuni.com:8080/speedtest/upload.php", source: "GitHub 历史候选 · superspeed · 2020-04-07" },
-    { id: "60794", name: "Guangzhou", country: "China", lat: 23.1291, lon: 113.2644, sponsor: "GuangZhou-5G", provider: "CM", host: "speedtest2.dpdfsd.com.prod.hosts.ooklaserver.net:8080", url: "http://speedtest2.dpdfsd.com:8080/speedtest/upload.php", https_functional: 1, source: "GitHub 候选 · NetQuality 2025-03-12 / speedtest 2026-10-16" },
-    { id: "6611", name: "Guangzhou", country: "China", lat: 23.1333, lon: 113.2667, sponsor: "China Mobile,Guangdong", host: "speedtest1.gd.chinamobile.com:8080", url: "http://speedtest1.gd.chinamobile.com:8080/speedtest/upload.php", source: "GitHub 历史候选 · superspeed · 2020-04-07" }
+    { id: "60794", name: "Guangzhou", country: "China", lat: 23.1291, lon: 113.2644, sponsor: "GuangZhou-5G", provider: "CM", host: "speedtest2.dpdfsd.com.prod.hosts.ooklaserver.net:8080", url: "http://speedtest2.dpdfsd.com:8080/speedtest/upload.php", https_functional: 1, source: "GitHub 候选 · NetQuality 2025-03-12 / speedtest 2026-10-16" }
   ];
   let completed = false;
   let mode = "ip";
@@ -709,77 +710,124 @@
     const middle = Math.floor(sorted.length / 2);
     return Math.round(sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2);
   }
-  function probeServer(record, target, source) {
-    if (!record || !/^(Guangzhou|Guang Zhou|广州|广州市)$/i.test(String(record.name || "").trim()) ||
-      !/^(China|CN|中国)$/i.test(String(record.country || record.cc || "")) || !/^\d{1,9}$/.test(String(record.id || ""))) return null;
+  function parseProbeServer(record, source) {
+    function reject(reason) { return { reject: reason }; }
+    if (!record || typeof record !== "object" || Array.isArray(record)) return reject("记录格式不符");
+    if (!/^(Guangzhou|Guang Zhou|广州|广州市)$/i.test(String(record.name || "").trim())) return reject("非广州城市");
+    if (!/^(China|CN|中国)$/i.test(String(record.country || record.cc || "").trim())) return reject("国家缺失或不符");
+    if (!/^\d{1,9}$/.test(String(record.id || ""))) return reject("测点 ID 缺失或不符");
     const lat = Number(record.lat), lon = Number(record.lon);
-    if (record.lat === null || record.lon === null || !Number.isFinite(lat) || !Number.isFinite(lon) || lat < 22.4 || lat > 24 || lon < 112.8 || lon > 114.2) return null;
+    if (record.lat === null || record.lat === undefined || record.lat === "" || record.lon === null || record.lon === undefined || record.lon === "" ||
+      !Number.isFinite(lat) || !Number.isFinite(lon) || lat < 22.4 || lat > 24 || lon < 112.8 || lon > 114.2) return reject("坐标缺失或超出广州");
+    const address = String(record.url || "");
+    const match = address.match(/^(https?):\/\/([a-z0-9.-]+)(?::(80|443|8080))?\//i);
+    if (!match || /[\s\\@]/.test(address)) return reject("探测 URL 不符");
+    const host = match[2].toLowerCase();
+    if (/^[\d.]+$/.test(host)) {
+      if (!validIP(host)) return reject("主机地址不符");
+      const p = host.split(".").map(Number);
+      if ([0, 10, 127].indexOf(p[0]) !== -1 || p[0] >= 224 || p[0] === 169 && p[1] === 254 || p[0] === 172 && p[1] >= 16 && p[1] <= 31 || p[0] === 192 && p[1] === 168 || p[0] === 100 && p[1] >= 64 && p[1] <= 127) return reject("主机地址不符");
+    } else if (!/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i.test(host) || /\.(local|localhost|invalid|internal|test|example)$/i.test(host)) return reject("主机地址不符");
+    const authority = host + (match[3] ? ":" + match[3] : "");
+    const declared = String(record.host || authority).toLowerCase();
+    // Only the exact Ookla alias (in either direction), at the same port, is allowed.
+    const baseHost = host.replace(/\.prod\.hosts\.ooklaserver\.net$/, "");
+    const baseAuthority = baseHost + (match[3] ? ":" + match[3] : "");
+    const alias = baseHost + ".prod.hosts.ooklaserver.net" + (match[3] ? ":" + match[3] : "");
+    if (declared !== authority && (validIP(baseHost) || declared !== baseAuthority && declared !== alias)) return reject("主机别名不匹配");
     const sponsor = String(record.sponsor || "");
     const named = TARGETS.filter(function (t) { return t.carrier.test(sponsor); });
     let provider = /^(CT|CU|CM)$/.test(record.provider || "") ? record.provider : "";
-    // Ookla's sponsor "GuangZhou-5G" alone does not identify a carrier. This exact
-    // ID + endpoint is independently classified CM in the pinned GitHub sources above.
-    if (!provider && String(record.id) === "60794" && /^https?:\/\/speedtest2\.dpdfsd\.com(?::8080)?\//i.test(record.url || "")) provider = "CM";
-    if (named.length > 1 || named.length && provider && named[0].code !== provider ||
-      (named.length ? named[0].code : provider) !== target.code) return null;
-    const address = String(record.url || "");
-    const match = address.match(/^(https?):\/\/([a-z0-9.-]+)(?::(80|443|8080))?\//i);
-    if (!match || /[\s\\@]/.test(address)) return null;
-    const host = match[2].toLowerCase();
-    if (/^[\d.]+$/.test(host)) {
-      if (!validIP(host)) return null;
-      const p = host.split(".").map(Number);
-      if ([0, 10, 127].indexOf(p[0]) !== -1 || p[0] >= 224 || p[0] === 169 && p[1] === 254 || p[0] === 172 && p[1] >= 16 && p[1] <= 31 || p[0] === 192 && p[1] === 168 || p[0] === 100 && p[1] >= 64 && p[1] <= 127) return null;
-    } else if (!/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i.test(host) || /\.(local|localhost|invalid|internal|test|example)$/i.test(host)) return null;
-    let authority = host + (match[3] ? ":" + match[3] : "");
-    const declared = String(record.host || authority).toLowerCase();
-    // Accept only the exact official Ookla alias for this URL host, never an arbitrary alternate host.
-    const alias = host + ".prod.hosts.ooklaserver.net" + (match[3] ? ":" + match[3] : "");
-    if (declared !== authority && (validIP(host) || declared !== alias)) return null;
-    authority = declared;
-    const scheme = record.https_functional === 1 || record.https_functional === "1" ? "https" : match[1].toLowerCase();
-    return { name: target.name, id: String(record.id), sponsor: clean(sponsor), host: authority,
-      source: clean(source || "Ookla 当前目录"), url: scheme + "://" + authority + "/speedtest/latency.txt",
+    // This pinned mapping needs BOTH the known ID and exact endpoint, including its official alias.
+    if (!provider && String(record.id) === "60794" && baseHost === "speedtest2.dpdfsd.com") provider = "CM";
+    if (named.length > 1 || named.length && provider && named[0].code !== provider) return reject("运营商证据冲突");
+    const code = named.length ? named[0].code : provider;
+    if (!code) return reject("运营商未识别");
+    const scheme = match[1].toLowerCase();
+    const urls = [scheme + "://" + authority + "/speedtest/latency.txt"];
+    // Test the advertised URL first. https_functional is a capability, not a mandate to rewrite it.
+    const alternate = (record.https_functional === 1 || record.https_functional === "1" ? "https" : scheme) + "://" + declared + "/speedtest/latency.txt";
+    if (alternate !== urls[0]) urls.push(alternate);
+    return { code: code, id: String(record.id), sponsor: clean(sponsor), host: authority,
+      source: clean(source || "Ookla 当前目录"), urls: urls,
       record: { id: String(record.id), name: "Guangzhou", country: "China", lat: lat, lon: lon, sponsor: clean(sponsor), provider: provider,
-        host: authority, url: scheme + "://" + authority + "/speedtest/upload.php" } };
+        host: declared, url: scheme + "://" + authority + "/speedtest/upload.php", https_functional: record.https_functional === 1 || record.https_functional === "1" ? 1 : 0 } };
+  }
+  function probeServer(record, target, source) {
+    const server = parseProbeServer(record, source);
+    return !server.reject && server.code === target.code ? server : null;
+  }
+  function directoryRecords(response, label) {
+    const issue = problem(response);
+    if (issue) return { servers: [], details: evidence(label, response, issue) };
+    if (response.body.length > 2097152) return { servers: [], details: evidence(label, response, "目录过大，未解析") };
+    const parsed = json(response.body);
+    const records = Array.isArray(parsed) ? parsed : parsed && Array.isArray(parsed.servers) ? parsed.servers : null;
+    if (!records) return { servers: [], details: evidence(label, response, "目录格式未知（需要数组或 servers 数组）") };
+    const rejected = {}, servers = [], previews = [];
+    records.slice(0, 1000).forEach(function (record) {
+      const server = parseProbeServer(record, label);
+      if (!server.reject) { servers.push(server); return; }
+      rejected[server.reject] = (rejected[server.reject] || 0) + 1;
+      if (server.reject !== "非广州城市" && previews.length < 4 && record && typeof record === "object") {
+        // Whitelist bounded public metadata. Never persist raw bodies, request headers or directory URLs/queries.
+        previews.push("未采用：ID " + clean(record.id) + " · 城市 " + clean(record.name) + " · " + clean(record.sponsor) + " · " + server.reject);
+      }
+    });
+    const carriers = TARGETS.filter(function (t) { return servers.some(function (s) { return s.code === t.code; }); }).length;
+    const notes = [evidence(label, response, "返回 " + records.length + " 条 · 合格记录 " + carriers + "/3" + (records.length > 1000 ? "（仅检查前 1000 条）" : ""))];
+    if (!records.length) notes.push("目录返回空列表，并非测点连接失败。");
+    if (Object.keys(rejected).length) notes.push("筛选：" + Object.keys(rejected).map(function (key) { return key + " " + rejected[key]; }).join(" · "));
+    return { servers: servers, details: notes.concat(previews).join("\n") };
   }
   async function guangzhouServers(context) {
-    const key = "VB_HEALTH_GZ_TARGETS_V2";
+    // V3 preserves the advertised transport and invalidates V2's rewritten HTTPS snapshots.
+    const key = "VB_HEALTH_GZ_TARGETS_V3";
     let servers = null;
     let source = "";
     try {
       const cache = json($persistentStore.read(key) || "");
-      if (cache && cache.version === 2 && typeof cache.updatedAt === "number" && cache.updatedAt <= Date.now() && Date.now() - cache.updatedAt < 1800000 && Array.isArray(cache.records) && cache.records.length === 3) {
+      if (cache && cache.version === 3 && typeof cache.updatedAt === "number" && cache.updatedAt <= Date.now() && Date.now() - cache.updatedAt < 1800000 && Array.isArray(cache.records) && cache.records.length === 3) {
         const selected = TARGETS.map(function (t, i) { return probeServer(cache.records[i], t); });
         if (selected.every(Boolean)) { servers = selected; source = "广州目录快照（30 分钟内固定测点，便于比较节点）"; }
       }
-    } catch (_) { /* Missing, stale or invalid cache requires a fresh directory. */ }
+    } catch (_) { /* Missing, stale or invalid cache requires fresh directories. */ }
     if (!servers) {
-      const response = await request(context, SERVER_DIRECTORY, { timeout: 3, headers: { Accept: "application/json", Referer: "https://www.speedtest.net/" } });
-      const list = !problem(response) && json(response.body);
+      // Parallel, with the same selected node and a shared three-second time budget.
+      const directories = await Promise.all(SERVER_DIRECTORIES.map(async function (directory) {
+        const response = await request(context, directory.url, { timeout: 3, headers: { Accept: "application/json", Referer: "https://www.speedtest.net/" } });
+        return directoryRecords(response, directory.name);
+      }));
+      const available = [].concat.apply([], directories.map(function (d) { return d.servers; }));
       servers = TARGETS.map(function (target) {
-        const matches = Array.isArray(list) ? list.map(function (record) { return probeServer(record, target); }).filter(Boolean) : [];
-        matches.sort(function (a, b) { return (a.id === target.preferred ? -1 : b.id === target.preferred ? 1 : Number(a.id) - Number(b.id)); });
+        const matches = available.filter(function (server) { return server.code === target.code; });
+        matches.sort(function (a, b) { return (a.id === b.id ? 0 : a.id === target.preferred ? -1 : b.id === target.preferred ? 1 : Number(a.id) - Number(b.id)); });
         return matches[0] || null;
       });
       if (servers.every(Boolean)) {
-        try { $persistentStore.write(JSON.stringify({ version: 2, updatedAt: Date.now(), records: servers.map(function (s) { return s.record; }) }), key); } catch (_) { /* Still use the current validated directory. */ }
+        try { $persistentStore.write(JSON.stringify({ version: 3, updatedAt: Date.now(), records: servers.map(function (s) { return s.record; }) }), key); } catch (_) { /* Still use the current validated directory. */ }
       }
-      source = evidence("广州测速目录", response, Array.isArray(list) ? "合格记录 " + servers.filter(Boolean).length + "/3" : problem(response) || "目录格式未知");
+      source = directories.map(function (d) { return d.details; }).join("\n");
     }
     const pools = TARGETS.map(function (target, i) {
-      const pool = servers[i] ? [servers[i]] : [];
+      const records = servers[i] ? [servers[i]] : [];
       GZ_CANDIDATES.forEach(function (record) {
         const candidate = probeServer(record, target, record.source);
-        if (candidate && !pool.some(function (s) { return s.host === candidate.host; })) pool.push(candidate);
+        if (candidate) records.push(candidate);
       });
-      return pool.slice(0, 2); // At most one fallback per carrier; bounded by the 25-second deadline.
+      const pool = [];
+      records.forEach(function (server) {
+        server.urls.forEach(function (url) {
+          if (!pool.some(function (s) { return s.url === url; })) pool.push(Object.assign({}, server, { url: url, host: url.split("/")[2] }));
+        });
+      });
+      return pool.slice(0, 2); // At most two first probes per carrier, then four samples on the selected URL.
     });
     return { pools: pools, source: source };
   }
   function validLatencySample(s) { return !s.error && s.status === 200 && s.body.trim() === "test=test"; }
   function latencyFailure(samples) {
-    if (!samples.length) return "检测超时";
+    if (!samples.length) return "未取得广州测点";
     if (samples.every(function (s) { return s.error === "超时"; })) return "检测超时";
     if (samples.some(function (s) { return s.status === 403 || s.status === 429; })) return "测点拒绝";
     const errors = ["DNS 解析失败", "TLS/证书失败", "连接被拒绝", "连接失败"];
@@ -791,7 +839,7 @@
     let selected = null;
     let samples = [];
     function describe(target, sample) {
-      return "ID " + target.id + " · " + target.host + " · " + target.sponsor + "\n来源：" + target.source + "\n首测：" +
+      return "ID " + target.id + " · " + target.sponsor + "\n地址：" + target.url + "\n来源：" + target.source + "\n首测：" +
         (sample.error || "HTTP " + sample.status + " · " + sample.ms + " ms" + (validLatencySample(sample) ? "" : "（测点响应异常）"));
     }
     async function sample(target, index) {
@@ -804,6 +852,7 @@
       if (validLatencySample(first)) { selected = candidates[i]; samples = [first]; break; }
     }
     const details = [name].concat(attempts.map(function (a) { return describe(a.target, a.reply); }));
+    if (!attempts.length) details.push("当前目录未取得该运营商的合格广州测点，未发起测点请求；不是 DNS 失败或节点断网。");
     if (!selected) return { line: name + "：" + latencyFailure(attempts.map(function (a) { return a.reply; })), details: details.join("\n") };
     // Keep all five timing samples on this one host. A fallback's failed request is never mixed in.
     for (let i = 1; i < 5 && !completed; i += 1) samples.push(await sample(selected, i));
@@ -812,11 +861,11 @@
     const changes = [];
     samples.forEach(function (s, i) { if (i && validLatencySample(s) && validLatencySample(samples[i - 1])) changes.push(Math.abs(s.ms - samples[i - 1].ms)); });
     const fluctuation = changes.length ? Math.round(changes.reduce(function (a, b) { return a + b; }, 0) / changes.length) + " ms" : "样本不足";
-    details.push("采用：ID " + selected.id + " · " + selected.host,
+    details.push("采用：ID " + selected.id + " · " + selected.url,
       "逐次：" + samples.map(function (s) { return s.error || "HTTP " + s.status + " · " + s.ms + " ms" + (validLatencySample(s) ? "" : "（测点响应异常）"); }).join(" / "),
       "中位数 " + median(values) + " ms · 有效 " + replies.length + "/5 · 范围 " + Math.min.apply(null, values) + "–" + Math.max.apply(null, values) + " ms · HTTP 波动 " + fluctuation);
     return { line: name + "：" + median(values) + " ms" + (replies.length < 5 ? " · " + replies.length + "/5" : "") +
-      (selected.source.indexOf("历史候选") >= 0 ? " · 历史测点" : ""), details: details.join("\n") };
+      (selected.source.indexOf("GitHub 候选") >= 0 ? " · 候选测点" : ""), details: details.join("\n") };
   }
   async function latencyPanel(context) {
     const directory = await guangzhouServers(context);
@@ -824,7 +873,7 @@
     function render() {
       finish(results.map(function (r) { return r.line; }).join("\n"), "info",
         [preamble(context), directory.source].concat(results.map(function (r) { return r.details; }),
-          ["目录未取得或首个测点失败时尝试内置候选；候选清单不保证当前在线，位置与运营商以来源声明为准。", "HTTP 波动：相邻有效样本耗时差绝对值均值；不跨失败样本计算。", "测量包含手机到节点及站点响应；不是节点端逐跳回程、ICMP 或线路等级判定。"]).join("\n"),
+          ["先探测目录原地址，再尝试声明的别名/HTTPS；移动保留 ID 60794 候选，电信/联通不再使用 2020 年内置旧域名。目录与候选均不保证在线，位置与运营商以来源声明为准。", "HTTP 波动：相邻有效样本耗时差绝对值均值；不跨失败样本计算。", "测量包含手机到节点及站点响应；不是节点端逐跳回程、ICMP 或线路等级判定。"]).join("\n"),
         { icon: "antenna.radiowaves.left.and.right", "icon-color": "#007AFF" }, "手机经节点到广州 · HTTP 往返");
     }
     deadlineResult = render;
