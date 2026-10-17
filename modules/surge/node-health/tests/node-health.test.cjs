@@ -754,14 +754,68 @@ test('HTML, malformed keys and handshake errors never start formal speed samples
   }
 });
 
-test('HEAD denial, generic HTML length, missing or incorrect length, and redirects cannot generate latency', async () => {
+test('HEAD denial or unsupported response falls back to verified small GET session timing', async () => {
   for(const reply of [{status:403,headers:{'Content-Length':'1073741824'}},{headers:{'Content-Length':'100'}},
     {headers:{}},{headers:{'Content-Length':'1073741824x'}},{status:302,headers:{Location:'http://other.net/','Content-Length':'1073741824'}}]) {
     const {result,requests}=await run({mode:'latency',reply:c=>c.url.includes('dovalid?')?cnReply(c):reply});
-    assert.doesNotMatch(result.content,/广州(?:电信|联通|移动)：\d+ ms/);
     assert.equal(requests.filter(r=>r.method==='head').length,3);
-    assert.ok(requests.every(r=>!r.url.startsWith('http://other.net')));
+    assert.equal(requests.filter(r=>r.method==='get'&&r.url.includes('dovalid?')).length,12);
+    assert.equal((result.content.match(/100 ms · HTTP 会话/g)||[]).length,3);
+    assert.match(result.diagnosticContent,/HEAD 预检未通过，改测独立小体积 GET 会话/);
+    assert.ok(requests.every(r=>!r.url.startsWith('http://other.net')&&
+      !(r.method==='get'&&r.url.includes('File(1G).dl'))));
   }
+});
+
+test('a real-network-style HEAD connection failure does not defeat successful Guangzhou GET sessions', async () => {
+  const {result,requests,storage}=await run({mode:'latency',reply:c=>c.url.includes('/speed/File(1G).dl?')?
+    {error:'Error Domain=SGSocketErrorDomain Code=6 Socket closed by remote peer'}:cnReply(c)});
+  assert.equal((result.content.match(/100 ms · HTTP 会话/g)||[]).length,3);
+  assert.equal(requests.filter(r=>r.url.includes('dovalid?')).length,12);
+  assert.equal(requests.filter(r=>r.method==='head').length,6);
+  assert.ok(requests.every(r=>r.policy==='Tokyo'&&!(r.method==='get'&&r.url.includes('File(1G).dl'))));
+  assert.match(result.diagnosticContent,/SGSocketErrorDomain#6/);
+  assert.match(result.diagnosticContent,/HTTP 往返，非 TCP Ping/);
+  for(const r of requests.filter(r=>r.url.includes('dovalid?'))) {
+    const query=new URL(r.url).searchParams;
+    assert.ok(!storage.VB_HEALTH_REPORT_V1_latency.includes(query.get('token')));
+    assert.ok(!storage.VB_HEALTH_REPORT_V1_latency.includes(query.get('imei')));
+  }
+});
+
+test('session fallback preserves failed attempts and counts valid samples without retrying them', async () => {
+  const counters={};
+  const {result,requests}=await run({mode:'latency',reply:c=>{
+    if(c.url.includes('/speed/File(1G).dl?')) return {error:'connection refused'};
+    if(c.url.includes('dovalid?')) {
+      const ip=new URL(c.url).hostname;
+      counters[ip]=(counters[ip]||0)+1;
+      if(counters[ip]===3) return {error:'ECONNRESET'};
+      return cnReply(c);
+    }
+    return cnReply(c);
+  }});
+  assert.equal((result.content.match(/100 ms · HTTP 会话 · 2\/3/g)||[]).length,3);
+  assert.equal(requests.filter(r=>r.url.includes('dovalid?')).length,12);
+  assert.match(result.diagnosticContent,/有效 2\/3 · 范围 100–100 ms · HTTP 波动 样本不足/);
+  assert.ok(requests.every(r=>!(r.method==='get'&&r.url.includes('File(1G).dl'))));
+});
+
+test('session fallback rejects HTTP 200 HTML and HTTP 403 instead of producing a fabricated latency', async () => {
+  const counters={};
+  const {result,requests}=await run({mode:'latency',reply:c=>{
+    if(c.url.includes('/speed/File(1G).dl?')) return {error:'connection refused'};
+    if(c.url.includes('dovalid?')) {
+      const ip=new URL(c.url).hostname;
+      counters[ip]=(counters[ip]||0)+1;
+      return counters[ip]===1 ? cnReply(c) : (counters[ip]===2 ? {body:'<html>OK</html>'} : {status:403,body:'denied'});
+    }
+    return cnReply(c);
+  }});
+  assert.doesNotMatch(result.content,/广州(?:电信|联通|移动)：\d+ ms/);
+  assert.match(result.content,/会话采样 · 测点拒绝/);
+  assert.equal(requests.filter(r=>r.url.includes('dovalid?')).length,12);
+  assert.ok(requests.every(r=>!(r.method==='get'&&r.url.includes('File(1G).dl'))));
 });
 
 test('a failed current target falls back once; all measured samples stay on the successful replacement', async () => {
