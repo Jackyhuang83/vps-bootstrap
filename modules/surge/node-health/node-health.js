@@ -1,11 +1,11 @@
 /* SPDX-License-Identifier: MIT
- * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.17
+ * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.18
  * Runs locally in Surge. No MITM, policy mutations, credentials or uploads.
  */
 (function () {
   "use strict";
 
-  const VERSION = "0.1.0-beta.17";
+  const VERSION = "0.1.0-beta.18";
   const SETTINGS_URL = "http://surge-node-health.invalid/";
   const SETTINGS_KEY = "VB_HEALTH_SELECTED_GROUP_V1";
   const TITLES = { ip: "IP 纯净度", unlock: "平台解锁检测", latency: "广州三网延迟", path: "入口落地查询" };
@@ -109,6 +109,11 @@
     const external = (policies["external-policies"] || []).filter(function (p) {
       return (p.name === current || p.identifier === current) && (!seen.length || seen.indexOf(p.group) !== -1);
     });
+    // A name from the selected external group must use its identifier, even
+    // if a local policy happens to have the same display name.
+    if (external.length === 1 && external[0].identifier && (seen.length || external[0].identifier === current)) {
+      return { policy: external[0].identifier, label: external[0].name || current };
+    }
     if (policies.proxies.indexOf(current) !== -1) return { policy: current, label: current };
     if (external.length === 1 && external[0].identifier) return { policy: external[0].identifier, label: external[0].name || current };
     if (policies["policy-groups"].indexOf(current) !== -1) {
@@ -124,10 +129,11 @@
     return new Promise(function (resolve) {
       const start = Date.now();
       let settled = false;
-      function settle(error, response, data) {
+      function settle(error, response, data, localFailure) {
         if (settled) return;
         settled = true;
-        resolve({ error: error ? networkError(error) : "",
+        resolve({ error: error ? networkError(error) : "", errorKind: error ? (localFailure ? "脚本调用失败" : connectionKind(error)) : "",
+          errorCode: error ? networkSignature(error) : "",
           status: Number(response && response.status) || 0,
           headers: (response && response.headers) || {},
           body: typeof data === "string" ? data : "", ms: Math.max(0, Date.now() - start) });
@@ -138,7 +144,7 @@
         headers: Object.assign({ "User-Agent": UA, "Accept-Language": "en-US,en;q=0.9", "Cache-Control": "no-cache" }, config.headers || {}) };
       if (config.body !== undefined) opts.body = config.body;
       try { $httpClient[config.method || "get"](opts, settle); }
-      catch (error) { settle(error, null, ""); }
+      catch (error) { settle(error, null, "", true); }
     });
   }
 
@@ -150,6 +156,26 @@
     if (/ssl|tls|certificate|证书/i.test(value)) return "TLS/证书失败";
     if (/refused|拒绝连接/i.test(value)) return "连接被拒绝";
     return "连接失败";
+  }
+  function connectionKind(error) {
+    const value = String(error);
+    if (/closed|reset|broken pipe|econnreset|连接.*关闭|连接.*重置/i.test(value)) return "连接被关闭";
+    if (/unreachable|no route|not connected|offline|enetunreach|网络.*不可达/i.test(value)) return "网络不可达";
+    if (/unsupported|invalid.*(?:url|policy)|policy.*(?:not found|unknown)|unknown.*policy/i.test(value)) return "请求参数被拒";
+    if (/not permitted|permission|operation.*denied/i.test(value)) return "请求被阻止";
+    if (/cancelled|canceled|取消/i.test(value)) return "请求取消";
+    return networkError(error);
+  }
+  function networkSignature(error) {
+    // Keep only system domain/code or a standard errno. Never retain raw errors,
+    // which may contain a node address, the full URL, or a session query.
+    const value = String(error);
+    const match = value.match(/\b((?:NS|CF|SG)[A-Za-z]{0,40}ErrorDomain)\b[\s\S]{0,50}?(?:Code\s*[=:]\s*|error\s+|[-:])(-?\d{1,6})\b/i);
+    if (match) return match[1] + "#" + match[2];
+    const errno = value.match(/\b(E(?:CONNRESET|CONNABORTED|CONNREFUSED|HOSTUNREACH|NETUNREACH|TIMEDOUT|ACCES|PERM))\b/);
+    if (errno) return errno[1];
+    const local = value.match(/\b(TypeError|ReferenceError|SyntaxError|RangeError)\b/);
+    return local ? local[1] : "";
   }
   async function page(context, url) {
     // Follow at most two same-origin redirects, pinning the same node each time.
@@ -776,17 +802,37 @@
     for (let i = 0; i < errors.length; i += 1) if (samples.every(function (s) { return s.error === errors[i]; })) return errors[i];
     return "测点响应异常";
   }
+  function cnFailure(samples) {
+    if (!samples.length) return "采样未完成";
+    const kinds = samples.map(function (s) { return s.errorKind; }).filter(Boolean);
+    const phases = samples.map(function (s) { return s.phase; }).filter(Boolean).filter(function (v, i, a) { return a.indexOf(v) === i; });
+    const codes = samples.map(function (s) { return s.errorCode; }).filter(Boolean).filter(function (v, i, a) { return a.indexOf(v) === i; });
+    const reason = kinds.length === samples.length && kinds[0] !== "超时" && kinds.every(function (k) { return k === kinds[0]; }) ? kinds[0] : latencyFailure(samples);
+    return (phases.length === 1 ? phases[0] + " · " : "") + reason +
+      (codes.length === 1 ? "（" + (codes[0].indexOf("#") >= 0 ? "错误 " + codes[0].split("#")[1] : codes[0]) + "）" : "");
+  }
+  async function cnSetupRequest(context, url, options, connection) {
+    function opts() { return Object.assign({}, options, { headers: Object.assign({}, options.headers || {},
+      { "Accept-Encoding": "identity" }, connection.close ? { Connection: "close" } : {}) }); }
+    const first = await request(context, url, opts());
+    if (completed || connection.close || !first.error || ["连接失败", "连接被关闭"].indexOf(first.errorKind) < 0) return first;
+    // Only initialization may retry. Formal samples never hide or merge a failed request.
+    connection.close = true;
+    const second = await request(context, url, opts());
+    second.compatibility = "初始化首次：" + (first.errorKind || first.error) + (first.errorCode ? " · " + first.errorCode : "") + "；Connection: close 重试";
+    return second;
+  }
   function validCNHead(sample) {
     return !sample.error && sample.status === 200 && /^1073741824$/.test(header(sample, "content-length"));
   }
   function cnEvidence(label, sample, valid) {
-    return evidence(label, sample, valid ? "校验通过" : sample.error ? "" : "响应校验未通过");
+    return evidence(label, sample, [valid ? "校验通过" : sample.error ? sample.errorKind : "响应校验未通过", sample.errorCode, sample.compatibility].filter(Boolean).join(" · "));
   }
   function cnLatencyResult(name, target, samples, setup) {
     const replies = samples.filter(validCNHead);
     const details = setup.concat(["采用：ID " + target.id + " · " + target.base + "/speed/File(1G).dl（HEAD）",
       "逐次：" + samples.map(function (s, i) { return cnEvidence(String(i + 1), s, validCNHead(s)); }).join(" / ")]);
-    if (!replies.length) return { line: name + "：" + latencyFailure(samples), details: details.join("\n") };
+    if (!replies.length) return { line: name + "：" + cnFailure(samples), details: details.join("\n"), networkFailure: samples.length > 0 && samples.every(function (s) { return Boolean(s.error); }) };
     const values = replies.map(function (s) { return s.ms; }), changes = [];
     samples.forEach(function (s, i) { if (i && validCNHead(s) && validCNHead(samples[i - 1])) changes.push(Math.abs(s.ms - samples[i - 1].ms)); });
     const fluctuation = changes.length ? Math.round(changes.reduce(function (a, b) { return a + b; }, 0) / changes.length) + " ms" : "样本不足";
@@ -797,24 +843,30 @@
     const setup = [name], failures = [];
     for (let n = 0; n < candidates.length && !completed; n += 1) {
       const target = candidates[n];
+      const connection = { close: false };
       setup.push("ID " + target.id + " · " + target.base, "来源：" + target.source);
       // A fresh random protocol identifier, NOT the phone's IMEI. Session values stay in memory only.
       const imei = "TS" + md5ASCII(String(Date.now()) + "_" + Math.random()).slice(8, 24).toUpperCase();
       const seconds = String(Math.floor(Date.now() / 1000));
       const token = md5ASCII(md5ASCII("model=Android&imei=" + imei) + md5ASCII("stime=" + seconds + "&band=200&rand=12345555"));
       const query = "key=&flag=true&bandwidth=200&model=Android&imei=" + imei + "&time=" + seconds + "&app=globalspeed&pkg=com.cnspeedtest.globalspeed&token=" + token;
-      const handshake = await request(context, target.base + "/speed/dovalid?" + query, { timeout: 6, headers: { "User-Agent": CN_UA } });
+      const handshake = await cnSetupRequest(context, target.base + "/speed/dovalid?" + query, { timeout: 8, headers: { "User-Agent": CN_UA } }, connection);
+      handshake.phase = "握手";
       const key = !handshake.error && handshake.status === 200 && /^1-[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(handshake.body.trim()) ? handshake.body.trim().slice(2) : "";
       setup.push(cnEvidence("会话握手", handshake, Boolean(key)));
       if (!key) { failures.push(handshake); continue; }
-      async function sample(index) {
+      async function sample(index, initialize) {
         // HEAD only: no file body is downloaded, including when a server rejects the request.
-        return request(context, target.base + "/speed/File(1G).dl?r=" + Date.now() + "_" + index + "&key=" + key,
-          { method: "head", timeout: 8, headers: { "Cache-Control": "no-cache, no-store" } });
+        const url = target.base + "/speed/File(1G).dl?r=" + Date.now() + "_" + index + "&key=" + key;
+        const options = { method: "head", timeout: 8, headers: { "Cache-Control": "no-cache, no-store", "Accept-Encoding": "identity" } };
+        if (connection.close) options.headers.Connection = "close";
+        const response = initialize ? await cnSetupRequest(context, url, options, connection) : await request(context, url, options);
+        response.phase = initialize ? "预检" : "采样";
+        return response;
       }
       if (completed) break;
-      const warmup = await sample("warmup");
-      setup.push(cnEvidence("预热（不计入延迟）", warmup, validCNHead(warmup)));
+      const warmup = await sample("warmup", true);
+      setup.push(cnEvidence(connection.close ? "预检（独立连接，不计入延迟）" : "预热（不计入延迟）", warmup, validCNHead(warmup)));
       if (!validCNHead(warmup)) { failures.push(warmup); continue; }
       const samples = [];
       for (let i = 0; i < CN_SAMPLES && !completed; i += 1) {
@@ -823,14 +875,15 @@
       }
       return cnLatencyResult(name, target, samples, setup);
     }
-    return { line: name + "：" + latencyFailure(failures), details: setup.join("\n") };
+    return { line: name + "：" + cnFailure(failures), details: setup.join("\n"), networkFailure: failures.length > 0 && failures.every(function (s) { return Boolean(s.error); }) };
   }
   async function latencyPanel(context) {
     const results = TARGETS.map(function (target) { return { line: target.name + "：检测超时", details: target.name + "：总时限内未完成，未生成数值。" }; });
     let source = "正在读取广州测点目录。";
+    let connectivity = "";
     function render() {
-      finish(results.map(function (r) { return r.line; }).join("\n"), "info",
-        [preamble(context), source].concat(results.map(function (r) { return r.details; }),
+      finish(results.map(function (r) { return r.line; }).concat(connectivity ? ["", connectivity] : []).join("\n"), "info",
+        [preamble(context), source].concat(results.map(function (r) { return r.details; }), connectivity ? [connectivity] : [],
           ["当前目录优先，失败时尝试 2026-10-17 目录快照；只采用广东广州且运营商名称匹配的测点。", "全球网测会话握手后，只以 HEAD 校验文件响应头，未下载测速文件；预热不计入三次正式采样。", "HTTP 波动：相邻有效样本耗时差绝对值均值；不跨失败样本计算。", "测量包含手机到节点及站点响应；不是节点端逐跳回程、ICMP/TCP Ping 或线路等级判定。", "接口使用 HTTP，结果是连接诊断，不构成服务端身份的密码学证明。"]).join("\n"),
         { icon: "antenna.radiowaves.left.and.right", "icon-color": "#007AFF" }, "手机经节点到广州 · HTTP 往返");
     }
@@ -840,6 +893,12 @@
     await Promise.all(TARGETS.map(async function (target, i) {
       results[i] = await latencyTarget(context, target.name, directory.pools[i], function (partial) { results[i] = partial; });
     }));
+    if (!completed && results.every(function (r) { return r.networkFailure; })) {
+      connectivity = "常规 HTTPS 对照：进行中";
+      const control = await request(context, "https://www.cloudflare.com/cdn-cgi/trace", { timeout: 4 });
+      connectivity = validIP(traceFields(control).ip) ? "常规 HTTPS 可达 · 广州测点连接未成功" :
+        "常规 HTTPS 对照也未通过：" + (control.errorKind || problem(control) || "响应不符") + (control.errorCode ? " · " + control.errorCode : "");
+    }
     render();
   }
 

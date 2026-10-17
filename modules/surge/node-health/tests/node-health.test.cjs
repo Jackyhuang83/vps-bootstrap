@@ -101,7 +101,7 @@ async function run(options = {}) {
     } else assert.equal(r.policy, options.expectedPolicy || 'Tokyo');
     assert.equal(r['auto-redirect'], false);
     assert.equal(r['auto-cookie'], false);
-    assert.ok(r.timeout > 0 && r.timeout <= (r.method==='head'&&r.url.includes('/speed/File(1G).dl?')?8:6), 'timeouts use seconds');
+    assert.ok(r.timeout > 0 && r.timeout <= (r.url.includes('/speed/File(1G).dl?')||r.url.includes('/speed/dovalid?')?8:6), 'timeouts use seconds');
     assert.equal(r.insecure, undefined);
   });
   // Probe assertions read the actual persisted diagnostics; compact UI is tested separately.
@@ -165,6 +165,19 @@ test('cyclic group and API timeout stop without external requests', async () => 
 test('external nodes use Surge identifiers, never their ambiguous display name', async () => {
   const { requests } = await run({ expectedPolicy: 'POLICY::opaque', policies: { proxies: [], 'policy-groups': ['Group'], 'external-policies': [{ name: 'Tokyo', group: 'Group', identifier: 'POLICY::opaque' }] } });
   assert.equal(requests.length, 3);
+});
+
+test('a selected external node identifier wins over a colliding local display name for all Guangzhou requests', async () => {
+  const {requests}=await run({mode:'latency',expectedPolicy:'POLICY::opaque',policies:{proxies:['Tokyo'],'policy-groups':['Group'],
+    'external-policies':[{name:'Tokyo',group:'Group',identifier:'POLICY::opaque'}]}});
+  assert.equal(requests.length,18);
+  assert.ok(requests.every(r=>r.policy==='POLICY::opaque'));
+});
+
+test('an unrelated external group cannot replace an explicitly selected local policy with the same name', async () => {
+  const {requests}=await run({mode:'latency',policies:{proxies:['Tokyo'],'policy-groups':['Group','Unrelated'],
+    'external-policies':[{name:'Tokyo',group:'Unrelated',identifier:'POLICY::other'}]}});
+  assert.ok(requests.every(r=>r.policy==='Tokyo'));
 });
 
 test('unlock: generic HTTP 200 cannot become full unlock, US region, or dialogue success', async () => {
@@ -231,7 +244,7 @@ test('Guangzhou latency authorizes first, discards warmup and measures only HEAD
 
 test('all Guangzhou handshakes timing out finish within the script budget', async () => {
   const {result,clock,requests}=await run({mode:'latency',reply:()=>null});
-  assert.equal(requests.length,6);
+  assert.equal(requests.length,7); // One same-policy HTTPS comparison after all carrier connections fail.
   assert.equal((result.content.match(/检测超时/g)||[]).length,3);
   assert.ok(clock<60000);
 });
@@ -760,6 +773,65 @@ test('a failed current target falls back once; all measured samples stay on the 
   assert.match(result.content,/^广州电信：200 ms$/m);
   assert.match(result.diagnosticContent,/连接被拒绝/);
   assert.match(result.diagnosticContent,/范围 200–200 ms/);
+});
+
+test('initial connection closure retries once with close/identity and retains independent measured samples', async () => {
+  const {result,requests}=await run({mode:'latency',reply:c=>{
+    if(c.url.includes('dovalid?')&&c.headers.Connection!=='close') return {error:'Error Domain=SGSocketErrorDomain Code=6 Socket closed by remote peer',delay:900};
+    return {...cnReply(c),delay:200};
+  }});
+  assert.equal(requests.length,21);
+  assert.equal(requests.filter(r=>r.url.includes('dovalid?')).length,6);
+  assert.ok(requests.filter(r=>r.method==='head').every(r=>r.headers.Connection==='close'&&r.headers['Accept-Encoding']==='identity'));
+  assert.equal((result.content.match(/200 ms/g)||[]).length,3);
+  assert.match(result.diagnosticContent,/SGSocketErrorDomain#6/);
+  assert.match(result.diagnosticContent,/Connection: close 重试/);
+  assert.doesNotMatch(result.content,/900 ms/);
+});
+
+test('persistent connection closure shows stage/code and checks ordinary HTTPS with the same policy without retaining raw errors', async () => {
+  const {result,requests}=await run({mode:'latency',reply:c=>c.url.includes('cloudflare.com')?
+    {body:'ip=203.0.113.7\nloc=JP\ncolo=NRT'}:
+    {error:'Error Domain=SGSocketErrorDomain Code=6 Socket closed by remote peer http://198.51.100.4/speed/dovalid?token=RAW_ERROR_SECRET'}});
+  assert.equal(requests.length,10);
+  for(const name of ['广州电信','广州联通','广州移动']) assert.ok(result.content.includes(name+'：握手 · 连接被关闭（错误 6）'));
+  assert.match(result.content,/常规 HTTPS 可达 · 广州测点连接未成功/);
+  assert.match(result.diagnosticContent,/SGSocketErrorDomain#6/);
+  assert.doesNotMatch(result.diagnosticContent,/RAW_ERROR_SECRET|198\.51\.100\.4|203\.0\.113\.7/);
+  assert.ok(requests.every(r=>r.policy==='Tokyo'));
+  assert.ok(requests.every(r=>!r.url.includes('File(1G)')));
+});
+
+test('formal sample connection failures are not retried or replaced by the HTTPS comparison', async () => {
+  const {result,requests}=await run({mode:'latency',reply:c=>{
+    if(c.url.includes('/speed/File(1G)')&&new URL(c.url).searchParams.get('r').endsWith('_1')) return {error:'ECONNRESET'};
+    return cnReply(c);
+  }});
+  assert.equal(requests.length,18);
+  assert.equal((result.content.match(/100 ms · 2\/3/g)||[]).length,3);
+  assert.ok(requests.every(r=>!r.url.includes('cloudflare.com')));
+  assert.ok(requests.filter(r=>r.method==='head').every(r=>r.headers.Connection===undefined));
+});
+
+test('local HTTP client exceptions are distinguished from network errors and never compatibility-retried', async () => {
+  const {result,requests}=await run({mode:'latency',reply:()=>{throw new TypeError('Bad option http://198.51.100.4/?token=RAW_THROW_SECRET');}});
+  assert.equal(requests.filter(r=>r.url.includes('dovalid?')).length,3);
+  assert.match(result.content,/握手 · 脚本调用失败（TypeError）/);
+  assert.doesNotMatch(result.diagnosticContent,/RAW_THROW_SECRET|198\.51\.100\.4/);
+});
+
+test('a failed same-policy HTTPS comparison cannot diagnose the node as broken or invent Guangzhou latency', async () => {
+  const {result,requests}=await run({mode:'latency',reply:()=>({error:'ENETUNREACH'})});
+  assert.equal(requests.length,7);
+  assert.match(result.content,/握手 · 网络不可达（ENETUNREACH）/);
+  assert.match(result.content,/常规 HTTPS 对照也未通过：网络不可达 · ENETUNREACH/);
+  assert.doesNotMatch(result.content,/节点故障|节点不可用|广州(?:电信|联通|移动)：\d+ ms/);
+});
+
+test('a deadline during compatibility retry starts neither formal sampling nor later HTTPS comparison', async () => {
+  const {requests}=await run({mode:'latency',deadlineMs:350,reply:c=>c.headers.Connection==='close'?null:{error:'ECONNRESET'}});
+  assert.equal(requests.filter(r=>r.url.includes('dovalid?')).length,6);
+  assert.ok(requests.every(r=>!r.url.includes('File(1G)')&&!r.url.includes('cloudflare.com')));
 });
 
 test('partial success uses valid measured samples only and does not bridge failures for fluctuation', async () => {
