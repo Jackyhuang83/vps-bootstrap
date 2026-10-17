@@ -609,9 +609,11 @@ test('module adds only local settings interception, host and panels; no capture,
   const moduleText = fs.readFileSync(path.join(__dirname, '..', 'node-health.sgmodule'), 'utf8');
   assert.deepEqual([...moduleText.matchAll(/^\[([^\]]+)\]/gm)].map(m => m[1]), ['Panel', 'Script', 'Host']);
   assert.equal((moduleText.match(/update-interval=-1/g) || []).length, 4);
-  assert.equal((moduleText.match(/type=generic/g) || []).length, 5);
+  assert.equal((moduleText.match(/type=generic/g) || []).length, 6);
   assert.ok(moduleText.indexOf('VB-Health-Path = script-name=')>moduleText.indexOf('VB-Health-Latency = script-name='));
   assert.match(moduleText,/VB-Health-Path = type=generic[^\n]+argument="mode=path"/);
+  assert.ok(moduleText.indexOf('VB-Health-Reports = script-name=')>moduleText.indexOf('VB-Health-Path = script-name='));
+  assert.match(moduleText,/VB-Health-Reports = type=generic[^\n]+settings\.js[^\n]+argument="mode=reports"/);
   assert.match(moduleText, /VB-Health-Settings-Entry = script-name=VB-Health-Settings-Entry/);
   assert.equal((moduleText.match(/type=http-request/g) || []).length, 1);
   assert.match(moduleText, /pattern=\^http:\/\/surge-node-health\\\.invalid/);
@@ -814,22 +816,115 @@ function settings(options = {}) {
   let result;
   let writes = 0;
   let done = 0;
+  let groupReads = 0;
   const notifications = [];
   const groups = options.groups || { Group: ['Tokyo', 'Other'], '🚀 常用节点': ['Other'] };
   const decisions = options.decisions || { Group: 'Tokyo', '🚀 常用节点': 'Other' };
   const headers = options.headers === undefined ? { Origin: 'http://surge-node-health.invalid', 'X-VB-Health-Settings': '1', 'Content-Type': 'application/json' } : options.headers;
   vm.runInNewContext(settingsSource, {
+    $argument: options.argument,
     $request: options.panel ? undefined : { url: options.url || 'http://surge-node-health.invalid' + (options.path || '/'), method: options.method || 'GET', headers, body: options.body || '' },
     $trigger: options.trigger,
     $notification: options.noNotifications ? undefined : { post: (...args) => { if(options.notificationThrows) throw new Error('Notification error'); notifications.push(args); } },
-    $surge: { selectGroupDetails: () => options.badDetails ? {} : ({ groups, decisions }), setSelectGroupPolicy: () => { throw new Error('Must not change selected node'); } },
+    $surge: { selectGroupDetails: () => { groupReads++; return options.badDetails ? {} : ({ groups, decisions }); }, setSelectGroupPolicy: () => { throw new Error('Must not change selected node'); } },
+    $httpClient: Object.fromEntries(['get','head','post'].map(method=>[method,()=>{throw new Error('Settings/report reader must not make external requests');}])),
+    $httpAPI: () => { throw new Error('Settings/report reader must not call the HTTP API'); },
     $persistentStore: { read: key => Object.hasOwn(storage, key) ? storage[key] : null, write: (value, key) => { writes++; if(options.writeFail) return false; storage[key] = value; return true; } },
     $done: value => { result = value; done++; }
   }, { timeout: 1000 });
   assert.equal(done, 1);
   assert.ok(result);
-  return { result, storage, writes, notifications, value: result.response && result.response.headers['Content-Type'].startsWith('application/json') ? JSON.parse(result.response.body) : undefined };
+  return { result, storage, writes, notifications, groupReads, value: result.response && result.response.headers['Content-Type'].startsWith('application/json') ? JSON.parse(result.response.body) : undefined };
 }
+
+test('native report reader shows the latest real cached diagnostic without browser, probes or group access', async () => {
+  const {storage}=await run({mode:'latency',directoryReply:{status:403},reply:()=>({status:404,body:'<html>Not found</html>'})});
+  const before=JSON.stringify(storage);
+  const summary=settings({panel:true,argument:'mode=reports',trigger:'auto-interval',storage,badDetails:true,noNotifications:true});
+  assert.match(summary.result.content,/最近检测：广州三网延迟/);
+  assert.equal(summary.groupReads,0);
+  assert.equal(summary.writes,0);
+  assert.equal(JSON.stringify(storage),before);
+  const expanded=settings({panel:true,argument:'mode=reports',trigger:'button',storage,badDetails:true,noNotifications:true});
+  assert.equal(expanded.result.title,'检测详情 · 广州三网延迟');
+  assert.match(expanded.result.content,/第 1\/\d+ 页/);
+  assert.match(expanded.result.content,/HTTP 403|HTTP 404/);
+  assert.equal(expanded.groupReads,0);
+  assert.deepEqual(expanded.notifications,[]);
+  assert.equal(storage[SETTINGS_KEY],undefined);
+  assert.doesNotMatch(expanded.result.content,/http:\/\/surge-node-health/);
+});
+
+test('native diagnostic pages preserve every character and fold after the final page', () => {
+  const details='节点：Test\n'+('HTTP 404 · 🇯🇵 · 😀 · 单次 100 ms\n'.repeat(120));
+  const report={version:1,mode:'latency',title:'广州三网延迟',build:'test',updatedAt:1792123200000,details};
+  const binding=JSON.stringify({version:1,group:'🚀 常用节点'});
+  const storage={VB_HEALTH_REPORT_V1_latency:JSON.stringify(report),[SETTINGS_KEY]:binding};
+  const pageCount=Math.ceil(Array.from(details).length/700);
+  let restored='';
+  for(let page=0;page<pageCount;page++) {
+    const shown=settings({panel:true,argument:'mode=reports',trigger:'button',storage});
+    assert.ok(shown.result.content.includes('第 '+(page+1)+'/'+pageCount+' 页'));
+    const body=shown.result.content.slice(shown.result.content.indexOf('\n\n')+2);
+    assert.ok(Array.from(body).length<=700);
+    assert.ok(!/^[\udc00-\udfff]|[\ud800-\udbff]$/.test(body));
+    restored+=body;
+    assert.equal(shown.writes,1);
+    assert.equal(shown.groupReads,0);
+    assert.equal(storage[SETTINGS_KEY],binding);
+  }
+  assert.equal(restored,details);
+  const folded=settings({panel:true,argument:'mode=reports',trigger:'button',storage});
+  assert.equal(folded.result.title,'检测详情');
+  assert.match(folded.result.content,/最近检测：广州三网延迟/);
+  assert.doesNotMatch(folded.result.content,/HTTP 404/);
+});
+
+test('native report background refreshes retain the page, while a new report resets to the summary', async () => {
+  const {storage}=await run({mode:'latency'});
+  settings({panel:true,argument:'mode=reports',trigger:'button',storage});
+  const before=JSON.stringify(storage);
+  for(const trigger of ['auto-interval','editor','http-api','intent',undefined]) {
+    const current=settings({panel:true,argument:'mode=reports',trigger,storage});
+    assert.match(current.result.content,/第 1\/\d+ 页/);
+    assert.equal(current.writes,0);
+    assert.equal(JSON.stringify(storage),before);
+  }
+  storage.VB_HEALTH_REPORT_V1_ip=JSON.stringify({version:1,mode:'ip',title:'IP 纯净度',build:'new',updatedAt:1792123300000,details:'新 IP 记录 · 203.0.*.*'});
+  const current=settings({panel:true,argument:'mode=reports',trigger:'auto-interval',storage});
+  assert.match(current.result.content,/最近检测：IP 纯净度/);
+  assert.doesNotMatch(current.result.content,/第 \d+\/|广州三网/);
+  const expanded=settings({panel:true,argument:'mode=reports',trigger:'button',storage});
+  assert.match(expanded.result.content,/第 1\/1 页/);
+  assert.match(expanded.result.content,/新 IP 记录/);
+});
+
+test('native report reader skips corrupt/oversized records and invalid page state without changing bindings', () => {
+  for(const raw of ['broken',JSON.stringify({version:1,mode:'latency',details:'x'.repeat(24001)}),JSON.stringify({version:1,mode:'latency',updatedAt:-1,title:'x',build:'x',details:'x'})]) {
+    const storage={VB_HEALTH_REPORT_V1_latency:raw};
+    const result=settings({panel:true,argument:'mode=reports',trigger:'button',storage});
+    assert.match(result.result.content,/暂无检测记录/);
+    assert.equal(result.writes,0);
+    assert.equal(result.groupReads,0);
+  }
+  for(const page of [null,NaN,-2,100,0.5,'0']) {
+    const storage={VB_HEALTH_REPORT_V1_latency:JSON.stringify({version:1,mode:'latency',title:'广州三网延迟',build:'t',updatedAt:1,details:'record'}),
+      VB_HEALTH_REPORT_VIEW_V1:JSON.stringify({version:1,mode:'latency',build:'t',updatedAt:1,page})};
+    assert.match(settings({panel:true,argument:'mode=reports',storage}).result.content,/最近检测/);
+    assert.match(settings({panel:true,argument:'mode=reports',trigger:'button',storage}).result.content,/第 1\/1 页/);
+  }
+});
+
+test('native report is readable even if cursor persistence fails and cached IPs remain masked', async () => {
+  const {storage}=await run();
+  const before=JSON.stringify(storage);
+  const shown=settings({panel:true,argument:'mode=reports',trigger:'button',storage,writeFail:true});
+  assert.match(shown.result.content,/第 1\/\d+ 页/);
+  assert.match(shown.result.content,/翻页位置未保存，请重试/);
+  assert.match(shown.result.content,/203\.0\.\*\.\*/);
+  assert.doesNotMatch(shown.result.content,/203\.0\.113\.7/);
+  assert.equal(JSON.stringify(storage),before);
+});
 
 test('panel taps cycle existing groups, save exact names and wrap without notifications', () => {
   const storage = {};
