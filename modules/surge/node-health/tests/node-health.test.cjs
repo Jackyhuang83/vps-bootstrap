@@ -745,7 +745,7 @@ test('session signatures match standard MD5 and no real device identifier is use
   assert.equal(new Set(sessions.map(r=>new URL(r.url).searchParams.get('imei'))).size,3);
 });
 
-test('HTML, malformed session keys, wrong status and busy replies never start a file probe', async () => {
+test('HTML, malformed keys and handshake errors never start formal speed samples', async () => {
   for(const reply of [{body:'<html>OK</html>'},{body:'1-'+sessionKey+'extra'},{body:'-1-'},{status:403,body:'1-'+sessionKey},
     {error:'connection refused'},{body:'1-'+sessionKey+'\nwrong'}]) {
     const {result,requests}=await run({mode:'latency',reply:()=>reply});
@@ -808,13 +808,13 @@ test('persistent connection closure shows stage/code and checks ordinary HTTPS w
 test('same-port probe can receive an HTTP rejection without manufacturing Guangzhou latency', async () => {
   const {result,requests}=await run({mode:'latency',reply:c=>{
     if(c.url.includes('vb_port_probe=1')) return {status:403,body:'Forbidden'};
-    if(c.url.includes('cloudflare.com')) return {body:'ip=203.0.113.7\\nloc=JP'};
+    if(c.url.includes('cloudflare.com')) return {body:'ip=203.0.113.7\nloc=JP'};
     return {error:'ECONNRESET'};
   }});
   assert.equal(requests.filter(r=>r.url.includes('vb_port_probe=1')).length,3);
   assert.match(result.content,/同端口 HTTP 有响应/);
   assert.match(result.diagnosticContent,/同 IP 端口 HTTP 已响应 · HTTP 403/);
-  assert.doesNotMatch(result.content,/广州(?:电信|联通|移动)：\\d+ ms/);
+  assert.doesNotMatch(result.content,/广州(?:电信|联通|移动)：\d+ ms/);
   assert.ok(requests.every(r=>r.policy==='Tokyo'));
 });
 
