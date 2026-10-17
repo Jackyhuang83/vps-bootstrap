@@ -1,11 +1,11 @@
 /* SPDX-License-Identifier: MIT
- * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.9
+ * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.10
  * Runs locally in Surge. No MITM, policy mutations, credentials or uploads.
  */
 (function () {
   "use strict";
 
-  const VERSION = "0.1.0-beta.9";
+  const VERSION = "0.1.0-beta.10";
   const SETTINGS_URL = "http://surge-node-health.invalid/";
   const SETTINGS_KEY = "VB_HEALTH_SELECTED_GROUP_V1";
   const TITLES = { ip: "IP 纯净度", unlock: "平台解锁检测", latency: "广州三网延迟" };
@@ -20,6 +20,7 @@
   let completed = false;
   let mode = "ip";
   let deadlineResult = null;
+  let detectedNode = "";
 
   function reportText(value) {
     return String(value || "").replace(/(?:\d{1,3}\.){3}\d{1,3}/g, function (ip) { return validIP(ip) ? masked(ip, false) : ip; })
@@ -28,13 +29,14 @@
   function finish(content, style, details, visual, footer) {
     if (completed) return;
     completed = true;
+    const panelContent = content + "\n\n" + (detectedNode ? "节点：" + detectedNode + "\n" : "") + (footer || "更新") + " · " + time();
     try {
       if (typeof $persistentStore !== "undefined" && typeof $persistentStore.write === "function") {
         $persistentStore.write(JSON.stringify({ version: 1, build: VERSION, mode: mode, title: TITLES[mode], updatedAt: Date.now(),
-          summary: reportText(content), details: reportText(details || content) }), REPORT_KEY + mode);
+          summary: reportText(panelContent), details: reportText(details || panelContent) }), REPORT_KEY + mode);
       }
     } catch (_) { /* Diagnostic storage never prevents a panel result. */ }
-    $done(Object.assign({ title: TITLES[mode] || "节点体检", content: content + "\n\n" + (footer || "更新") + " · " + time() }, visual || { style: style || "info" }));
+    $done(Object.assign({ title: TITLES[mode] || "节点体检", content: panelContent }, visual || { style: style || "info" }));
   }
 
   function parseArgument(raw) {
@@ -192,17 +194,33 @@
   function flag(code) {
     return /^[A-Z]{2}$/.test(code || "") ? String.fromCodePoint(127397 + code.charCodeAt(0), 127397 + code.charCodeAt(1)) + " " : "";
   }
+  function regionLabel(value) {
+    // Normalize only known codes. Unrecognized labels stay literal, without a guessed flag.
+    const aliases = { JPN: "JP", USA: "US", HKG: "HK", TWN: "TW", SGP: "SG", KOR: "KR", GBR: "GB", DEU: "DE", CAN: "CA", AUS: "AU" };
+    const code = country(value);
+    const normalized = aliases[code] || code;
+    return /^[A-Z]{2}$/.test(normalized) ? flag(normalized) + normalized : clean(value);
+  }
   function compactFinding(result) {
-    let text = result.summary.replace(/，待验证对话|，待登录验证|，播放待验证/g, "")
-      .replace("网页功能标志已启用", "网页可达").replace("页面地区检查通过", "地区通过")
-      .replace("香港地区检查通过", "地区通过").replace("地区检查通过", "地区通过")
-      .replace("授权片样本可见", "片库样本可见").replace("仅自制片样本可见（两个授权样本不可见）", "仅自制样本可见")
-      .replace("搜索结果可达", "搜索正常").replace(" · 页面地区 ", " · ")
-      .replace("页面证据不足，未知", "未知").replace("接口格式变化，未知", "未知")
-      .replace(/接口异常 HTTP \d{3}/g, "服务异常").replace("接口需认证，待验证", "需登录验证").replace("页面跳转，待验证", "需登录或确认")
-      .replace("检测尚未完成（总时限）", "检测超时");
-    return result.name + "：" + text +
-      (result.region ? " · " + (result.name === "ChatGPT" ? "边缘 " : "") + result.region : "");
+    const labels = {
+      "网页可达，待验证对话": "网页可达", "网页可达，待登录验证": "网页可达", "网页功能标志已启用，待登录验证": "网页可达",
+      "页面地区检查通过": "地区支持", "香港地区检查通过": "地区支持", "地区检查通过": "地区支持",
+      "仅自制片样本可见（两个授权样本不可见）": "仅自制样本可见", "未取得有效片库证据": "片库待确认",
+      "页面证据不足，未知": "待确认", "接口格式变化，未知": "接口变化", "地区状态未知": "地区待确认",
+      "会话证据不足，未知": "会话待确认", "地区未知": "地区待确认", "页面地区冲突，未知": "地区冲突",
+      "需要人机验证": "需要验证", "接口需认证，待验证": "需要登录", "页面跳转，待验证": "跳转待确认",
+      "请求被拒，原因待确认": "请求被拒", "检测尚未完成（总时限）": "检测超时", "检测异常，待重试": "检测失败",
+      "网页可达，地区未知": "网页可达 · 地区待确认"
+    };
+    let text = labels[result.summary] || result.summary;
+    let region = result.region;
+    const webRegion = result.name === "TikTok" && result.summary.match(/^网页地区 ([A-Z]{2,3})，播放待验证$/);
+    const search = result.name === "Google" && result.summary.match(/^(搜索结果可达|网页可达，搜索待验证) · (?:页面地区 (.+)|地区未知)$/);
+    if (webRegion) { text = "网页地区"; region = webRegion[1]; }
+    if (search) { text = search[1] === "搜索结果可达" ? "搜索正常" : "搜索待确认"; region = search[2] || "地区待确认"; }
+    if (/^授权片样本可见（[12]\/2）$/.test(result.summary)) text = "授权样本可见";
+    if (/^接口异常 HTTP \d{3}$/.test(result.summary)) text = "服务异常";
+    return result.name + "：" + text + (region ? " · " + (result.name === "ChatGPT" ? "边缘 " : "") + regionLabel(region) : "");
   }
   function traceFields(response) {
     if (problem(response)) return {};
@@ -252,7 +270,7 @@
     const sources = [{ name: "IPPure", data: pure, response: response }, { name: "IP.SB", data: geo, response: responses[1] },
       { name: "Cloudflare", data: trace, response: responses[2] }];
     const valid = sources.filter(function (s) { return s.data && validIP(s.data.ip); });
-    if (!valid.length) return finish([preamble(context), "出口查询失败，请稍后刷新"].join("\n"), "alert", [preamble(context), "出口 IP 未取得；未生成纯净度分数。"].concat(sources.map(function (s) {
+    if (!valid.length) return finish("出口查询失败，请稍后刷新", "alert", [preamble(context), "出口 IP 未取得；未生成纯净度分数。"].concat(sources.map(function (s) {
       return evidence(s.name, s.response, problem(s.response) || "数据格式未知");
     })).join("\n"));
     const primary = valid[0];
@@ -287,10 +305,10 @@
     });
     if (unique.length === 1 && countries.length > 1) lines.push("地区库差异：" + countries.join(" / ") + "（IP 一致，地区资料不同）");
     lines.push("主信息来源 " + primary.name + "；风险分仅来自 IPPure · " + time(), "第三方评分，仅供参考");
-    const summary = [preamble(context), "", (ipv6 ? "IPv6：" : "IPv4：") + masked(data.ip, showIP),
-      "ASN：" + (/^\d+$/.test(String(data.asn || "")) ? "AS" : "") + clean(data.asn || "未知") + " " + clean(data.asOrganization || data.asn_organization || data.organization || ""),
+    const summary = [(ipv6 ? "IPv6：" : "IPv4：") + masked(data.ip, showIP),
       "位置：" + flag(country(data.countryCode || data.country_code || data.loc)) + (location || "未知"),
-      "类型：" + (types.join(" · ") || "未知") + (warp.indexOf("已启用") === 0 ? " · WARP" + (trace.warp === "plus" ? " Plus" : "") : ""),
+      "ASN：" + (/^\d+$/.test(String(data.asn || "")) ? "AS" : "") + clean(data.asn || "未知") + " " + clean(data.asOrganization || data.asn_organization || data.organization || ""), "",
+      "属性：" + (types.join(" · ") || "未知") + (warp.indexOf("已启用") === 0 ? " · WARP" + (trace.warp === "plus" ? " Plus" : "") : ""),
       score === null ? "风险分：未知" + (ipv6 ? "（IPv6 无评分）" : "") : "风险分：" + score + "/100 · " + risk + "风险"];
     if (unique.length > 1) summary.push("注意：多站出口不同");
     else if (valid.length < 2) summary.push("核对：仅一个来源有效");
@@ -541,7 +559,7 @@
       const details = [preamble(context), "通过 " + counts.pass + " · 部分 " + counts.partial + " · 限制 " + counts.blocked + " · 未知 " + counts.unknown]
         .concat(results.map(function (r) { return r.text; }), ["未登录，实际播放/对话未测", "API 认证响应仅证明入口可达，不等于调用通过"]).join("\n");
       const rows = results.map(compactFinding);
-      finish([preamble(context), ""].concat(rows.slice(0, 4), [""], rows.slice(4)).join("\n"), "info", details,
+      finish(rows.slice(0, 4).concat([""], rows.slice(4)).join("\n"), "info", details,
         { icon: "play.tv.fill", "icon-color": "#FF2D55" }, "播放/对话未测");
     }
     deadlineResult = render;
@@ -625,7 +643,7 @@
     const directory = await guangzhouServers(context);
     const results = await Promise.all(TARGETS.map(function (target, i) { return directory.servers[i] ? latencyTarget(context, directory.servers[i]) :
       { line: target.name + "：暂无可用测点", details: target.name + "：目录未取得合格广州测点；未改用其他城市或全国网站。" }; }));
-    finish([preamble(context), ""].concat(results.map(function (r) { return r.line; })).join("\n"), "info",
+    finish(results.map(function (r) { return r.line; }).join("\n"), "info",
       [preamble(context), directory.source].concat(results.map(function (r) { return r.details; }),
         ["HTTP 波动：相邻有效样本耗时差绝对值均值；不跨失败样本计算。", "测量包含手机到节点及站点响应；不是节点端逐跳回程、ICMP 或线路等级判定。"]).join("\n"),
       { icon: "antenna.radiowaves.left.and.right", "icon-color": "#007AFF" }, "手机经节点到广州 · HTTP 往返");
@@ -641,6 +659,7 @@
         else finish("本次检测超过总时限，请点击面板重试。\n未生成本次检测结论。", "alert");
       }, 25000);
       const context = await resolvePolicy(args.policy);
+      detectedNode = clean(context.label);
       if (mode === "ip") await ipPanel(context, args.showIP);
       else if (mode === "unlock") await unlockPanel(context);
       else await latencyPanel(context);

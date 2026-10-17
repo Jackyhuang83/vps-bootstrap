@@ -137,6 +137,8 @@ test('unlock: generic HTTP 200 cannot become full unlock, US region, or dialogue
   assert.doesNotMatch(result.diagnosticContent, /完整解锁|US|检查通过|网页可达/);
   assert.match(result.diagnosticContent, /未取得有效片库证据/);
   assert.match(result.diagnosticContent, /接口格式变化/);
+  assert.match(result.content, /^ChatGPT：待确认$/m);
+  assert.doesNotMatch(result.content, /地区支持|完整支持|已解锁/);
 });
 
 test('unlock: exact Disney session boolean and catalogue markup give bounded conclusions', async () => {
@@ -151,6 +153,10 @@ test('unlock: exact Disney session boolean and catalogue markup give bounded con
   assert.match(result.diagnosticContent, /Netflix：授权片样本可见/);
   assert.match(result.diagnosticContent, /ChatGPT：网页可达，待验证对话 · JP/);
   assert.match(result.diagnosticContent, /Gemini：网页可达，待登录验证/);
+  assert.match(result.content, /^Disney\+：地区支持 · 🇯🇵 JP$/m);
+  assert.match(result.content, /^Netflix：授权样本可见 · 🇯🇵 JP$/m);
+  assert.match(result.content, /^ChatGPT：网页可达 · 边缘 🇯🇵 JP$/m);
+  assert.doesNotMatch(result.content, /完整支持|完整解锁/);
   assert.doesNotMatch(result.diagnosticContent, /完整解锁|203\.0\.113\.7/);
 });
 
@@ -380,6 +386,7 @@ test('Gemini records its own runtime region and absent flags remain inconclusive
   const enabled=await run({mode:'unlock',reply:c=>({body:c.url.includes('gemini.google.com')
     ?'<html>Gemini [45631641,null,true] [0,2,1,200,"JPN"]</html>':'<html></html>'})});
   assert.match(enabled.result.diagnosticContent,/Gemini：网页功能标志已启用，待登录验证 · JPN/);
+  assert.match(enabled.result.content,/^Gemini：网页可达 · 🇯🇵 JP$/m);
   const absent=await run({mode:'unlock',reply:c=>({body:c.url.includes('gemini.google.com')?'<html>Gemini</html>':'<html></html>'})});
   assert.match(absent.result.diagnosticContent,/Gemini：网页可达，待登录验证/);
   assert.doesNotMatch(absent.result.diagnosticContent,/Gemini：地区受限|Gemini：地区不支持/);
@@ -476,6 +483,9 @@ test('native cards are compact while evidence remains available in the local rep
   assert.equal(ip.result.icon,'checkmark.seal.fill');
   assert.equal(ip.result.style,undefined);
   assert.match(ip.result.content,/^风险分：25\/100 · 低风险$/m);
+  assert.match(ip.result.content,/^IPv4：/);
+  assert.match(ip.result.content,/ASN：[^\n]+\n\n属性：/);
+  assert.match(ip.result.content,/\n\n节点：Tokyo\n更新 · \d{2}:\d{2}:\d{2}$/);
   assert.doesNotMatch(ip.result.content,/纯净度：|v0\.1\.0|源一致/);
   assert.doesNotMatch(ip.result.content,/HTTP |IP\.SB：|主信息来源|asOrganization/);
   assert.match(ip.result.diagnosticContent,/IPPure：HTTP 200/);
@@ -486,9 +496,14 @@ test('native cards are compact while evidence remains available in the local rep
   assert.doesNotMatch(platforms.result.content, /✅|◐|🚫|❔/);
   assert.ok(platforms.result.content.split('\n').length<=14);
   assert.match(platforms.result.content,/Google：[^\n]+\n\nNetflix：/);
+  assert.match(platforms.result.content,/^ChatGPT：/);
+  assert.match(platforms.result.content,/\n\n节点：Tokyo\n播放\/对话未测 · \d{2}:\d{2}:\d{2}$/);
   assert.doesNotMatch(platforms.result.content,/v0\.1\.0/);
   assert.doesNotMatch(platforms.result.content,/HTTP |OpenAI API|App 入口|逐次：|inSupportedLocation/);
   assert.match(platforms.result.diagnosticContent,/OpenAI API：HTTP 200/);
+  const latency=await run({mode:'latency'});
+  assert.match(latency.result.content,/^广州电信：/);
+  assert.match(latency.result.content,/\n\n节点：Tokyo\n手机经节点到广州 · HTTP 往返 · \d{2}:\d{2}:\d{2}$/);
 });
 
 test('full IP is shown only on the requested panel and stays masked in stored records', async () => {
