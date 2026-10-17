@@ -1,33 +1,28 @@
 /* SPDX-License-Identifier: MIT
- * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.16
+ * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.17
  * Runs locally in Surge. No MITM, policy mutations, credentials or uploads.
  */
 (function () {
   "use strict";
 
-  const VERSION = "0.1.0-beta.16";
+  const VERSION = "0.1.0-beta.17";
   const SETTINGS_URL = "http://surge-node-health.invalid/";
   const SETTINGS_KEY = "VB_HEALTH_SELECTED_GROUP_V1";
   const TITLES = { ip: "IP 纯净度", unlock: "平台解锁检测", latency: "广州三网延迟", path: "入口落地查询" };
   const REPORT_KEY = "VB_HEALTH_REPORT_V1_";
   const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
   const TARGETS = [
-    { name: "广州电信", code: "CT", carrier: /China\s*Telecom|Telecom-GZ|电信/i, preferred: "27594" },
-    { name: "广州联通", code: "CU", carrier: /Unicom|联通/i, preferred: "26678" },
-    { name: "广州移动", code: "CM", carrier: /China\s*Mobile|GZ-CMCC|CMCC|移动/i, preferred: "60794" }
+    { name: "广州电信", code: "CT", carrier: "电信", fallback: { hostid: "1101", pname: "广东", city: "广州", port: "65499", hostname: "广州电信", hostip: "61.144.6.18" } },
+    { name: "广州联通", code: "CU", carrier: "联通", fallback: { hostid: "1102", pname: "广东", city: "广州", port: "65499", hostname: "广州联通", hostip: "218.107.8.18" } },
+    { name: "广州移动", code: "CM", carrier: "移动", fallback: { hostid: "1103", pname: "广东", city: "广州", port: "65499", hostname: "广州移动", hostip: "183.235.59.38" } }
   ];
-  const SERVER_DIRECTORIES = [
-    { name: "Ookla 英文目录", url: "https://www.speedtest.net/api/js/servers?engine=js&limit=100&search=Guangzhou" },
-    { name: "Ookla 中文目录", url: "https://www.speedtest.net/api/js/servers?engine=js&limit=100&search=%E5%B9%BF%E5%B7%9E" },
-    { name: "Ookla SDK 目录", url: "https://www.speedtest.net/api/js/config-sdk?engine=js&limit=1000&https_functional=true" }
-  ];
-  // Candidate addresses, NOT a claim of current availability. Each run must validate latency.txt.
-  // Removed the three 2020 fallback hosts after actual device DNS failures.
-  // New CM: xykt/NetQuality@b53a5b88 (2025-03-12), also present in
-  // oneclickvirt/speedtest@286f8fd7 (2026-10-16, availability="candidate").
-  const GZ_CANDIDATES = [
-    { id: "60794", name: "Guangzhou", country: "China", lat: 23.1291, lon: 113.2644, sponsor: "GuangZhou-5G", provider: "CM", host: "speedtest2.dpdfsd.com.prod.hosts.ooklaserver.net:8080", url: "http://speedtest2.dpdfsd.com:8080/speedtest/upload.php", https_functional: 1, source: "GitHub 候选 · NetQuality 2025-03-12 / speedtest 2026-10-16" }
-  ];
+  // Public discovery and session protocol: Gaimoydev/better-speedtest@238741b0,
+  // internal/nodes/cnspeed.go + assets/config.default.json. No account credentials.
+  // Fallback metadata was returned by the directory on 2026-10-17; all three
+  // completed the session handshake and authenticated HEAD checks in this environment.
+  const CN_DIRECTORY = "https://dlcv2.cnspeedtest.cn:8443/dataServer/mobilematch_many.php?network=4&province=%E5%B9%BF%E4%B8%9C&city=%E5%B9%BF%E5%B7%9E&mobileoperid=0&ipv6=0&model=Android&pkg=com.cnspeedtest.globalspeed&wifioper=";
+  const CN_UA = "Dalvik/2.1.0 (Linux; U; Android 12; RMX3031 Build/SP1A.210812.016)";
+  const CN_SAMPLES = 3;
   let completed = false;
   let mode = "ip";
   let deadlineResult = null;
@@ -710,174 +705,141 @@
     const middle = Math.floor(sorted.length / 2);
     return Math.round(sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2);
   }
-  function parseProbeServer(record, source) {
-    function reject(reason) { return { reject: reason }; }
-    if (!record || typeof record !== "object" || Array.isArray(record)) return reject("记录格式不符");
-    if (!/^(Guangzhou|Guang Zhou|广州|广州市)$/i.test(String(record.name || "").trim())) return reject("非广州城市");
-    if (!/^(China|CN|中国)$/i.test(String(record.country || record.cc || "").trim())) return reject("国家缺失或不符");
-    if (!/^\d{1,9}$/.test(String(record.id || ""))) return reject("测点 ID 缺失或不符");
-    const lat = Number(record.lat), lon = Number(record.lon);
-    if (record.lat === null || record.lat === undefined || record.lat === "" || record.lon === null || record.lon === undefined || record.lon === "" ||
-      !Number.isFinite(lat) || !Number.isFinite(lon) || lat < 22.4 || lat > 24 || lon < 112.8 || lon > 114.2) return reject("坐标缺失或超出广州");
-    const address = String(record.url || "");
-    const match = address.match(/^(https?):\/\/([a-z0-9.-]+)(?::(80|443|8080))?\//i);
-    if (!match || /[\s\\@]/.test(address)) return reject("探测 URL 不符");
-    const host = match[2].toLowerCase();
-    if (/^[\d.]+$/.test(host)) {
-      if (!validIP(host)) return reject("主机地址不符");
-      const p = host.split(".").map(Number);
-      if ([0, 10, 127].indexOf(p[0]) !== -1 || p[0] >= 224 || p[0] === 169 && p[1] === 254 || p[0] === 172 && p[1] >= 16 && p[1] <= 31 || p[0] === 192 && p[1] === 168 || p[0] === 100 && p[1] >= 64 && p[1] <= 127) return reject("主机地址不符");
-    } else if (!/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i.test(host) || /\.(local|localhost|invalid|internal|test|example)$/i.test(host)) return reject("主机地址不符");
-    const authority = host + (match[3] ? ":" + match[3] : "");
-    const declared = String(record.host || authority).toLowerCase();
-    // Only the exact Ookla alias (in either direction), at the same port, is allowed.
-    const baseHost = host.replace(/\.prod\.hosts\.ooklaserver\.net$/, "");
-    const baseAuthority = baseHost + (match[3] ? ":" + match[3] : "");
-    const alias = baseHost + ".prod.hosts.ooklaserver.net" + (match[3] ? ":" + match[3] : "");
-    if (declared !== authority && (validIP(baseHost) || declared !== baseAuthority && declared !== alias)) return reject("主机别名不匹配");
-    const sponsor = String(record.sponsor || "");
-    const named = TARGETS.filter(function (t) { return t.carrier.test(sponsor); });
-    let provider = /^(CT|CU|CM)$/.test(record.provider || "") ? record.provider : "";
-    // This pinned mapping needs BOTH the known ID and exact endpoint, including its official alias.
-    if (!provider && String(record.id) === "60794" && baseHost === "speedtest2.dpdfsd.com") provider = "CM";
-    if (named.length > 1 || named.length && provider && named[0].code !== provider) return reject("运营商证据冲突");
-    const code = named.length ? named[0].code : provider;
-    if (!code) return reject("运营商未识别");
-    const scheme = match[1].toLowerCase();
-    const urls = [scheme + "://" + authority + "/speedtest/latency.txt"];
-    // Test the advertised URL first. https_functional is a capability, not a mandate to rewrite it.
-    const alternate = (record.https_functional === 1 || record.https_functional === "1" ? "https" : scheme) + "://" + declared + "/speedtest/latency.txt";
-    if (alternate !== urls[0]) urls.push(alternate);
-    return { code: code, id: String(record.id), sponsor: clean(sponsor), host: authority,
-      source: clean(source || "Ookla 当前目录"), urls: urls,
-      record: { id: String(record.id), name: "Guangzhou", country: "China", lat: lat, lon: lon, sponsor: clean(sponsor), provider: provider,
-        host: declared, url: scheme + "://" + authority + "/speedtest/upload.php", https_functional: record.https_functional === 1 || record.https_functional === "1" ? 1 : 0 } };
-  }
-  function probeServer(record, target, source) {
-    const server = parseProbeServer(record, source);
-    return !server.reject && server.code === target.code ? server : null;
-  }
-  function directoryRecords(response, label) {
-    const issue = problem(response);
-    if (issue) return { servers: [], details: evidence(label, response, issue) };
-    if (response.body.length > 2097152) return { servers: [], details: evidence(label, response, "目录过大，未解析") };
-    const parsed = json(response.body);
-    const records = Array.isArray(parsed) ? parsed : parsed && Array.isArray(parsed.servers) ? parsed.servers : null;
-    if (!records) return { servers: [], details: evidence(label, response, "目录格式未知（需要数组或 servers 数组）") };
-    const rejected = {}, servers = [], previews = [];
-    records.slice(0, 1000).forEach(function (record) {
-      const server = parseProbeServer(record, label);
-      if (!server.reject) { servers.push(server); return; }
-      rejected[server.reject] = (rejected[server.reject] || 0) + 1;
-      if (server.reject !== "非广州城市" && previews.length < 4 && record && typeof record === "object") {
-        // Whitelist bounded public metadata. Never persist raw bodies, request headers or directory URLs/queries.
-        previews.push("未采用：ID " + clean(record.id) + " · 城市 " + clean(record.name) + " · " + clean(record.sponsor) + " · " + server.reject);
+  function md5ASCII(input) {
+    // RFC 1321, little-endian MD5 for the ASCII-only public protocol strings below.
+    const words = Array(Math.ceil((input.length + 9) / 64) * 16).fill(0);
+    for (let i = 0; i < input.length; i += 1) words[i >> 2] |= input.charCodeAt(i) << ((i % 4) * 8);
+    words[input.length >> 2] |= 128 << ((input.length % 4) * 8);
+    words[words.length - 2] = input.length * 8;
+    const state = [1732584193, -271733879, -1732584194, 271733878];
+    const shifts = [[7, 12, 17, 22], [5, 9, 14, 20], [4, 11, 16, 23], [6, 10, 15, 21]];
+    for (let offset = 0; offset < words.length; offset += 16) {
+      let a = state[0], b = state[1], c = state[2], d = state[3];
+      for (let i = 0; i < 64; i += 1) {
+        const round = Math.floor(i / 16);
+        const f = round === 0 ? (b & c) | (~b & d) : round === 1 ? (d & b) | (~d & c) : round === 2 ? b ^ c ^ d : c ^ (b | ~d);
+        const index = round === 0 ? i : round === 1 ? (5 * i + 1) % 16 : round === 2 ? (3 * i + 5) % 16 : (7 * i) % 16;
+        const value = (a + f + (Math.floor(Math.abs(Math.sin(i + 1)) * 4294967296) | 0) + words[offset + index]) | 0;
+        const shift = shifts[round][i % 4];
+        a = d; d = c; c = b; b = (b + ((value << shift) | (value >>> (32 - shift)))) | 0;
       }
-    });
-    const carriers = TARGETS.filter(function (t) { return servers.some(function (s) { return s.code === t.code; }); }).length;
-    const notes = [evidence(label, response, "返回 " + records.length + " 条 · 合格记录 " + carriers + "/3" + (records.length > 1000 ? "（仅检查前 1000 条）" : ""))];
-    if (!records.length) notes.push("目录返回空列表，并非测点连接失败。");
-    if (Object.keys(rejected).length) notes.push("筛选：" + Object.keys(rejected).map(function (key) { return key + " " + rejected[key]; }).join(" · "));
-    return { servers: servers, details: notes.concat(previews).join("\n") };
+      [a, b, c, d].forEach(function (v, i) { state[i] = (state[i] + v) | 0; });
+    }
+    return state.map(function (v) {
+      return [0, 8, 16, 24].map(function (shift) { return ("0" + ((v >>> shift) & 255).toString(16)).slice(-2); }).join("");
+    }).join("");
+  }
+  function cnServer(record, target, source) {
+    if (!record || !/^(广东|广东省)$/.test(record.pname || "") || !/^(广州|广州市)$/.test(record.city || "") ||
+      record.hostname !== target.name || !/^\d{1,9}$/.test(String(record.hostid || "")) || !/^(65499|9443)$/.test(String(record.port || ""))) return null;
+    const ip = String(record.hostip || "");
+    if (ip.indexOf(":") >= 0 || !validIP(ip) || privateAddress(ip)) return null;
+    return { id: String(record.hostid), name: target.name, source: source, base: "http://" + ip + ":" + record.port,
+      record: { hostid: String(record.hostid), pname: "广东", city: "广州", hostname: target.name, hostip: ip, port: String(record.port) } };
+  }
+  function cnPool(server, target) {
+    const pool = server ? [server] : [];
+    const fallback = cnServer(target.fallback, target, "全球网测目录快照 · 2026-10-17");
+    if (fallback && !pool.some(function (s) { return s.base === fallback.base; })) pool.push(fallback);
+    return pool;
   }
   async function guangzhouServers(context) {
-    // V3 preserves the advertised transport and invalidates V2's rewritten HTTPS snapshots.
-    const key = "VB_HEALTH_GZ_TARGETS_V3";
-    let servers = null;
-    let source = "";
+    const key = "VB_HEALTH_GZ_CN_TARGETS_V1";
     try {
       const cache = json($persistentStore.read(key) || "");
-      if (cache && cache.version === 3 && typeof cache.updatedAt === "number" && cache.updatedAt <= Date.now() && Date.now() - cache.updatedAt < 1800000 && Array.isArray(cache.records) && cache.records.length === 3) {
-        const selected = TARGETS.map(function (t, i) { return probeServer(cache.records[i], t); });
-        if (selected.every(Boolean)) { servers = selected; source = "广州目录快照（30 分钟内固定测点，便于比较节点）"; }
+      if (cache && cache.version === 1 && typeof cache.updatedAt === "number" && cache.updatedAt <= Date.now() && Date.now() - cache.updatedAt < 1800000 &&
+        Array.isArray(cache.records) && cache.records.length === 3) {
+        const servers = TARGETS.map(function (t, i) { return cnServer(cache.records[i], t, "全球网测目录快照（30 分钟内）"); });
+        if (servers.every(Boolean)) return { pools: servers.map(function (s, i) { return cnPool(s, TARGETS[i]); }), source: "广州测点：30 分钟内固定目录快照；本次仍需握手与响应头校验。" };
       }
-    } catch (_) { /* Missing, stale or invalid cache requires fresh directories. */ }
-    if (!servers) {
-      // Parallel, with the same selected node and a shared three-second time budget.
-      const directories = await Promise.all(SERVER_DIRECTORIES.map(async function (directory) {
-        const response = await request(context, directory.url, { timeout: 3, headers: { Accept: "application/json", Referer: "https://www.speedtest.net/" } });
-        return directoryRecords(response, directory.name);
-      }));
-      const available = [].concat.apply([], directories.map(function (d) { return d.servers; }));
-      servers = TARGETS.map(function (target) {
-        const matches = available.filter(function (server) { return server.code === target.code; });
-        matches.sort(function (a, b) { return (a.id === b.id ? 0 : a.id === target.preferred ? -1 : b.id === target.preferred ? 1 : Number(a.id) - Number(b.id)); });
-        return matches[0] || null;
-      });
-      if (servers.every(Boolean)) {
-        try { $persistentStore.write(JSON.stringify({ version: 3, updatedAt: Date.now(), records: servers.map(function (s) { return s.record; }) }), key); } catch (_) { /* Still use the current validated directory. */ }
-      }
-      source = directories.map(function (d) { return d.details; }).join("\n");
+    } catch (_) { /* Re-discover invalid or expired public metadata. */ }
+    const directories = await Promise.all(TARGETS.map(async function (target) {
+      const response = await request(context, CN_DIRECTORY + encodeURIComponent(target.carrier), { timeout: 6, headers: { Accept: "application/json" } });
+      const issue = problem(response);
+      const records = !issue && response.body.length <= 100000 ? json(response.body) : null;
+      const matches = Array.isArray(records) ? records.slice(0, 100).map(function (r) { return cnServer(r, target, "全球网测当前目录"); }).filter(Boolean) : [];
+      matches.sort(function (a, b) { return Number(a.id) - Number(b.id); });
+      return { server: matches[0] || null, details: evidence(target.name + "目录", response, issue ||
+        (Array.isArray(records) ? "返回 " + records.length + " 条 · 合格广州测点 " + matches.length : "目录格式不符")) };
+    }));
+    if (directories.every(function (d) { return d.server; })) {
+      try { $persistentStore.write(JSON.stringify({ version: 1, updatedAt: Date.now(), records: directories.map(function (d) { return d.server.record; }) }), key); } catch (_) { /* Cache is optional. */ }
     }
-    const pools = TARGETS.map(function (target, i) {
-      const records = servers[i] ? [servers[i]] : [];
-      GZ_CANDIDATES.forEach(function (record) {
-        const candidate = probeServer(record, target, record.source);
-        if (candidate) records.push(candidate);
-      });
-      const pool = [];
-      records.forEach(function (server) {
-        server.urls.forEach(function (url) {
-          if (!pool.some(function (s) { return s.url === url; })) pool.push(Object.assign({}, server, { url: url, host: url.split("/")[2] }));
-        });
-      });
-      return pool.slice(0, 2); // At most two first probes per carrier, then four samples on the selected URL.
-    });
-    return { pools: pools, source: source };
+    return { source: directories.map(function (d) { return d.details; }).join("\n"),
+      pools: TARGETS.map(function (t, i) { return cnPool(directories[i].server, t); }) };
   }
-  function validLatencySample(s) { return !s.error && s.status === 200 && s.body.trim() === "test=test"; }
   function latencyFailure(samples) {
-    if (!samples.length) return "未取得广州测点";
+    if (!samples.length) return "采样未完成";
     if (samples.every(function (s) { return s.error === "超时"; })) return "检测超时";
     if (samples.some(function (s) { return s.status === 403 || s.status === 429; })) return "测点拒绝";
     const errors = ["DNS 解析失败", "TLS/证书失败", "连接被拒绝", "连接失败"];
     for (let i = 0; i < errors.length; i += 1) if (samples.every(function (s) { return s.error === errors[i]; })) return errors[i];
-    return "测点不可用";
+    return "测点响应异常";
   }
-  async function latencyTarget(context, name, candidates) {
-    const attempts = [];
-    let selected = null;
-    let samples = [];
-    function describe(target, sample) {
-      return "ID " + target.id + " · " + target.sponsor + "\n地址：" + target.url + "\n来源：" + target.source + "\n首测：" +
-        (sample.error || "HTTP " + sample.status + " · " + sample.ms + " ms" + (validLatencySample(sample) ? "" : "（测点响应异常）"));
-    }
-    async function sample(target, index) {
-      return request(context, target.url + "?vb_probe=" + Date.now() + "_" + index,
-        { method: "get", timeout: 3, headers: { "Cache-Control": "no-cache, no-store" } });
-    }
-    for (let i = 0; i < candidates.length && !completed; i += 1) {
-      const first = await sample(candidates[i], 0);
-      attempts.push({ target: candidates[i], reply: first });
-      if (validLatencySample(first)) { selected = candidates[i]; samples = [first]; break; }
-    }
-    const details = [name].concat(attempts.map(function (a) { return describe(a.target, a.reply); }));
-    if (!attempts.length) details.push("当前目录未取得该运营商的合格广州测点，未发起测点请求；不是 DNS 失败或节点断网。");
-    if (!selected) return { line: name + "：" + latencyFailure(attempts.map(function (a) { return a.reply; })), details: details.join("\n") };
-    // Keep all five timing samples on this one host. A fallback's failed request is never mixed in.
-    for (let i = 1; i < 5 && !completed; i += 1) samples.push(await sample(selected, i));
-    const replies = samples.filter(validLatencySample);
-    const values = replies.map(function (s) { return s.ms; });
-    const changes = [];
-    samples.forEach(function (s, i) { if (i && validLatencySample(s) && validLatencySample(samples[i - 1])) changes.push(Math.abs(s.ms - samples[i - 1].ms)); });
+  function validCNHead(sample) {
+    return !sample.error && sample.status === 200 && /^1073741824$/.test(header(sample, "content-length"));
+  }
+  function cnEvidence(label, sample, valid) {
+    return evidence(label, sample, valid ? "校验通过" : sample.error ? "" : "响应校验未通过");
+  }
+  function cnLatencyResult(name, target, samples, setup) {
+    const replies = samples.filter(validCNHead);
+    const details = setup.concat(["采用：ID " + target.id + " · " + target.base + "/speed/File(1G).dl（HEAD）",
+      "逐次：" + samples.map(function (s, i) { return cnEvidence(String(i + 1), s, validCNHead(s)); }).join(" / ")]);
+    if (!replies.length) return { line: name + "：" + latencyFailure(samples), details: details.join("\n") };
+    const values = replies.map(function (s) { return s.ms; }), changes = [];
+    samples.forEach(function (s, i) { if (i && validCNHead(s) && validCNHead(samples[i - 1])) changes.push(Math.abs(s.ms - samples[i - 1].ms)); });
     const fluctuation = changes.length ? Math.round(changes.reduce(function (a, b) { return a + b; }, 0) / changes.length) + " ms" : "样本不足";
-    details.push("采用：ID " + selected.id + " · " + selected.url,
-      "逐次：" + samples.map(function (s) { return s.error || "HTTP " + s.status + " · " + s.ms + " ms" + (validLatencySample(s) ? "" : "（测点响应异常）"); }).join(" / "),
-      "中位数 " + median(values) + " ms · 有效 " + replies.length + "/5 · 范围 " + Math.min.apply(null, values) + "–" + Math.max.apply(null, values) + " ms · HTTP 波动 " + fluctuation);
-    return { line: name + "：" + median(values) + " ms" + (replies.length < 5 ? " · " + replies.length + "/5" : "") +
-      (selected.source.indexOf("GitHub 候选") >= 0 ? " · 候选测点" : ""), details: details.join("\n") };
+    details.push("中位数 " + median(values) + " ms · 有效 " + replies.length + "/" + CN_SAMPLES + " · 范围 " + Math.min.apply(null, values) + "–" + Math.max.apply(null, values) + " ms · HTTP 波动 " + fluctuation);
+    return { line: name + "：" + median(values) + " ms" + (replies.length < CN_SAMPLES ? " · " + replies.length + "/" + CN_SAMPLES : ""), details: details.join("\n") };
+  }
+  async function latencyTarget(context, name, candidates, progress) {
+    const setup = [name], failures = [];
+    for (let n = 0; n < candidates.length && !completed; n += 1) {
+      const target = candidates[n];
+      setup.push("ID " + target.id + " · " + target.base, "来源：" + target.source);
+      // A fresh random protocol identifier, NOT the phone's IMEI. Session values stay in memory only.
+      const imei = "TS" + md5ASCII(String(Date.now()) + "_" + Math.random()).slice(8, 24).toUpperCase();
+      const seconds = String(Math.floor(Date.now() / 1000));
+      const token = md5ASCII(md5ASCII("model=Android&imei=" + imei) + md5ASCII("stime=" + seconds + "&band=200&rand=12345555"));
+      const query = "key=&flag=true&bandwidth=200&model=Android&imei=" + imei + "&time=" + seconds + "&app=globalspeed&pkg=com.cnspeedtest.globalspeed&token=" + token;
+      const handshake = await request(context, target.base + "/speed/dovalid?" + query, { timeout: 6, headers: { "User-Agent": CN_UA } });
+      const key = !handshake.error && handshake.status === 200 && /^1-[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(handshake.body.trim()) ? handshake.body.trim().slice(2) : "";
+      setup.push(cnEvidence("会话握手", handshake, Boolean(key)));
+      if (!key) { failures.push(handshake); continue; }
+      async function sample(index) {
+        // HEAD only: no file body is downloaded, including when a server rejects the request.
+        return request(context, target.base + "/speed/File(1G).dl?r=" + Date.now() + "_" + index + "&key=" + key,
+          { method: "head", timeout: 8, headers: { "Cache-Control": "no-cache, no-store" } });
+      }
+      if (completed) break;
+      const warmup = await sample("warmup");
+      setup.push(cnEvidence("预热（不计入延迟）", warmup, validCNHead(warmup)));
+      if (!validCNHead(warmup)) { failures.push(warmup); continue; }
+      const samples = [];
+      for (let i = 0; i < CN_SAMPLES && !completed; i += 1) {
+        samples.push(await sample(i));
+        progress(cnLatencyResult(name, target, samples, setup));
+      }
+      return cnLatencyResult(name, target, samples, setup);
+    }
+    return { line: name + "：" + latencyFailure(failures), details: setup.join("\n") };
   }
   async function latencyPanel(context) {
-    const directory = await guangzhouServers(context);
     const results = TARGETS.map(function (target) { return { line: target.name + "：检测超时", details: target.name + "：总时限内未完成，未生成数值。" }; });
+    let source = "正在读取广州测点目录。";
     function render() {
       finish(results.map(function (r) { return r.line; }).join("\n"), "info",
-        [preamble(context), directory.source].concat(results.map(function (r) { return r.details; }),
-          ["先探测目录原地址，再尝试声明的别名/HTTPS；移动保留 ID 60794 候选，电信/联通不再使用 2020 年内置旧域名。目录与候选均不保证在线，位置与运营商以来源声明为准。", "HTTP 波动：相邻有效样本耗时差绝对值均值；不跨失败样本计算。", "测量包含手机到节点及站点响应；不是节点端逐跳回程、ICMP 或线路等级判定。"]).join("\n"),
+        [preamble(context), source].concat(results.map(function (r) { return r.details; }),
+          ["当前目录优先，失败时尝试 2026-10-17 目录快照；只采用广东广州且运营商名称匹配的测点。", "全球网测会话握手后，只以 HEAD 校验文件响应头，未下载测速文件；预热不计入三次正式采样。", "HTTP 波动：相邻有效样本耗时差绝对值均值；不跨失败样本计算。", "测量包含手机到节点及站点响应；不是节点端逐跳回程、ICMP/TCP Ping 或线路等级判定。", "接口使用 HTTP，结果是连接诊断，不构成服务端身份的密码学证明。"]).join("\n"),
         { icon: "antenna.radiowaves.left.and.right", "icon-color": "#007AFF" }, "手机经节点到广州 · HTTP 往返");
     }
     deadlineResult = render;
-    await Promise.all(TARGETS.map(async function (target, i) { results[i] = await latencyTarget(context, target.name, directory.pools[i]); }));
+    const directory = await guangzhouServers(context);
+    source = directory.source;
+    await Promise.all(TARGETS.map(async function (target, i) {
+      results[i] = await latencyTarget(context, target.name, directory.pools[i], function (partial) { results[i] = partial; });
+    }));
     render();
   }
 
@@ -889,7 +851,7 @@
         if (completed) return;
         if (deadlineResult) deadlineResult();
         else finish("本次检测超过总时限，请点击面板重试。\n未生成本次检测结论。", "alert");
-      }, 25000);
+      }, mode === "latency" ? 65000 : 25000);
       const context = await resolvePolicy(args.policy);
       detectedNode = clean(context.label);
       if (mode === "ip") await ipPanel(context);
@@ -899,4 +861,5 @@
     } catch (error) { finish(clean(error.message || error), "alert"); }
   })();
 })();
+
 

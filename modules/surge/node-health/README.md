@@ -1,8 +1,8 @@
-# Surge 节点体检 · v0.1.0-beta.16
+# Surge 节点体检 · v0.1.0-beta.17
 
 选定已有策略组后，在组内选哪个节点就检测哪个。默认面板参考网络信息 𝕏、Stream-All 和 IPPure 的紧凑布局：IP 信息几行、平台一项一行、广州三网各一行。详细诊断可直接在 Surge 原生「检测详情」面板读取，无需打开网页。
 
-**当前为测试版，尚未完成真实 Surge、用户节点、广州测速目录及手机界面的验收。** 本地模拟测试不代表真实解锁或线路测试通过。
+**当前为测试版，真实 Surge、所选节点路径及手机界面尚未实机验收。** 广州目录、会话握手和响应头流程已在执行环境完成真实网络请求；该结果不代表每个用户节点均可到达。
 
 ## 安装与使用
 
@@ -20,7 +20,7 @@ https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/feat/surge-node-hea
 
 不需要通知权限、输入组名、MITM、证书或 HTTP API 监听端口。IP 纯净度面板直接显示完整出口 IP，不再需要 SHOW_IP 开关；旧版 showIP=false 参数仍可读取，但不会隐藏面板地址。保存的详细记录仍会打码。
 
-已有旧版时，用同一安装地址更新模块；脚本 URL 和「检测设置」面板应显示 `v0.1.0-beta.16`。四个检测面板只显示更新时间，详情保留记录生成时的版本。必须更新模块定义才会添加新的详情入口及数字地址拦截；仅刷新旧面板不会添加它们。旧缓存的生成版本不会随模块更新自动变化。Beta 1/2 的旧 `policy` 参数仍可读，本机保存的组优先。
+已有旧版时，用同一安装地址更新模块；脚本 URL 和「检测设置」面板应显示 `v0.1.0-beta.17`。四个检测面板只显示更新时间，详情保留记录生成时的版本。必须更新模块定义才会添加新的详情入口及数字地址拦截；仅刷新旧面板不会添加它们。旧缓存的生成版本不会随模块更新自动变化。Beta 1/2 的旧 `policy` 参数仍可读，本机保存的组优先。
 
 需要当前 Surge 的脚本能力。外部订阅节点标识依赖官方标注的 iOS 5.24.0+ / Mac 6.11.0+；旧版无法识别时会提示，不回退直连。嵌套手动组可解析；自动测速、故障转移或负载均衡子组无法固定到具体节点时，会要求改选具体节点。
 
@@ -96,38 +96,42 @@ AI API 不发送用户 Key、不生成对话。仅平台特定结构化认证错
 
 ## 广州三网的测量范围
 
-**目标只取来源标注为广州的电信、联通、移动测点。** 首次通过选中节点并行请求 Ookla 英文搜索、中文搜索和 SDK 目录，各自最多等 3 秒，不累加为 9 秒。支持顶层数组或明确的 `servers` 数组；不将任意 JSON 字段猜成测点。目录返回 HTTP 200 时，详情会列出返回条数、覆盖的运营商数、筛选原因计数，以及最多四条未采用的广州记录（仅 ID、城市、运营商名称与原因）。空列表、格式不符、非广州、国家/坐标缺失、运营商不明/冲突、地址不符会分别记录，不再只有含糊的 0/3。这里的三个入口属于同一服务，并非三个独立测点来源；SDK 目录可能只返回出口附近的其他城市，仍须通过广州筛选。
+采用“目录发现 → 会话握手 → 连接预热 → 固定测点多次采样”的流程。测点来自全球网测的公开目录，握手流程参考 `better-speedtest` 的客户端实现；预热剔除的思路参考 `speedtest-go` 的 HTTP 模式。这里使用 HTTP 响应头往返，**不声称实现 Ookla 原生 TCP/UDP 协议或与 Speedtest App 数值相同**。
 
-筛选要求城市名 Guangzhou/Guang Zhou/广州/广州市、中国、广州范围坐标及运营商证据；同运营商优先已知 ID，否则按 ID 稳定排序。兼容 `provider` 的 CT/CU/CM 标记；`GuangZhou-5G` 名称本身不证明运营商，只为有 GitHub 对照记录的 ID 60794 和精确域名采用移动映射，兼容 URL 已使用对应 Ookla 别名的记录。主机只允许与 URL 精确对应的 `.prod.hosts.ooklaserver.net` 别名和相同端口。
+三网目录请求并行，全部固定当前选中的具体节点；只接受省份广东、城市广州/广州市、名称严格对应广州电信/联通/移动、公网 IPv4、规定端口和数字 ID。其他城市、内网地址、混合运营商或任意主机 URL 不采用。齐全目录元数据缓存 30 分钟，切换节点时优先相同测点；不缓存会话标识。目录缺失时，使用 2026-10-17 返回并在执行环境验证过的三个地址：
 
-**先测目录提供的原始协议与主机，不再因 `https_functional=1` 强制替换成 HTTPS 别名。** 原地址首测失败后，才尝试该记录明确声明的别名或 HTTPS 能力地址。每运营商最多尝试两个完整 URL，详情保留实际协议、主机、路径与首测结果。正常首测后固定同一 URL 继续四次，备用统计不混入原地址失败耗时，不挑最快值。
+| 运营商 | 目录 ID | 公网测点 | 目录声明 |
+| --- | --- | --- | --- |
+| 电信 | 1101 | `61.144.6.18:65499` | 广东 · 广州电信 |
+| 联通 | 1102 | `218.107.8.18:65499` | 广东 · 广州联通 |
+| 移动 | 1103 | `183.235.59.38:65499` | 广东 · 广州移动 |
 
-齐全的目录元数据在本机固定 30 分钟，切换节点时优先相同目标。V3 快照保留原始协议、主机和声明的备用能力；不读取旧版 V2 强制改写过的 HTTPS 快照，过期后重新请求目录。快照不代表在线，首次采样仍需校验响应。
+这些地址是测速服务，不是 DNS Ping 目标。目录与快照表示来源声明，不独立证明机房位置，也不保证永久在线；每次必须重新握手和校验响应。已移除此前 Ookla 目录和旧候选依赖。
 
-已移除截图中 DNS 失败的三个 2020 年内置候选：电信 `www.gdspeedtest.com`、联通 `speedtest1.gzuni.com`、移动 `speedtest1.gd.chinamobile.com`。目前仅保留有 2025/2026 年来源记录的移动 ID 60794 候选：
+先按公开协议请求 `/speed/dovalid`，只接受 HTTP 200 与严格的 `1-UUID` 会话响应。握手使用临时随机协议标识，**不读取手机 IMEI、不需要账号或 VPS 程序**。协议签名只针对公开字段，不是用户账号凭据。会话值、临时标识和完整带参数的请求 URL 只在当次运行内使用，不写入模块诊断缓存或日志；Surge 自身流量查看器仍可能显示脚本请求 URL。
 
-| 运营商 | ID | 原地址主机 | 声明的备用地址 | 来源记录日期 |
-| --- | --- | --- | --- | --- |
-| 移动 | 60794 | `http://speedtest2.dpdfsd.com:8080` | `https://speedtest2.dpdfsd.com.prod.hosts.ooklaserver.net:8080` | NetQuality 2025-03-12；speedtest 2026-10-16 仍列为 candidate |
+带会话参数对 `/speed/File(1G).dl` 发送 **HEAD**，只读响应头，**不 GET 或下载该文件**。只有 HTTP 200 且 `Content-Length` 严格为 `1073741824` 才通过当前服务的响应校验；直接访问文件的 403、通用网页、缺少/错误长度、跳转均不生成延迟。HEAD 是用于轻量检测，不是下载测速。接口使用 HTTP，响应校验不是服务端身份的密码学证明。
 
-**候选尚未验证在线；用户此前对其 HTTPS 别名的首测为超时。电信、联通没有已确认在线的新内置地址。** 当前目录没有合格测点时，对应行显示「未取得广州测点」，详情明确未发起测点请求；不再拿旧域名的 DNS 失败当作本次节点线路结论。目录有地址但连接失败时，保留 DNS、TLS、拒绝、超时等实际原因。所有请求固定所选节点；不换直连、其他城市或全国官网。
+首次 HEAD 用于预热，不计入统计；随后在同一地址、同一会话正式采样三次，显示有效样本中位数。失败不当作零毫秒；部分有效标明 `1/3` 或 `2/3`，波动只计算相邻均有效样本的差。当前新地址握手/预热失败时，最多尝试一次不同的内置快照地址，两个地址的统计不混用。采样中即保存内存进度，总时限到达时保留已取得的有效样本。
 
-三网并行，只将小型 `/speedtest/latency.txt` 的 HTTP 200 且正文严格为 `test=test` 的正常响应计入五次样本中位数。验证码、403、限流、跳转、异常 HTML 不生成延迟。详情保存有效次数、范围和相邻有效样本耗时差均值，不跨失败样本计算。单次 3 秒，总保护时限 25 秒，模块超时 30 秒；超时保留已完成结果，不下载测速大文件。使用 GitHub 候选成功时标注「候选测点」，比较节点前核对采用的完整 URL 一致。
+目录/握手每次 6 秒，HEAD 每次 8 秒；三网并行，整体保护 65 秒、模块超时 70 秒。正常完成即返回，不会固定等待 65 秒。各网失败独立，所有请求固定所选节点。
 
-**这里测量的是手机 → 所选节点 → 广州测速点的 HTTP 往返，包含手机到节点和服务器处理时间。** 它不是节点端逐跳回程、纯 ICMP/TCP Ping、丢包率或 CN2/CMIN2/CUII 等级。真正查看节点到广州每一跳，需要该节点端能运行 traceroute/NextTrace 或提供等价检测能力；纯 Surge 模块无法替代。
+MiniProbe 的 IPv4 默认由 VPS Agent 对运营商 DNS 做 ICMP，另外支持 TCP/UDP 53；Surge 脚本的公开接口不提供对应的原始套接字能力，不能把 DNS 地址直接换成 HTTP URL。这里参考其三网并行、固定目标及失败隔离的设计，保留客户端可执行的 HTTP 方案。
+
+**测量范围仍是手机 → 所选节点 → 广州 HTTP 测点的往返，包含手机到节点及服务器处理时间。** 它不是 VPS 端回程 Ping、逐跳路由、丢包率或 CN2/CMIN2/CUII 等级。MiniProbe 在 VPS 上测得的结果与这里的数值不能直接等同。
 
 ## 手机验收
 
 1. 通知保持关闭，切换检测组，重新进入策略页后确认绑定不变。
 2. 在同组选择两个出口不同的节点分别刷新 IP，核对节点/IP 跟随，默认卡片是否保持简洁。
 3. 平台卡片应每平台一行；在详情页核对 AI/API、样本/CDN 等分项，并用同一节点实际登录、播放或对话对照。
-4. 广州卡片应显示三网的耗时或明确失败原因。详情应分别显示三个目录的返回条数和筛选原因；目录缺少电信/联通时应显示“未取得广州测点”，移动候选的首测应保留实际 URL。切换节点比较时核对采用的 ID/主机，失败不等于节点到国内断网。
+4. 广州卡片应显示三网的耗时或明确失败原因。详情应显示当前目录/快照、会话握手、预热和三次 HEAD 结果；握手和预热耗时不进入中位数，不能出现会话参数。切换节点比较时核对采用的 ID/主机，失败不等于节点到国内断网。
 5. IP 面板应显示完整 IPv4/IPv6，即使沿用旧版 showIP=false 参数；检测详情保留各卡片独立时间和版本，仍对出口打码，刷新记录不发起网络检测。
 6. 更新模块后，广州三网下面应出现独立入口落地面板；点击后核对直连公网、入口、落地三个区块。入口未取得时查看本地详情，不把落地 IP 复制成入口；换节点后分别刷新并核对底部节点和时间。
 7. 更新模块后，最下方应出现原生「检测详情」。刷新广州三网后点按详情，核对记录类别、节点、时间、请求主机和状态码；翻至末页后再点按应收起。新检测记录生成后应回到摘要。
 8. Beta 15 更新模块定义后，在 Safari 打开 `http://192.0.2.1/copy`，点「复制全文」并粘贴到其他 App，核对完整末尾内容而非只有当前原生页。复制被阻止时应保留选中状态、提示长按复制，不虚报成功；纯文本入口应显示同一份完整记录。上述入口不依赖通知。
 
-当前执行环境无法连接外部探测站，未得到用户节点的真实接口返回；手机面板布局、本地页面拦截和广州目录/测速服务仍需实测。macOS 亦未实机验证。
+执行环境已取得三网广州目录，完成真实会话握手及授权 HEAD 200 校验，未读取测速文件正文。模块实际逻辑另通过网络适配器执行；此验证使用执行环境的出口，不能替代用户 Surge/节点路径。手机面板布局、本地页面拦截及 macOS 仍未实机验证。
 
 ## 开发验证
 
@@ -139,7 +143,7 @@ node --check modules/surge/node-health/settings.js
 node --test modules/surge/node-health/tests/node-health.test.cjs
 ```
 
-模拟测试覆盖检测边界、指定节点、无直连回退、面板轮换、记录隐私、紧凑展示、网页纯文本呈现、广州筛选/别名/运营商证据/快照/过期/目录失败/候选切换/独立统计/具体错误及请求并发上限；入口落地另验证直连/节点分离、唯一探测匹配、外部节点标识、入口歧义、IPv6、地理响应地址核对、本地库回退、私有地址、失败独立和超时收尾。原生详情另验证本机真实缓存读取、最新记录选择、完整分页、Unicode、自动刷新不翻页、新记录重置、损坏记录、存储失败和不读策略组/不发请求；复制页验证数字地址只读路由、完整导出、HTML 转义、HTTP 复制及安全上下文剪贴板、拒绝/异常时不虚报、选中文本与空记录。它们不替代真实 Surge 和在线节点验收。CI 运行相同验证。
+模拟测试覆盖检测边界、指定节点、无直连回退、面板轮换、记录隐私、紧凑展示、网页纯文本呈现、广州城市/运营商/公网地址筛选、目录快照/过期、MD5 签名、会话格式、HEAD 独占与长度校验、握手/预热剔除、候选切换、独立统计、部分样本、总时限及请求并发上限；入口落地另验证直连/节点分离、唯一探测匹配、外部节点标识、入口歧义、IPv6、地理响应地址核对、本地库回退、私有地址、失败独立和超时收尾。原生详情另验证本机真实缓存读取、最新记录选择、完整分页、Unicode、自动刷新不翻页、新记录重置、损坏记录、存储失败和不读策略组/不发请求；复制页验证数字地址只读路由、完整导出、HTML 转义、HTTP 复制及安全上下文剪贴板、拒绝/异常时不虚报、选中文本与空记录。它们不替代真实 Surge 和在线节点验收。CI 运行相同验证。
 
 ## 参考
 
@@ -148,8 +152,9 @@ node --test modules/surge/node-health/tests/node-health.test.cjs
 - [IP.SB GeoIP API](https://ip.sb/api/)、[Cloudflare cdn-cgi 文档](https://developers.cloudflare.com/fundamentals/reference/cdn-cgi-endpoint/)。入口连接字段的读取方式参考网络信息 𝕏，但增加本次 URL 和策略身份严格匹配。
 - [IPPure API](https://ippure.com/en/MyIP-Info-API)、[IPv6/评分说明](https://ippure.com/faq)、[IP.SB API](https://ip.sb/api/)、[Cloudflare Trace](https://developers.cloudflare.com/fundamentals/reference/cdn-cgi-endpoint/)。
 - [RegionRestrictionCheck](https://github.com/lmc999/RegionRestrictionCheck)、[Gemini 误判反馈](https://github.com/lmc999/RegionRestrictionCheck/issues/177)、[TikTokCheck](https://github.com/lmc999/TikTokCheck)：检测入口及误判边界参考。
-- [SDK 目录使用示例](https://github.com/Gaimoydev/better-speedtest/blob/238741b0bb7873e168c68f8f27cf4cf6750bba4e/internal/nodes/ookla.go)与 [配置地址](https://github.com/Gaimoydev/better-speedtest/blob/238741b0bb7873e168c68f8f27cf4cf6750bba4e/assets/config.default.json)：作为补充元数据入口，不将附近城市当广州，也不直接套用其大文件传输实现。
-- [Speedtest CLI](https://github.com/sivel/speedtest-cli/blob/master/speedtest.py)：小型延迟探测响应格式参考；[当前广州目录入口](https://www.speedtest.net/api/js/servers?engine=js&limit=100&search=Guangzhou)。
-- 已移除的历史地址来自 [superspeed 原始记录](https://github.com/xianren78/superspeed/blob/a82bb1278a1e88af575b514d2f1071db96262f95/speedtest-servers.php)；移动候选来自 [NetQuality 广州移动记录](https://github.com/xykt/NetQuality/blob/b53a5b886e73fe8bb49f1724682c60e928cb5c24/ref/speedtest_cn.json)、[speedtest 候选快照](https://github.com/oneclickvirt/speedtest/blob/286f8fd7c9cf98e44f991fecd457530c78e3eddf/model/snapshot/speedtest-servers.json)。记录日期为仓库文件提交日期，非测点在线证明。未将常见的深圳三网 traceroute IP 冒充广州 HTTP 测点。
+- [better-speedtest 目录与握手](https://github.com/Gaimoydev/better-speedtest/blob/238741b0bb7873e168c68f8f27cf4cf6750bba4e/internal/nodes/cnspeed.go)、[公开协议配置](https://github.com/Gaimoydev/better-speedtest/blob/238741b0bb7873e168c68f8f27cf4cf6750bba4e/assets/config.default.json)、[会话参数使用](https://github.com/Gaimoydev/better-speedtest/blob/238741b0bb7873e168c68f8f27cf4cf6750bba4e/internal/engine/transfer.go)。仅参考协议；未引入其下载/上传执行器或关闭证书验证的设置。
+- [speedtest-go HTTP 预热/采样](https://github.com/showwin/speedtest-go/blob/master/speedtest/request.go)：采用预热剔除的思路，响应校验按本模块服务协议单独实现。
+- [MiniProbe Agent](https://github.com/Jackyhuang83/MiniProbe/blob/747e75d21a46819531a9e4fd6a0942f16d3b6199/cmd/miniprobe-agent/main.go)：对照 VPS 端 ICMP/TCP/UDP 与客户端 HTTP 的差异；未修改 MiniProbe。
 
 代码按仓库 MIT 许可证分发。
+

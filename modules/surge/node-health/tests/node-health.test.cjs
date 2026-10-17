@@ -7,7 +7,13 @@ const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '..', 'node-health.js'), 'utf8');
 const settingsSource = fs.readFileSync(path.join(__dirname, '..', 'settings.js'), 'utf8');
 const SETTINGS_KEY = 'VB_HEALTH_SELECTED_GROUP_V1';
-const gzDirectory = ['China Telecom', 'China Unicom', 'China Mobile'].map((sponsor,i)=>({id:['27594','26678','6611'][i],name:'Guangzhou',country:'China',lat:'23.1333',lon:'113.2667',sponsor,host:['ct.gzspeed.net:8080','cu.gzspeed.net:8080','cm.gzspeed.net:8080'][i],url:'http://'+['ct.gzspeed.net:8080','cu.gzspeed.net:8080','cm.gzspeed.net:8080'][i]+'/speedtest/upload.php'}));
+const cnDirectory = ['电信','联通','移动'].map((carrier,i)=>({hostid:String(1101+i),pname:'广东',city:'广州',port:'65499',hostname:'广州'+carrier,hostip:['61.144.6.18','218.107.8.18','183.235.59.38'][i]}));
+const sessionKey='12345678-1234-1234-1234-123456789abc';
+function cnReply(c) {
+  if(c.url.includes('/speed/dovalid?')) return {body:'1-'+sessionKey};
+  if(c.url.includes('/speed/File(1G).dl?')) return {headers:{'Content-Length':'1073741824'}};
+  return {body:'unknown'};
+}
 
 function pathReply(config) {
   if(config.url.includes('/cdn-cgi/trace?vb_health_path=')) return {body:'ip='+(config.policy==='DIRECT'?'203.0.113.7':'203.0.113.9')+'\nloc=JP\ncolo=NRT'};
@@ -34,7 +40,7 @@ async function run(options = {}) {
   class Clock extends Date { constructor(...args) { super(...(args.length ? args : [(options.epoch || 1792123200000) + clock])); } static now() { return (options.epoch || 1792123200000) + clock; } }
   const env = {
     Date: Clock,
-    setTimeout: (fn, delay) => schedule(fn, delay === 25000 && options.deadlineMs ? options.deadlineMs : delay),
+    setTimeout: (fn, delay) => schedule(fn, (delay === 25000 || delay === 65000) && options.deadlineMs ? options.deadlineMs : delay),
     $argument: options.argument || `mode=${options.mode || 'ip'}&showIP=false&policy=Group`,
     $done: value => { result = value; doneCount++; },
     $persistentStore: { read: key => Object.hasOwn(storage, key) ? storage[key] : null, write: (value,key) => { if(options.writeFail) return false; storage[key]=value; return true; } },
@@ -63,9 +69,10 @@ async function run(options = {}) {
       peakRequests = Math.max(peakRequests, activeRequests);
       assert.ok(peakRequests <= 20, 'must remain within the Surge concurrent request limit');
       requests.push({ method, ...config });
-      const directory = /^https:\/\/www\.speedtest\.net\/api\/js\/(?:servers|config-sdk)\?/.test(config.url);
-      const directoryKey = config.url.includes('config-sdk?') ? 'sdk' : config.url.includes('search=Guangzhou') ? 'en' : 'zh';
-      const reply = directory ? (options.directoryReplies && Object.hasOwn(options.directoryReplies,directoryKey) ? options.directoryReplies[directoryKey] : options.directoryReply === undefined ? {body:JSON.stringify(gzDirectory)} : options.directoryReply) : options.reply ? options.reply(config, method, index) : pathMode ? pathReply(config) : config.url.includes('/speedtest/latency.txt') ? {body:'test=test'} : { body: JSON.stringify({ ip: '203.0.113.7', fraudScore: 25, countryCode: 'JP', asn: 64496, isResidential: false }) };
+      const directory = config.url.startsWith('https://dlcv2.cnspeedtest.cn:8443/dataServer/mobilematch_many.php?');
+      const carrier = new URL(config.url).searchParams.get('wifioper');
+      const directoryRecord=cnDirectory.find(r=>r.hostname==='广州'+carrier);
+      const reply = directory ? (options.directoryReplies && Object.hasOwn(options.directoryReplies,carrier) ? options.directoryReplies[carrier] : options.directoryReply === undefined ? {body:JSON.stringify([directoryRecord])} : options.directoryReply) : options.reply ? options.reply(config, method, index) : pathMode ? pathReply(config) : config.url.includes('/speed/') ? cnReply(config) : { body: JSON.stringify({ ip: '203.0.113.7', fraudScore: 25, countryCode: 'JP', asn: 64496, isResidential: false }) };
       if (reply === null) return;
       schedule(() => { activeRequests--; callback(reply.error || null, reply.noResponse ? null : { status: reply.status || 200, headers: reply.headers || {} }, reply.body || ''); }, reply.delay || 100);
     }]))
@@ -94,7 +101,7 @@ async function run(options = {}) {
     } else assert.equal(r.policy, options.expectedPolicy || 'Tokyo');
     assert.equal(r['auto-redirect'], false);
     assert.equal(r['auto-cookie'], false);
-    assert.ok(r.timeout > 0 && r.timeout <= 6, 'timeouts use seconds');
+    assert.ok(r.timeout > 0 && r.timeout <= (r.method==='head'&&r.url.includes('/speed/File(1G).dl?')?8:6), 'timeouts use seconds');
     assert.equal(r.insecure, undefined);
   });
   // Probe assertions read the actual persisted diagnostics; compact UI is tested separately.
@@ -203,32 +210,30 @@ test('challenge and timeout are not reported as a regional ban', async () => {
   }
 });
 
-test('Guangzhou latency uses validated small replies and never counts denial pages as latency', async () => {
-  const counts = {};
-  const { result, requests } = await run({ mode: 'latency', reply: c => {
-    const host = new URL(c.url).host;
-    counts[host] = (counts[host] || 0) + 1;
-    if (host === 'cu.gzspeed.net:8080' && counts[host] === 2) return null;
-    return { status: /cm\.gzspeed|dpdfsd/.test(host) ? 412 : 200, body:'test=test', delay: counts[host] * 100 };
-  } });
-  assert.equal(requests.length, 15);
-  assert.equal(requests.filter(r=>r.url.includes('/speedtest/latency.txt')).length,12);
-  assert.ok(requests.every(r => r.method === 'get'));
-  assert.match(result.content, /^广州电信：300 ms$/m);
-  assert.match(result.diagnosticContent, /HTTP 412/);
-  assert.match(result.content, /^广州联通：350 ms · 4\/5$/m);
-  assert.match(result.diagnosticContent, /范围 100–500 ms · HTTP 波动 100 ms/);
-  assert.match(result.diagnosticContent, /HTTP 412 · 100 ms（测点响应异常）/);
-  assert.match(result.content, /^广州移动：测点不可用$/m);
-  assert.match(result.diagnosticContent, /不是节点端逐跳回程/);
-  assert.doesNotMatch(result.diagnosticContent, /丢包/);
+test('Guangzhou latency authorizes first, discards warmup and measures only HEAD responses', async () => {
+  const counts={};
+  const {result,requests}=await run({mode:'latency',reply:c=>{
+    if(c.url.includes('dovalid?')) return {body:'1-'+sessionKey,delay:900};
+    const ip=new URL(c.url).hostname;
+    counts[ip]=(counts[ip]||0)+1;
+    if(counts[ip]===1) return {...cnReply(c),delay:1700};
+    return {...cnReply(c),delay:counts[ip]*100};
+  }});
+  assert.equal(requests.length,18); // Three directories, three handshakes, three warmups, nine measured HEADs.
+  assert.equal(requests.filter(r=>r.method==='head').length,12);
+  assert.ok(requests.filter(r=>r.url.includes('File(1G)')).every(r=>r.method==='head'&&r.body===undefined));
+  for(const name of ['广州电信','广州联通','广州移动']) assert.ok(result.content.includes(name+'：300 ms'));
+  assert.match(result.diagnosticContent,/有效 3\/3 · 范围 200–400 ms · HTTP 波动 100 ms/);
+  assert.doesNotMatch(result.content,/900 ms|1700 ms/);
+  assert.match(result.diagnosticContent,/预热（不计入延迟）/);
+  assert.doesNotMatch(result.diagnosticContent,/12345678-1234|imei=|token=|key=/);
 });
 
-test('all latency targets timing out finish within the declared script budget', async () => {
-  const { result, clock, requests } = await run({ mode: 'latency', reply: () => null });
-  assert.equal(requests.length, 7);
+test('all Guangzhou handshakes timing out finish within the script budget', async () => {
+  const {result,clock,requests}=await run({mode:'latency',reply:()=>null});
+  assert.equal(requests.length,6);
   assert.equal((result.content.match(/检测超时/g)||[]).length,3);
-  assert.ok(clock < 25000);
+  assert.ok(clock<60000);
 });
 
 test('same-origin page redirects retain the node; external redirects are not followed', async () => {
@@ -667,167 +672,127 @@ test('native IPv4 and IPv6 are complete by default, old masking arguments cannot
   }
 });
 
-test('Guangzhou discovery rejects other cities, wrong coordinates and ambiguous carriers; removed old hosts are never probed', async () => {
-  const bad=gzDirectory.flatMap(r=>[{...r,name:'Shenzhen'},{...r,country:'Japan'},{...r,lat:'31.2',lon:'121.4'},{...r,sponsor:'China Telecom China Unicom'}]);
-  const {result,requests}=await run({mode:'latency',directoryReply:{body:JSON.stringify(bad)}});
-  assert.equal(requests.length,8);
-  assert.ok(requests.every(r=>!r.url.includes('gzspeed.net')));
-  assert.match(result.content,/广州电信：未取得广州测点/);
-  assert.match(result.content,/广州联通：未取得广州测点/);
-  assert.match(result.content,/广州移动：100 ms · 候选测点/);
-  assert.match(result.diagnosticContent,/非广州城市 3 · 国家缺失或不符 3 · 坐标缺失或超出广州 3 · 运营商证据冲突 3/);
-  assert.match(result.diagnosticContent,/未发起测点请求/);
-  assert.doesNotMatch(source,/www\.gdspeedtest\.com|speedtest1\.gzuni\.com|speedtest1\.gd\.chinamobile\.com/);
-});
-
-test('Guangzhou discovery rejects private addresses and unsafe server URLs', async () => {
-  for(const url of ['http://127.0.0.1:8080/','http://192.168.1.1/','http://10.0.0.1/','http://100.64.0.1/','http://localhost:8080/','http://x.local/','http://user:pass@ct.gzspeed.net:8080/','file:///x','http://ct.gzspeed.net:22/']) {
-    const records=gzDirectory.map(r=>({...r,url,host:''}));
-    const {requests}=await run({mode:'latency',directoryReply:{body:JSON.stringify(records)}});
-    assert.equal(requests.length,8,url);
-    assert.ok(requests.every(r=>!r.url.startsWith(url)),url);
-  }
-});
-
-test('Guangzhou targets remain the same across selected nodes for a fresh local snapshot', async () => {
-  const storage={};
-  const extra={...gzDirectory[0],id:'99999',host:'other.gzspeed.net:8080',url:'http://other.gzspeed.net:8080/speedtest/upload.php'};
-  const first=await run({mode:'latency',storage,directoryReply:{body:JSON.stringify([extra,...gzDirectory].reverse())}});
-  assert.ok(first.requests.some(r=>r.url.startsWith('http://ct.gzspeed.net:8080/')));
-  assert.ok(first.requests.every(r=>!r.url.includes('other.gzspeed.net')));
-  const second=await run({mode:'latency',storage,epoch:1792123210000,decisions:{Group:'Other'},expectedPolicy:'Other',directoryReply:{status:503}});
-  assert.equal(second.requests.length,15);
-  assert.ok(second.requests.every(r=>r.url.includes('/speedtest/latency.txt')));
-  assert.match(second.result.diagnosticContent,/30 分钟内固定测点/);
-});
-
-test('expired and old rewritten V2 snapshots are not reused', async () => {
-  const storage={VB_HEALTH_GZ_TARGETS_V2:JSON.stringify({version:2,updatedAt:1792123200000,records:gzDirectory})};
-  const initial=await run({mode:'latency',storage});
-  assert.equal(initial.requests.length,18);
-  assert.equal(JSON.parse(storage.VB_HEALTH_GZ_TARGETS_V3).version,3);
-  const {result,requests}=await run({mode:'latency',storage,epoch:1792125100000,directoryReply:{status:503}});
-  assert.equal(requests.length,8);
-  assert.ok(requests.every(r=>!r.url.includes('gzspeed.net')));
-  assert.match(result.content,/广州电信：未取得广州测点/);
-  assert.match(result.diagnosticContent,/HTTP 503/);
-});
-
-test('a generic HTTP 200 page or a denial response cannot generate a Guangzhou latency', async () => {
-  for(const reply of [{body:'<html>Welcome</html>'},{body:'test=test\nextra text'},{status:403,body:'test=test'}]) {
-    const {result,requests}=await run({mode:'latency',reply:()=>reply});
-    assert.equal(requests.length,7);
-    assert.doesNotMatch(result.content,/广州(?:电信|联通|移动)：\d+ ms/);
-    assert.match(result.diagnosticContent,/测点响应异常/);
-  }
-});
-
-test('parallel directory timeout retains the mobile candidate and accurately reports missing CT/CU targets', async () => {
-  const {result,requests,clock}=await run({mode:'latency',directoryReply:null});
-  assert.equal(requests.length,8);
-  assert.ok(clock<25000);
-  assert.equal((result.content.match(/未取得广州测点/g)||[]).length,2);
-  assert.match(result.content,/广州移动：100 ms · 候选测点/);
-  assert.match(result.diagnosticContent,/超时/);
-  assert.doesNotMatch(source,/www\.189\.cn|iservice\.10010\.com|www\.10086\.cn/);
-});
-
-test('directory rejection, HTML, changed shape and empty list have distinct diagnostics', async () => {
-  for(const [directoryReply,reason]of[[{status:403},'请求被拒'],[{body:'<html>Blocked</html>'},'目录格式未知'],
-    [{body:'{}'},'目录格式未知'],[{body:'[]'},'目录返回空列表']]) {
-    const {result,requests}=await run({mode:'latency',directoryReply});
-    assert.equal(requests.filter(r=>r.url.includes('/speedtest/latency.txt')).length,5);
-    assert.match(result.content,/广州电信：未取得广州测点/);
-    assert.ok(result.diagnosticContent.includes(reason));
-    assert.ok(requests.every(r=>r.policy==='Tokyo'));
-  }
-});
-
-test('Chinese search and SDK servers envelope supply current targets when English search is empty', async () => {
-  const {result,requests}=await run({mode:'latency',directoryReplies:{
-    en:{body:'[]'},zh:{body:JSON.stringify([gzDirectory[1]])},sdk:{body:JSON.stringify({servers:[gzDirectory[0],gzDirectory[2]]})}
-  }});
+test('Guangzhou discovery rejects other cities, mismatched carriers and unsafe addresses before using the verified snapshot', async () => {
+  const records=cnDirectory.flatMap(r=>[{...r,city:'深圳'},{...r,pname:'福建'},{...r,hostip:'127.0.0.1'},
+    {...r,hostip:'10.0.0.1'},{...r,hostip:'100.64.0.1'},{...r,hostip:'http://evil.net'},
+    {...r,hostname:'广州电信联通'},{...r,port:'22'}]);
+  const {result,requests}=await run({mode:'latency',directoryReply:{body:JSON.stringify(records)}});
   assert.equal(requests.length,18);
-  assert.match(result.content,/广州电信：100 ms/);
-  assert.match(result.content,/广州联通：100 ms/);
-  assert.match(result.content,/广州移动：100 ms/);
-  assert.match(result.diagnosticContent,/Ookla 英文目录：HTTP 200 · 100 ms · 返回 0 条 · 合格记录 0\/3/);
-  assert.match(result.diagnosticContent,/Ookla 中文目录：HTTP 200 · 100 ms · 返回 1 条 · 合格记录 1\/3/);
-  assert.match(result.diagnosticContent,/Ookla SDK 目录：HTTP 200 · 100 ms · 返回 2 条 · 合格记录 2\/3/);
+  assert.ok(requests.filter(r=>r.url.startsWith('http:')).every(r=>cnDirectory.some(n=>new URL(r.url).hostname===n.hostip)));
+  assert.match(result.diagnosticContent,/合格广州测点 0/);
+  assert.match(result.diagnosticContent,/目录快照 · 2026-10-17/);
+  assert.doesNotMatch(source,/gdspeedtest|gzuni|dpdfsd|ooklaserver/);
 });
 
-test('directory rejection details explain missing fields and never persist arbitrary raw response data', async () => {
-  const records=[{...gzDirectory[0],lat:null}, {...gzDirectory[1],sponsor:'Unknown',country:' CN '},
-    {...gzDirectory[2],host:'other.public.net:8080'}].map(r=>({...r,token:'RAW_TOKEN_MARKER',headers:{Cookie:'RAW_COOKIE_MARKER'}}));
-  const {result}=await run({mode:'latency',directoryReply:{body:JSON.stringify(records)}});
-  assert.match(result.diagnosticContent,/坐标缺失或超出广州 1 · 运营商未识别 1 · 主机别名不匹配 1/);
-  assert.match(result.diagnosticContent,/未采用：ID 27594 · 城市 Guangzhou · China Telecom · 坐标缺失或超出广州/);
-  assert.doesNotMatch(result.diagnosticContent,/RAW_TOKEN_MARKER|RAW_COOKIE_MARKER|other\.public/);
+test('fresh Guangzhou directory metadata stays fixed across nodes, without reusing sessions', async () => {
+  const storage={};
+  const first=await run({mode:'latency',storage});
+  const second=await run({mode:'latency',storage,epoch:1792123210000,decisions:{Group:'Other'},expectedPolicy:'Other',directoryReply:{status:503}});
+  assert.equal(first.requests.length,18);
+  assert.equal(second.requests.length,15);
+  assert.ok(second.requests.every(r=>!r.url.includes('mobilematch_many')));
+  assert.match(second.result.diagnosticContent,/30 分钟内固定目录快照/);
+  const cache=JSON.parse(storage.VB_HEALTH_GZ_CN_TARGETS_V1);
+  assert.deepEqual(cache.records,cnDirectory);
+  assert.ok(!JSON.stringify(cache).includes(sessionKey));
+  assert.equal(second.requests.filter(r=>r.url.includes('dovalid?')).length,3);
 });
 
-test('Guangzhou-5G mapping accepts the exact raw or official alias URL and preserves the advertised scheme across cache', async () => {
-  const mobile={id:'60794',name:'Guangzhou',country:'China',lat:'23.1291',lon:'113.2644',sponsor:'GuangZhou-5G',
-    host:'speedtest2.dpdfsd.com.prod.hosts.ooklaserver.net:8080',url:'http://speedtest2.dpdfsd.com:8080/speedtest/upload.php',https_functional:1};
-  for(const provider of [undefined,'CM']) for(const advertised of [mobile.url,'https://'+mobile.host+'/speedtest/upload.php']) {
-    const storage={};
-    const first=await run({mode:'latency',storage,directoryReply:{body:JSON.stringify([gzDirectory[0],gzDirectory[1],{...mobile,url:advertised,provider}])}});
-    const selected=first.requests.filter(r=>r.url.includes('dpdfsd'));
-    assert.equal(selected.length,5);
-    const origin=new URL(advertised).origin;
-    assert.ok(selected.every(r=>r.url.startsWith(origin+'/')));
-    assert.match(first.result.diagnosticContent,/合格记录 3\/3/);
-    const second=await run({mode:'latency',storage,epoch:1792123210000});
-    assert.equal(second.requests.length,15);
-    assert.ok(second.requests.filter(r=>r.url.includes('dpdfsd')).every(r=>r.url.startsWith(origin+'/')));
-    assert.match(second.result.diagnosticContent,/30 分钟内固定测点/);
+test('expired, future, malformed and older Ookla snapshots cannot bypass current discovery', async () => {
+  for(const raw of [JSON.stringify({version:1,updatedAt:1792121000000,records:cnDirectory}),
+    JSON.stringify({version:1,updatedAt:1792123300000,records:cnDirectory}),'broken',
+    JSON.stringify({version:1,updatedAt:1792123200000,records:cnDirectory.map(r=>({...r,hostip:'127.0.0.1'}))})]) {
+    const storage={VB_HEALTH_GZ_CN_TARGETS_V1:raw,VB_HEALTH_GZ_TARGETS_V3:'old Ookla'};
+    const {requests}=await run({mode:'latency',storage});
+    assert.equal(requests.filter(r=>r.url.includes('mobilematch_many')).length,3);
   }
 });
 
-test('carrier conflicts, unknown sponsors and arbitrary aliases cannot enter the candidate pool', async () => {
-  const mobile={...gzDirectory[2],id:'99888',sponsor:'GuangZhou-5G',host:'unverified.gzspeed.net:8080',url:'http://unverified.gzspeed.net:8080/speedtest/upload.php'};
-  for(const record of [mobile,{...mobile,sponsor:'China Telecom',provider:'CM'},
-    {...mobile,sponsor:'China Mobile',host:'other.public.net:8080'},
-    {...mobile,sponsor:'China Mobile',host:'unverified.gzspeed.net.evil.ooklaserver.net:8080'}]) {
-    const {result,requests}=await run({mode:'latency',directoryReply:{body:JSON.stringify([gzDirectory[0],gzDirectory[1],record])}});
-    assert.ok(requests.every(r=>!/unverified|other\.public|evil/.test(r.url)));
-    assert.match(result.diagnosticContent,/合格记录 2\/3/);
+test('directory timeout or denial still probes all three verified Guangzhou snapshot addresses', async () => {
+  for(const directoryReply of [null,{status:403},{body:'[]'},{body:'<html>Blocked</html>'}]) {
+    const {result,requests,clock}=await run({mode:'latency',directoryReply});
+    assert.equal(requests.length,18);
+    assert.equal((result.content.match(/100 ms/g)||[]).length,3);
+    assert.match(result.diagnosticContent,/目录快照 · 2026-10-17/);
+    assert.ok(clock<60000);
   }
 });
 
-test('a failed advertised URL tries only its exact declared alternate; statistics stay on the selected URL', async () => {
-  const record={...gzDirectory[0],host:'ct.gzspeed.net.prod.hosts.ooklaserver.net:8080',https_functional:1};
-  const {result,requests}=await run({mode:'latency',directoryReply:{body:JSON.stringify([record,...gzDirectory.slice(1)])},reply:c=>
-    c.url.startsWith('http://ct.gzspeed.net:8080/')?{error:'DNS resolve failed',delay:900}:{body:'test=test',delay:250}});
-  assert.equal(requests.filter(r=>r.url.startsWith('http://ct.gzspeed.net:8080/')).length,1);
-  assert.equal(requests.filter(r=>r.url.startsWith('https://ct.gzspeed.net.prod.hosts.ooklaserver.net:8080/')).length,5);
-  assert.match(result.content,/^广州电信：250 ms$/m);
-  assert.match(result.diagnosticContent,/地址：http:\/\/ct\.gzspeed\.net:8080\/speedtest\/latency\.txt/);
-  assert.match(result.diagnosticContent,/DNS 解析失败/);
-  assert.match(result.diagnosticContent,/中位数 250 ms · 有效 5\/5 · 范围 250–250 ms/);
-  assert.doesNotMatch(result.diagnosticContent,/中位数 900/);
+test('session signatures match standard MD5 and no real device identifier is used', async () => {
+  const crypto=require('node:crypto');const md5=s=>crypto.createHash('md5').update(s).digest('hex');
+  const {requests,storage}=await run({mode:'latency'});
+  const sessions=requests.filter(r=>r.url.includes('dovalid?'));
+  for(const r of sessions) {
+    const q=new URL(r.url).searchParams;
+    assert.match(q.get('imei'),/^TS[0-9A-F]{16}$/);
+    assert.equal(q.get('token'),md5(md5('model=Android&imei='+q.get('imei'))+md5('stime='+q.get('time')+'&band=200&rand=12345555')));
+    assert.ok(!storage.VB_HEALTH_REPORT_V1_latency.includes(q.get('imei')));
+    assert.ok(!storage.VB_HEALTH_REPORT_V1_latency.includes(q.get('token')));
+  }
+  assert.equal(new Set(sessions.map(r=>new URL(r.url).searchParams.get('imei'))).size,3);
 });
 
-test('each discovered carrier reports actual failures without inventing latency', async () => {
-  for(const [reply,reason]of[[{error:'DNS resolve failed'},'DNS 解析失败'],[{error:'connection refused'},'连接被拒绝'],
-    [{error:'TLS certificate failed'},'TLS/证书失败'],[{status:403,body:'test=test'},'测点拒绝']]) {
-    const {result}=await run({mode:'latency',reply:()=>reply});
-    for(const name of ['广州电信','广州联通','广州移动']) assert.ok(result.content.includes(name+'：'+reason));
-    assert.doesNotMatch(result.content,/：\d+ ms/);
+test('HTML, malformed session keys, wrong status and busy replies never start a file probe', async () => {
+  for(const reply of [{body:'<html>OK</html>'},{body:'1-'+sessionKey+'extra'},{body:'-1-'},{status:403,body:'1-'+sessionKey},
+    {error:'connection refused'},{body:'1-'+sessionKey+'\nwrong'}]) {
+    const {result,requests}=await run({mode:'latency',reply:()=>reply});
+    assert.ok(requests.every(r=>!r.url.includes('File(1G)')));
+    assert.doesNotMatch(result.content,/广州(?:电信|联通|移动)：\d+ ms/);
   }
 });
 
-test('hung directories and advertised mobile URL plus slow HTTPS alternate remain within the Surge budget', async () => {
-  const {result,clock,requests}=await run({mode:'latency',directoryReply:null,reply:c=>
-    c.url.startsWith('http://speedtest2.dpdfsd.com:8080/')?null:{body:'test=test',delay:3000}});
-  assert.ok(clock<25000);
-  assert.match(result.content,/广州移动：3000 ms · 候选测点/);
-  assert.equal(requests.filter(r=>r.url.startsWith('http://speedtest2.dpdfsd.com:8080/')).length,1);
-  assert.equal(requests.filter(r=>r.url.startsWith('https://speedtest2.dpdfsd.com.prod.hosts.ooklaserver.net:8080/')).length,5);
+test('HEAD denial, generic HTML length, missing or incorrect length, and redirects cannot generate latency', async () => {
+  for(const reply of [{status:403,headers:{'Content-Length':'1073741824'}},{headers:{'Content-Length':'100'}},
+    {headers:{}},{headers:{'Content-Length':'1073741824x'}},{status:302,headers:{Location:'http://other.net/','Content-Length':'1073741824'}}]) {
+    const {result,requests}=await run({mode:'latency',reply:c=>c.url.includes('dovalid?')?cnReply(c):reply});
+    assert.doesNotMatch(result.content,/广州(?:电信|联通|移动)：\d+ ms/);
+    assert.equal(requests.filter(r=>r.method==='head').length,3);
+    assert.ok(requests.every(r=>!r.url.startsWith('http://other.net')));
+  }
 });
 
-test('latency deadline keeps the carriers already completed and never starts later probes', async () => {
-  const {result}=await run({mode:'latency',deadlineMs:800,reply:c=>c.url.includes('ct.gzspeed.net')?{body:'test=test',delay:100}:null});
+test('a failed current target falls back once; all measured samples stay on the successful replacement', async () => {
+  const current={...cnDirectory[0],hostid:'9999',hostip:'61.144.6.19'};
+  const {result,requests}=await run({mode:'latency',directoryReplies:{'电信':{body:JSON.stringify([current])}},reply:c=>
+    c.url.includes('61.144.6.19')?{error:'connection refused',delay:900}:{...cnReply(c),delay:200}});
+  assert.equal(requests.filter(r=>r.url.includes('61.144.6.19')).length,1);
+  assert.equal(requests.filter(r=>r.url.startsWith('http://61.144.6.18:65499/')).length,5);
+  assert.match(result.content,/^广州电信：200 ms$/m);
+  assert.match(result.diagnosticContent,/连接被拒绝/);
+  assert.match(result.diagnosticContent,/范围 200–200 ms/);
+});
+
+test('partial success uses valid measured samples only and does not bridge failures for fluctuation', async () => {
+  let head=0;
+  const {result}=await run({mode:'latency',reply:c=>{
+    if(!c.url.startsWith('http://61.144.6.18')) return cnReply(c);
+    if(c.url.includes('dovalid?')) return cnReply(c);
+    head++;
+    return head===3?null:{...cnReply(c),delay:head*100};
+  }});
+  assert.match(result.content,/^广州电信：300 ms · 2\/3$/m);
+  assert.match(result.diagnosticContent,/有效 2\/3 · 范围 200–400 ms · HTTP 波动 样本不足/);
+});
+
+test('fresh metadata cache keeps the verified fallback when its selected current address fails', async () => {
+  const records=cnDirectory.map((r,i)=>i===0?{...r,hostid:'9999',hostip:'61.144.6.19'}:r);
+  const storage={VB_HEALTH_GZ_CN_TARGETS_V1:JSON.stringify({version:1,updatedAt:1792123200000,records})};
+  const {result,requests}=await run({mode:'latency',storage,reply:c=>c.url.includes('61.144.6.19')?{error:'connection refused'}:cnReply(c)});
+  assert.ok(requests.every(r=>!r.url.includes('mobilematch_many')));
+  assert.equal(requests.filter(r=>r.url.includes('61.144.6.19')).length,1);
   assert.match(result.content,/^广州电信：100 ms$/m);
+});
+
+test('a slow initial request and five-second formal samples stay within the 60-second budget', async () => {
+  const {result,clock}=await run({mode:'latency',directoryReply:null,reply:c=>({...cnReply(c),delay:5000})});
+  assert.ok(clock<60000);
+  assert.equal((result.content.match(/5000 ms/g)||[]).length,3);
+});
+
+test('deadline retains valid partial carrier results and never starts further probes', async () => {
+  const {result}=await run({mode:'latency',deadlineMs:450,reply:c=>
+    c.url.startsWith('http://61.144.6.18')?cnReply(c):null});
+  assert.match(result.content,/^广州电信：100 ms · 1\/3$/m);
   assert.match(result.content,/^广州联通：检测超时$/m);
   assert.match(result.content,/^广州移动：检测超时$/m);
 });
@@ -1239,6 +1204,9 @@ function copyUI(storage,options={}) {
 
 test('literal-IP copy and text endpoints read the complete latest report without group access or writes', async () => {
   const {storage}=await run({mode:'latency',directoryReply:{status:403},reply:()=>({status:404})});
+  const report=JSON.parse(storage.VB_HEALTH_REPORT_V1_latency);
+  report.details+='\n'+('长记录分页与完整导出验证。'.repeat(80));
+  storage.VB_HEALTH_REPORT_V1_latency=JSON.stringify(report);
   const before=JSON.stringify(storage);
   const view=copyUI(storage);
   const plain=settings({url:'http://192.0.2.1/reports.txt',storage});
@@ -1327,3 +1295,4 @@ test('empty copy page disables copy/select actions and serves a readable plain t
   assert.match(view.plain,/暂无检测记录/);
   assert.match(settings({url:'http://192.0.2.1/reports.txt'}).result.response.body,/暂无检测记录/);
 });
+
