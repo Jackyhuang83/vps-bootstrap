@@ -1,11 +1,11 @@
 /* SPDX-License-Identifier: MIT
- * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.18
+ * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.19
  * Runs locally in Surge. No MITM, policy mutations, credentials or uploads.
  */
 (function () {
   "use strict";
 
-  const VERSION = "0.1.0-beta.18";
+  const VERSION = "0.1.0-beta.19";
   const SETTINGS_URL = "http://surge-node-health.invalid/";
   const SETTINGS_KEY = "VB_HEALTH_SELECTED_GROUP_V1";
   const TITLES = { ip: "IP 纯净度", unlock: "平台解锁检测", latency: "广州三网延迟", path: "入口落地查询" };
@@ -839,6 +839,17 @@
     details.push("中位数 " + median(values) + " ms · 有效 " + replies.length + "/" + CN_SAMPLES + " · 范围 " + Math.min.apply(null, values) + "–" + Math.max.apply(null, values) + " ms · HTTP 波动 " + fluctuation);
     return { line: name + "：" + median(values) + " ms" + (replies.length < CN_SAMPLES ? " · " + replies.length + "/" + CN_SAMPLES : ""), details: details.join("\n") };
   }
+  async function cnPortControl(context, target) {
+    // Independent same-IP, same-port HTTP check without a session. A 4xx
+    // response still proves HTTP reachability; never count it as a sample.
+    const response = await request(context, target.base + "/speed/File(1G).dl?vb_port_probe=1",
+      { method: "head", timeout: 5, headers: { "Accept-Encoding": "identity", Connection: "close" } });
+    if (!response.error && response.status > 0) {
+      return { reached: true, detail: "同 IP 端口 HTTP 已响应 · HTTP " + response.status };
+    }
+    return { reached: false, detail: "同 IP 端口 HTTP 未响应 · " +
+      (response.errorKind || response.error || "HTTP 无状态") + (response.errorCode ? " · " + response.errorCode : "") };
+  }
   async function latencyTarget(context, name, candidates, progress) {
     const setup = [name], failures = [];
     for (let n = 0; n < candidates.length && !completed; n += 1) {
@@ -854,7 +865,15 @@
       handshake.phase = "握手";
       const key = !handshake.error && handshake.status === 200 && /^1-[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(handshake.body.trim()) ? handshake.body.trim().slice(2) : "";
       setup.push(cnEvidence("会话握手", handshake, Boolean(key)));
-      if (!key) { failures.push(handshake); continue; }
+      if (!key) {
+        if (handshake.error && handshake.errorKind !== "脚本调用失败" && !completed) {
+          const portControl = await cnPortControl(context, target);
+          handshake.portControl = portControl;
+          setup.push(portControl.detail);
+        }
+        failures.push(handshake);
+        continue;
+      }
       async function sample(index, initialize) {
         // HEAD only: no file body is downloaded, including when a server rejects the request.
         const url = target.base + "/speed/File(1G).dl?r=" + Date.now() + "_" + index + "&key=" + key;
@@ -875,7 +894,11 @@
       }
       return cnLatencyResult(name, target, samples, setup);
     }
-    return { line: name + "：" + cnFailure(failures), details: setup.join("\n"), networkFailure: failures.length > 0 && failures.every(function (s) { return Boolean(s.error); }) };
+    const ports = failures.map(function (s) { return s.portControl; }).filter(Boolean);
+    const portNote = ports.length && ports.every(function (p) { return !p.reached; }) ? " · 同端口 HTTP 未响应" :
+      ports.some(function (p) { return p.reached; }) ? " · 同端口 HTTP 有响应" : "";
+    return { line: name + "：" + cnFailure(failures) + portNote, details: setup.join("\n"),
+      networkFailure: failures.length > 0 && failures.every(function (s) { return Boolean(s.error); }) };
   }
   async function latencyPanel(context) {
     const results = TARGETS.map(function (target) { return { line: target.name + "：检测超时", details: target.name + "：总时限内未完成，未生成数值。" }; });
@@ -896,8 +919,13 @@
     if (!completed && results.every(function (r) { return r.networkFailure; })) {
       connectivity = "常规 HTTPS 对照：进行中";
       const control = await request(context, "https://www.cloudflare.com/cdn-cgi/trace", { timeout: 4 });
-      connectivity = validIP(traceFields(control).ip) ? "常规 HTTPS 可达 · 广州测点连接未成功" :
+      const httpsNote = validIP(traceFields(control).ip) ? "常规 HTTPS 可达 · 广州测点连接未成功" :
         "常规 HTTPS 对照也未通过：" + (control.errorKind || problem(control) || "响应不符") + (control.errorCode ? " · " + control.errorCode : "");
+      const httpControl = await request(context, "http://cp.cloudflare.com/generate_204", { timeout: 4 });
+      const httpNote = !httpControl.error && httpControl.status > 0 ? "常规 HTTP:80 可达（HTTP " + httpControl.status + "）" :
+        "常规 HTTP:80 未成功：" + (httpControl.errorKind || httpControl.error || "无 HTTP 响应") +
+        (httpControl.errorCode ? " · " + httpControl.errorCode : "");
+      connectivity = httpsNote + "\n" + httpNote;
     }
     render();
   }
