@@ -923,7 +923,10 @@
         }
         const fallbackResult = cnLatencyResult(name, target, sessions, setup, "session");
         if (fallbackResult.validCount) return fallbackResult;
-        failures.push(warmup, ...sessions);
+        // HEAD preflight failure is retained in setup diagnostics. The final
+        // user-visible failure stage should reflect the subsequent GET samples,
+        // not mix preflight and fallback phases into an ambiguous label.
+        failures.push(...(sessions.length ? sessions : [warmup]));
         continue;
       }
       const samples = [];
