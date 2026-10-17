@@ -1,20 +1,22 @@
 #!name=节点体检 Beta
-#!desc=IP纯净度（完整IP）、九个平台地区检测、广州电信/广州联通/广州移动延迟。点击「检测设置」选择已有策略组，详细记录：http://surge-node-health.invalid/ 。
+#!desc=IP纯净度（完整IP）、九个平台地区检测、广州三网延迟、独立入口落地查询。点击「检测设置」选择已有策略组，详细记录：http://surge-node-health.invalid/ 。入口落地中的公网IP使用直连，落地使用所选节点。
 #!category=VPS Bootstrap
 
-# v0.1.0-beta.11 — settings are answered locally over HTTP; no MITM/server.
+# v0.1.0-beta.12 — settings are answered locally over HTTP; no MITM/server.
 [Panel]
 VB-Health-Settings-Entry = script-name=VB-Health-Settings-Entry,title="检测设置",content="点按切换已有策略组\n选组 / 详情：http://surge-node-health.invalid/",update-interval=1
 VB-Health-IP = script-name=VB-Health-IP,title="IP 纯净度",content="首次请点击「检测设置」面板，切换到要检测的策略组",update-interval=-1
 VB-Health-Unlock = script-name=VB-Health-Unlock,title="平台解锁检测",content="点击刷新 · 每个平台一行结果",update-interval=-1
 VB-Health-Latency = script-name=VB-Health-Latency,title="广州三网延迟",content="广州电信：待检测\n广州联通：待检测\n广州移动：待检测",update-interval=-1
+VB-Health-Path = script-name=VB-Health-Path,title="入口落地查询",content="公网 IP：待检测\n入口 IP：待检测\n落地 IP：待检测",update-interval=-1
 
 [Script]
-VB-Health-Settings-Entry = type=generic,timeout=5,script-path=https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/feat/surge-node-health/modules/surge/node-health/settings.js?v=0.1.0-beta.11
-VB-Health-IP = type=generic,timeout=30,script-path=https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/feat/surge-node-health/modules/surge/node-health/node-health.js?v=0.1.0-beta.11,argument="mode=ip"
-VB-Health-Unlock = type=generic,timeout=30,script-path=https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/feat/surge-node-health/modules/surge/node-health/node-health.js?v=0.1.0-beta.11,argument="mode=unlock"
-VB-Health-Latency = type=generic,timeout=30,script-path=https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/feat/surge-node-health/modules/surge/node-health/node-health.js?v=0.1.0-beta.11,argument="mode=latency"
-VB-Health-Settings = type=http-request,pattern=^http://surge-node-health\.invalid(?::80)?(?:/|$),requires-body=true,max-size=4096,timeout=10,script-path=https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/feat/surge-node-health/modules/surge/node-health/settings.js?v=0.1.0-beta.11
+VB-Health-Settings-Entry = type=generic,timeout=5,script-path=https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/feat/surge-node-health/modules/surge/node-health/settings.js?v=0.1.0-beta.12
+VB-Health-IP = type=generic,timeout=30,script-path=https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/feat/surge-node-health/modules/surge/node-health/node-health.js?v=0.1.0-beta.12,argument="mode=ip"
+VB-Health-Unlock = type=generic,timeout=30,script-path=https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/feat/surge-node-health/modules/surge/node-health/node-health.js?v=0.1.0-beta.12,argument="mode=unlock"
+VB-Health-Latency = type=generic,timeout=30,script-path=https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/feat/surge-node-health/modules/surge/node-health/node-health.js?v=0.1.0-beta.12,argument="mode=latency"
+VB-Health-Path = type=generic,timeout=30,script-path=https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/feat/surge-node-health/modules/surge/node-health/node-health.js?v=0.1.0-beta.12,argument="mode=path"
+VB-Health-Settings = type=http-request,pattern=^http://surge-node-health\.invalid(?::80)?(?:/|$),requires-body=true,max-size=4096,timeout=10,script-path=https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/feat/surge-node-health/modules/surge/node-health/settings.js?v=0.1.0-beta.12
 
 [Host]
 # Reserved documentation address; settings.js answers before any upstream dial.

@@ -9,6 +9,13 @@ const settingsSource = fs.readFileSync(path.join(__dirname, '..', 'settings.js')
 const SETTINGS_KEY = 'VB_HEALTH_SELECTED_GROUP_V1';
 const gzDirectory = ['China Telecom', 'China Unicom', 'China Mobile'].map((sponsor,i)=>({id:['27594','26678','6611'][i],name:'Guangzhou',country:'China',lat:'23.1333',lon:'113.2667',sponsor,host:['ct.gzspeed.net:8080','cu.gzspeed.net:8080','cm.gzspeed.net:8080'][i],url:'http://'+['ct.gzspeed.net:8080','cu.gzspeed.net:8080','cm.gzspeed.net:8080'][i]+'/speedtest/upload.php'}));
 
+function pathReply(config) {
+  if(config.url.includes('/cdn-cgi/trace?vb_health_path=')) return {body:'ip='+(config.policy==='DIRECT'?'203.0.113.7':'203.0.113.9')+'\nloc=JP\ncolo=NRT'};
+  const pathname=new URL(config.url).pathname;
+  const ip=pathname==='/geoip'?(config.policy==='DIRECT'?'203.0.113.7':'203.0.113.9'):decodeURIComponent(pathname.slice('/geoip/'.length));
+  return {body:JSON.stringify({ip,country:'Japan',country_code:'JP',city:'Tokyo',asn:64496,asn_organization:'Example ISP'})};
+}
+
 async function run(options = {}) {
   let clock = 0;
   let result;
@@ -16,10 +23,13 @@ async function run(options = {}) {
   let activeRequests = 0;
   let peakRequests = 0;
   let lateRequests = 0;
+  let lateAPICalls = 0;
   let sequence = 0;
   const timers = [];
   const requests = [];
+  const apiCalls = [];
   const storage = options.storage || {};
+  const pathMode = options.mode==='path' || /^mode=path(?:&|$)/.test(options.argument||'');
   const schedule = (fn, delay = 0) => timers.push({ fn, at: clock + delay, id: ++sequence });
   class Clock extends Date { constructor(...args) { super(...(args.length ? args : [(options.epoch || 1792123200000) + clock])); } static now() { return (options.epoch || 1792123200000) + clock; } }
   const env = {
@@ -29,8 +39,20 @@ async function run(options = {}) {
     $done: value => { result = value; doneCount++; },
     $persistentStore: { read: key => Object.hasOwn(storage, key) ? storage[key] : null, write: (value,key) => { if(options.writeFail) return false; storage[key]=value; return true; } },
     $surge: { selectGroupDetails: () => ({ decisions: options.decisions || { Group: 'Tokyo' } }) },
+    $utils: options.utilsMissing ? undefined : Object.fromEntries(['geoip','ipasn','ipaso'].map(name=>[name,ip=>{
+      const value=typeof options.localGeo==='function'?options.localGeo(ip):options.localGeo||{};
+      return value[name]||null;
+    }])),
     $httpAPI: (method, url, body, callback) => {
       assert.equal(method, 'GET');
+      if(doneCount) lateAPICalls++;
+      apiCalls.push({method,url,body});
+      if(url==='/v1/requests/recent') {
+        if(options.recentHang) return;
+        const recent=typeof options.recent==='function'?options.recent(requests):options.recent;
+        const value=recent===undefined?{requests:requests.filter(r=>r.policy!=='DIRECT'&&/vb_health_path=.*_node$/.test(r.url)).map(r=>({URL:r.url,policyName:r.policy,remoteAddress:'198.51.100.42 (Proxy)'}))}:recent;
+        schedule(()=>callback(value),1);return;
+      }
       assert.equal(url, '/v1/policies');
       if (!options.apiHang) schedule(() => callback(options.policies || { proxies: ['Tokyo', 'Other'], 'policy-groups': ['Group'] }), 1);
     },
@@ -41,7 +63,7 @@ async function run(options = {}) {
       peakRequests = Math.max(peakRequests, activeRequests);
       assert.ok(peakRequests <= 20, 'must remain within the Surge concurrent request limit');
       requests.push({ method, ...config });
-      const reply = config.url.startsWith('https://www.speedtest.net/api/js/servers?') ? (options.directoryReply === undefined ? {body:JSON.stringify(gzDirectory)} : options.directoryReply) : options.reply ? options.reply(config, method, index) : config.url.includes('/speedtest/latency.txt') ? {body:'test=test'} : { body: JSON.stringify({ ip: '203.0.113.7', fraudScore: 25, countryCode: 'JP', asn: 64496, isResidential: false }) };
+      const reply = config.url.startsWith('https://www.speedtest.net/api/js/servers?') ? (options.directoryReply === undefined ? {body:JSON.stringify(gzDirectory)} : options.directoryReply) : options.reply ? options.reply(config, method, index) : pathMode ? pathReply(config) : config.url.includes('/speedtest/latency.txt') ? {body:'test=test'} : { body: JSON.stringify({ ip: '203.0.113.7', fraudScore: 25, countryCode: 'JP', asn: 64496, isResidential: false }) };
       if (reply === null) return;
       schedule(() => { activeRequests--; callback(reply.error || null, reply.noResponse ? null : { status: reply.status || 200, headers: reply.headers || {} }, reply.body || ''); }, reply.delay || 100);
     }]))
@@ -62,8 +84,12 @@ async function run(options = {}) {
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(doneCount, 1);
   assert.equal(lateRequests, 0, 'a finished run must not start more network requests');
+  assert.equal(lateAPICalls,0,'a finished run must not start more local API calls');
   requests.forEach(r => {
-    assert.equal(r.policy, options.expectedPolicy || 'Tokyo');
+    if(r.policy==='DIRECT') {
+      assert.ok(pathMode,'DIRECT is reserved for the new path panel');
+      assert.match(r.url,/^https:\/\/(?:www\.cloudflare\.com\/cdn-cgi\/trace|api\.ip\.sb\/geoip)\?vb_health_path=[\w]+_direct$/);
+    } else assert.equal(r.policy, options.expectedPolicy || 'Tokyo');
     assert.equal(r['auto-redirect'], false);
     assert.equal(r['auto-cookie'], false);
     assert.ok(r.timeout > 0 && r.timeout <= 6, 'timeouts use seconds');
@@ -72,7 +98,7 @@ async function run(options = {}) {
   // Probe assertions read the actual persisted diagnostics; compact UI is tested separately.
   const report=storage['VB_HEALTH_REPORT_V1_'+(options.mode||(options.argument||'').match(/^mode=(\w+)/)?.[1]||'ip')];
   result.diagnosticContent=report?JSON.parse(report).details:result.content;
-  return { result, requests, clock, peakRequests, storage };
+  return { result, requests, clock, peakRequests, storage, apiCalls };
 }
 
 test('zero fraud score stays zero; missing classification is unknown, IP masked', async () => {
@@ -464,11 +490,128 @@ test('redirect evidence measures the complete same-origin path', async () => {
   assert.match(result.diagnosticContent,/Web：HTTP 200 · 400 ms · 跳转 1 次/);
 });
 
+test('path panel separates DIRECT public IP, observed entrance and pinned-node exit, with masked local reports', async () => {
+  const {result,requests,apiCalls,storage}=await run({mode:'path'});
+  assert.equal(result.title,'入口落地查询');
+  assert.match(result.content,/^公网 IP（直连）：203\.0\.113\.7/m);
+  assert.match(result.content,/^入口 IP：198\.51\.100\.42/m);
+  assert.match(result.content,/^落地 IP：203\.0\.113\.9/m);
+  assert.equal(requests.filter(r=>r.policy==='DIRECT').length,1);
+  assert.equal(requests.filter(r=>r.url.includes('/geoip/')).length,3);
+  assert.equal(apiCalls.filter(r=>r.url==='/v1/requests/recent').length,1);
+  assert.match(result.content,/ASN：AS64496 Example ISP/);
+  assert.match(result.content,/节点：Tokyo\n更新 · \d{2}:\d{2}:\d{2}$/);
+  const report=storage.VB_HEALTH_REPORT_V1_path;
+  for(const ip of ['203.0.113.7','198.51.100.42','203.0.113.9']) assert.ok(!report.includes(ip));
+  assert.doesNotMatch(report,/vb_health_path=/);
+  assert.match(result.diagnosticContent,/未还原服务商隐藏转发链路/);
+  const {value}=settings({path:'/api/reports',storage});
+  assert.equal(value.reports.length,1);
+  assert.equal(value.reports[0].mode,'path');
+});
+
+test('entrance matching ignores stale URLs, another selected node, and destination addresses without a proxy marker', async () => {
+  for(const change of [r=>({...r,URL:r.URL+'&old=1'}),r=>({...r,policyName:'Other'}),r=>({...r,remoteAddress:'192.0.2.66'})]) {
+    const {result,storage}=await run({mode:'path',recent:requests=>({requests:requests.filter(r=>r.policy==='Tokyo').map(r=>change({URL:r.url,policyName:'Tokyo',remoteAddress:'192.0.2.66 (Proxy)',headers:{Cookie:'unrelated-private-cookie'}}))})});
+    assert.match(result.content,/入口 IP：未取得（未取得本次节点连接地址）/);
+    assert.doesNotMatch(result.content,/192\.0\.2\.66/);
+    assert.doesNotMatch(storage.VB_HEALTH_REPORT_V1_path,/unrelated-private-cookie|Cookie|old=1/);
+  }
+});
+
+test('entrance records support IPv4 ports and bracketed or bare IPv6 without treating a hostname as an IP', async () => {
+  for(const [remote,address]of[['198.51.100.42:443 (Proxy)','198.51.100.42'],['[2001:db8::5]:443 (Proxy)','2001:db8::5'],['2001:db8::5 (Proxy)','2001:db8::5'],['entry.example.com:443 (Proxy)','']]) {
+    const {result}=await run({mode:'path',recent:requests=>({requests:requests.filter(r=>r.policy==='Tokyo'&&r.url.includes('vb_health_path=')).map(r=>({URL:r.url,policyName:'Tokyo',remoteAddress:remote}))})});
+    if(address) assert.ok(result.content.includes('入口 IP：'+address));
+    else assert.match(result.content,/入口 IP：未取得/);
+  }
+});
+
+test('multiple observed entrance addresses stay ambiguous rather than choosing one arbitrarily', async () => {
+  const {result,requests,storage}=await run({mode:'path',reply:c=>c.policy==='Tokyo'&&c.url.includes('/cdn-cgi/trace')?{status:503}:pathReply(c),
+    recent:requests=>({requests:requests.filter(r=>r.policy==='Tokyo'&&r.url.includes('vb_health_path=')).map((r,i)=>({URL:r.url,policyName:'Tokyo',remoteAddress:'198.51.100.'+(42+i)+' (Proxy)'}))})});
+  assert.match(result.content,/入口 IP：未取得（多个连接地址，待确认）/);
+  assert.match(result.content,/落地 IP：203\.0\.113\.9/);
+  assert.ok(requests.every(r=>!r.url.includes('/geoip/198.51.100.')));
+  assert.doesNotMatch(storage.VB_HEALTH_REPORT_V1_path,/198\.51\.100\.(42|43)/);
+});
+
+test('geolocation must match the requested IP and can fall back to independent local ASN fields', async () => {
+  const {result}=await run({mode:'path',localGeo:{geoip:'US',ipasn:'64497',ipaso:'Local ASN Org'},reply:c=>c.url.includes('/geoip/')
+    ?{body:JSON.stringify({ip:'192.0.2.99',country:'WrongCountry',city:'WrongCity',asn:64500,asn_organization:'WrongOrg'})}:pathReply(c)});
+  assert.match(result.content,/位置：🇺🇸 US/);
+  assert.match(result.content,/ASN：AS64497 Local ASN Org/);
+  assert.doesNotMatch(result.content,/Wrong|64500/);
+  assert.match(result.diagnosticContent,/地址不匹配或格式变化/);
+});
+
+test('equivalent IPv6 endpoints share one geolocation lookup and keep full panel addresses', async () => {
+  const ip='2001:db8::5';
+  const {result,requests}=await run({mode:'path',reply:c=>c.url.includes('/cdn-cgi/trace')?{body:'ip='+ip+'\nloc=JP'}:
+    {body:JSON.stringify({ip:'2001:0db8:0:0:0:0:0:5',country_code:'JP',asn:64496,asn_organization:'IPv6 Org'})},
+    recent:requests=>({requests:requests.filter(r=>r.policy==='Tokyo').map(r=>({URL:r.url,policyName:'Tokyo',remoteAddress:'[2001:0db8:0:0:0:0:0:5]:443 (Proxy)'}))})});
+  assert.equal(requests.filter(r=>r.url.includes('/geoip/')).length,1);
+  assert.ok(result.content.includes(ip));
+  assert.match(result.content,/ASN：AS64496 IPv6 Org/);
+});
+
+test('DIRECT and node probe failures remain independent and never substitute one exit for the other', async () => {
+  for(const policy of ['DIRECT','Tokyo']) {
+    const {result,clock}=await run({mode:'path',reply:c=>c.policy===policy&&c.url.includes('vb_health_path=')?null:pathReply(c)});
+    if(policy==='DIRECT') { assert.match(result.content,/公网 IP（直连）：未取得（超时）/);assert.match(result.content,/落地 IP：203\.0\.113\.9/); }
+    else { assert.match(result.content,/公网 IP（直连）：203\.0\.113\.7/);assert.match(result.content,/落地 IP：未取得（超时）/); }
+    assert.ok(clock<25000);
+  }
+});
+
+test('unreadable connection records preserve public and exit results while reporting entrance as unknown', async () => {
+  for(const options of [{recent:{error:'unavailable'}},{recent:{requests:[]}},{recentHang:true}]) {
+    const {result,clock}=await run({mode:'path',...options});
+    assert.match(result.content,/入口 IP：未取得/);
+    assert.match(result.content,/公网 IP（直连）：203\.0\.113\.7/);
+    assert.match(result.content,/落地 IP：203\.0\.113\.9/);
+    assert.ok(clock<25000);
+  }
+});
+
+test('path deadline retains observed addresses, finishes once and starts no late probes', async () => {
+  const {result,clock}=await run({mode:'path',deadlineMs:150});
+  assert.equal(clock,150);
+  assert.match(result.content,/公网 IP（直连）：203\.0\.113\.7/);
+  assert.match(result.content,/落地 IP：203\.0\.113\.9/);
+  assert.match(result.content,/ASN：待查询/);
+});
+
+test('path detection stops before DIRECT traffic if no valid concrete node is selected', async () => {
+  for(const options of [{argument:'mode=path'},{decisions:{Group:'DIRECT'}},{decisions:{Group:'REJECT'}},{decisions:{Group:'Missing'}}]) {
+    const {requests}=await run({mode:'path',...options});
+    assert.equal(requests.length,0);
+  }
+});
+
+test('path metadata and exit use the external policy identifier, while entrance may carry its display name', async () => {
+  const {result,requests}=await run({mode:'path',expectedPolicy:'POLICY::opaque',policies:{proxies:[],'policy-groups':['Group'],'external-policies':[{name:'Tokyo',group:'Group',identifier:'POLICY::opaque'}]},
+    recent:requests=>({requests:requests.filter(r=>r.policy==='POLICY::opaque').map(r=>({URL:r.url,policyName:'Tokyo',remoteAddress:'198.51.100.42 (Proxy)'}))})});
+  assert.match(result.content,/入口 IP：198\.51\.100\.42/);
+  assert.ok(requests.some(r=>r.policy==='POLICY::opaque'));
+});
+
+test('private entrance addresses are displayed but are never submitted to an external geolocation API', async () => {
+  for(const ip of ['10.0.0.1','192.168.1.1','fc00::1','fe80::1','::ffff:7f00:1']) {
+    const {result,requests}=await run({mode:'path',recent:requests=>({requests:requests.filter(r=>r.policy==='Tokyo').map(r=>({URL:r.url,policyName:'Tokyo',remoteAddress:ip+' (Proxy)'}))})});
+    assert.ok(result.content.includes('入口 IP：'+ip));
+    assert.match(result.content,/位置：内网地址/);
+    assert.ok(!requests.some(r=>r.url.includes('/geoip/'+encodeURIComponent(ip))));
+  }
+});
+
 test('module adds only local settings interception, host and panels; no capture, MITM or rules', () => {
   const moduleText = fs.readFileSync(path.join(__dirname, '..', 'node-health.sgmodule'), 'utf8');
   assert.deepEqual([...moduleText.matchAll(/^\[([^\]]+)\]/gm)].map(m => m[1]), ['Panel', 'Script', 'Host']);
-  assert.equal((moduleText.match(/update-interval=-1/g) || []).length, 3);
-  assert.equal((moduleText.match(/type=generic/g) || []).length, 4);
+  assert.equal((moduleText.match(/update-interval=-1/g) || []).length, 4);
+  assert.equal((moduleText.match(/type=generic/g) || []).length, 5);
+  assert.ok(moduleText.indexOf('VB-Health-Path = script-name=')>moduleText.indexOf('VB-Health-Latency = script-name='));
+  assert.match(moduleText,/VB-Health-Path = type=generic[^\n]+argument="mode=path"/);
   assert.match(moduleText, /VB-Health-Settings-Entry = script-name=VB-Health-Settings-Entry/);
   assert.equal((moduleText.match(/type=http-request/g) || []).length, 1);
   assert.match(moduleText, /pattern=\^http:\/\/surge-node-health\\\.invalid/);
@@ -644,7 +787,7 @@ test('button-selected group is followed by all checks and tracks its selected no
   const storage = {};
   settings({ panel:true, trigger:'button', storage });
   settings({ panel:true, trigger:'button', storage });
-  for(const mode of ['ip','unlock','latency']) {
+  for(const mode of ['ip','unlock','latency','path']) {
     const { result, requests } = await run({storage,argument:`mode=${mode}&showIP=false`,decisions:{'🚀 常用节点':'Other'},expectedPolicy:'Other'});
     assert.match(result.content,/节点：Other/);
     assert.ok(requests.length>0);
@@ -700,7 +843,7 @@ test('selecting an existing group saves it locally; each panel follows its curre
   const { value, storage } = settings({ path: '/api/select', method: 'POST', body: JSON.stringify({ group: '🚀 常用节点' }) });
   assert.equal(value.saved, true);
   assert.equal(JSON.parse(storage[SETTINGS_KEY]).group, '🚀 常用节点');
-  for (const mode of ['ip', 'unlock', 'latency']) {
+  for (const mode of ['ip', 'unlock', 'latency', 'path']) {
     const { result, requests } = await run({ storage, argument: `mode=${mode}&showIP=false`, decisions: { '🚀 常用节点': 'Other' }, expectedPolicy: 'Other' });
     assert.match(result.content, /节点：Other/);
     assert.ok(requests.length > 0);

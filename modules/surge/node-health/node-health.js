@@ -1,14 +1,14 @@
 /* SPDX-License-Identifier: MIT
- * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.11
+ * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.12
  * Runs locally in Surge. No MITM, policy mutations, credentials or uploads.
  */
 (function () {
   "use strict";
 
-  const VERSION = "0.1.0-beta.11";
+  const VERSION = "0.1.0-beta.12";
   const SETTINGS_URL = "http://surge-node-health.invalid/";
   const SETTINGS_KEY = "VB_HEALTH_SELECTED_GROUP_V1";
-  const TITLES = { ip: "IP 纯净度", unlock: "平台解锁检测", latency: "广州三网延迟" };
+  const TITLES = { ip: "IP 纯净度", unlock: "平台解锁检测", latency: "广州三网延迟", path: "入口落地查询" };
   const REPORT_KEY = "VB_HEALTH_REPORT_V1_";
   const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
   const TARGETS = [
@@ -42,7 +42,7 @@
   function parseArgument(raw) {
     // Policy is last: node/group names may contain &, =, + or literal %.
     // Legacy showIP remains readable; the native IP panel now always shows the complete address.
-    const match = String(raw || "").match(/^mode=(ip|unlock|latency)(?:&showIP=(?:true|false))?(?:&policy=([\s\S]*))?$/);
+    const match = String(raw || "").match(/^mode=(ip|unlock|latency|path)(?:&showIP=(?:true|false))?(?:&policy=([\s\S]*))?$/);
     if (!match) throw new Error("模块参数不完整，请重新安装模块。");
     mode = match[1];
     let selected = "";
@@ -316,6 +316,130 @@
     else if (countries.length > 1) summary.push("注意：地区库存在差异");
     const color = unique.length > 1 ? "#FF9500" : score === null ? "#8E8E93" : score <= 25 ? "#34C759" : score <= 50 ? "#FFCC00" : score <= 70 ? "#FF9500" : "#FF3B30";
     finish(summary.join("\n"), "info", lines.join("\n"), { icon: score !== null && score <= 50 && unique.length === 1 ? "checkmark.seal.fill" : "exclamationmark.triangle.fill", "icon-color": color });
+  }
+
+  function localGeo(ip) {
+    const result = { countryCode: "", asn: "", organization: "" };
+    if (typeof $utils === "undefined") return result;
+    try { result.countryCode = country($utils.geoip(ip)); } catch (_) { /* Missing local database. */ }
+    try { result.asn = $utils.ipasn(ip) || ""; } catch (_) { /* Independent fields. */ }
+    try { result.organization = $utils.ipaso(ip) || ""; } catch (_) { /* Independent fields. */ }
+    return result;
+  }
+  function privateAddress(ip) {
+    if (ip.indexOf(":") >= 0) {
+      const key = ipKey(ip);
+      const groups = key.split(":").map(function (v) { return parseInt(v, 16); });
+      if (groups.slice(0, 5).every(function (v) { return v === 0; }) && groups[5] === 65535) {
+        return privateAddress([groups[6] >> 8, groups[6] & 255, groups[7] >> 8, groups[7] & 255].join("."));
+      }
+      return key === "0:0:0:0:0:0:0:0" || key === "0:0:0:0:0:0:0:1" ||
+        (groups[0] & 65024) === 64512 || (groups[0] & 65472) === 65152 || (groups[0] & 65280) === 65280;
+    }
+    const p = ip.split(".").map(Number);
+    return [0, 10, 127].indexOf(p[0]) >= 0 || p[0] >= 224 || p[0] === 169 && p[1] === 254 ||
+      p[0] === 172 && p[1] >= 16 && p[1] <= 31 || p[0] === 192 && p[1] === 168 || p[0] === 100 && p[1] >= 64 && p[1] <= 127;
+  }
+  function proxyAddress(value) {
+    if (typeof value !== "string") return "";
+    const match = value.match(/^(\S+)\s+\(Proxy\)$/i);
+    if (!match) return "";
+    let address = match[1];
+    const bracketed = address.match(/^\[([0-9a-f:]+)\](?::(\d{1,5}))?$/i);
+    if (bracketed) {
+      if (bracketed[2] && (Number(bracketed[2]) < 1 || Number(bracketed[2]) > 65535)) return "";
+      address = bracketed[1];
+    }
+    else if (!validIP(address)) {
+      const withPort = address.match(/^((?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})$/);
+      if (withPort && Number(withPort[2]) >= 1 && Number(withPort[2]) <= 65535) address = withPort[1];
+    }
+    return validIP(address) ? address : "";
+  }
+  async function observedPublicIP(context, tag, state) {
+    const traceURL = "https://www.cloudflare.com/cdn-cgi/trace?vb_health_path=" + tag;
+    state.urls.push(traceURL);
+    const trace = await request(context, traceURL, { timeout: 4 });
+    const fields = traceFields(trace);
+    state.details.push(evidence("Cloudflare", trace, fields.ip && validIP(fields.ip) ? "出口地址已取得" : problem(trace) || "无有效地址"));
+    if (validIP(fields.ip) && !privateAddress(fields.ip)) {
+      state.ip = fields.ip; state.countryCode = country(fields.loc); state.reason = "";
+      return;
+    }
+    if (completed) return;
+    const fallbackURL = "https://api.ip.sb/geoip?vb_health_path=" + tag;
+    state.urls.push(fallbackURL);
+    const response = await request(context, fallbackURL, { timeout: 4 });
+    const data = !problem(response) && json(response.body);
+    state.details.push(evidence("IP.SB 备用", response, data && validIP(data.ip) ? "地址已取得" : problem(response) || "无有效地址"));
+    if (data && validIP(data.ip) && !privateAddress(data.ip)) {
+      state.ip = data.ip; state.countryCode = country(data.country_code || data.countryCode); state.geoData = data; state.reason = "";
+    } else state.reason = problem(response) || problem(trace) || "地址待确认";
+  }
+  async function pathGeo(context, ip, known) {
+    if (privateAddress(ip)) return { location: "内网地址", asn: "未知", note: "私有或非公网地址，不提交给外部地理接口" };
+    const local = localGeo(ip);
+    let data = known && known.ip && validIP(known.ip) && ipKey(known.ip) === ipKey(ip) ? known : null;
+    let note = "IP.SB 备用探测资料";
+    if (!data && !completed) {
+      const response = await request(context, "https://api.ip.sb/geoip/" + encodeURIComponent(ip), { timeout: 4 });
+      const parsed = !problem(response) && json(response.body);
+      data = parsed && validIP(parsed.ip) && ipKey(parsed.ip) === ipKey(ip) ? parsed : null;
+      note = evidence("IP.SB 地理", response, data ? "返回地址核对一致" : problem(response) || "地址不匹配或格式变化");
+    }
+    data = data || {};
+    function field(value) { return typeof value === "string" ? clean(value) : ""; }
+    const code = country(data.country_code || data.countryCode) || local.countryCode;
+    const location = [field(data.country) || code, field(data.region), field(data.city)].filter(Boolean)
+      .filter(function (v, i, a) { return a.indexOf(v) === i; }).join(" · ");
+    const rawASN = data.asn || local.asn;
+    const asn = /^\d+$/.test(String(rawASN)) && Number(rawASN) > 0 && Number(rawASN) <= 4294967295 ? "AS" + rawASN : "";
+    const organization = field(data.asn_organization || data.asOrganization || data.organization) || field(local.organization);
+    return { location: (flag(code) + location).trim() || "未知", asn: [asn, organization].filter(Boolean).join(" ") || "未知", note: note + "；缺失字段可使用 Surge 本地库" };
+  }
+  async function pathPanel(context) {
+    const nonce = Date.now() + "_" + Math.random().toString(36).slice(2);
+    function blank(label) { return { label: label, ip: "", countryCode: "", urls: [], details: [], reason: "检测中" }; }
+    const direct = blank("公网 IP（直连）"), entrance = blank("入口 IP"), exit = blank("落地 IP");
+    function block(state) {
+      if (!state.ip) return state.label + "：未取得（" + (state.reason === "检测中" ? "检测超时" : state.reason) + "）";
+      return [state.label + "：" + state.ip, "位置：" + (state.geo ? state.geo.location : regionLabel(state.countryCode) || "待查询"),
+        "ASN：" + (state.geo ? state.geo.asn : "待查询")].join("\n");
+    }
+    function render() {
+      const states = [direct, entrance, exit];
+      const details = [preamble(context)].concat(states.map(function (s) {
+        return block(s) + (s.details.length ? "\n" + s.details.join("\n") : "") + (s.geo ? "\n" + s.geo.note : "");
+      }), ["公网地址仅由 DIRECT 实测，落地由固定的所选节点实测；未把直连结果代替落地。", "入口仅匹配本次带唯一标识的节点探测 URL、策略身份及带 (Proxy) 标记的连接地址。", "入口和落地不同不能证明中间节点数量，未还原服务商隐藏转发链路。"]).join("\n\n");
+      finish(states.map(block).join("\n\n"), "info", details, { icon: "network", "icon-color": "#007AFF" });
+    }
+    deadlineResult = render;
+    await Promise.all([observedPublicIP({ policy: "DIRECT" }, nonce + "_direct", direct), observedPublicIP(context, nonce + "_node", exit)]);
+    if (completed) return;
+    try {
+      const recent = await api("GET", "/v1/requests/recent", {});
+      const addresses = [];
+      (Array.isArray(recent.requests) ? recent.requests : []).forEach(function (r) {
+        if (!r || exit.urls.indexOf(r.URL) < 0 || [context.policy, context.label].indexOf(r.policyName) < 0) return;
+        const ip = proxyAddress(r.remoteAddress);
+        if (ip && !addresses.some(function (v) { return ipKey(v) === ipKey(ip); })) addresses.push(ip);
+      });
+      if (addresses.length === 1) { entrance.ip = addresses[0]; entrance.reason = ""; entrance.details.push("来源：本次探测连接记录"); }
+      else {
+        entrance.reason = addresses.length > 1 ? "多个连接地址，待确认" : "未取得本次节点连接地址";
+        if (addresses.length > 1) entrance.details.push("本次记录出现多个入口：" + addresses.join(" / "));
+      }
+    } catch (_) { entrance.reason = "连接记录暂不可读"; }
+    if (completed) return;
+    const lookups = Object.create(null);
+    await Promise.all([direct, entrance, exit].map(async function (state) {
+      if (!state.ip || completed) return;
+      const key = ipKey(state.ip);
+      if (!lookups[key]) lookups[key] = pathGeo(context, state.ip, state.geoData);
+      state.geo = await lookups[key];
+      if (state.geo.location === "未知" && state.countryCode) state.geo = Object.assign({}, state.geo, { location: regionLabel(state.countryCode) });
+    }));
+    render();
   }
 
   function netflixSample(response, id) {
@@ -663,7 +787,8 @@
       detectedNode = clean(context.label);
       if (mode === "ip") await ipPanel(context);
       else if (mode === "unlock") await unlockPanel(context);
-      else await latencyPanel(context);
+      else if (mode === "latency") await latencyPanel(context);
+      else await pathPanel(context);
     } catch (error) { finish(clean(error.message || error), "alert"); }
   })();
 })();
