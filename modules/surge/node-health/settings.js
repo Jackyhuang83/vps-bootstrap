@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: MIT
- * Surge 节点体检 v0.1.0-beta.18 — local-only group picker.
+ * Surge 节点体检 v0.1.0-beta.19 — local-only group picker.
  * The request is answered by Surge; no socket, remote API or credentials.
  */
 (function () {
@@ -128,10 +128,10 @@
       }
       if (index >= 0) {
         message = "当前节点：" + label(groups[index].selected) + "\n" +
-          (groups.length > 1 ? "点按切组 · " + (index + 1) + "/" + groups.length : "仅有 1 个手动组") + " · v0.1.0-beta.18";
+          (groups.length > 1 ? "点按切组 · " + (index + 1) + "/" + groups.length : "仅有 1 个手动组") + " · v0.1.0-beta.19";
       } else {
         if (group) { message = "原检测组已不存在。\n"; style = "alert"; }
-        message += "点按选择：" + label(groups[0].name) + "\n共 " + groups.length + " 组 · v0.1.0-beta.18";
+        message += "点按选择：" + label(groups[0].name) + "\n共 " + groups.length + " 组 · v0.1.0-beta.19";
       }
     } catch (error) {
       message = error.message || "无法读取策略组，请更新 Surge 后重试。";
@@ -211,7 +211,7 @@ selectButton.addEventListener("click",function(){if(selectButton.disabled)return
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>选择检测策略组</title>
 <style>
 :root{color-scheme:light dark;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f4f6fa;color:#17243d}body{margin:0}main{max-width:560px;margin:auto;padding:38px 20px 48px}header small{color:#60718a;font-size:13px}h1{font-size:27px;letter-spacing:-.6px;margin:12px 0}p{line-height:1.65;color:#5d6a7e}.list{display:grid;gap:10px;margin:22px 0}button.group{display:block;text-align:left;appearance:none;border:1px solid #dce2ec;background:white;color:#17243d;border-radius:15px;padding:17px 18px;width:100%;cursor:pointer}button.group strong{display:block;font-size:17px;overflow-wrap:anywhere}button.group small{display:block;font-size:13px;color:#60718a;margin-top:7px;overflow-wrap:anywhere}button.group.selected{border:2px solid #2870ed;background:#f0f5ff;padding:16px 17px}button:disabled{opacity:.55}#status{border-radius:12px;padding:13px 15px;background:#e8eef9;color:#24466f;overflow-wrap:anywhere}#status.error{background:#fff0ee;color:#973a2c}#retry{border:0;color:#2563d6;background:transparent;padding:12px 0;font-size:15px;cursor:pointer}footer{color:#778399;font-size:12px;line-height:1.7;margin-top:24px}@media(prefers-color-scheme:dark){:root{background:#111824;color:#f1f4fa}p{color:#adb9ce}button.group{background:#1c2739;color:#f1f4fa;border-color:#334058}button.group.selected{background:#172d50;border-color:#6b9fff}button.group small,header small{color:#b0bfd5}#status{background:#1d304a;color:#cbdefa}#status.error{background:#482927;color:#ffcdc8}#retry{color:#8bb6ff}}
-</style></head><body><main><nav style="display:flex;gap:20px;margin-bottom:24px"><a href="/" style="color:#2870ed">选检测组</a><a href="/reports" style="color:#2870ed">检测详情</a></nav><header><small>节点体检 · 本地设置</small><h1>选择检测策略组</h1><p>点选你平时用来切换节点的那一组。保存一次，以后在 Surge 中选哪个节点，就检测哪个节点。</p></header><div id="status" role="status" aria-live="polite">正在读取 Surge 策略组…</div><div id="groups" class="list"></div><button id="retry" type="button">重新加载列表</button><footer>选择后，返回 Surge，选好节点并点击检测面板刷新。<br>详细检测记录可在上方「检测详情」查看。v0.1.0-beta.18</footer></main>
+</style></head><body><main><nav style="display:flex;gap:20px;margin-bottom:24px"><a href="/" style="color:#2870ed">选检测组</a><a href="/reports" style="color:#2870ed">检测详情</a></nav><header><small>节点体检 · 本地设置</small><h1>选择检测策略组</h1><p>点选你平时用来切换节点的那一组。保存一次，以后在 Surge 中选哪个节点，就检测哪个节点。</p></header><div id="status" role="status" aria-live="polite">正在读取 Surge 策略组…</div><div id="groups" class="list"></div><button id="retry" type="button">重新加载列表</button><footer>选择后，返回 Surge，选好节点并点击检测面板刷新。<br>详细检测记录可在上方「检测详情」查看。v0.1.0-beta.19</footer></main>
 <script>
 "use strict";
 var list=document.getElementById("groups"),statusBox=document.getElementById("status"),retry=document.getElementById("retry"),busy=false;
