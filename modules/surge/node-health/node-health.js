@@ -808,7 +808,9 @@
     const phases = samples.map(function (s) { return s.phase; }).filter(Boolean).filter(function (v, i, a) { return a.indexOf(v) === i; });
     const codes = samples.map(function (s) { return s.errorCode; }).filter(Boolean).filter(function (v, i, a) { return a.indexOf(v) === i; });
     const reason = kinds.length === samples.length && kinds[0] !== "超时" && kinds.every(function (k) { return k === kinds[0]; }) ? kinds[0] : latencyFailure(samples);
-    return (phases.length === 1 ? phases[0] + " · " : "") + reason +
+    const phase = phases.length === 1 ? phases[0] :
+      phases.indexOf("会话采样") >= 0 && phases.every(function (p) { return p === "会话采样" || p === "预检"; }) ? "会话采样" : "";
+    return (phase ? phase + " · " : "") + reason +
       (codes.length === 1 ? "（" + (codes[0].indexOf("#") >= 0 ? "错误 " + codes[0].split("#")[1] : codes[0]) + "）" : "");
   }
   async function cnSetupRequest(context, url, options, connection) {
