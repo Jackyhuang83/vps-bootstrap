@@ -625,18 +625,20 @@ test('private entrance addresses are displayed but are never submitted to an ext
   }
 });
 
-test('module adds only local settings interception, host and panels; no capture, MITM or rules', () => {
+test('module retains five compact panels and local diagnostic page without a visible reports panel, capture, MITM or rules', () => {
   const moduleText = fs.readFileSync(path.join(__dirname, '..', 'node-health.sgmodule'), 'utf8');
   assert.deepEqual([...moduleText.matchAll(/^\[([^\]]+)\]/gm)].map(m => m[1]), ['General', 'Panel', 'Script', 'Host']);
   assert.match(moduleText,/^tun-included-routes = %INSERT% 192\.0\.2\.1\/32$/m);
   assert.match(moduleText,/^force-http-engine-hosts = %INSERT% surge-node-health\.invalid:80, 192\.0\.2\.1:80$/m);
   assert.match(moduleText,/^always-raw-tcp-hosts = %INSERT% -surge-node-health\.invalid:80, -192\.0\.2\.1:80$/m);
   assert.equal((moduleText.match(/update-interval=-1/g) || []).length, 4);
-  assert.equal((moduleText.match(/type=generic/g) || []).length, 6);
+  assert.equal((moduleText.match(/type=generic/g) || []).length, 5);
   assert.ok(moduleText.indexOf('VB-Health-Path = script-name=')>moduleText.indexOf('VB-Health-Latency = script-name='));
   assert.match(moduleText,/VB-Health-Path = type=generic[^\n]+argument="mode=path"/);
-  assert.ok(moduleText.indexOf('VB-Health-Reports = script-name=')>moduleText.indexOf('VB-Health-Path = script-name='));
-  assert.match(moduleText,/VB-Health-Reports = type=generic[^\n]+settings\.js[^\n]+argument="mode=reports"/);
+  assert.doesNotMatch(moduleText,/^VB-Health-Reports = /m);
+  assert.doesNotMatch(moduleText,/script-name=VB-Health-Reports|argument="mode=reports"/);
+  assert.match(moduleText,/settings\.js\?v=0\.1\.0-beta\.21/);
+  assert.match(moduleText,/node-health\.js\?v=0\.1\.0-beta\.21/);
   assert.match(moduleText, /VB-Health-Settings-Entry = script-name=VB-Health-Settings-Entry/);
   assert.equal((moduleText.match(/type=http-request/g) || []).length, 1);
   assert.ok(moduleText.includes('pattern=^http://(?:surge-node-health\\.invalid|192\\.0\\.2\\.1)(?::80)?(?:/|$)'));
