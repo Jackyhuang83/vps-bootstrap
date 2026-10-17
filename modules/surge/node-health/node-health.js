@@ -1,11 +1,11 @@
 /* SPDX-License-Identifier: MIT
- * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.10
+ * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.11
  * Runs locally in Surge. No MITM, policy mutations, credentials or uploads.
  */
 (function () {
   "use strict";
 
-  const VERSION = "0.1.0-beta.10";
+  const VERSION = "0.1.0-beta.11";
   const SETTINGS_URL = "http://surge-node-health.invalid/";
   const SETTINGS_KEY = "VB_HEALTH_SELECTED_GROUP_V1";
   const TITLES = { ip: "IP 纯净度", unlock: "平台解锁检测", latency: "广州三网延迟" };
@@ -41,7 +41,8 @@
 
   function parseArgument(raw) {
     // Policy is last: node/group names may contain &, =, + or literal %.
-    const match = String(raw || "").match(/^mode=(ip|unlock|latency)&showIP=(true|false)(?:&policy=([\s\S]*))?$/);
+    // Legacy showIP remains readable; the native IP panel now always shows the complete address.
+    const match = String(raw || "").match(/^mode=(ip|unlock|latency)(?:&showIP=(?:true|false))?(?:&policy=([\s\S]*))?$/);
     if (!match) throw new Error("模块参数不完整，请重新安装模块。");
     mode = match[1];
     let selected = "";
@@ -52,11 +53,11 @@
       } catch (_) { /* Corrupt settings must require re-selection, not a guessed group. */ }
     }
     // Preserve exact stored names. Legacy argument remains readable for Beta 1/2.
-    const policy = selected || String(match[3] || "").trim();
+    const policy = selected || String(match[2] || "").trim();
     if (!policy || /[\r\n]/.test(policy) || (!selected && /填写|\{\{\{/.test(policy))) {
       throw new Error("请点击「检测设置」面板切换到要检测的策略组。也可网页点选：" + SETTINGS_URL);
     }
-    return { mode: match[1], showIP: match[2] === "true", policy: policy };
+    return { mode: match[1], policy: policy };
   }
 
   function api(method, path, body) {
@@ -259,7 +260,7 @@
     return groups.map(function (v) { return parseInt(v, 16).toString(16); }).join(":");
   }
 
-  async function ipPanel(context, showIP) {
+  async function ipPanel(context) {
     const responses = await Promise.all([request(context, "https://my.ippure.com/v1/info"),
       request(context, "https://api.ip.sb/geoip"), request(context, "https://www.cloudflare.com/cdn-cgi/trace")]);
     const response = responses[0];
@@ -291,7 +292,7 @@
     const classifications = ["住宅：" + (typeof data.isResidential === "boolean" ? data.isResidential ? "是" : "否" : "未知"),
       "机房：" + (typeof data.isDataCenter === "boolean" ? data.isDataCenter ? "是" : "否" : "未知")];
     const warp = trace.warp === "on" || trace.warp === "plus" ? "已启用" + (trace.warp === "plus" ? " Plus" : "") : trace.warp === "off" ? "未启用" : "未知";
-    const lines = [preamble(context), "出口：" + masked(data.ip, showIP) + (ipv6 ? "（IPv6）" : "（IPv4）"), location || "地区未知",
+    const lines = [preamble(context), "出口：" + data.ip + (ipv6 ? "（IPv6）" : "（IPv4）"), location || "地区未知",
       score === null ? "纯净度：未知" + (ipv6 ? "（IPPure 不评估 IPv6）" : "（无有效风险分）") : "纯净度参考：" + (100 - score) + "/100 · 风险" + risk,
       "IPPure 风险分：" + (score === null ? "未知" : score + "/100（越低越好）"),
       "类型：" + (types.join(" · ") || "未知"),
@@ -299,13 +300,13 @@
       "ASN：" + clean(data.asn || "未知") + " · " + clean(data.asOrganization || data.asn_organization || data.organization || "未知"), comparison,
       "Cloudflare：地区 " + (country(trace.loc) || "未知") + " · 接入点 " + (/^[A-Z]{3}$/.test(trace.colo || "") ? trace.colo : "未知") + " · WARP " + warp];
     sources.forEach(function (s) {
-      const value = s.data && validIP(s.data.ip) ? masked(s.data.ip, showIP) : problem(s.response) || "数据格式未知";
+      const value = s.data && validIP(s.data.ip) ? s.data.ip : problem(s.response) || "数据格式未知";
       const region = s.data && validIP(s.data.ip) && country(s.data.countryCode || s.data.country_code || s.data.loc);
       lines.push(evidence(s.name, s.response, value + (region ? " · " + region : "")));
     });
     if (unique.length === 1 && countries.length > 1) lines.push("地区库差异：" + countries.join(" / ") + "（IP 一致，地区资料不同）");
     lines.push("主信息来源 " + primary.name + "；风险分仅来自 IPPure · " + time(), "第三方评分，仅供参考");
-    const summary = [(ipv6 ? "IPv6：" : "IPv4：") + masked(data.ip, showIP),
+    const summary = [(ipv6 ? "IPv6：" : "IPv4：") + data.ip,
       "位置：" + flag(country(data.countryCode || data.country_code || data.loc)) + (location || "未知"),
       "ASN：" + (/^\d+$/.test(String(data.asn || "")) ? "AS" : "") + clean(data.asn || "未知") + " " + clean(data.asOrganization || data.asn_organization || data.organization || ""), "",
       "属性：" + (types.join(" · ") || "未知") + (warp.indexOf("已启用") === 0 ? " · WARP" + (trace.warp === "plus" ? " Plus" : "") : ""),
@@ -660,7 +661,7 @@
       }, 25000);
       const context = await resolvePolicy(args.policy);
       detectedNode = clean(context.label);
-      if (mode === "ip") await ipPanel(context, args.showIP);
+      if (mode === "ip") await ipPanel(context);
       else if (mode === "unlock") await unlockPanel(context);
       else await latencyPanel(context);
     } catch (error) { finish(clean(error.message || error), "alert"); }

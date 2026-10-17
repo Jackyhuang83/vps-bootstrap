@@ -506,11 +506,15 @@ test('native cards are compact while evidence remains available in the local rep
   assert.match(latency.result.content,/\n\n节点：Tokyo\n手机经节点到广州 · HTTP 往返 · \d{2}:\d{2}:\d{2}$/);
 });
 
-test('full IP is shown only on the requested panel and stays masked in stored records', async () => {
-  const {result,storage}=await run({argument:'mode=ip&showIP=true&policy=Group',reply:()=>({body:JSON.stringify({ip:'2001:db8::abcd',fraudScore:0})})});
-  assert.match(result.content,/2001:db8::abcd/);
-  assert.doesNotMatch(storage.VB_HEALTH_REPORT_V1_ip,/2001:db8::abcd/);
-  assert.match(storage.VB_HEALTH_REPORT_V1_ip,/2001:db8:\*\*\*\*/);
+test('native IPv4 and IPv6 are complete by default, old masking arguments cannot hide them, records stay masked', async () => {
+  for(const argument of ['mode=ip&policy=Group','mode=ip&showIP=false&policy=Group','mode=ip&showIP=true&policy=Group']) {
+    for(const [ip,masked]of[['203.0.113.7','203.0.*.*'],['2001:db8::abcd','2001:db8:****']]) {
+      const {result,storage}=await run({argument,reply:()=>({body:JSON.stringify({ip,fraudScore:0})})});
+      assert.ok(result.content.includes(ip));
+      assert.ok(!storage.VB_HEALTH_REPORT_V1_ip.includes(ip));
+      assert.ok(storage.VB_HEALTH_REPORT_V1_ip.includes(masked));
+    }
+  }
 });
 
 test('Guangzhou discovery rejects other cities, wrong coordinates and ambiguous carriers', async () => {
