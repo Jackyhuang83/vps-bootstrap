@@ -1,11 +1,11 @@
 /* SPDX-License-Identifier: MIT
- * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.19
+ * VPS Bootstrap — Surge 节点体检 v0.1.0-beta.20
  * Runs locally in Surge. No MITM, policy mutations, credentials or uploads.
  */
 (function () {
   "use strict";
 
-  const VERSION = "0.1.0-beta.19";
+  const VERSION = "0.1.0-beta.20";
   const SETTINGS_URL = "http://surge-node-health.invalid/";
   const SETTINGS_KEY = "VB_HEALTH_SELECTED_GROUP_V1";
   const TITLES = { ip: "IP 纯净度", unlock: "平台解锁检测", latency: "广州三网延迟", path: "入口落地查询" };
@@ -828,16 +828,39 @@
   function cnEvidence(label, sample, valid) {
     return evidence(label, sample, [valid ? "校验通过" : sample.error ? sample.errorKind : "响应校验未通过", sample.errorCode, sample.compatibility].filter(Boolean).join(" · "));
   }
-  function cnLatencyResult(name, target, samples, setup) {
-    const replies = samples.filter(validCNHead);
-    const details = setup.concat(["采用：ID " + target.id + " · " + target.base + "/speed/File(1G).dl（HEAD）",
-      "逐次：" + samples.map(function (s, i) { return cnEvidence(String(i + 1), s, validCNHead(s)); }).join(" / ")]);
-    if (!replies.length) return { line: name + "：" + cnFailure(samples), details: details.join("\n"), networkFailure: samples.length > 0 && samples.every(function (s) { return Boolean(s.error); }) };
+  function cnSessionURL(target) {
+    // Each lightweight sample uses a fresh public-protocol ID and signs it.
+    // Do not replay/cache a session URL or use the phone's device identifier.
+    const imei = "TS" + md5ASCII(String(Date.now()) + "_" + Math.random()).slice(8, 24).toUpperCase();
+    const seconds = String(Math.floor(Date.now() / 1000));
+    const token = md5ASCII(md5ASCII("model=Android&imei=" + imei) + md5ASCII("stime=" + seconds + "&band=200&rand=12345555"));
+    return target.base + "/speed/dovalid?key=&flag=true&bandwidth=200&model=Android&imei=" + imei +
+      "&time=" + seconds + "&app=globalspeed&pkg=com.cnspeedtest.globalspeed&token=" + token;
+  }
+  function validCNSession(sample) {
+    return !sample.error && sample.status === 200 &&
+      /^1-[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(sample.body.trim());
+  }
+  function cnLatencyResult(name, target, samples, setup, transport) {
+    const session = transport === "session";
+    const valid = session ? validCNSession : validCNHead;
+    const replies = samples.filter(valid);
+    const label = session ? " · HTTP 会话" : "";
+    const details = setup.concat(["采用：ID " + target.id + " · " +
+      (session ? target.base + "/speed/dovalid（独立 GET 会话，HTTP 往返，非 TCP Ping）" :
+        target.base + "/speed/File(1G).dl（HEAD）"),
+      "逐次：" + samples.map(function (s, i) { return cnEvidence(String(i + 1), s, valid(s)); }).join(" / ")]);
+    if (!replies.length) return { line: name + "：" + cnFailure(samples), details: details.join("\n"),
+      validCount: 0, networkFailure: samples.length > 0 && samples.every(function (s) { return Boolean(s.error); }) };
     const values = replies.map(function (s) { return s.ms; }), changes = [];
-    samples.forEach(function (s, i) { if (i && validCNHead(s) && validCNHead(samples[i - 1])) changes.push(Math.abs(s.ms - samples[i - 1].ms)); });
+    samples.forEach(function (s, i) { if (i && valid(s) && valid(samples[i - 1])) changes.push(Math.abs(s.ms - samples[i - 1].ms)); });
     const fluctuation = changes.length ? Math.round(changes.reduce(function (a, b) { return a + b; }, 0) / changes.length) + " ms" : "样本不足";
-    details.push("中位数 " + median(values) + " ms · 有效 " + replies.length + "/" + CN_SAMPLES + " · 范围 " + Math.min.apply(null, values) + "–" + Math.max.apply(null, values) + " ms · HTTP 波动 " + fluctuation);
-    return { line: name + "：" + median(values) + " ms" + (replies.length < CN_SAMPLES ? " · " + replies.length + "/" + CN_SAMPLES : ""), details: details.join("\n") };
+    details.push("中位数 " + median(values) + " ms · 有效 " + replies.length + "/" + CN_SAMPLES +
+      " · 范围 " + Math.min.apply(null, values) + "–" + Math.max.apply(null, values) + " ms · HTTP 波动 " + fluctuation,
+      session ? "仅反映三次重新建立会话的 HTTP 请求耗时，包含服务端计算；不能称为 TCP RTT。" : "HEAD 响应头耗时，非 TCP RTT。");
+    return { line: name + "：" + median(values) + " ms" + label +
+      (replies.length < CN_SAMPLES ? " · " + replies.length + "/" + CN_SAMPLES : ""),
+      details: details.join("\n"), validCount: replies.length };
   }
   async function cnPortControl(context, target) {
     // Independent same-IP, same-port HTTP check without a session. A 4xx
@@ -856,14 +879,10 @@
       const target = candidates[n];
       const connection = { close: false };
       setup.push("ID " + target.id + " · " + target.base, "来源：" + target.source);
-      // A fresh random protocol identifier, NOT the phone's IMEI. Session values stay in memory only.
-      const imei = "TS" + md5ASCII(String(Date.now()) + "_" + Math.random()).slice(8, 24).toUpperCase();
-      const seconds = String(Math.floor(Date.now() / 1000));
-      const token = md5ASCII(md5ASCII("model=Android&imei=" + imei) + md5ASCII("stime=" + seconds + "&band=200&rand=12345555"));
-      const query = "key=&flag=true&bandwidth=200&model=Android&imei=" + imei + "&time=" + seconds + "&app=globalspeed&pkg=com.cnspeedtest.globalspeed&token=" + token;
-      const handshake = await cnSetupRequest(context, target.base + "/speed/dovalid?" + query, { timeout: 8, headers: { "User-Agent": CN_UA } }, connection);
+      // Initial lightweight GET handshake is required; never GET the 1 GiB download file.
+      const handshake = await cnSetupRequest(context, cnSessionURL(target), { timeout: 8, headers: { "User-Agent": CN_UA } }, connection);
       handshake.phase = "握手";
-      const key = !handshake.error && handshake.status === 200 && /^1-[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(handshake.body.trim()) ? handshake.body.trim().slice(2) : "";
+      const key = validCNSession(handshake) ? handshake.body.trim().slice(2) : "";
       setup.push(cnEvidence("会话握手", handshake, Boolean(key)));
       if (!key) {
         if (handshake.error && handshake.errorKind !== "脚本调用失败" && !completed) {
@@ -886,7 +905,25 @@
       if (completed) break;
       const warmup = await sample("warmup", true);
       setup.push(cnEvidence(connection.close ? "预检（独立连接，不计入延迟）" : "预热（不计入延迟）", warmup, validCNHead(warmup)));
-      if (!validCNHead(warmup)) { failures.push(warmup); continue; }
+      if (!validCNHead(warmup)) {
+        // The upstream tests TCP sockets and GET downloads, not HEAD. A network
+        // failure of HEAD does not invalidate an already successful GET handshake.
+        // Three independent, small GET handshakes are the safe compatibility path.
+        setup.push("HEAD 预检未通过，改测独立小体积 GET 会话；不访问 1GB 文件正文。");
+        const sessions = [];
+        for (let i = 0; i < CN_SAMPLES && !completed; i += 1) {
+          const response = await request(context, cnSessionURL(target), { timeout: 8, headers: Object.assign(
+            { "User-Agent": CN_UA, "Accept-Encoding": "identity" },
+            handshake.compatibility ? { Connection: "close" } : {}) });
+          response.phase = "会话采样";
+          sessions.push(response);
+          progress(cnLatencyResult(name, target, sessions, setup, "session"));
+        }
+        const fallbackResult = cnLatencyResult(name, target, sessions, setup, "session");
+        if (fallbackResult.validCount) return fallbackResult;
+        failures.push(warmup, ...sessions);
+        continue;
+      }
       const samples = [];
       for (let i = 0; i < CN_SAMPLES && !completed; i += 1) {
         samples.push(await sample(i));
@@ -907,7 +944,7 @@
     function render() {
       finish(results.map(function (r) { return r.line; }).concat(connectivity ? ["", connectivity] : []).join("\n"), "info",
         [preamble(context), source].concat(results.map(function (r) { return r.details; }), connectivity ? [connectivity] : [],
-          ["当前目录优先，失败时尝试 2026-10-17 目录快照；只采用广东广州且运营商名称匹配的测点。", "全球网测会话握手后，只以 HEAD 校验文件响应头，未下载测速文件；预热不计入三次正式采样。", "HTTP 波动：相邻有效样本耗时差绝对值均值；不跨失败样本计算。", "测量包含手机到节点及站点响应；不是节点端逐跳回程、ICMP/TCP Ping 或线路等级判定。", "接口使用 HTTP，结果是连接诊断，不构成服务端身份的密码学证明。"]).join("\n"),
+          ["当前目录优先，失败时尝试 2026-10-17 目录快照；只采用广东广州且运营商名称匹配的测点。", "先尝试 HEAD 响应头采样；若预检失败，则使用三次独立、小体积 GET 会话计时（带服务端处理时间），绝不 GET 1GB 文件。", "HTTP 波动：相邻有效样本耗时差绝对值均值；不跨失败样本计算。", "测量包含手机到节点及站点响应；不是节点端逐跳回程、ICMP/TCP Ping 或线路等级判定。", "接口使用 HTTP，结果是连接诊断，不构成服务端身份的密码学证明。"]).join("\n"),
         { icon: "antenna.radiowaves.left.and.right", "icon-color": "#007AFF" }, "手机经节点到广州 · HTTP 往返");
     }
     deadlineResult = render;
