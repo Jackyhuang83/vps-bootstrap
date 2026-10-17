@@ -637,8 +637,11 @@ test('module retains five compact panels and local diagnostic page without a vis
   assert.match(moduleText,/VB-Health-Path = type=generic[^\n]+argument="mode=path"/);
   assert.doesNotMatch(moduleText,/^VB-Health-Reports = /m);
   assert.doesNotMatch(moduleText,/script-name=VB-Health-Reports|argument="mode=reports"/);
-  assert.match(moduleText,/settings\.js\?v=0\.1\.0-beta\.21/);
-  assert.match(moduleText,/node-health\.js\?v=0\.1\.0-beta\.21/);
+  assert.match(moduleText,/^#!name=节点体检$/m);
+  assert.match(moduleText,/settings\\.js\\?v=1\\.0\\.0/);
+  assert.match(moduleText,/node-health\\.js\\?v=1\\.0\\.0/);
+  assert.ok((moduleText.match(/\/vps-bootstrap\/surge-node-health-v1\\.0\\.0\/modules\/surge\/node-health\//g)||[]).length===6);
+  assert.doesNotMatch(moduleText,/feat\/surge-node-health|0\\.1\\.0-beta\\.21/);
   assert.match(moduleText, /VB-Health-Settings-Entry = script-name=VB-Health-Settings-Entry/);
   assert.equal((moduleText.match(/type=http-request/g) || []).length, 1);
   assert.ok(moduleText.includes('pattern=^http://(?:surge-node-health\\.invalid|192\\.0\\.2\\.1)(?::80)?(?:/|$)'));
