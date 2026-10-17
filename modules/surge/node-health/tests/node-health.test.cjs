@@ -749,7 +749,7 @@ test('HTML, malformed session keys, wrong status and busy replies never start a 
   for(const reply of [{body:'<html>OK</html>'},{body:'1-'+sessionKey+'extra'},{body:'-1-'},{status:403,body:'1-'+sessionKey},
     {error:'connection refused'},{body:'1-'+sessionKey+'\nwrong'}]) {
     const {result,requests}=await run({mode:'latency',reply:()=>reply});
-    assert.ok(requests.every(r=>!r.url.includes('File(1G)')));
+    assert.ok(requests.every(r=>!r.url.includes('File(1G).dl?r=')));
     assert.doesNotMatch(result.content,/广州(?:电信|联通|移动)：\d+ ms/);
   }
 });
@@ -768,7 +768,7 @@ test('a failed current target falls back once; all measured samples stay on the 
   const current={...cnDirectory[0],hostid:'9999',hostip:'61.144.6.19'};
   const {result,requests}=await run({mode:'latency',directoryReplies:{'电信':{body:JSON.stringify([current])}},reply:c=>
     c.url.includes('61.144.6.19')?{error:'connection refused',delay:900}:{...cnReply(c),delay:200}});
-  assert.equal(requests.filter(r=>r.url.includes('61.144.6.19')).length,1);
+  assert.equal(requests.filter(r=>r.url.includes('61.144.6.19')).length,2);
   assert.equal(requests.filter(r=>r.url.startsWith('http://61.144.6.18:65499/')).length,5);
   assert.match(result.content,/^广州电信：200 ms$/m);
   assert.match(result.diagnosticContent,/连接被拒绝/);
@@ -793,13 +793,29 @@ test('persistent connection closure shows stage/code and checks ordinary HTTPS w
   const {result,requests}=await run({mode:'latency',reply:c=>c.url.includes('cloudflare.com')?
     {body:'ip=203.0.113.7\nloc=JP\ncolo=NRT'}:
     {error:'Error Domain=SGSocketErrorDomain Code=6 Socket closed by remote peer http://198.51.100.4/speed/dovalid?token=RAW_ERROR_SECRET'}});
-  assert.equal(requests.length,10);
+  assert.equal(requests.length,14);
   for(const name of ['广州电信','广州联通','广州移动']) assert.ok(result.content.includes(name+'：握手 · 连接被关闭（错误 6）'));
   assert.match(result.content,/常规 HTTPS 可达 · 广州测点连接未成功/);
+  assert.match(result.content,/常规 HTTP:80 可达/);
+  assert.match(result.content,/同端口 HTTP 未响应/);
+  assert.equal(requests.filter(r=>r.url.includes('vb_port_probe=1')).length,3);
   assert.match(result.diagnosticContent,/SGSocketErrorDomain#6/);
   assert.doesNotMatch(result.diagnosticContent,/RAW_ERROR_SECRET|198\.51\.100\.4|203\.0\.113\.7/);
   assert.ok(requests.every(r=>r.policy==='Tokyo'));
-  assert.ok(requests.every(r=>!r.url.includes('File(1G)')));
+  assert.ok(requests.every(r=>!r.url.includes('File(1G).dl?r=')));
+});
+
+test('same-port probe can receive an HTTP rejection without manufacturing Guangzhou latency', async () => {
+  const {result,requests}=await run({mode:'latency',reply:c=>{
+    if(c.url.includes('vb_port_probe=1')) return {status:403,body:'Forbidden'};
+    if(c.url.includes('cloudflare.com')) return {body:'ip=203.0.113.7\\nloc=JP'};
+    return {error:'ECONNRESET'};
+  }});
+  assert.equal(requests.filter(r=>r.url.includes('vb_port_probe=1')).length,3);
+  assert.match(result.content,/同端口 HTTP 有响应/);
+  assert.match(result.diagnosticContent,/同 IP 端口 HTTP 已响应 · HTTP 403/);
+  assert.doesNotMatch(result.content,/广州(?:电信|联通|移动)：\\d+ ms/);
+  assert.ok(requests.every(r=>r.policy==='Tokyo'));
 });
 
 test('formal sample connection failures are not retried or replaced by the HTTPS comparison', async () => {
@@ -822,9 +838,10 @@ test('local HTTP client exceptions are distinguished from network errors and nev
 
 test('a failed same-policy HTTPS comparison cannot diagnose the node as broken or invent Guangzhou latency', async () => {
   const {result,requests}=await run({mode:'latency',reply:()=>({error:'ENETUNREACH'})});
-  assert.equal(requests.length,7);
+  assert.equal(requests.length,11);
   assert.match(result.content,/握手 · 网络不可达（ENETUNREACH）/);
   assert.match(result.content,/常规 HTTPS 对照也未通过：网络不可达 · ENETUNREACH/);
+  assert.match(result.content,/常规 HTTP:80 未成功：网络不可达 · ENETUNREACH/);
   assert.doesNotMatch(result.content,/节点故障|节点不可用|广州(?:电信|联通|移动)：\d+ ms/);
 });
 
@@ -851,7 +868,7 @@ test('fresh metadata cache keeps the verified fallback when its selected current
   const storage={VB_HEALTH_GZ_CN_TARGETS_V1:JSON.stringify({version:1,updatedAt:1792123200000,records})};
   const {result,requests}=await run({mode:'latency',storage,reply:c=>c.url.includes('61.144.6.19')?{error:'connection refused'}:cnReply(c)});
   assert.ok(requests.every(r=>!r.url.includes('mobilematch_many')));
-  assert.equal(requests.filter(r=>r.url.includes('61.144.6.19')).length,1);
+  assert.equal(requests.filter(r=>r.url.includes('61.144.6.19')).length,2);
   assert.match(result.content,/^广州电信：100 ms$/m);
 });
 
