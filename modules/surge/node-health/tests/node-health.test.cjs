@@ -244,7 +244,7 @@ test('Guangzhou latency authorizes first, discards warmup and measures only HEAD
 
 test('all Guangzhou handshakes timing out finish within the script budget', async () => {
   const {result,clock,requests}=await run({mode:'latency',reply:()=>null});
-  assert.equal(requests.length,7); // One same-policy HTTPS comparison after all carrier connections fail.
+  assert.equal(requests.length,11); // Directory(3), handshake(3), same-port HEAD(3), HTTPS/HTTP controls(2).
   assert.equal((result.content.match(/检测超时/g)||[]).length,3);
   assert.ok(clock<60000);
 });
