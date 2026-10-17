@@ -607,7 +607,10 @@ test('private entrance addresses are displayed but are never submitted to an ext
 
 test('module adds only local settings interception, host and panels; no capture, MITM or rules', () => {
   const moduleText = fs.readFileSync(path.join(__dirname, '..', 'node-health.sgmodule'), 'utf8');
-  assert.deepEqual([...moduleText.matchAll(/^\[([^\]]+)\]/gm)].map(m => m[1]), ['Panel', 'Script', 'Host']);
+  assert.deepEqual([...moduleText.matchAll(/^\[([^\]]+)\]/gm)].map(m => m[1]), ['General', 'Panel', 'Script', 'Host']);
+  assert.match(moduleText,/^tun-included-routes = %INSERT% 192\.0\.2\.1\/32$/m);
+  assert.match(moduleText,/^force-http-engine-hosts = %INSERT% surge-node-health\.invalid:80, 192\.0\.2\.1:80$/m);
+  assert.match(moduleText,/^always-raw-tcp-hosts = %INSERT% -surge-node-health\.invalid:80, -192\.0\.2\.1:80$/m);
   assert.equal((moduleText.match(/update-interval=-1/g) || []).length, 4);
   assert.equal((moduleText.match(/type=generic/g) || []).length, 6);
   assert.ok(moduleText.indexOf('VB-Health-Path = script-name=')>moduleText.indexOf('VB-Health-Latency = script-name='));
@@ -616,7 +619,7 @@ test('module adds only local settings interception, host and panels; no capture,
   assert.match(moduleText,/VB-Health-Reports = type=generic[^\n]+settings\.js[^\n]+argument="mode=reports"/);
   assert.match(moduleText, /VB-Health-Settings-Entry = script-name=VB-Health-Settings-Entry/);
   assert.equal((moduleText.match(/type=http-request/g) || []).length, 1);
-  assert.match(moduleText, /pattern=\^http:\/\/surge-node-health\\\.invalid/);
+  assert.ok(moduleText.includes('pattern=^http://(?:surge-node-health\\.invalid|192\\.0\\.2\\.1)(?::80)?(?:/|$)'));
   assert.match(moduleText, /surge-node-health\.invalid = 192\.0\.2\.1/);
   assert.doesNotMatch(moduleText, /\{\{\{POLICY\}\}\}|#!arguments=POLICY/);
   assert.doesNotMatch(moduleText, /type=cron|type=event|insecure=true/);
@@ -1173,3 +1176,123 @@ test('details page renders cached diagnostics as plain text and refreshes withou
   assert.ok(created.every(tag=>['article','h2','small','pre'].includes(tag)));
 });
 
+
+function copyUI(storage,options={}) {
+  const served=settings({url:'http://192.0.2.1/copy',storage});
+  assert.equal(served.result.response.status,200);
+  assert.equal(served.groupReads,0);
+  const html=served.result.response.body;
+  const encoded=html.match(/<textarea\b[^>]*>([\s\S]*?)<\/textarea>/)[1];
+  const plain=encoded.replace(/&#39;/g,"'").replace(/&quot;/g,'"').replace(/&gt;/g,'>').replace(/&lt;/g,'<').replace(/&amp;/g,'&');
+  const nodes={
+    'report-text':{value:plain,focus(){this.focused=true;},select(){this.selected=true;},setSelectionRange(start,end){this.selection=[start,end];}},
+    'copy-report':{disabled:/id="copy-report"[^>]* disabled/.test(html),events:{},addEventListener(name,fn){this.events[name]=fn;}},
+    'select-report':{disabled:/id="select-report"[^>]* disabled/.test(html),events:{},addEventListener(name,fn){this.events[name]=fn;}},
+    'copy-status':{textContent:''}
+  };
+  const copied=[];
+  const script=html.match(/<script>([\s\S]*?)<\/script>/)[1];
+  vm.runInNewContext(script,{
+    window:{isSecureContext:!!options.secure},navigator:options.navigator||{},
+    document:{getElementById:id=>nodes[id],execCommand:options.noExec?undefined:command=>{
+      assert.equal(command,'copy');assert.ok(nodes['report-text'].focused&&nodes['report-text'].selected);
+      assert.deepEqual(nodes['report-text'].selection,[0,plain.length]);
+      if(options.execThrows)throw new Error('Clipboard unavailable');
+      if(options.execResult!==false)copied.push(plain);
+      return options.execResult!==false;
+    }},
+    fetch:()=>{throw new Error('Copy page must not make a network request');}
+  });
+  return {html,nodes,copied,plain,served};
+}
+
+test('literal-IP copy and text endpoints read the complete latest report without group access or writes', async () => {
+  const {storage}=await run({mode:'latency',directoryReply:{status:403},reply:()=>({status:404})});
+  const before=JSON.stringify(storage);
+  const view=copyUI(storage);
+  const plain=settings({url:'http://192.0.2.1/reports.txt',storage});
+  assert.equal(plain.result.response.headers['Content-Type'],'text/plain; charset=utf-8');
+  assert.equal(plain.result.response.body,view.plain);
+  assert.match(view.plain,/广州三网延迟/);
+  assert.match(view.plain,/HTTP 403/);
+  assert.match(view.plain,/HTTP 404/);
+  assert.ok(view.plain.length>700,'export must include all native pages');
+  assert.equal(plain.groupReads,0);
+  assert.equal(plain.writes,0);
+  assert.deepEqual(view.copied,[],'no copying until the user clicks');
+  view.nodes['copy-report'].events.click();
+  assert.deepEqual(view.copied,[plain.result.response.body]);
+  assert.match(view.nodes['copy-status'].textContent,/已复制全文/);
+  assert.equal(JSON.stringify(storage),before);
+});
+
+test('copy page safely embeds literal text including textarea/script delimiters and preserves masked IPs', async () => {
+  const {storage}=await run();
+  const report=JSON.parse(storage.VB_HEALTH_REPORT_V1_ip);
+  report.details+='\n</textarea><script>globalThis.unsafe=true</script>&lt; "quotes" & \'single\' 🇯🇵';
+  storage.VB_HEALTH_REPORT_V1_ip=JSON.stringify(report);
+  const view=copyUI(storage);
+  assert.equal((view.html.match(/<textarea\b/g)||[]).length,1);
+  assert.equal((view.html.match(/<script>/g)||[]).length,1);
+  assert.ok(!view.html.includes('<script>globalThis.unsafe'));
+  assert.ok(view.plain.endsWith(report.details));
+  assert.match(view.plain,/203\.0\.\*\.\*/);
+  assert.doesNotMatch(view.plain,/203\.0\.113\.7/);
+  view.nodes['copy-report'].events.click();
+  assert.equal(view.copied[0],view.plain);
+});
+
+test('HTTP copy fallback reports failure truthfully and leaves selectable text when browser copying is blocked', () => {
+  const storage={VB_HEALTH_REPORT_V1_latency:JSON.stringify({version:1,mode:'latency',title:'广州三网延迟',build:'test',updatedAt:1,details:'HTTP 404'})};
+  for(const options of [{execResult:false},{execThrows:true},{noExec:true}]) {
+    const view=copyUI(storage,options);
+    view.nodes['copy-report'].events.click();
+    assert.match(view.nodes['copy-status'].textContent,/未能自动复制/);
+    assert.doesNotMatch(view.nodes['copy-status'].textContent,/已复制/);
+    assert.ok(view.nodes['report-text'].selected);
+    assert.deepEqual(view.copied,[]);
+    view.nodes['select-report'].events.click();
+    assert.match(view.nodes['copy-status'].textContent,/已选中全文/);
+  }
+});
+
+test('secure-context clipboard success and rejection both keep the exact full export text', async () => {
+  const storage={VB_HEALTH_REPORT_V1_latency:JSON.stringify({version:1,mode:'latency',title:'广州三网延迟',build:'test',updatedAt:1,details:'HTTP 404'})};
+  const saved=[];
+  const success=copyUI(storage,{secure:true,navigator:{clipboard:{writeText:value=>{saved.push(value);return Promise.resolve();}}}});
+  success.nodes['copy-report'].events.click();
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.deepEqual(saved,[success.plain]);
+  assert.deepEqual(success.copied,[]);
+  assert.match(success.nodes['copy-status'].textContent,/已复制全文/);
+  const fallback=copyUI(storage,{secure:true,navigator:{clipboard:{writeText:()=>Promise.reject(new Error('Denied'))}}});
+  fallback.nodes['copy-report'].events.click();
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.deepEqual(fallback.copied,[fallback.plain]);
+  assert.match(fallback.nodes['copy-status'].textContent,/已复制全文/);
+});
+
+test('literal-IP export origin cannot read group listings or mutate group binding', () => {
+  const storage={[SETTINGS_KEY]:JSON.stringify({version:1,group:'Group'})};
+  const before=JSON.stringify(storage);
+  for(const path of ['/api/select','/api/groups','/unrelated']) {
+    const response=settings({url:'http://192.0.2.1'+path,method:path==='/api/select'?'POST':'GET',body:JSON.stringify({group:'🚀 常用节点'}),storage});
+    assert.ok([404,405].includes(response.result.response.status));
+    assert.equal(response.groupReads,0);
+    assert.equal(response.writes,0);
+  }
+  for(const url of ['http://192.0.2.11/copy','http://192.0.2.1.evil.com/copy','https://192.0.2.1/copy','http://192.0.2.1:8080/copy','http://user@192.0.2.1/copy']) {
+    assert.equal(settings({url,storage}).result.abort,true);
+  }
+  assert.equal(JSON.stringify(storage),before);
+});
+
+test('empty copy page disables copy/select actions and serves a readable plain text explanation', () => {
+  const view=copyUI({});
+  assert.equal(view.nodes['copy-report'].disabled,true);
+  assert.equal(view.nodes['select-report'].disabled,true);
+  view.nodes['copy-report'].events.click();
+  assert.deepEqual(view.copied,[]);
+  assert.match(view.plain,/暂无检测记录/);
+  assert.match(settings({url:'http://192.0.2.1/reports.txt'}).result.response.body,/暂无检测记录/);
+});
