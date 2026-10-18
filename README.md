@@ -240,6 +240,8 @@ Snell v5 保持官方 `snell-server` 架构，不参与 VPS 服务端分流。
 - MyTVSuper
 - Apple TV+
 - TikTok
+- Google Gemini（网页、AI Studio、Gemini API）
+- Claude（网页、Anthropic API）
 - 自定义域名 / IP / CIDR
 
 自定义规则支持：
@@ -257,6 +259,16 @@ Snell v5 保持官方 `snell-server` 架构，不参与 VPS 服务端分流。
 - IPv4 / IPv6 / 默认地址族
 
 同时支持规则顺序调整和全局默认出口。
+
+### Gemini / Claude 独立分流（v1.9.1-dev2 开发分支）
+
+进入 `分流管理 → 分流规则管理 → 添加规则`，选择 **9. Google Gemini** 或 **10. Claude**，再分别选择 DIRECT、WARP 或已添加的落地节点；在 `应用 IPv4 / IPv6 分流` 中也可单独调整两者的地址族。
+
+- **Gemini**：`gemini.google.com`、`aistudio.google.com`、`generativelanguage.googleapis.com`、`ai.google.dev`（含其子域名）。
+- **Claude**：`claude.ai`、`anthropic.com`、`claude.com`、`claudeusercontent.com`（含其子域名）。
+- **规则优先级**：如果已有 Google 规则排在 Gemini 前，生成 sing-box/Xray 配置时自动将 Gemini 放在 Google 前，避免广泛的 `google.com` / `googleapis.com` 覆盖 Gemini；**不改写** `routing.json` 中的规则顺序，也不改变其他规则的相对顺序。
+- **边界**：`accounts.google.com` 等通用 Google 登录域名不单独纳入 Gemini，以免影响 Google 账户等其它服务；涉及共享域名时，登录流量仍可能走 Google 规则或默认出口。
+- **升级保护**：只新增可选预置规则，不自动添加、不修改用户现有出站或规则。更改分流后仍走现有候选配置校验与失败回滚流程。
 
 ---
 
