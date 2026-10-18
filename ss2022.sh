@@ -91,6 +91,11 @@
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
 #
+# v1.9.1-dev2:
+#   - 新增 Gemini / Claude 独立服务端分流规则及应用 IPv4/IPv6 选项
+#   - Gemini 优先于通用 Google 规则匹配，不改写用户原有分流顺序
+#   - 新增 CI 对预置域名和规则优先级的回归检查
+#
 # v1.9.0 Release:
 #   - 正式支持 Debian / Ubuntu + systemd，并将 Alpine 3.21 + OpenRC 纳入稳定支持范围
 #   - Alpine 正式支持 SS2022、SS2022 + ShadowTLS v3、VLESS Reality、Realm、服务器管理工具与服务器测试
