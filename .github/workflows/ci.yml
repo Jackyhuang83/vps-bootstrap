@@ -94,6 +94,53 @@ jobs:
 
           exit "${missing}"
 
+      - name: Verify Gemini and Claude presets and Google precedence
+        shell: bash
+        run: |
+          set -euo pipefail
+          export SS2022_LIB_ONLY=1
+          # shellcheck disable=SC1091
+          source ./ss2022.sh
+
+          gemini=$(routing_preset_match_json gemini)
+          claude=$(routing_preset_match_json claude)
+          jq -e '
+            (.domain_suffix | index("gemini.google.com") != null) and
+            (.domain_suffix | index("aistudio.google.com") != null) and
+            (.domain_suffix | index("generativelanguage.googleapis.com") != null) and
+            (.domain_suffix | index("ai.google.dev") != null) and
+            (.domain_suffix | index("google.com") == null) and
+            (.domain_suffix | index("googleapis.com") == null)
+          ' <<<"$gemini"
+          jq -e '
+            (.domain_suffix | index("claude.ai") != null) and
+            (.domain_suffix | index("anthropic.com") != null) and
+            (.domain_suffix | index("claude.com") != null) and
+            (.domain_suffix | index("claudeusercontent.com") != null)
+          ' <<<"$claude"
+
+          ROUTING_FILE=$(mktemp)
+          trap 'rm -f "$ROUTING_FILE"' EXIT
+          cat >"$ROUTING_FILE" <<'JSON'
+          {"rules":[{"service":"openai"},{"service":"google"},{"service":"netflix"},{"service":"gemini"},{"service":"claude"}]}
+          JSON
+          order=$(routing_compiled_rules_json)
+          jq -e 'map(.service) == ["openai","gemini","google","netflix","claude"]' <<<"$order"
+          jq -e '.rules | map(.service) == ["openai","google","netflix","gemini","claude"]' "$ROUTING_FILE"
+
+          cat >"$ROUTING_FILE" <<'JSON'
+          {"rules":[{"service":"openai"},{"service":"gemini"},{"service":"netflix"},{"service":"google"},{"service":"claude"}]}
+          JSON
+          order=$(routing_compiled_rules_json)
+          jq -e 'map(.service) == ["openai","gemini","netflix","google","claude"]' <<<"$order"
+
+          cat >"$ROUTING_FILE" <<'JSON'
+          {"rules":[{"service":"openai"},{"service":"google"},{"service":"netflix"},{"service":"claude"}]}
+          JSON
+          order=$(routing_compiled_rules_json)
+          jq -e 'map(.service) == ["openai","google","netflix","claude"]' <<<"$order"
+          [[ $(grep -Fc 'compiled_rules=$(routing_compiled_rules_json)' ss2022.sh) -eq 2 ]]
+
       - name: Check full uninstall managed units
         shell: bash
         run: |
