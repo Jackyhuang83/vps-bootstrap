@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
-# 当前版本: v1.9.0
+# 当前版本: v1.9.1-dev2
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -632,7 +632,7 @@
 # 注意: v1.9.0 为稳定正式版；Alpine 3.21 上 Snell v5 与 Cloudflare WARP 仍受官方组件兼容性限制。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.0"
+SCRIPT_VERSION="v1.9.1-dev2"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -4659,6 +4659,8 @@ routing_commit_state_candidate() {
 routing_service_name() {
     case "$1" in
         openai) echo "OpenAI / ChatGPT" ;;
+        gemini) echo "Google Gemini" ;;
+        claude) echo "Claude (Anthropic)" ;;
         netflix) echo "Netflix" ;;
         youtube) echo "YouTube" ;;
         google) echo "Google" ;;
@@ -4675,6 +4677,13 @@ routing_preset_match_json() {
     case "$1" in
         openai)
             jq -nc '{domain:[],domain_suffix:["openai.com","chatgpt.com","oaistatic.com","oaiusercontent.com"],domain_keyword:[],ip_cidr:[]}'
+            ;;
+        gemini)
+            # 避免泛匹配 google.com/googleapis.com，保留其它 Google 服务的独立出口。
+            jq -nc '{domain:[],domain_suffix:["gemini.google.com","aistudio.google.com","generativelanguage.googleapis.com","ai.google.dev"],domain_keyword:[],ip_cidr:[]}'
+            ;;
+        claude)
+            jq -nc '{domain:[],domain_suffix:["claude.ai","anthropic.com","claude.com","claudeusercontent.com"],domain_keyword:[],ip_cidr:[]}'
             ;;
         netflix)
             jq -nc '{domain:[],domain_suffix:["netflix.com","netflix.net","nflxext.com","nflximg.com","nflximg.net","nflxso.net","nflxvideo.net"],domain_keyword:[],ip_cidr:[]}'
@@ -4719,6 +4728,21 @@ routing_rule_match_json() {
         ip_cidr) jq -nc --argjson v "$values" '{domain:[],domain_suffix:[],domain_keyword:[],ip_cidr:$v}' ;;
         *) jq -nc '{domain:[],domain_suffix:[],domain_keyword:[],ip_cidr:[]}' ;;
     esac
+}
+
+routing_compiled_rules_json() {
+    # Google 预置的 google.com/googleapis.com 会覆盖 Gemini 的专用域名。
+    # 仅在 Google 位于 Gemini 之前时，将 Gemini 插入 Google 前面；
+    # 其余规则次序及 routing.json 中用户保存的顺序均保持不变。
+    jq -c '
+      .rules as $rules |
+      ($rules | map(.service) | index("google")) as $google_idx |
+      ($rules | map(.service) | index("gemini")) as $gemini_idx |
+      if $google_idx != null and $gemini_idx != null and $google_idx < $gemini_idx then
+        $rules[$gemini_idx] as $gemini |
+        ($rules | del(.[$gemini_idx]) | .[0:$google_idx] + [$gemini] + .[$google_idx:])
+      else $rules end
+    ' "$ROUTING_FILE"
 }
 
 routing_node_name_exists() {
@@ -5299,7 +5323,7 @@ routing_choose_ip_family() {
 
 build_singbox_routing_candidate() {
     local output="$1" outbounds='[]' rules='[{"action":"sniff","timeout":"300ms"}]' bridge_inbounds='[]' nodes count i node type tag ref default_ref default_tag port
-    local rule_count r rmatch family outbound domains suffix keywords ips part action global_family global_strategy
+    local compiled_rules rule_count r rmatch family outbound domains suffix keywords ips part action global_family global_strategy
     [[ -f "$SINGBOX_CONF" && -x "$SINGBOX_BIN" ]] || return 2
     routing_init_state || return 1
     global_family=$(routing_global_ip_family)
@@ -5345,10 +5369,11 @@ build_singbox_routing_candidate() {
         i=$((i+1))
     done
 
-    rule_count=$(jq '.rules|length' "$ROUTING_FILE")
+    compiled_rules=$(routing_compiled_rules_json) || return 1
+    rule_count=$(jq 'length' <<<"$compiled_rules")
     i=0
     while [[ $i -lt $rule_count ]]; do
-        r=$(jq -c ".rules[$i]" "$ROUTING_FILE")
+        r=$(jq -c ".[$i]" <<<"$compiled_rules")
         rmatch=$(routing_rule_match_json "$r")
         outbound=$(jq -r '.outbound' <<<"$r")
         family=$(routing_effective_family "$(jq -r '.ip_family // "default"' <<<"$r")" "$outbound")
@@ -5475,7 +5500,7 @@ ensure_existing_bridges_for_vless() {
 
 build_xray_routing_candidate() {
     local output="$1" outbounds='[]' rules='[]' nodes count i node ref family base match
-    local rule_count r rmatch domains suffix keywords ips xdomains tag part arr default_ref default_tag global_family default_family
+    local compiled_rules rule_count r rmatch domains suffix keywords ips xdomains tag part arr default_ref default_tag global_family default_family
     [[ -f "$XRAY_CONF" && -x "$XRAY_BIN" ]] || return 2
     routing_init_state || return 1
     global_family=$(routing_global_ip_family)
@@ -5496,10 +5521,11 @@ build_xray_routing_candidate() {
         i=$((i+1))
     done
 
-    rule_count=$(jq '.rules|length' "$ROUTING_FILE")
+    compiled_rules=$(routing_compiled_rules_json) || return 1
+    rule_count=$(jq 'length' <<<"$compiled_rules")
     i=0
     while [[ $i -lt $rule_count ]]; do
-        r=$(jq -c ".rules[$i]" "$ROUTING_FILE")
+        r=$(jq -c ".[$i]" <<<"$compiled_rules")
         rmatch=$(routing_rule_match_json "$r")
         ref=$(jq -r '.outbound' <<<"$r")
         family=$(routing_effective_family "$(jq -r '.ip_family // "default"' <<<"$r")" "$ref")
@@ -6443,13 +6469,16 @@ routing_add_rule() {
     echo "  6. MyTVSuper"
     echo "  7. Apple TV+"
     echo "  8. TikTok"
-    echo "  9. 自定义域名 / IP"
+    echo "  9. Google Gemini"
+    echo " 10. Claude (Anthropic)"
+    echo " 11. 自定义域名 / IP"
     echo "  0. 返回"
-    read -rp "请选择 [0-9]: " c
+    read -rp "请选择 [0-11]: " c
     case "$c" in
         1) service=openai ;; 2) service=netflix ;; 3) service=youtube ;; 4) service=google ;;
         5) service=telegram ;; 6) service=mytvsuper ;; 7) service=appletv ;; 8) service=tiktok ;;
-        9) service=custom ;;
+        9) service=gemini ;; 10) service=claude ;;
+        11) service=custom ;;
         0) return 0 ;;
         *) return 1 ;;
     esac
@@ -6625,7 +6654,7 @@ routing_app_family_list() {
     local service idx rule fam out i=1
     printf '%-4s %-22s %-28s %-12s\n' "序号" "应用 / 服务" "出口" "地址族"
     printf '%s\n' "----------------------------------------------------------------------------"
-    for service in openai netflix youtube google telegram mytvsuper appletv tiktok; do
+    for service in openai netflix youtube google telegram mytvsuper appletv tiktok gemini claude; do
         idx=$(routing_app_family_rule_index "$service")
         if [[ -n "$idx" ]]; then
             rule=$(jq -c --argjson idx "$idx" '.rules[$idx]' "$ROUTING_FILE")
@@ -6759,13 +6788,14 @@ routing_app_family_management() {
         echo ""
         routing_app_family_list
         echo ""
-        echo "  9. 自定义域名 / IP（进入现有分流规则管理）"
+        echo " 11. 自定义域名 / IP（进入现有分流规则管理）"
         echo "  0. 返回"
-        read -rp "请选择应用 [0-9]: " c
+        read -rp "请选择应用 [0-11]: " c
         case "$c" in
             1) service=openai ;; 2) service=netflix ;; 3) service=youtube ;; 4) service=google ;;
             5) service=telegram ;; 6) service=mytvsuper ;; 7) service=appletv ;; 8) service=tiktok ;;
-            9) routing_rule_management; continue ;;
+            9) service=gemini ;; 10) service=claude ;;
+            11) routing_rule_management; continue ;;
             0) return 0 ;;
             *) sleep 1; continue ;;
         esac
