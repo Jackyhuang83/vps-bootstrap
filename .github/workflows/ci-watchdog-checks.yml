@@ -1,0 +1,37 @@
+name: Global CI watchdog · offline checks
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    paths:
+      - "ci-watchdog/**"
+      - "tests/test_ci_watchdog.py"
+      - "docs/CI_WATCHDOG.md"
+      - ".github/workflows/ci-watchdog-checks.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-checks:
+    name: Watchdog Python policy tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Checkout without persisting credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Python syntax
+        run: python3 -m py_compile ci-watchdog/watchdog.py tests/test_ci_watchdog.py
+      - name: Offline unit tests
+        run: python3 -m unittest discover -s tests -p test_ci_watchdog.py -v
+      - name: Safety checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fq 'DynamicUser=yes' ci-watchdog/systemd/ci-watchdog.service
+          grep -Fq 'OnUnitInactiveSec=60s' ci-watchdog/systemd/ci-watchdog.timer
+          grep -Fq 'ProtectSystem=strict' ci-watchdog/systemd/ci-watchdog.service
+          ! grep -E 'CI_WATCHDOG_READ_TOKEN=(ghp_|github_pat_)' ci-watchdog/watchdog.env.example
