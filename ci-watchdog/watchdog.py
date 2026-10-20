@@ -208,8 +208,35 @@ def notify(text: str, dry_run: bool) -> None:
     if endpoint == "stdout":
         print(text, flush=True)
         return
+    if endpoint == "telegram":
+        token = os.environ.get("CI_WATCHDOG_TELEGRAM_BOT_TOKEN", "")
+        chat = os.environ.get("CI_WATCHDOG_TELEGRAM_CHAT_ID", "")
+        if not token or not chat.lstrip("-").isdigit():
+            raise RuntimeError("Telegram notification needs BOT_TOKEN and numeric CHAT_ID")
+        # Avoid exceeding Telegram's 4096-char limit; do not expose token in logs.
+        for start in range(0, len(text), 3500):
+            payload = json.dumps({
+                "chat_id": chat,
+                "text": text[start:start + 3500],
+                "disable_web_page_preview": True,
+            }, ensure_ascii=False).encode("utf-8")
+            request = urllib.request.Request(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                data=payload, method="POST",
+                headers={"Content-Type": "application/json", "User-Agent": "ci-watchdog/1.0"},
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=15) as response:
+                    if not json.loads(response.read(10000)).get("ok"):
+                        raise RuntimeError("Telegram API declined the alert")
+            except urllib.error.HTTPError as error:
+                raise RuntimeError(f"Telegram API HTTP {error.code}; no alert sent") from None
+            except urllib.error.URLError:
+                raise RuntimeError("Telegram network failure; no alert sent") from None
+        print("Sent watchdog notification via Telegram")
+        return
     if endpoint != "github_issue":
-        raise ValueError("CI_WATCHDOG_NOTIFY must be github_issue or stdout")
+        raise ValueError("CI_WATCHDOG_NOTIFY must be github_issue, telegram or stdout")
     token = os.environ.get("CI_WATCHDOG_NOTIFY_TOKEN", "")
     owner = os.environ.get("CI_WATCHDOG_OWNER", "Jackyhuang83")
     issue = os.environ.get("CI_WATCHDOG_ISSUE_NUMBER", "")
@@ -226,7 +253,7 @@ def run_once(now: float, dry_run: bool) -> None:
     token = os.environ.get("CI_WATCHDOG_READ_TOKEN", "")
     github = GitHub(token)
     owner = os.environ.get("CI_WATCHDOG_OWNER", "Jackyhuang83")
-    mode = os.environ.get("CI_WATCHDOG_REPO_MODE", "explicit")
+    mode = os.environ.get("CI_WATCHDOG_REPO_MODE", "discover")
     if mode == "discover":
         repos = github.discover_repos(owner)
     elif mode == "explicit":
@@ -255,7 +282,12 @@ def run_once(now: float, dry_run: bool) -> None:
                 repo_errors.append(f"⚠️ {repo}：监控查询失败：{error}")
                 # Never assume a failed query means a build succeeded.
         notices, new_state = select_reports(repos, by_repo, state, now, github.current_step)
-        notices.extend(repo_errors)
+        if repo_errors:
+            error_key = "__repository_access_errors"
+            last_error_report = float(state.get(error_key, {}).get("last_sent", 0.0))
+            if now - last_error_report >= FIVE_MINUTES:
+                notices.extend(repo_errors)
+                new_state[error_key] = {"last_sent": now, "seen": now}
         if notices:
             notify("\n\n---\n\n".join(notices), dry_run=dry_run)
         elif dry_run:
