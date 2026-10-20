@@ -1,0 +1,11 @@
+[Unit]
+Description=Check all GitHub Actions workflow runs once per minute
+
+[Timer]
+OnBootSec=60s
+OnUnitInactiveSec=60s
+AccuracySec=10s
+Unit=ci-watchdog.service
+
+[Install]
+WantedBy=timers.target

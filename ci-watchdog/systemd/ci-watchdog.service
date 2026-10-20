@@ -1,0 +1,25 @@
+[Unit]
+Description=Read-only multi-repository GitHub Actions CI watchdog
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+DynamicUser=yes
+StateDirectory=ci-watchdog
+StateDirectoryMode=0700
+ExecStart=/usr/bin/python3 /opt/ci-watchdog/watchdog.py
+EnvironmentFile=/etc/ci-watchdog/watchdog.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictRealtime=yes
+UMask=0077
+TimeoutStartSec=90
