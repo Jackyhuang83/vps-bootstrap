@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
-# 当前版本: v1.9.1-dev2
+# 当前版本: v1.9.1-dev3
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -95,6 +95,11 @@
 #   - 新增 Gemini / Claude 独立服务端分流规则及应用 IPv4/IPv6 选项
 #   - Gemini 优先于通用 Google 规则匹配，不改写用户原有分流顺序
 #   - 新增 CI 对预置域名和规则优先级的回归检查
+#
+# v1.9.1-dev3:
+#   - 通过 GitHub API 与临时只读 Token 更新私有仓库脚本
+#   - 默认正式 Release；main 开发版本需主动选择
+#   - 不持久化 Token，保留更新验证与回滚
 #
 # v1.9.0 Release:
 #   - 正式支持 Debian / Ubuntu + systemd，并将 Alpine 3.21 + OpenRC 纳入稳定支持范围
@@ -637,9 +642,9 @@
 # 注意: v1.9.0 为稳定正式版；Alpine 3.21 上 Snell v5 与 Cloudflare WARP 仍受官方组件兼容性限制。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.1-dev2"
+SCRIPT_VERSION="v1.9.1-dev3"
 # ----------------------------- 脚本自更新 --------------------------------------
-SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
+SCRIPT_UPDATE_URL="https://api.github.com/repos/Jackyhuang83/vps-bootstrap/contents/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
 SCRIPT_PROXY_LINK="/usr/local/bin/proxy"
 SCRIPT_BACKUP_PATH="/usr/local/bin/ss2022.bak"
@@ -8525,10 +8530,34 @@ compare_script_versions() {
     fi
 }
 
+# GitHub 私有仓库下载：Token 仅经 curl 标准输入传递，不进入命令行参数和持久文件。
+private_github_api_fetch() {
+    local url="$1" out="$2" token="${3:-}" accept="${4:-application/vnd.github.raw+json}"
+    local -a curl_args=(
+        -q --fail --silent --show-error --location
+        --retry 2 --retry-delay 1 --connect-timeout 8 --max-time 60
+        --proto '=https' --proto-redir '=https'
+        -H "Accept: ${accept}"
+        -H 'X-GitHub-Api-Version: 2022-11-28'
+        -H 'Cache-Control: no-cache'
+    )
+    [[ "$url" == https://api.github.com/repos/Jackyhuang83/vps-bootstrap/* ]] || return 1
+    if [[ -n "$token" ]]; then
+        if [[ ! "$token" =~ ^[a-zA-Z0-9_]+$ ]]; then
+            echo -e "${RED}[错误] Token 格式非法，已拒绝请求。${PLAIN}"
+            return 1
+        fi
+        printf 'header = "Authorization: Bearer %s"\n' "$token" |
+            curl "${curl_args[@]}" --config - "$url" -o "$out"
+    else
+        curl "${curl_args[@]}" "$url" -o "$out"
+    fi
+}
+
 check_script_update() {
     clear
     echo -e "${CYAN}════════════════════ 检查脚本更新 ════════════════════${PLAIN}"
-    echo "更新源 : ${SCRIPT_UPDATE_URL}"
+    echo "更新源 : GitHub 私有仓库（保留现有节点和配置）"
     echo ""
 
     command -v curl >/dev/null 2>&1 || {
@@ -8538,9 +8567,32 @@ check_script_update() {
     }
 
     local tmp remote_version running_file running_version installed_version
-    local running_hash installed_hash remote_hash cache_bust relation
-    local install_reason=""
-    local ans
+    local running_hash installed_hash remote_hash relation
+    local install_reason="" github_token="" target_ref="" source_label="" release_meta=""
+    local ans choice
+
+    echo "  1. 最新正式 Release（推荐）"
+    echo "  2. main 开发版"
+    echo "  0. 取消"
+    read -rp "请选择 [1]: " choice
+    case "${choice:-1}" in
+        1) source_label="最新正式版" ;;
+        2) target_ref="main"; source_label="main 开发版" ;;
+        0) return ;;
+        *) echo "无效选项。"; pause; return ;;
+    esac
+    if [[ ! -r /dev/tty ]]; then
+        echo -e "${RED}[错误] 需要交互式终端安全输入 GitHub Token。${PLAIN}"
+        pause
+        return
+    fi
+    if ! IFS= read -r -s -p "GitHub 只读 Token（输入隐藏，不保存）: " github_token </dev/tty; then
+        echo ""
+        echo "[错误] 读取 Token 失败。"
+        pause
+        return
+    fi
+    echo ""
 
     running_file=$(script_source_path)
     running_version=$(extract_script_version "$running_file")
@@ -8561,17 +8613,47 @@ check_script_update() {
         pause
         return
     }
-    cache_bust=$(date +%s)
+    if [[ -z "$target_ref" ]]; then
+        command -v jq >/dev/null 2>&1 || {
+            rm -f "$tmp"
+            unset github_token
+            echo -e "${RED}[错误] 最新 Release 检查需要 jq。${PLAIN}"
+            pause
+            return
+        }
+        release_meta=$(mktemp /tmp/ss2022-release.XXXXXX.json) || {
+            rm -f "$tmp"
+            unset github_token
+            pause
+            return
+        }
+        if ! private_github_api_fetch "https://api.github.com/repos/Jackyhuang83/vps-bootstrap/releases/latest" "$release_meta" "$github_token" "application/vnd.github+json"; then
+            rm -f "$tmp" "$release_meta"
+            unset github_token
+            echo -e "${RED}[错误] 无法读取最新正式版，请检查 Token 的仓库权限及有效期。${PLAIN}"
+            pause
+            return
+        fi
+        target_ref=$(jq -r '.tag_name // empty' "$release_meta" 2>/dev/null)
+        rm -f "$release_meta"
+        if [[ ! "$target_ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            rm -f "$tmp"
+            unset github_token
+            echo -e "${RED}[错误] Release 版本标签无效，已取消更新。${PLAIN}"
+            pause
+            return
+        fi
+    fi
 
-    echo -e "${YELLOW}>> 正在从 GitHub main 获取最新脚本...${PLAIN}"
-    if ! curl -fsSL --retry 2 --retry-delay 1 --connect-timeout 8 --max-time 60 \
-        -H 'Cache-Control: no-cache' \
-        "${SCRIPT_UPDATE_URL}?t=${cache_bust}" -o "$tmp"; then
+    echo -e "${YELLOW}>> 正在下载 ${source_label} (${target_ref})...${PLAIN}"
+    if ! private_github_api_fetch "${SCRIPT_UPDATE_URL}?ref=${target_ref}" "$tmp" "$github_token"; then
         rm -f "$tmp"
-        echo -e "${RED}[错误] 下载 GitHub 最新脚本失败。${PLAIN}"
+        unset github_token
+        echo -e "${RED}[错误] 下载失败。请检查 GitHub 只读 Token 与仓库授权。${PLAIN}"
         pause
         return
     fi
+    unset github_token
 
     # 只接受本项目脚本，避免 URL / CDN 异常返回 HTML 或其它内容后被直接执行。
     if ! grep -q '^# 项目名称: vps-bootstrap / ss2022.sh$' "$tmp"; then
@@ -8600,24 +8682,24 @@ check_script_update() {
 
     echo "当前运行 : ${running_version}"
     echo "系统安装 : ${installed_version}"
-    echo "GitHub main: ${remote_version}"
+    echo "GitHub 目标: ${remote_version}"
     echo ""
     echo "运行 SHA : ${running_hash:-无法读取}"
     echo "安装 SHA : ${installed_hash:-未安装}"
     echo "远程 SHA : ${remote_hash}"
     echo ""
 
-    # 情况 1：当前正在运行的文件与 GitHub main 完全一致。
+    # 情况 1：当前正在运行的文件与 GitHub 目标完全一致。
     if [[ -n "$running_hash" && "$running_hash" == "$remote_hash" ]]; then
         if [[ -n "$installed_hash" && "$installed_hash" == "$remote_hash" ]]; then
             rm -f "$tmp"
-            echo -e "${GREEN}✔ 当前运行脚本、系统安装脚本与 GitHub main 完全一致。${PLAIN}"
+            echo -e "${GREEN}✔ 当前运行脚本、系统安装脚本与 GitHub 目标完全一致。${PLAIN}"
             pause
             return
         fi
 
         echo -e "${YELLOW}当前运行脚本已与 GitHub main 一致，但系统安装版本仍不一致。${PLAIN}"
-        echo "可以把当前 GitHub main 版本同步安装到：${SCRIPT_INSTALL_PATH}"
+        echo "可以把当前 GitHub 目标版本同步安装到：${SCRIPT_INSTALL_PATH}"
         install_reason="sync_install"
     else
         case "$relation" in
@@ -8627,23 +8709,23 @@ check_script_update() {
                 ;;
             remote_older)
                 rm -f "$tmp"
-                echo -e "${YELLOW}GitHub main 版本比当前运行版本更旧：${remote_version} < ${running_version}${PLAIN}"
+                echo -e "${YELLOW}GitHub 目标版本比当前运行版本更旧：${remote_version} < ${running_version}${PLAIN}"
                 echo "为避免误降级，本工具不会自动覆盖当前版本。"
                 echo ""
-                echo "如果你刚从测试文件运行了新版，请先把新版 ss2022.sh 提交到 GitHub main，"
+                echo "如果你刚从测试文件运行了新版，请先把新版 ss2022.sh 提交到对应分支，"
                 echo "之后再使用“检查脚本更新”。"
                 pause
                 return
                 ;;
             equal)
                 echo -e "${YELLOW}检测到同版本号内容变化：${running_version}${PLAIN}"
-                echo "版本号相同，但当前运行文件与 GitHub main 的 SHA256 不同。"
+                echo "版本号相同，但当前运行文件与 GitHub 目标的 SHA256 不同。"
                 install_reason="same_version_changed"
                 ;;
             *)
                 echo -e "${YELLOW}检测到脚本内容不同，但无法可靠判断版本新旧。${PLAIN}"
                 echo "当前运行：${running_version}"
-                echo "GitHub main：${remote_version}"
+                echo "GitHub 目标：${remote_version}"
                 echo "为避免误降级，默认不自动覆盖。"
                 rm -f "$tmp"
                 pause
@@ -8655,7 +8737,7 @@ check_script_update() {
     echo ""
     echo "更新将："
     echo "  1. 备份当前系统安装脚本到 ${SCRIPT_BACKUP_PATH}"
-    echo "  2. 安装 GitHub main 脚本到 ${SCRIPT_INSTALL_PATH}"
+    echo "  2. 安装 GitHub 目标脚本到 ${SCRIPT_INSTALL_PATH}"
     echo "  3. 若 ${SCRIPT_PROXY_LINK} 未被其它程序占用，则保持该快捷命令"
     echo "  4. 自动重新进入安装后的管理面板"
     echo ""

@@ -4,7 +4,7 @@
 
 当前正式版本：**v1.9.0**
 
-当前开发版本：**v1.9.1-dev2**
+当前开发版本：**v1.9.1-dev3**
 
 项目以单一交互式 Bash 脚本 `ss2022.sh` 为入口，整合 **SS2022、SS2022 + ShadowTLS v3、VLESS Reality、Snell v5**，并提供 WARP 出口、链式落地、规则分流、Realm L4 端口转发、组件管理、服务器工具、服务器测试与脚本自更新。
 
@@ -50,31 +50,47 @@
 
 ---
 
-## 一键安装
+## 私有仓库安装（新 VPS）
 
-在 VPS 中使用 **root** 权限执行：
+旧的公开 Raw 安装地址已失效。首先在 [GitHub Fine-grained Tokens](https://github.com/settings/personal-access-tokens) 创建仅限本仓库、Contents: Read-only 的 Token。
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh \
-  -o /usr/local/bin/ss2022 \
-  && chmod +x /usr/local/bin/ss2022 \
-  && { [ -e /usr/local/bin/proxy ] || [ -L /usr/local/bin/proxy ] || ln -s /usr/local/bin/ss2022 /usr/local/bin/proxy; } \
-  && /usr/local/bin/ss2022
-```
+在 VPS **root 的交互式 SSH 终端**执行。默认安装稳定版 v1.9.0；后续正式发布新版本时更新 TAG，也可主动选择 main 进行开发测试。
 
-安装后可随时执行：
-
-```bash
+~~~bash
+bash <<'PRIVATE_INSTALL'
+set -euo pipefail
+umask 077
+TAG="v1.9.0"
+read -r -s -p "GitHub 只读 Token: " TOKEN </dev/tty
+printf '\n'
+[[ "$TOKEN" =~ ^[a-zA-Z0-9_]+$ ]] || { echo "Token 格式非法"; exit 1; }
+tmp=$(mktemp /tmp/ss2022-install.XXXXXX)
+trap 'rm -f "$tmp"; unset TOKEN' EXIT
+printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" |
+  curl -q --config - --fail --silent --show-error --location \
+    --proto '=https' --proto-redir '=https' \
+    -H 'Accept: application/vnd.github.raw+json' \
+    -H 'X-GitHub-Api-Version: 2022-11-28' \
+    "https://api.github.com/repos/Jackyhuang83/vps-bootstrap/contents/ss2022.sh?ref=${TAG}" \
+    -o "$tmp"
+unset TOKEN
+grep -Fqx '# 项目名称: vps-bootstrap / ss2022.sh' "$tmp"
+bash -n "$tmp"
+if [[ -f /usr/local/bin/ss2022 ]]; then
+  cp -a /usr/local/bin/ss2022 /usr/local/bin/ss2022.bak
+fi
+install -m 0755 "$tmp" /usr/local/bin/ss2022
+if [[ ! -e /usr/local/bin/proxy && ! -L /usr/local/bin/proxy ]]; then
+  ln -s /usr/local/bin/ss2022 /usr/local/bin/proxy
+fi
 ss2022
-```
+PRIVATE_INSTALL
+~~~
 
-如果 `/usr/local/bin/proxy` 没有被其它程序占用，安装/更新也会保留快捷命令：
+已有 VPS 的服务不会受到影响。**首次升级到包含私有仓库支持的新脚本**仍必须执行上述手动下载（TAG 需改为包含适配功能的正式版本或 main）。此后可以直接运行 ss2022 → 9 在线检查更新。
 
-```bash
-proxy
-```
+Token 仅用于本次请求，不写入历史、命令行参数或持久配置文件。下载失败不会覆盖当前脚本；替换前会保留备份文件。
 
-进入管理面板。
 
 ---
 
@@ -536,7 +552,7 @@ AI 测试使用 UnlockTests 的 AI-only 模式，可检测包括：
 更新源：
 
 ```text
-https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh
+https://api.github.com/repos/Jackyhuang83/vps-bootstrap/contents/ss2022.sh?ref=<release-tag-or-main>
 ```
 
 更新检查会分别显示：
@@ -544,7 +560,7 @@ https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh
 ```text
 当前运行版本
 系统安装版本
-GitHub main 版本
+GitHub 目标 版本
 ```
 
 支持识别：
@@ -552,7 +568,7 @@ GitHub main 版本
 - 远程版本更新
 - 远程版本更旧
 - 相同版本但内容 SHA256 不同
-- 当前运行脚本与 GitHub main 一致，但系统安装版本落后
+- 当前运行脚本与 GitHub 目标 一致，但系统安装版本落后
 
 为避免误操作：
 
