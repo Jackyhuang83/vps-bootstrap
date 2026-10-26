@@ -185,7 +185,7 @@ jobs:
           [[ $(grep -Fc '12) service=custom ;;' ss2022.sh) -eq 1 ]]
           [[ $(grep -Fc '12) routing_rule_management; continue ;;' ss2022.sh) -eq 1 ]]
           [[ $(grep -Fc 'echo " 11. 4GTV（台湾四季线上）"' ss2022.sh) -eq 1 ]]
-          [[ $(grep -Fc 'echo " 12. 自定义域名 / IP"' ss2022.sh) -eq 2 ]]
+          [[ $(grep -Fc 'echo " 12. 自定义域名 / IP' ss2022.sh) -eq 2 ]]
 
       - name: Guard sing-box 1.14 domain resolver migration
         shell: bash
