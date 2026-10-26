@@ -4,7 +4,7 @@
 
 当前正式版本：**v1.9.0**
 
-当前开发版本：**v1.9.1-dev3**
+当前开发版本：**v1.9.1-dev4**
 
 项目以单一交互式 Bash 脚本 `ss2022.sh` 为入口，整合 **SS2022、SS2022 + ShadowTLS v3、VLESS Reality、Snell v5**，并提供 WARP 出口、链式落地、规则分流、Realm L4 端口转发、组件管理、服务器工具、服务器测试与脚本自更新。
 
@@ -244,6 +244,7 @@ Snell v5 保持官方 `snell-server` 架构，不参与 VPS 服务端分流。
 - TikTok
 - Google Gemini（网页、AI Studio、Gemini API）
 - Claude（网页、Anthropic API）
+- 4GTV（台湾四季线上）
 - 自定义域名 / IP / CIDR
 
 自定义规则支持：
@@ -261,6 +262,15 @@ Snell v5 保持官方 `snell-server` 架构，不参与 VPS 服务端分流。
 - IPv4 / IPv6 / 默认地址族
 
 同时支持规则顺序调整和全局默认出口。
+
+### 4GTV（台湾四季线上）独立分流（v1.9.1-dev4 开发分支）
+
+通过 `分流管理 → 分流规则管理 → 新增规则 → 11. 4GTV` 创建可选规则，可选择 DIRECT、WARP 或已有落地节点；在「应用 IPv4 / IPv6 分流」中也增加第 11 项 4GTV，可独立指定地址族。两个菜单的「自定义域名 / IP」选项均调整为第 12 项。
+
+- 官网与子域名：`4gtv.tv`。
+- 指定 CDN 主机：`4gtvfreepc-cds.cdn.hinet.net`、`4gtvfreepcvod-cds.cdn.hinet.net`、`4gtvpc-cds.cdn.hinet.net`、`4gtvpcvod-cds.cdn.hinet.net`。
+- 不泛匹配共享的 `cdn.hinet.net` 或 `ftv.com.tw`，避免波及其它服务。
+- 只新增可选预置；升级不会自动创建规则或修改 `routing.json`。实际播放可能仍受登录、授权、CDN 变化、DRM 和地区限制影响。
 
 ### Gemini / Claude 独立分流（v1.9.1-dev3 开发分支）
 

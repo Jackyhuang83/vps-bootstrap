@@ -141,6 +141,52 @@ jobs:
           jq -e 'map(.service) == ["openai","google","netflix","claude"]' <<<"$order"
           [[ $(grep -Fc 'compiled_rules=$(routing_compiled_rules_json)' ss2022.sh) -eq 2 ]]
 
+      - name: Verify 4GTV routing preset and both menus
+        shell: bash
+        run: |
+          set -euo pipefail
+          export SS2022_LIB_ONLY=1
+          # shellcheck disable=SC1091
+          source ./ss2022.sh
+
+          [[ "$(routing_service_name 4gtv)" == "4GTV（台湾四季线上）" ]]
+          preset=$(routing_preset_match_json 4gtv)
+          jq -e '
+            (.domain_suffix == ["4gtv.tv"]) and
+            (.domain | sort == ([
+              "4gtvfreepc-cds.cdn.hinet.net",
+              "4gtvfreepcvod-cds.cdn.hinet.net",
+              "4gtvpc-cds.cdn.hinet.net",
+              "4gtvpcvod-cds.cdn.hinet.net"
+            ] | sort)) and
+            (.domain_keyword == []) and (.ip_cidr == []) and
+            ([.domain[], .domain_suffix[]] | index("cdn.hinet.net") == null) and
+            ([.domain[], .domain_suffix[]] | index("ftv.com.tw") == null)
+          ' <<<"$preset"
+          [[ "$(routing_rule_match_json '{"service":"4gtv"}')" == "$preset" ]]
+
+          tmp=$(mktemp)
+          trap 'rm -f "$tmp"' EXIT
+          ROUTING_FILE="$tmp"
+          cat > "$ROUTING_FILE" <<'JSON'
+          {"default_outbound":"direct","chain_nodes":[],"rules":[
+            {"service":"youtube","outbound":"direct","ip_family":"default"},
+            {"service":"4gtv","outbound":"direct","ip_family":"ipv4"},
+            {"service":"claude","outbound":"direct","ip_family":"default"}]}
+          JSON
+          compiled=$(routing_compiled_rules_json)
+          jq -e 'map(.service) == ["youtube","4gtv","claude"]' <<<"$compiled"
+          jq -e '.rules | map(.service) == ["youtube","4gtv","claude"]' "$ROUTING_FILE"
+
+          list=$(routing_app_family_list)
+          grep -Eq '^11[[:space:]]+4GTV' <<<"$list"
+          # Bash declare -f re-formats case branches, so inspect source lines for menu mappings.
+          [[ $(grep -Fc '11) service=4gtv ;;' ss2022.sh) -eq 2 ]]
+          [[ $(grep -Fc '12) service=custom ;;' ss2022.sh) -eq 1 ]]
+          [[ $(grep -Fc '12) routing_rule_management; continue ;;' ss2022.sh) -eq 1 ]]
+          [[ $(grep -Fc 'echo " 11. 4GTV（台湾四季线上）"' ss2022.sh) -eq 1 ]]
+          [[ $(grep -Fc 'echo " 12. 自定义域名 / IP' ss2022.sh) -eq 2 ]]
+
       - name: Guard sing-box 1.14 domain resolver migration
         shell: bash
         run: |

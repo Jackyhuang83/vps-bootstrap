@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
-# 当前版本: v1.9.1-dev3
+# 当前版本: v1.9.1-dev4
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,11 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.9.1-dev4:
+#   - 新增 4GTV（台湾四季线上）分流预置，精确覆盖 4gtv.tv 与四个专属 Hinet CDN 主机
+#   - 新增规则与应用 IPv4/IPv6 菜单均支持 4GTV，原有出口、规则和排序不变
+#   - 不使用 cdn.hinet.net 全域匹配；不自动启用新增规则
 #
 # v1.9.1-dev3:
 #   - 将 Shadowsocks/SS2022 落地出站的 domain_strategy 迁移到 domain_resolver
@@ -642,7 +647,7 @@
 # 注意: v1.9.0 为稳定正式版；Alpine 3.21 上 Snell v5 与 Cloudflare WARP 仍受官方组件兼容性限制。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.1-dev3"
+SCRIPT_VERSION="v1.9.1-dev4"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -4676,6 +4681,7 @@ routing_service_name() {
         google) echo "Google" ;;
         telegram) echo "Telegram" ;;
         mytvsuper) echo "MyTVSuper" ;;
+        4gtv) echo "4GTV（台湾四季线上）" ;;
         appletv) echo "Apple TV+" ;;
         tiktok) echo "TikTok" ;;
         custom) echo "自定义规则" ;;
@@ -4709,6 +4715,10 @@ routing_preset_match_json() {
             ;;
         mytvsuper)
             jq -nc '{domain:[],domain_suffix:["mytvsuper.com","tvb.com"],domain_keyword:["nowtv100","rthklive"],ip_cidr:[]}'
+            ;;
+        4gtv)
+            # 仅匹配 4GTV 官方站点及平台常用专属 Hinet CDN，避免泛匹配共享 CDN。
+            jq -nc '{domain:["4gtvfreepc-cds.cdn.hinet.net","4gtvfreepcvod-cds.cdn.hinet.net","4gtvpc-cds.cdn.hinet.net","4gtvpcvod-cds.cdn.hinet.net"],domain_suffix:["4gtv.tv"],domain_keyword:[],ip_cidr:[]}'
             ;;
         appletv)
             jq -nc '{domain:["hls-amt.itunes.apple.com","hls.itunes.apple.com","np-edge.itunes.apple.com","play-edge.itunes.apple.com","tv.applemusic.com","uts-api.itunes.apple.com"],domain_suffix:["tv.apple.com"],domain_keyword:[],ip_cidr:[]}'
@@ -6481,14 +6491,15 @@ routing_add_rule() {
     echo "  8. TikTok"
     echo "  9. Google Gemini"
     echo " 10. Claude (Anthropic)"
-    echo " 11. 自定义域名 / IP"
+    echo " 11. 4GTV（台湾四季线上）"
+    echo " 12. 自定义域名 / IP"
     echo "  0. 返回"
-    read -rp "请选择 [0-11]: " c
+    read -rp "请选择 [0-12]: " c
     case "$c" in
         1) service=openai ;; 2) service=netflix ;; 3) service=youtube ;; 4) service=google ;;
         5) service=telegram ;; 6) service=mytvsuper ;; 7) service=appletv ;; 8) service=tiktok ;;
-        9) service=gemini ;; 10) service=claude ;;
-        11) service=custom ;;
+        9) service=gemini ;; 10) service=claude ;; 11) service=4gtv ;;
+        12) service=custom ;;
         0) return 0 ;;
         *) return 1 ;;
     esac
@@ -6664,7 +6675,7 @@ routing_app_family_list() {
     local service idx rule fam out i=1
     printf '%-4s %-22s %-28s %-12s\n' "序号" "应用 / 服务" "出口" "地址族"
     printf '%s\n' "----------------------------------------------------------------------------"
-    for service in openai netflix youtube google telegram mytvsuper appletv tiktok gemini claude; do
+    for service in openai netflix youtube google telegram mytvsuper appletv tiktok gemini claude 4gtv; do
         idx=$(routing_app_family_rule_index "$service")
         if [[ -n "$idx" ]]; then
             rule=$(jq -c --argjson idx "$idx" '.rules[$idx]' "$ROUTING_FILE")
@@ -6798,14 +6809,14 @@ routing_app_family_management() {
         echo ""
         routing_app_family_list
         echo ""
-        echo " 11. 自定义域名 / IP（进入现有分流规则管理）"
+        echo " 12. 自定义域名 / IP（进入现有分流规则管理）"
         echo "  0. 返回"
-        read -rp "请选择应用 [0-11]: " c
+        read -rp "请选择应用 [0-12]: " c
         case "$c" in
             1) service=openai ;; 2) service=netflix ;; 3) service=youtube ;; 4) service=google ;;
             5) service=telegram ;; 6) service=mytvsuper ;; 7) service=appletv ;; 8) service=tiktok ;;
-            9) service=gemini ;; 10) service=claude ;;
-            11) routing_rule_management; continue ;;
+            9) service=gemini ;; 10) service=claude ;; 11) service=4gtv ;;
+            12) routing_rule_management; continue ;;
             0) return 0 ;;
             *) sleep 1; continue ;;
         esac
