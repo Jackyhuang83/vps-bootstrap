@@ -141,6 +141,59 @@ jobs:
           jq -e 'map(.service) == ["openai","google","netflix","claude"]' <<<"$order"
           [[ $(grep -Fc 'compiled_rules=$(routing_compiled_rules_json)' ss2022.sh) -eq 2 ]]
 
+      - name: Guard sing-box 1.14 domain resolver migration
+        shell: bash
+        run: |
+          set -euo pipefail
+          export SS2022_LIB_ONLY=1
+          # shellcheck disable=SC1091
+          source ./ss2022.sh
+
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          SINGBOX_CONF="$tmp/base.json"
+          SINGBOX_BIN=/bin/true
+          ROUTING_FILE="$tmp/routing.json"
+
+          printf '%s\n' '{"inbounds":[],"outbounds":[],"route":{}}' > "$SINGBOX_CONF"
+          cat > "$ROUTING_FILE" <<'JSON'
+          {
+            "chain_nodes": [
+              {"id":"v4","type":"ss2022","server":"v4.example.test","port":443,"method":"2022-blake3-aes-128-gcm","password":"test","_test_strategy":"ipv4_only"},
+              {"id":"v6-warp","type":"shadowsocks","server":"v6.example.test","port":443,"method":"aes-128-gcm","password":"test","_test_strategy":"ipv6_only","_test_warp":true},
+              {"id":"default","type":"shadowsocks","server":"example.test","port":443,"method":"aes-128-gcm","password":"test","_test_strategy":""}
+            ],
+            "rules": [],
+            "default_outbound": "direct"
+          }
+          JSON
+
+          # Exercise actual JSON generation while isolating host network and state.
+          routing_init_state() { :; }
+          routing_global_ip_family() { echo default; }
+          routing_compiled_rules_json() { echo '[]'; }
+          chain_node_singbox_resolve_strategy() { jq -r '._test_strategy // ""' <<<"$1"; }
+          chain_node_needs_warp_underlay() { [[ "$(jq -r '._test_warp // false' <<<"$1")" == true ]]; }
+          warp_proxy_port() { echo 40000; }
+
+          build_singbox_routing_candidate "$tmp/candidate.json"
+          jq -e '
+            .route.default_domain_resolver == "local-dns" and
+            ([.dns.servers[] | select(.tag == "local-dns" and .type == "local")] | length) == 1 and
+            ([.outbounds[] | select(has("domain_strategy"))] | length) == 0 and
+            ([.outbounds[] | select(.tag == "route-chain-v4") | .domain_resolver] == [{server:"local-dns",strategy:"ipv4_only"}]) and
+            ([.outbounds[] | select(.tag == "route-chain-v6-warp") | .domain_resolver] == [{server:"local-dns",strategy:"ipv6_only"}]) and
+            ([.outbounds[] | select(.tag == "route-chain-v6-warp") | .detour] == ["route-warp"]) and
+            ([.outbounds[] | select(.tag == "route-chain-default") | has("domain_resolver")] == [false])
+          ' "$tmp/candidate.json"
+
+          # Temporary real-connection tests use the same DNS resolver migration.
+          test_body=$(declare -f test_shadowsocks_node_with_singbox)
+          [[ $(grep -Fc 'domain_resolver:{server:"local-dns",strategy:$ds}' <<<"$test_body") -eq 2 ]]
+          [[ $(grep -Fc 'default_domain_resolver:"local-dns"' <<<"$test_body") -eq 2 ]]
+          [[ $(grep -Fc 'dns:{servers:[{type:"local",tag:"local-dns",prefer_go:true}]}' <<<"$test_body") -eq 2 ]]
+          ! grep -Fq 'domain_strategy:$ds' <<<"$test_body"
+
       - name: Check full uninstall managed units
         shell: bash
         run: |
