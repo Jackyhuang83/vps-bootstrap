@@ -4,7 +4,7 @@
 
 当前正式版本：**v1.9.0**
 
-当前开发版本：**v1.9.1-dev2**
+当前开发版本：**v1.9.1-dev3**
 
 项目以单一交互式 Bash 脚本 `ss2022.sh` 为入口，整合 **SS2022、SS2022 + ShadowTLS v3、VLESS Reality、Snell v5**，并提供 WARP 出口、链式落地、规则分流、Realm L4 端口转发、组件管理、服务器工具、服务器测试与脚本自更新。
 
@@ -262,7 +262,9 @@ Snell v5 保持官方 `snell-server` 架构，不参与 VPS 服务端分流。
 
 同时支持规则顺序调整和全局默认出口。
 
-### Gemini / Claude 独立分流（v1.9.1-dev2 开发分支）
+### Gemini / Claude 独立分流（v1.9.1-dev3 开发分支）
+
+> v1.9.1-dev3 修复 sing-box 1.14+ 的分流与 Shadowsocks 落地测试兼容问题：将废弃的 `domain_strategy` 改为 `domain_resolver`，保留 IPv4/IPv6 指定解析及 WARP 中转，并继续在正式应用前进行配置校验与失败回滚。
 
 进入 `分流管理 → 分流规则管理 → 添加规则`，选择 **9. Google Gemini** 或 **10. Claude**，再分别选择 DIRECT、WARP 或已添加的落地节点；在 `应用 IPv4 / IPv6 分流` 中也可单独调整两者的地址族。
 

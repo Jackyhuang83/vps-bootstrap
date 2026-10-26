@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
-# 当前版本: v1.9.1-dev2
+# 当前版本: v1.9.1-dev3
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,11 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.9.1-dev3:
+#   - 将 Shadowsocks/SS2022 落地出站的 domain_strategy 迁移到 domain_resolver
+#   - 正式分流与临时实连测试均接入 local-dns，保留双栈接入优先级与 WARP detour
+#   - 兼容 sing-box 1.14+ 的配置校验，不使用废弃功能环境变量
 #
 # v1.9.1-dev2:
 #   - 新增 Gemini / Claude 独立服务端分流规则及应用 IPv4/IPv6 选项
@@ -637,7 +642,7 @@
 # 注意: v1.9.0 为稳定正式版；Alpine 3.21 上 Snell v5 与 Cloudflare WARP 仍受官方组件兼容性限制。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.1-dev2"
+SCRIPT_VERSION="v1.9.1-dev3"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -5347,9 +5352,9 @@ build_singbox_routing_candidate() {
         case "$type" in
             ss2022|shadowsocks)
                 if chain_node_needs_warp_underlay "$node"; then
-                    outbounds=$(jq -c --arg tag "$tag" --arg server "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" --arg ds "$(chain_node_singbox_domain_strategy "$node")" '. + [({type:"shadowsocks",tag:$tag,server:$server,server_port:$port,method:$method,password:$pass,detour:"route-warp"} + (if $ds!="" then {domain_strategy:$ds} else {} end))]' <<<"$outbounds")
+                    outbounds=$(jq -c --arg tag "$tag" --arg server "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" --arg ds "$(chain_node_singbox_resolve_strategy "$node")" '. + [({type:"shadowsocks",tag:$tag,server:$server,server_port:$port,method:$method,password:$pass,detour:"route-warp"} + (if $ds!="" then {domain_resolver:{server:"local-dns",strategy:$ds}} else {} end))]' <<<"$outbounds")
                 else
-                    outbounds=$(jq -c --arg tag "$tag" --arg server "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" --arg ds "$(chain_node_singbox_domain_strategy "$node")" '. + [({type:"shadowsocks",tag:$tag,server:$server,server_port:$port,method:$method,password:$pass} + (if $ds!="" then {domain_strategy:$ds} else {} end))]' <<<"$outbounds")
+                    outbounds=$(jq -c --arg tag "$tag" --arg server "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" --arg ds "$(chain_node_singbox_resolve_strategy "$node")" '. + [({type:"shadowsocks",tag:$tag,server:$server,server_port:$port,method:$method,password:$pass} + (if $ds!="" then {domain_resolver:{server:"local-dns",strategy:$ds}} else {} end))]' <<<"$outbounds")
                 fi
                 if [[ "$type" == "shadowsocks" && "$(jq -r '.bridge_required // false' <<<"$node")" == "true" ]]; then
                     local bridge_port bridge_tag
@@ -6181,7 +6186,7 @@ chain_node_xray_server_strategy() {
     esac
 }
 
-chain_node_singbox_domain_strategy() {
+chain_node_singbox_resolve_strategy() {
     local family
     family=$(chain_node_effective_connect_family "$1")
     case "$family" in
@@ -6230,7 +6235,7 @@ curl_chain_test_via_local_socks() {
 test_shadowsocks_node_with_singbox() {
     local node="$1" family="${2:-default}" port cfg pid out rc=1 n=19080 url warp_port use_warp=false sb_ds
     url=$(ip_echo_url_for_family "$family")
-    sb_ds=$(chain_node_singbox_domain_strategy "$node")
+    sb_ds=$(chain_node_singbox_resolve_strategy "$node")
     [[ -x "$SINGBOX_BIN" ]] || { echo -e "${YELLOW}[提示] 未安装 sing-box，无法执行 Shadowsocks 落地实连测试。${PLAIN}"; return 1; }
     chain_node_needs_warp_underlay "$node" && use_warp=true
     while ss -H -ltn 2>/dev/null | grep -q ":${n} "; do n=$((n+1)); [[ $n -lt 19150 ]] || return 1; done
@@ -6239,11 +6244,11 @@ test_shadowsocks_node_with_singbox() {
     if [[ "$use_warp" == true ]]; then
         warp_port=$(warp_proxy_port)
         jq -n --arg server "$(jq -r '.server' <<<"$node")" --argjson sport "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" --argjson lp "$port" --argjson wp "$warp_port" --arg ds "$sb_ds" \
-          '{log:{level:"warn"},inbounds:[{type:"socks",tag:"test-in",listen:"127.0.0.1",listen_port:$lp}],outbounds:[{type:"socks",tag:"test-warp",server:"127.0.0.1",server_port:$wp},({type:"shadowsocks",tag:"test-out",server:$server,server_port:$sport,method:$method,password:$pass,detour:"test-warp"} + (if $ds!="" then {domain_strategy:$ds} else {} end))],route:{final:"test-out"}}' > "$cfg"
+          '{log:{level:"warn"},dns:{servers:[{type:"local",tag:"local-dns",prefer_go:true}]},inbounds:[{type:"socks",tag:"test-in",listen:"127.0.0.1",listen_port:$lp}],outbounds:[{type:"socks",tag:"test-warp",server:"127.0.0.1",server_port:$wp},({type:"shadowsocks",tag:"test-out",server:$server,server_port:$sport,method:$method,password:$pass,detour:"test-warp"} + (if $ds!="" then {domain_resolver:{server:"local-dns",strategy:$ds}} else {} end))],route:{final:"test-out",default_domain_resolver:"local-dns"}}' > "$cfg"
         echo -e "${YELLOW}节点接入链路: WARP（VPS 缺少该地址族的原生出口）${PLAIN}"
     else
         jq -n --arg server "$(jq -r '.server' <<<"$node")" --argjson sport "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" --argjson lp "$port" --arg ds "$sb_ds" \
-          '{log:{level:"warn"},inbounds:[{type:"socks",tag:"test-in",listen:"127.0.0.1",listen_port:$lp}],outbounds:[({type:"shadowsocks",tag:"test-out",server:$server,server_port:$sport,method:$method,password:$pass} + (if $ds!="" then {domain_strategy:$ds} else {} end))],route:{final:"test-out"}}' > "$cfg"
+          '{log:{level:"warn"},dns:{servers:[{type:"local",tag:"local-dns",prefer_go:true}]},inbounds:[{type:"socks",tag:"test-in",listen:"127.0.0.1",listen_port:$lp}],outbounds:[({type:"shadowsocks",tag:"test-out",server:$server,server_port:$sport,method:$method,password:$pass} + (if $ds!="" then {domain_resolver:{server:"local-dns",strategy:$ds}} else {} end))],route:{final:"test-out",default_domain_resolver:"local-dns"}}' > "$cfg"
     fi
     "$SINGBOX_BIN" check -c "$cfg" >/dev/null 2>&1 || { rm -f "$cfg"; return 1; }
     "$SINGBOX_BIN" run -c "$cfg" >/tmp/ss2022-chain-test.log 2>&1 & pid=$!
