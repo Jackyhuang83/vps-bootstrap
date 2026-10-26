@@ -180,11 +180,12 @@ jobs:
 
           list=$(routing_app_family_list)
           grep -Eq '^11[[:space:]]+4GTV' <<<"$list"
-          grep -Fq '4GTV' <<<"$(declare -f routing_add_rule)"
-          grep -Fq '11) service=4gtv' <<<"$(declare -f routing_add_rule)"
-          grep -Fq '12) service=custom' <<<"$(declare -f routing_add_rule)"
-          grep -Fq '11) service=4gtv' <<<"$(declare -f routing_app_family_management)"
-          grep -Fq '12) routing_rule_management' <<<"$(declare -f routing_app_family_management)"
+          # Bash declare -f re-formats case branches, so inspect source lines for menu mappings.
+          [[ $(grep -Fc '11) service=4gtv ;;' ss2022.sh) -eq 2 ]]
+          [[ $(grep -Fc '12) service=custom ;;' ss2022.sh) -eq 1 ]]
+          [[ $(grep -Fc '12) routing_rule_management; continue ;;' ss2022.sh) -eq 1 ]]
+          [[ $(grep -Fc 'echo " 11. 4GTV（台湾四季线上）"' ss2022.sh) -eq 1 ]]
+          [[ $(grep -Fc 'echo " 12. 自定义域名 / IP"' ss2022.sh) -eq 2 ]]
 
       - name: Guard sing-box 1.14 domain resolver migration
         shell: bash
