@@ -1984,8 +1984,7 @@ singbox_assert_safe_ownership() {
         echo -e "${YELLOW}[提示] 发现无配置/服务的宿主机 sing-box 二进制；可备份后接管。${PLAIN}"
         read -rp "备份现有二进制并允许 vps-bootstrap 安装？[y/N]: " answer
         [[ "$answer" =~ ^[Yy]$ ]] || return 1
-        cp -p -- "$SINGBOX_BIN" "$SINGBOX_ORIGINAL_BACKUP" || return 1
-        chmod 600 "$SINGBOX_ORIGINAL_BACKUP" || return 1
+        SINGBOX_PENDING_TAKEOVER=1
         return 0
     fi
 
@@ -2258,6 +2257,10 @@ WRAPPER
         return 0
     fi
 
+    # Back up only after the downloaded release passes verification, immediately before replacement.
+    if [[ "${SINGBOX_PENDING_TAKEOVER:-0}" == "1" ]]; then
+        cp -p -- "$SINGBOX_BIN" "$SINGBOX_ORIGINAL_BACKUP" || return 1
+    fi
     # Debian / Ubuntu: preserve the original binary on any failure before ownership is established.
     if ! install -m 755 /tmp/ss2022-sb-temp/sing-box "$SINGBOX_BIN"; then
         [[ ! -f "$SINGBOX_ORIGINAL_BACKUP" ]] || cp -p -- "$SINGBOX_ORIGINAL_BACKUP" "$SINGBOX_BIN"
@@ -8103,7 +8106,6 @@ full_uninstall() {
         if [[ -f "$SINGBOX_ORIGINAL_BACKUP" ]]; then
             if [[ ! -e "$SINGBOX_BIN" ]]; then
                 mv -- "$SINGBOX_ORIGINAL_BACKUP" "$SINGBOX_BIN" || echo "[警告] 原始 sing-box 恢复失败"
-                chmod 755 "$SINGBOX_BIN" 2>/dev/null || true
             fi
         fi
         if [[ -f "$SINGBOX_DIR_MARKER" ]]; then
