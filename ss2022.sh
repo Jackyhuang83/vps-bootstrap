@@ -1997,6 +1997,17 @@ singbox_assert_safe_ownership() {
     return 0
 }
 
+singbox_restore_failed_takeover() {
+    [[ "${SINGBOX_PENDING_TAKEOVER:-0}" == "1" ]] || return 0
+    [[ -f "$SINGBOX_ORIGINAL_BACKUP" ]] || return 1
+    # The original was not managed; restore it and remove only newly created assets.
+    cp -p -- "$SINGBOX_ORIGINAL_BACKUP" "$SINGBOX_BIN" || return 1
+    rm -f -- "$SINGBOX_SERVICE" "$SINGBOX_OPENRC_SERVICE" "$SINGBOX_MANAGED_MARKER"
+    service_daemon_reload || true
+    rm -f -- "$SINGBOX_ORIGINAL_BACKUP"
+    return 0
+}
+
 mark_singbox_project_managed() {
     touch "$SINGBOX_MANAGED_MARKER" || return 1
     chmod 600 "$SINGBOX_MANAGED_MARKER"
@@ -2263,15 +2274,13 @@ WRAPPER
     fi
     # Debian / Ubuntu: preserve the original binary on any failure before ownership is established.
     if ! install -m 755 /tmp/ss2022-sb-temp/sing-box "$SINGBOX_BIN"; then
-        [[ ! -f "$SINGBOX_ORIGINAL_BACKUP" ]] || cp -p -- "$SINGBOX_ORIGINAL_BACKUP" "$SINGBOX_BIN"
+        singbox_restore_failed_takeover || echo "[警告] 自动恢复失败，请保留备份并人工检查"
         return 1
     fi
     rm -rf /tmp/ss2022-sb-temp "/tmp/ss2022-${tar_file}"
     if ! "$SINGBOX_BIN" version >/dev/null 2>&1 || ! write_singbox_service || ! mark_singbox_project_managed; then
         echo -e "${RED}[错误] sing-box 安装/服务初始化失败，尝试恢复原二进制。${PLAIN}"
-        if [[ -f "$SINGBOX_ORIGINAL_BACKUP" ]]; then
-            cp -p -- "$SINGBOX_ORIGINAL_BACKUP" "$SINGBOX_BIN" || echo "[错误] 恢复失败，请人工检查备份"
-        fi
+        singbox_restore_failed_takeover || echo "[警告] 自动恢复失败，请保留备份并人工检查"
         return 1
     fi
     echo -e "${GREEN}✔ sing-box ${SINGBOX_VERSION} 核心与服务管理已就绪。${PLAIN}"
