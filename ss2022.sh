@@ -683,6 +683,7 @@ SINGBOX_GROUP="sing-box"
 SINGBOX_USER_MARKER="/etc/ss2022-singbox-user-managed"
 SINGBOX_GROUP_MARKER="/etc/ss2022-singbox-group-managed"
 SINGBOX_MANAGED_MARKER="/etc/ss2022-singbox-install-managed"
+SINGBOX_ORIGINAL_BACKUP="/usr/local/bin/.ss2022-sing-box-original.bak"
 SINGBOX_ALPINE_PKG_MARKER="/etc/ss2022-singbox-apk-managed"
 SINGBOX_ALPINE_RUNTIME_DIR="/usr/local/lib/ss2022/sing-box-runtime"
 SINGBOX_ALPINE_RUNTIME_BIN="${SINGBOX_ALPINE_RUNTIME_DIR}/sing-box"
@@ -1967,6 +1968,27 @@ singbox_assert_safe_ownership() {
         return 0
     fi
 
+    # An unowned binary alone may be an orphan from an interrupted installation.
+    # Never infer ownership from Docker processes or the absence of a systemd unit.
+    if [[ -f "$SINGBOX_BIN" && ! -L "$SINGBOX_BIN" && ! -e "$SINGBOX_CONF" && ! -e "$SINGBOX_SERVICE" && ! -e "$SINGBOX_OPENRC_SERVICE" && ! -e "$SINGBOX_ORIGINAL_BACKUP" ]]; then
+        local proc exe inode candidate_inode answer
+        candidate_inode=$(stat -Lc '%d:%i' "$SINGBOX_BIN" 2>/dev/null) || return 1
+        for proc in /proc/[0-9]*; do
+            [[ -r "$proc/exe" ]] || continue
+            exe=$(stat -Lc '%d:%i' "$proc/exe" 2>/dev/null || true)
+            if [[ "$exe" == "$candidate_inode" ]]; then
+                echo -e "${RED}[错误] 现有 sing-box 二进制正被进程使用，拒绝接管。${PLAIN}"
+                return 1
+            fi
+        done
+        echo -e "${YELLOW}[提示] 发现无配置/服务的宿主机 sing-box 二进制；可备份后接管。${PLAIN}"
+        read -rp "备份现有二进制并允许 vps-bootstrap 安装？[y/N]: " answer
+        [[ "$answer" =~ ^[Yy]$ ]] || return 1
+        cp -p -- "$SINGBOX_BIN" "$SINGBOX_ORIGINAL_BACKUP" || return 1
+        chmod 600 "$SINGBOX_ORIGINAL_BACKUP" || return 1
+        return 0
+    fi
+
     if [[ -e "$SINGBOX_BIN" || -e "$SINGBOX_CONF" || -e "$SINGBOX_SERVICE" || -e "$SINGBOX_OPENRC_SERVICE" ]]; then
         echo -e "${RED}[错误] 检测到服务器已有非 vps-bootstrap 管理的 sing-box。${PLAIN}"
         echo -e "${YELLOW}为避免覆盖现有二进制、配置或服务，本脚本停止安装 sing-box。${PLAIN}"
@@ -2236,16 +2258,19 @@ WRAPPER
         return 0
     fi
 
-    # Debian / Ubuntu 保持 v1.8.1 原有安装路径。
-    install -m 755 /tmp/ss2022-sb-temp/sing-box "$SINGBOX_BIN" || return 1
-    rm -rf /tmp/ss2022-sb-temp "/tmp/ss2022-${tar_file}"
-    "$SINGBOX_BIN" version >/dev/null 2>&1 || {
-        echo -e "${RED}[错误] sing-box 安装后无法执行。${PLAIN}"
+    # Debian / Ubuntu: preserve the original binary on any failure before ownership is established.
+    if ! install -m 755 /tmp/ss2022-sb-temp/sing-box "$SINGBOX_BIN"; then
+        [[ ! -f "$SINGBOX_ORIGINAL_BACKUP" ]] || cp -p -- "$SINGBOX_ORIGINAL_BACKUP" "$SINGBOX_BIN"
         return 1
-    }
-
-    write_singbox_service || return 1
-    mark_singbox_project_managed || return 1
+    fi
+    rm -rf /tmp/ss2022-sb-temp "/tmp/ss2022-${tar_file}"
+    if ! "$SINGBOX_BIN" version >/dev/null 2>&1 || ! write_singbox_service || ! mark_singbox_project_managed; then
+        echo -e "${RED}[错误] sing-box 安装/服务初始化失败，尝试恢复原二进制。${PLAIN}"
+        if [[ -f "$SINGBOX_ORIGINAL_BACKUP" ]]; then
+            cp -p -- "$SINGBOX_ORIGINAL_BACKUP" "$SINGBOX_BIN" || echo "[错误] 恢复失败，请人工检查备份"
+        fi
+        return 1
+    fi
     echo -e "${GREEN}✔ sing-box ${SINGBOX_VERSION} 核心与服务管理已就绪。${PLAIN}"
     return 0
 }
@@ -8075,6 +8100,12 @@ full_uninstall() {
     if [[ $singbox_managed -eq 1 ]]; then
         rm -f "$SINGBOX_CONF" "${SINGBOX_CONF_DIR}"/.ss2022-*
         rm -f "$SINGBOX_BIN" "$SINGBOX_SERVICE" "$SINGBOX_OPENRC_SERVICE" "$SINGBOX_MANAGED_MARKER"
+        if [[ -f "$SINGBOX_ORIGINAL_BACKUP" ]]; then
+            if [[ ! -e "$SINGBOX_BIN" ]]; then
+                mv -- "$SINGBOX_ORIGINAL_BACKUP" "$SINGBOX_BIN" || echo "[警告] 原始 sing-box 恢复失败"
+                chmod 755 "$SINGBOX_BIN" 2>/dev/null || true
+            fi
+        fi
         if [[ -f "$SINGBOX_DIR_MARKER" ]]; then
             rmdir "$SINGBOX_CONF_DIR" 2>/dev/null || true
             rm -f "$SINGBOX_DIR_MARKER"
