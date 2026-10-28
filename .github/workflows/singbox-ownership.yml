@@ -1,0 +1,15 @@
+name: Sing-box Ownership Regression
+on:
+  pull_request:
+    paths:
+      - 'ss2022.sh'
+      - 'tests/test-singbox-ownership.sh'
+      - '.github/workflows/singbox-ownership.yml'
+  workflow_dispatch:
+jobs:
+  ownership:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Isolated rollback and ownership tests
+        run: bash tests/test-singbox-ownership.sh
