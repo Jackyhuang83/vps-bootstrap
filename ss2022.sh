@@ -684,6 +684,7 @@ SINGBOX_USER_MARKER="/etc/ss2022-singbox-user-managed"
 SINGBOX_GROUP_MARKER="/etc/ss2022-singbox-group-managed"
 SINGBOX_MANAGED_MARKER="/etc/ss2022-singbox-install-managed"
 SINGBOX_ORIGINAL_BACKUP="/usr/local/bin/.ss2022-sing-box-original.bak"
+SINGBOX_ORIGINAL_BACKUP_SHA="/etc/ss2022-singbox-original.sha256"
 SINGBOX_ALPINE_PKG_MARKER="/etc/ss2022-singbox-apk-managed"
 SINGBOX_ALPINE_RUNTIME_DIR="/usr/local/lib/ss2022/sing-box-runtime"
 SINGBOX_ALPINE_RUNTIME_BIN="${SINGBOX_ALPINE_RUNTIME_DIR}/sing-box"
@@ -1970,7 +1971,7 @@ singbox_assert_safe_ownership() {
 
     # An unowned binary alone may be an orphan from an interrupted installation.
     # Never infer ownership from Docker processes or the absence of a systemd unit.
-    if [[ -f "$SINGBOX_BIN" && ! -L "$SINGBOX_BIN" && ! -e "$SINGBOX_CONF" && ! -e "$SINGBOX_SERVICE" && ! -e "$SINGBOX_OPENRC_SERVICE" && ! -e "$SINGBOX_ORIGINAL_BACKUP" ]]; then
+    if [[ -f "$SINGBOX_BIN" && ! -L "$SINGBOX_BIN" && ! -e "$SINGBOX_CONF" && ! -e "$SINGBOX_SERVICE" && ! -e "$SINGBOX_OPENRC_SERVICE" && ! -e "$SINGBOX_ORIGINAL_BACKUP" && ! -e "$SINGBOX_ORIGINAL_BACKUP_SHA" ]]; then
         local proc exe inode candidate_inode answer
         candidate_inode=$(stat -Lc '%d:%i' "$SINGBOX_BIN" 2>/dev/null) || return 1
         for proc in /proc/[0-9]*; do
@@ -1999,12 +2000,13 @@ singbox_assert_safe_ownership() {
 
 singbox_restore_failed_takeover() {
     [[ "${SINGBOX_PENDING_TAKEOVER:-0}" == "1" ]] || return 0
-    [[ -f "$SINGBOX_ORIGINAL_BACKUP" ]] || return 1
+    [[ -f "$SINGBOX_ORIGINAL_BACKUP" && -f "$SINGBOX_ORIGINAL_BACKUP_SHA" ]] || return 1
+    [[ "$(sha256sum "$SINGBOX_ORIGINAL_BACKUP" | awk '{print $1}')" == "$(cat "$SINGBOX_ORIGINAL_BACKUP_SHA")" ]] || return 1
     # The original was not managed; restore it and remove only newly created assets.
     cp -p -- "$SINGBOX_ORIGINAL_BACKUP" "$SINGBOX_BIN" || return 1
     rm -f -- "$SINGBOX_SERVICE" "$SINGBOX_OPENRC_SERVICE" "$SINGBOX_MANAGED_MARKER"
     service_daemon_reload || true
-    rm -f -- "$SINGBOX_ORIGINAL_BACKUP"
+    rm -f -- "$SINGBOX_ORIGINAL_BACKUP" "$SINGBOX_ORIGINAL_BACKUP_SHA"
     return 0
 }
 
@@ -2271,6 +2273,8 @@ WRAPPER
     # Back up only after the downloaded release passes verification, immediately before replacement.
     if [[ "${SINGBOX_PENDING_TAKEOVER:-0}" == "1" ]]; then
         cp -p -- "$SINGBOX_BIN" "$SINGBOX_ORIGINAL_BACKUP" || return 1
+        sha256sum "$SINGBOX_ORIGINAL_BACKUP" | awk '{print $1}' > "$SINGBOX_ORIGINAL_BACKUP_SHA" || return 1
+        chmod 600 "$SINGBOX_ORIGINAL_BACKUP_SHA" || return 1
     fi
     # Debian / Ubuntu: preserve the original binary on any failure before ownership is established.
     if ! install -m 755 /tmp/ss2022-sb-temp/sing-box "$SINGBOX_BIN"; then
@@ -8112,10 +8116,17 @@ full_uninstall() {
     if [[ $singbox_managed -eq 1 ]]; then
         rm -f "$SINGBOX_CONF" "${SINGBOX_CONF_DIR}"/.ss2022-*
         rm -f "$SINGBOX_BIN" "$SINGBOX_SERVICE" "$SINGBOX_OPENRC_SERVICE" "$SINGBOX_MANAGED_MARKER"
-        if [[ -f "$SINGBOX_ORIGINAL_BACKUP" ]]; then
+        if [[ -f "$SINGBOX_ORIGINAL_BACKUP" && -f "$SINGBOX_ORIGINAL_BACKUP_SHA" ]] &&
+           [[ "$(sha256sum "$SINGBOX_ORIGINAL_BACKUP" | awk '{print $1}')" == "$(cat "$SINGBOX_ORIGINAL_BACKUP_SHA")" ]]; then
             if [[ ! -e "$SINGBOX_BIN" ]]; then
-                mv -- "$SINGBOX_ORIGINAL_BACKUP" "$SINGBOX_BIN" || echo "[警告] 原始 sing-box 恢复失败"
+                if mv -- "$SINGBOX_ORIGINAL_BACKUP" "$SINGBOX_BIN"; then
+                    rm -f -- "$SINGBOX_ORIGINAL_BACKUP_SHA"
+                else
+                    echo "[警告] 原始 sing-box 恢复失败，请保留备份"
+                fi
             fi
+        elif [[ -e "$SINGBOX_ORIGINAL_BACKUP" || -e "$SINGBOX_ORIGINAL_BACKUP_SHA" ]]; then
+            echo "[警告] 原始 sing-box 备份缺少完整性凭据或 SHA256 不匹配，拒绝自动恢复"
         fi
         if [[ -f "$SINGBOX_DIR_MARKER" ]]; then
             rmdir "$SINGBOX_CONF_DIR" 2>/dev/null || true
