@@ -6198,6 +6198,17 @@ chain_add_vless_reality() {
     fi
     [[ "$flow" == "" || "$flow" == "xtls-rprx-vision" ]] || { echo "[错误] 不支持的 flow"; return 1; }
     [[ "$fp" =~ ^[a-zA-Z0-9_-]+$ && "$spx" == /* ]] || return 1
+    if [[ ! -x "$XRAY_BIN" ]]; then
+        echo "[提示] VLESS 落地实连测试需要 Xray-core，当前未安装。"
+        echo "[提示] 安装会注册 Xray 服务，但不会主动重启 sing-box。"
+        local install_answer
+        read -rp "现在下载并安装官方 Xray-core？[y/N]: " install_answer
+        if [[ "$install_answer" =~ ^[Yy]$ ]]; then
+            install_xray_core || { echo "[错误] Xray-core 安装失败，节点尚未保存"; return 1; }
+        else
+            echo "[提示] 暂不安装 Xray-core；仍可保存节点，稍后安装再测试。"
+        fi
+    fi
     [[ -x "$XRAY_BIN" || -x "$SINGBOX_BIN" ]] || { echo "[错误] 请先安装 Xray 或 sing-box 核心"; return 1; }
     id="n$(date +%s)${RANDOM}"
     local node_type="vless_reality"
@@ -6520,7 +6531,10 @@ test_vless_reality_node() {
     wait "$pid" 2>/dev/null || true
     rm -f "$cfg"
     if [[ "$rc" == 0 ]]; then echo "✔ VLESS 落地可用，出口 IP: $out"; return 0; fi
-    echo "[错误] VLESS Reality 落地连接失败"
+    local test_type
+    test_type=$(jq -r '.type // "unknown"' <<<"$node")
+    echo "[错误] VLESS ${test_type#vless_} 落地连接失败（TCP 接入成功不代表 TLS/VLESS 握手成功）"
+    echo "[提示] 请核对服务端 TLS 证书与 SNI、Vision flow 及节点传输参数。"
     [[ -s /tmp/ss2022-chain-curl.err ]] && tail -n 3 /tmp/ss2022-chain-curl.err
     tail -n 5 /tmp/ss2022-vless-chain-test.log 2>/dev/null || true
     return 1
