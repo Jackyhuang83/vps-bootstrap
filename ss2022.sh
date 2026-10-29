@@ -6151,7 +6151,16 @@ chain_add_vless_reality() {
             spx|spiderX) spx="$val" ;;
         esac
     done
-    [[ "$security" == reality && "$transport" == tcp && "$encryption" == none ]] || { echo "[错误] 仅支持 Reality + TCP + none"; return 1; }
+    # Some URI exporters omit default fields; require pbk to infer Reality.
+    security=${security,,}
+    transport=${transport,,}
+    encryption=${encryption,,}
+    [[ -z "$security" && -n "$pbk" ]] && security="reality"
+    [[ "$transport" == "raw" ]] && transport="tcp"
+    if [[ "$security" != "reality" || "$transport" != "tcp" || "$encryption" != "none" ]]; then
+        echo "[错误] 仅支持 Reality + TCP + none（security=${security:-缺失}, type=${transport:-缺失}, encryption=${encryption:-缺失}）"
+        return 1
+    fi
     [[ -n "$sni" && "$sni" != *[[:space:]]* && "$pbk" =~ ^[A-Za-z0-9_-]{43}$ && "$sid" =~ ^([[:xdigit:]]{2}){0,8}$ ]] || { echo "[错误] SNI/Public Key/Short ID 无效"; return 1; }
     [[ "$flow" == "" || "$flow" == "xtls-rprx-vision" ]] || { echo "[错误] 不支持的 flow"; return 1; }
     [[ "$fp" =~ ^[a-zA-Z0-9_-]+$ && "$spx" == /* ]] || return 1
