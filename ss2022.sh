@@ -5300,6 +5300,7 @@ chain_node_type_label() {
     case "$1" in
         ss2022|shadowsocks) echo "Shadowsocks" ;;
         socks5) echo "SOCKS5" ;;
+        vless_reality) echo "VLESS Reality" ;;
         *) echo "$1" ;;
     esac
 }
@@ -5419,6 +5420,9 @@ build_singbox_routing_candidate() {
                     rules=$(jq -c --arg inbound "$bridge_tag" --arg out "$tag" '. + [{inbound:[$inbound],action:"route",outbound:$out}]' <<<"$rules")
                 fi
                 ;;
+            vless_reality)
+                outbounds=$(jq -c --arg tag "$tag" --argjson node "$node" --arg ds "$(chain_node_singbox_resolve_strategy "$node")" --argjson warp "$(chain_node_needs_warp_underlay "$node" && echo true || echo false)" '. + [({type:"vless",tag:$tag,server:$node.server,server_port:$node.port,uuid:$node.uuid,flow:($node.flow // ""),tls:{enabled:true,server_name:$node.sni,utls:{enabled:true,fingerprint:($node.fingerprint // "chrome")},reality:{enabled:true,public_key:$node.public_key,short_id:($node.short_id // "")}}} + (if $warp then {detour:"route-warp"} else {} end) + (if $ds!="" then {domain_resolver:{server:"local-dns",strategy:$ds}} else {} end))]' <<<"$outbounds")
+                ;;
             socks5)
                 outbounds=$(jq -c --arg tag "$tag" --arg server "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg user "$(jq -r '.username // ""' <<<"$node")" --arg pass "$(jq -r '.password // ""' <<<"$node")" '. + [({type:"socks",tag:$tag,server:$server,server_port:$port} + (if $user!="" then {username:$user,password:$pass} else {} end))]' <<<"$outbounds")
                 ;;
@@ -5526,6 +5530,9 @@ xray_outbound_for_node() {
                     jq -nc --arg tag "$tag" --arg address "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg method "$method" --arg pass "$(jq -r '.password' <<<"$node")" --arg ts "$strategy" --arg ss "$server_strategy" '{protocol:"shadowsocks",tag:$tag,targetStrategy:$ts,settings:{address:$address,port:$port,method:$method,password:$pass},streamSettings:{sockopt:{domainStrategy:$ss}}}'
                 fi
             fi
+            ;;
+        vless_reality)
+            jq -nc --arg tag "$tag" --argjson node "$node" --arg ts "$strategy" --arg ss "$server_strategy" --argjson warp "$(chain_node_needs_warp_underlay "$node" && echo true || echo false)" ' {protocol:"vless",tag:$tag,targetStrategy:$ts,settings:{vnext:[{address:$node.server,port:$node.port,users:[{id:$node.uuid,encryption:"none",flow:($node.flow // "")}]}]},streamSettings:{network:"tcp",security:"reality",realitySettings:{serverName:$node.sni,publicKey:$node.public_key,shortId:($node.short_id // ""),fingerprint:($node.fingerprint // "chrome"),spiderX:($node.spider_x // "/")},sockopt:({domainStrategy:$ss} + (if $warp then {dialerProxy:"route-warp"} else {} end))}}'
             ;;
         socks5)
             jq -nc --arg tag "$tag" --arg address "$(jq -r '.server' <<<"$node")" --argjson port "$(jq -r '.port' <<<"$node")" --arg user "$(jq -r '.username // ""' <<<"$node")" --arg pass "$(jq -r '.password // ""' <<<"$node")" --arg ts "$strategy" '{protocol:"socks",tag:$tag,targetStrategy:$ts,settings:({address:$address,port:$port} + (if $user!="" then {user:$user,pass:$pass} else {} end))}'
@@ -6102,6 +6109,61 @@ chain_add_shadowsocks() {
         echo -e "${GREEN}  VLESS/Xray: Xray 原生直连${PLAIN}"
     fi
 }
+chain_add_vless_reality() {
+    local name uri authority params uuid host port sni pbk sid fp flow spx id node tmp query key val
+    read -rp "节点名称（例如 HK-VLESS）: " name
+    [[ -n "$name" ]] || return 1
+    routing_node_name_exists "$name" && { echo "[错误] 节点名称已存在"; return 1; }
+    read -rp "粘贴 VLESS Reality 的 vless:// 链接: " uri
+    [[ "$uri" == vless://* ]] || { echo "[错误] 不是 vless:// 链接"; return 1; }
+    uri=${uri#vless://}
+    uri=${uri%%#*}
+    authority=${uri%%\?*}
+    [[ "$authority" != "$uri" && "$authority" == *@* ]] || { echo "[错误] 缺少 Reality 参数"; return 1; }
+    uuid=${authority%@*}
+    host=${authority#*@}
+    if [[ "$host" == \[*\]:* ]]; then
+        port=${host##*:}
+        host=${host#\[}; host=${host%%\]*}
+    else
+        port=${host##*:}
+        host=${host%:*}
+    fi
+    [[ "$uuid" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ && -n "$host" ]] || { echo "[错误] UUID/服务器地址无效"; return 1; }
+    validate_port_number "$port" || return 1
+    params=${uri#*\?}
+    local security="" transport="tcp" encryption="none"
+    sni="" pbk="" sid="" fp="chrome" flow="" spx="/"
+    local -a parts
+    IFS='&' read -ra parts <<<"$params"
+    for query in "${parts[@]}"; do
+        key=${query%%=*}; val=${query#*=}
+        val=$(url_decode_simple "$val")
+        case "$key" in
+            security) security="$val" ;;
+            type) transport="$val" ;;
+            encryption) encryption="$val" ;;
+            sni|serverName) sni="$val" ;;
+            pbk|publicKey) pbk="$val" ;;
+            sid|shortId) sid="$val" ;;
+            fp|fingerprint) fp="$val" ;;
+            flow) flow="$val" ;;
+            spx|spiderX) spx="$val" ;;
+        esac
+    done
+    [[ "$security" == reality && "$transport" == tcp && "$encryption" == none ]] || { echo "[错误] 仅支持 Reality + TCP + none"; return 1; }
+    [[ -n "$sni" && "$sni" != *[[:space:]]* && "$pbk" =~ ^[A-Za-z0-9_-]{43}$ && "$sid" =~ ^([[:xdigit:]]{2}){0,8}$ ]] || { echo "[错误] SNI/Public Key/Short ID 无效"; return 1; }
+    [[ "$flow" == "" || "$flow" == "xtls-rprx-vision" ]] || { echo "[错误] 不支持的 flow"; return 1; }
+    [[ "$fp" =~ ^[a-zA-Z0-9_-]+$ && "$spx" == /* ]] || return 1
+    [[ -x "$XRAY_BIN" || -x "$SINGBOX_BIN" ]] || { echo "[错误] 请先安装 Xray 或 sing-box 核心"; return 1; }
+    id="n$(date +%s)${RANDOM}"
+    node=$(jq -nc --arg id "$id" --arg name "$name" --arg server "$host" --argjson port "$port" --arg uuid "$uuid" --arg sni "$sni" --arg pbk "$pbk" --arg sid "$sid" --arg fp "$fp" --arg flow "$flow" --arg spx "$spx" '{id:$id,name:$name,type:"vless_reality",server:$server,port:$port,uuid:$uuid,sni:$sni,public_key:$pbk,short_id:$sid,fingerprint:$fp,flow:$flow,spider_x:$spx}')
+    tmp=$(mktemp "${STATE_DIR}/routing.json.tmp.XXXXXX") || return 1
+    jq --argjson n "$node" '.chain_nodes += [$n]' "$ROUTING_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+    routing_commit_state_candidate "$tmp" || return 1
+    echo "✔ VLESS Reality 落地节点已添加：$name"
+}
+
 chain_add_socks5() {
     local name server port auth user="" pass="" id node tmp
     echo -e "${YELLOW}[提示] SOCKS5 本身不加密；公网落地优先建议使用 Shadowsocks，SOCKS5 仅用于可信或已受保护的链路。${PLAIN}"
@@ -6504,9 +6566,11 @@ chain_management() {
             1)
                 echo "  1. Shadowsocks（自动识别 SS2022 / 标准 SS）"
                 echo "  2. SOCKS5"
-                read -rp "节点类型 [1-2]: " t
+                echo "  3. VLESS Reality（粘贴 vless:// 链接）"
+                read -rp "节点类型 [1-3]: " t
                 [[ "$t" == "1" ]] && chain_add_shadowsocks
                 [[ "$t" == "2" ]] && chain_add_socks5
+                [[ "$t" == "3" ]] && chain_add_vless_reality
                 pause ;;
             2) chain_list_nodes; pause ;;
             3) chain_delete_node; pause ;;
