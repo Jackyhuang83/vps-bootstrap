@@ -4685,6 +4685,23 @@ EOF
     chmod 600 "$ROUTING_FILE"
 }
 
+routing_commit_node_inventory_candidate() {
+    # Inventory-only change: never touch active proxy configs or restart services.
+    # Caller must ensure the candidate changes only unreferenced chain nodes.
+    local candidate="$1" old_active new_active
+    [[ -f "$candidate" ]] || return 1
+    old_active=$(jq -c '{default_outbound,rules,global_ip_family,warp}' "$ROUTING_FILE") || return 1
+    new_active=$(jq -c '{default_outbound,rules,global_ip_family,warp}' "$candidate") || return 1
+    if [[ "$old_active" != "$new_active" ]]; then
+        echo "[错误] 节点清单操作不得修改正在使用的分流规则。"
+        rm -f "$candidate"
+        return 1
+    fi
+    jq -e 'type=="object" and (.chain_nodes|type=="array") and (.rules|type=="array")' "$candidate" >/dev/null 2>&1 || { rm -f "$candidate"; return 1; }
+    chmod 600 "$candidate"
+    mv -f "$candidate" "$ROUTING_FILE"
+}
+
 routing_commit_state_candidate() {
     # 原子更新 routing.json：只有 sing-box / Xray 两侧都校验并应用成功后才提交状态。
     local candidate="$1" backup rc=0
@@ -6188,8 +6205,8 @@ chain_add_vless_reality() {
     node=$(jq -nc --arg type "$node_type" --arg id "$id" --arg name "$name" --arg server "$host" --argjson port "$port" --arg uuid "$uuid" --arg sni "$sni" --arg pbk "$pbk" --arg sid "$sid" --arg fp "$fp" --arg flow "$flow" --arg spx "$spx" '{id:$id,name:$name,type:$type,server:$server,port:$port,uuid:$uuid,sni:$sni,public_key:$pbk,short_id:$sid,fingerprint:$fp,flow:$flow,spider_x:$spx}')
     tmp=$(mktemp "${STATE_DIR}/routing.json.tmp.XXXXXX") || return 1
     jq --argjson n "$node" '.chain_nodes += [$n]' "$ROUTING_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
-    routing_commit_state_candidate "$tmp" || return 1
-    echo "✔ VLESS $security 落地节点已添加：$name"
+    routing_commit_node_inventory_candidate "$tmp" || return 1
+    echo "✔ VLESS $security 节点已保存（未重启代理服务）。请先测试，确认可用后再启用分流。"
 }
 
 chain_add_socks5() {
@@ -6585,7 +6602,7 @@ chain_delete_node() {
     [[ "$yes" =~ ^[Yy]$ ]] || return 0
     tmp=$(mktemp "${STATE_DIR}/routing.json.tmp.XXXXXX") || return 1
     jq --arg id "$id" '.chain_nodes |= map(select(.id!=$id))' "$ROUTING_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
-    routing_commit_state_candidate "$tmp" || return 1
+    routing_commit_node_inventory_candidate "$tmp" || return 1
     echo -e "${GREEN}✔ 已删除 ${name}。${PLAIN}"
 }
 
