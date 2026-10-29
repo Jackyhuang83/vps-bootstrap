@@ -6448,6 +6448,39 @@ test_shadowsocks_node_auto() {
     return 1
 }
 
+test_vless_reality_node() {
+    local node="$1" family="${2:-default}" port cfg pid out rc=1 n=19260 url outbound warp=false
+    [[ -x "$XRAY_BIN" ]] || { echo "[错误] VLESS Reality 实连测试需要 Xray-core"; return 1; }
+    url=$(ip_echo_url_for_family "$family")
+    while ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${n}$"; do n=$((n+1)); [[ $n -lt 19320 ]] || return 1; done
+    port=$n
+    cfg=$(mktemp /tmp/ss2022-vless-chain-test.XXXXXX.json) || return 1
+    outbound=$(xray_outbound_for_node "$node" "test-out" "$family") || { rm -f "$cfg"; return 1; }
+    chain_node_needs_warp_underlay "$node" && warp=true
+    if [[ "$warp" == true ]]; then
+        outbound=$(jq -c '.streamSettings.sockopt.dialerProxy="test-warp"' <<<"$outbound") || { rm -f "$cfg"; return 1; }
+    fi
+    jq -n --argjson p "$port" --argjson out "$outbound" --argjson warp "$warp" --argjson wp "$(warp_proxy_port)" '{
+      log:{loglevel:"warning"},
+      inbounds:[{listen:"127.0.0.1",port:$p,protocol:"socks",tag:"test-in",settings:{auth:"noauth",udp:true}}],
+      outbounds:([$out] + (if $warp then [{protocol:"socks",tag:"test-warp",settings:{address:"127.0.0.1",port:$wp}}] else [] end)),
+      routing:{rules:[{type:"field",inboundTag:["test-in"],outboundTag:"test-out"}]}
+    }' > "$cfg" || { rm -f "$cfg"; return 1; }
+    chmod 600 "$cfg"
+    "$XRAY_BIN" run -test -format json -config "$cfg" >/dev/null 2>&1 || { echo "[错误] Xray Reality 配置校验失败"; rm -f "$cfg"; return 1; }
+    "$XRAY_BIN" run -format json -config "$cfg" >/tmp/ss2022-vless-chain-test.log 2>&1 & pid=$!
+    sleep 1
+    out=$(curl_chain_test_via_local_socks "$port" "$family" "$url") && rc=0
+    kill "$pid" >/dev/null 2>&1 || true
+    wait "$pid" 2>/dev/null || true
+    rm -f "$cfg"
+    if [[ "$rc" == 0 ]]; then echo "✔ VLESS Reality 落地可用，出口 IP: $out"; return 0; fi
+    echo "[错误] VLESS Reality 落地连接失败"
+    [[ -s /tmp/ss2022-chain-curl.err ]] && tail -n 3 /tmp/ss2022-chain-curl.err
+    tail -n 5 /tmp/ss2022-vless-chain-test.log 2>/dev/null || true
+    return 1
+}
+
 chain_test_node() {
     chain_select_id || return 1
     local node type server port user pass out family detected_family url
@@ -6481,6 +6514,9 @@ chain_test_node() {
     case "$type" in
         ss2022|shadowsocks)
             test_shadowsocks_node_auto "$node" "$family"
+            ;;
+        vless_reality)
+            test_vless_reality_node "$node" "$family"
             ;;
         socks5)
             server=$(jq -r '.server' <<<"$node")
