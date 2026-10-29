@@ -6155,6 +6155,11 @@ chain_add_vless_reality() {
     security=${security,,}
     transport=${transport,,}
     encryption=${encryption,,}
+    # Some clients export Reality as security=tls with pbk present.
+    # A valid Reality public key is mandatory before normalizing tls -> reality.
+    if [[ "$security" == "tls" && "$pbk" =~ ^[A-Za-z0-9_-]{43}$ ]]; then
+        security="reality"
+    fi
     [[ -z "$security" && -n "$pbk" ]] && security="reality"
     [[ "$transport" == "raw" ]] && transport="tcp"
     if [[ "$security" != "reality" || "$transport" != "tcp" || "$encryption" != "none" ]]; then
