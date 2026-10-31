@@ -4,7 +4,7 @@
 
 当前正式版本：**v1.9.0**
 
-当前开发版本：**v1.9.1-dev6**
+当前开发版本：**v1.9.1-dev7**
 
 项目以单一交互式 Bash 脚本 `ss2022.sh` 为入口，整合 **SS2022、SS2022 + ShadowTLS v3、VLESS Reality、Snell v5**，并提供 WARP 出口、链式落地、规则分流、Realm L4 端口转发、组件管理、服务器工具、服务器测试与脚本自更新。
 
@@ -457,11 +457,11 @@ SSH 端口修改采用安全方式：
 | 平台流媒体AI通信软件解锁测试 | 流媒体：1-stream / RegionRestrictionCheck；AI：oneclickvirt / UnlockTests；通信：curl 可达性检测 |
 | Google 测试 | Google 搜索 IP 定位 / YouTube 地区辅助；澳门与所在地定位尝试 |
 
-## Google 测试（v1.9.1-dev5）
+## Google 测试（v1.9.1-dev7）
 
 入口：`ss2022 → 8. 服务器测试管理 → 4. Google 测试`。包含三个功能菜单：
 
-1. **Google 送中检测**：按 IPv4 / IPv6 分开检测，显示当前出口 IP、出口地理库地区、Google 搜索底栏中明确标注来自 IP 的定位，以及 YouTube 客户端地区辅助信号。明确区分中国大陆 CN、香港 HK、澳门 MO、台湾 TW；搜索与 YouTube 冲突会单独提示，验证码、限流、超时、页面结构变化或证据不足均不报“正常”。检测使用全新无 Cookie 请求，不带 `gl` / `uule` 等强制地区参数，也不会把不跳转到国家域名解释为美国。
+1. **Google 送中检测**：按 IPv4 / IPv6 分开检测，显示当前出口 IP、出口地理库地区、Google 搜索底栏中明确标注来自 IP 的定位，以及 YouTube 客户端地区辅助信号。搜索底栏缺失时，追加一次匿名 Google 服务（Gemini）IP 地区查询；只解析指定 RPC 帧中明确标注 `SWML_DESCRIPTION_FROM_YOUR_INTERNET_ADDRESS` 的地区，不接受设备定位、账号活动或其他 RPC 字段。明确区分中国大陆 CN、香港 HK、澳门 MO、台湾 TW；搜索与 YouTube 冲突会单独提示，验证码、限流、超时、页面结构变化或证据不足均不报“正常”。搜索底栏有效时不追加接口请求；各服务分开列出，不把 Gemini 地区冒充搜索地区。若仅 YouTube 有台湾结果，会显示“部分结果——YouTube 地区为 TW，未见大陆信号；Google 搜索定位尚未确认”；接口与 YouTube 都为台湾时显示“未发现送中信号，Google 服务 IP 地区 TW，搜索定位未确认”；服务冲突及 CN 信号单独提示。检测使用全新无 Cookie 请求，不带 `gl` / `uule` 等强制地区参数，也不会把不跳转到国家域名解释为美国。
 2. **尝试主动定位澳门**：向 Google 搜索和地图发送澳门地区及参考坐标请求。可手动运行，或主动启用每 6 小时的定时尝试。
 3. **尝试拉回 VPS 所在地**：先查询 IP 地理库作为建议，再由用户按 VPS 实际机房位置核对国家代码、纬度和经度；查询失败可手动输入。提供 Google 官方 IP 定位纠错入口。
 
@@ -470,6 +470,8 @@ SSH 端口修改采用安全方式：
 **定位尝试的边界**：这些请求只能表达目标地区偏好，不能直接改写 Google 的 IP 定位数据库，不等同于浏览器 GPS，不保证送澳或拉回成功。HTTP 200 仅表示取得页面；执行后需回到第 1 项，用不带地区参数的请求独立复测。即使搜索显示目标地区，也不能证明其他 Google 产品已同步。Google 官方提供 [报告 IP 问题](https://support.google.com/websearch/workflow/9308722?hl=zh-Hans)，说明更正可能需要一个月以上。
 
 所有请求使用系统当前路由并绕过 curl 环境代理和 `.curlrc`；已存在的全局 WARP、透明代理或策略路由仍可改变实际出口。IP 地理库与 Google 的识别结果可能不同，均不能证明实际机房位置。本功能不调整 DNS、WARP、代理节点、防火墙或已有分流规则。首次使用按需安装 curl / Python 3；无第三方脚本下载执行。
+
+接口协议参考 [RegionRestrictionCheck 的 Google 地区探测](https://github.com/1-stream/RegionRestrictionCheck/blob/main/check.sh) 和 [GetUserLocation 响应结构](https://github.com/Leechael/gemini-web-cli/blob/main/internal/client/protocol/rpcs/get_user_location.go)，以独立的结构化解析实现，不下载或导入第三方代码。该接口非稳定公开 API；拒绝访问或结构变化时仍会显示未知，不推测成功。
 
 验证：`bash tests/test-google.sh` 使用离线页面和 HTTP / systemd / cron 替身，检查识别、失败路径、配置、生成的独立 worker、定时替换和停止。该回归不证明真实 VPS 的地区已改变；页面解析与长期定位效果仍需实机验证。
 
