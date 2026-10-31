@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
-# 当前版本: v1.9.1-dev6
+# 当前版本: v1.9.1-dev7
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,10 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.9.1-dev7:
+#   - Google 搜索底栏缺失时增加匿名服务 IP 地区查询，按来源分别展示，不依赖单个页面结构
+#   - 仅接受明确来自互联网地址的地区，区分部分结果、送中信号、服务冲突与无法判断
 #
 # v1.9.1-dev6:
 #   - 所有 mktemp 模板改为以 XXXXXX 结尾，修复 BusyBox/Alpine 更新、配置与测试临时文件创建失败
@@ -656,7 +660,7 @@
 # 注意: v1.9.0 为稳定正式版；Alpine 3.21 上 Snell v5 与 Cloudflare WARP 仍受官方组件兼容性限制。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.1-dev6"
+SCRIPT_VERSION="v1.9.1-dev7"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -11862,13 +11866,14 @@ google_test_dependencies() {
 
 google_fetch() {
     local family="$1" url="$2" body="$3" meta
+    shift 3
     GOOGLE_CURL_RC=0
     meta=$(curl -q "-$family" --noproxy '*' --proto '=https' --proto-redir '=https' \
         -sS -L --max-redirs 3 --connect-timeout 5 --max-time 15 \
         --max-filesize 2097152 --compressed \
         -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36' \
         -H 'Accept-Language: en-US,en;q=0.9' -o "$body" \
-        -w $'%{http_code}\t%{url_effective}' "$url" 2>/dev/null) || GOOGLE_CURL_RC=$?
+        -w $'%{http_code}\t%{url_effective}' "$@" "$url" 2>/dev/null) || GOOGLE_CURL_RC=$?
     GOOGLE_HTTP_CODE=${meta%%$'\t'*}
     GOOGLE_HTTP_URL=${meta#*$'\t'}
 }
@@ -11888,7 +11893,9 @@ if code != '200':
     sys.exit()
 body = open(path, encoding='utf-8', errors='replace').read()
 host, route = urlparse(url).hostname or '', urlparse(url).path
-expected = ('www.google.com', 'google.com') if kind == 'search' else ('www.youtube.com', 'youtube.com')
+expected = {'search': ('www.google.com', 'google.com'),
+            'youtube': ('www.youtube.com', 'youtube.com'),
+            'location': ('gemini.google.com',)}.get(kind, ())
 if host.startswith('consent.') or '/sorry' in route or re.search(
         r'unusual traffic|g-recaptcha|id=["\x27]captcha|before you continue to (?:google|youtube)', body, re.I):
     print('UNKNOWN\t验证码/同意页面，无法判断地区')
@@ -11896,6 +11903,33 @@ if host.startswith('consent.') or '/sorry' in route or re.search(
 if host not in expected:
     print('UNKNOWN\t跳转到其他站点，不能据此判定送中')
     sys.exit()
+names = {
+    'Hong Kong': 'HK', 'Macao': 'MO', 'Macau': 'MO', 'Taiwan': 'TW',
+    'United States': 'US', 'United Kingdom': 'GB', 'South Korea': 'KR',
+    'New Zealand': 'NZ', 'South Africa': 'ZA', 'United Arab Emirates': 'AE',
+    'China': 'CN', 'Japan': 'JP', 'Singapore': 'SG', 'Germany': 'DE',
+    'France': 'FR', 'Canada': 'CA', 'Australia': 'AU', 'Netherlands': 'NL',
+    'Sweden': 'SE', 'Switzerland': 'CH', 'Finland': 'FI', 'Norway': 'NO',
+    'Denmark': 'DK', 'Ireland': 'IE', 'Italy': 'IT', 'Spain': 'ES',
+    'Poland': 'PL', 'Austria': 'AT', 'Belgium': 'BE', 'Portugal': 'PT',
+    'India': 'IN', 'Indonesia': 'ID', 'Malaysia': 'MY', 'Thailand': 'TH',
+    'Vietnam': 'VN', 'Philippines': 'PH', 'Brazil': 'BR', 'Mexico': 'MX',
+    'Argentina': 'AR', 'Chile': 'CL', 'Turkey': 'TR', 'Türkiye': 'TR',
+    'Israel': 'IL', 'Russia': 'RU', 'Ukraine': 'UA', 'Romania': 'RO',
+    'Czechia': 'CZ', 'Iceland': 'IS', 'Luxembourg': 'LU', 'Saudi Arabia': 'SA',
+}
+
+def country_code(location):
+    # A bare ISO code is unambiguous; a city suffix such as CA may be a
+    # subdivision and is not assumed to mean Canada.
+    if location.strip().upper() in set(names.values()):
+        return location.strip().upper()
+    found = {cc for name, cc in names.items()
+             if re.search(r'\b' + re.escape(name) + r'\b', location, re.I)}
+    if found.intersection(('HK', 'MO', 'TW')):
+        found.discard('CN')
+    return next(iter(found)) if len(found) == 1 else 'UNKNOWN'
+
 if kind == 'youtube':
     countries = set()
     for match in re.finditer(r'"INNERTUBE_CONTEXT"\s*:\s*', body):
@@ -11913,13 +11947,58 @@ if kind == 'youtube':
         print('UNKNOWN\tYouTube 地区字段缺失或冲突')
     sys.exit()
 
+if kind == 'location':
+    # Public batchexecute framing: anti-XSSI prefix, byte counts, JSON batches.
+    # Inspect only the named RPC frame, never arbitrary text or other RPC data.
+    frames = []
+    def collect(value):
+        if not isinstance(value, list):
+            return
+        if len(value) >= 3 and value[0] == 'wrb.fr':
+            if value[1] == 'K4WWud':
+                frames.append(value)
+            return
+        for item in value:
+            collect(item)
+    consumed = 0
+    for match in re.finditer(r'(?m)^\s*(?=\[)', body):
+        if match.start() < consumed:
+            continue
+        try:
+            value, end = json.JSONDecoder().raw_decode(body[match.end():])
+            consumed = match.end() + end
+            collect(value)
+        except (ValueError, RecursionError):
+            pass
+    try:
+        if len(frames) != 1 or not isinstance(frames[0][2], str):
+            raise ValueError()
+        frame = frames[0]
+        if len(frame) > 5 and frame[5] is not None:
+            if not isinstance(frame[5], list) or any(type(v) is not int or v != 0 for v in frame[5]):
+                raise ValueError()
+        payload = json.loads(frame[2])
+        row = payload[0]
+        if not isinstance(row, list) or len(row) < 2 or row[1] != 'SWML_DESCRIPTION_FROM_YOUR_INTERNET_ADDRESS':
+            raise ValueError()
+        region = row[0]
+        if not isinstance(region, str) or not 0 < len(region) <= 160 or not all(c.isprintable() for c in region):
+            raise ValueError()
+        cc = country_code(region)
+        if cc == 'UNKNOWN':
+            raise ValueError()
+        print(cc + '\tGoogle 服务 IP 定位（Gemini）：' + region)
+    except (ValueError, TypeError, IndexError, KeyError, RecursionError):
+        print('UNKNOWN\t服务接口未提供唯一、可确认的互联网地址定位')
+    sys.exit()
+
 class Footer(HTMLParser):
     def __init__(self):
         super().__init__()
         self.stack, self.chunks, self.hidden = [], [], 0
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
-        active = any(self.stack) or attrs.get('id', '') in ('fbar', 'footer', 'fsl', 'swml', 'Wprf1b') or attrs.get('role') == 'contentinfo' or tag == 'footer'
+        active = any(self.stack) or attrs.get('id', '') in ('fbar', 'footer', 'footcnt', 'fsl', 'swml', 'Wprf1b') or attrs.get('role') == 'contentinfo' or tag == 'footer'
         if tag not in ('br', 'hr', 'img', 'input', 'meta', 'link', 'source', 'wbr', 'area', 'base', 'embed', 'param', 'track', 'col'):
             self.stack.append(active)
         if tag in ('script', 'style'):
@@ -11940,39 +12019,24 @@ text = ''.join(c for c in text if c.isprintable())
 # Only the Search footer, explicitly attributed to the IP, is primary evidence.
 ip_basis = re.search(r'(?:from your (?:internet|IP) address|based on your IP address)', text, re.I)
 if not ip_basis:
-    print('UNKNOWN\t搜索页未提供可确认的 IP 定位底栏')
+    if re.search(r'enablejs|please enable javascript|javascript (?:is )?disabled', body, re.I):
+        print('UNKNOWN\t搜索页依赖 JavaScript，未取得 IP 定位底栏')
+    else:
+        print('UNKNOWN\t搜索页未提供可确认的 IP 定位底栏')
     sys.exit()
 # Limit to the location part, excluding footer links and result snippets.
 location = text[:ip_basis.start()].strip().rstrip(' -·—')
-names = {
-    'Hong Kong': 'HK', 'Macao': 'MO', 'Macau': 'MO', 'Taiwan': 'TW',
-    'United States': 'US', 'United Kingdom': 'GB', 'South Korea': 'KR',
-    'New Zealand': 'NZ', 'South Africa': 'ZA', 'United Arab Emirates': 'AE',
-    'China': 'CN', 'Japan': 'JP', 'Singapore': 'SG', 'Germany': 'DE',
-    'France': 'FR', 'Canada': 'CA', 'Australia': 'AU', 'Netherlands': 'NL',
-    'Sweden': 'SE', 'Switzerland': 'CH', 'Finland': 'FI', 'Norway': 'NO',
-    'Denmark': 'DK', 'Ireland': 'IE', 'Italy': 'IT', 'Spain': 'ES',
-    'Poland': 'PL', 'Austria': 'AT', 'Belgium': 'BE', 'Portugal': 'PT',
-    'India': 'IN', 'Indonesia': 'ID', 'Malaysia': 'MY', 'Thailand': 'TH',
-    'Vietnam': 'VN', 'Philippines': 'PH', 'Brazil': 'BR', 'Mexico': 'MX',
-    'Argentina': 'AR', 'Chile': 'CL', 'Turkey': 'TR', 'Türkiye': 'TR',
-    'Israel': 'IL', 'Russia': 'RU', 'Ukraine': 'UA', 'Romania': 'RO',
-    'Czechia': 'CZ', 'Iceland': 'IS', 'Luxembourg': 'LU', 'Saudi Arabia': 'SA',
-}
-found = [cc for name, cc in names.items() if re.search(r'\b' + re.escape(name) + r'\b', location, re.I)]
-# HK/MO/TW followed by China can be a territory name, not mainland China.
-if any(cc in found for cc in ('HK', 'MO', 'TW')):
-    found = [cc for cc in found if cc != 'CN']
-found = set(found)
-if len(found) == 1:
-    print(next(iter(found)) + '\tGoogle 搜索 IP 定位：' + location[:180])
+
+cc = country_code(location)
+if cc != 'UNKNOWN':
+    print(cc + '\tGoogle 搜索 IP 定位：' + location[:180])
 else:
     print('UNKNOWN\tIP 定位底栏无法映射国家/地区：' + location[:180])
 PY_GOOGLE
 }
 
 google_probe_family() (
-    local family="$1" tmp search_result yt_result search_cc yt_cc
+    local family="$1" tmp search_result yt_result geo_result search_cc yt_cc geo_cc
     tmp=$(mktemp -d /tmp/ss2022-google.XXXXXX) || return 1
     trap 'rm -rf "$tmp"' EXIT
     trap 'exit 130' INT
@@ -11986,18 +12050,41 @@ google_probe_family() (
     fi
     google_fetch "$family" 'https://www.google.com/search?q=weather&hl=en&pws=0' "$tmp/search"
     search_result=$(google_parse_response search "$tmp/search" "$GOOGLE_HTTP_CODE" "$GOOGLE_HTTP_URL" "$GOOGLE_CURL_RC") || return 1
+    search_cc=${search_result%%$'\t'*}
+    geo_cc=UNKNOWN
+    geo_result=$'UNKNOWN\t搜索底栏已有结果，未追加请求'
+    if [[ "$search_cc" == UNKNOWN ]]; then
+        echo "搜索底栏未确认，正在补测 Google 服务 IP 定位..."
+        # Read-only, anonymous location RPC. No target country, coordinates,
+        # account cookie, or location-update request is supplied.
+        google_fetch "$family" 'https://gemini.google.com/_/BardChatUi/data/batchexecute?rpcids=K4WWud&hl=en&rt=c&source-path=%2Fapp' "$tmp/location" \
+            --data-urlencode 'f.req=[[["K4WWud","[[0],[\"en-US\"]]",null,"generic"]]]'
+        geo_result=$(google_parse_response location "$tmp/location" "$GOOGLE_HTTP_CODE" "$GOOGLE_HTTP_URL" "$GOOGLE_CURL_RC") || return 1
+        geo_cc=${geo_result%%$'\t'*}
+    fi
     google_fetch "$family" 'https://www.youtube.com/premium?hl=en' "$tmp/youtube"
     yt_result=$(google_parse_response youtube "$tmp/youtube" "$GOOGLE_HTTP_CODE" "$GOOGLE_HTTP_URL" "$GOOGLE_CURL_RC") || return 1
-    search_cc=${search_result%%$'\t'*}; yt_cc=${yt_result%%$'\t'*}
-    printf 'Google 搜索: %s\nYouTube 辅助: %s\n' "$search_result" "$yt_result"
+    yt_cc=${yt_result%%$'\t'*}
+    printf 'Google 搜索: %s\n' "$search_result"
+    [[ "$search_cc" != UNKNOWN ]] || printf 'Google 服务: %s\n' "$geo_result"
+    printf 'YouTube 辅助: %s\n' "$yt_result"
     if [[ "$search_cc" == CN ]]; then
         echo "结论：Google 搜索 IP 定位为中国大陆（送中）。"
     elif [[ "$search_cc" != UNKNOWN && "$yt_cc" != UNKNOWN && "$search_cc" != "$yt_cc" ]]; then
         echo "结论：Google 搜索与 YouTube 地区不一致，不能给出统一定位。"
     elif [[ "$search_cc" != UNKNOWN ]]; then
         echo "结论：本次 Google 搜索未发现送中（${search_cc}）；不代表 Gemini 或其他产品可用。"
+    elif [[ "$geo_cc" != UNKNOWN && "$yt_cc" != UNKNOWN && "$geo_cc" != "$yt_cc" ]]; then
+        echo "结论：服务地区不一致（Google 服务 ${geo_cc} / YouTube ${yt_cc}），搜索定位未确认。"
+        [[ "$geo_cc" != CN && "$yt_cc" != CN ]] || echo "提示：存在中国大陆 CN 信号，疑似部分服务送中。"
+    elif [[ "$geo_cc" == CN ]]; then
+        echo "结论：发现送中信号——Google 服务将 IP 定位为中国大陆（搜索底栏未确认）。"
     elif [[ "$yt_cc" == CN ]]; then
         echo "结论：YouTube 出现 CN 信号；Google 搜索证据不足，疑似送中。"
+    elif [[ "$geo_cc" != UNKNOWN ]]; then
+        echo "结论：本次未发现送中信号；Google 服务 IP 地区为 ${geo_cc}（搜索定位未确认）。"
+    elif [[ "$yt_cc" != UNKNOWN ]]; then
+        echo "结论：部分结果——YouTube 地区为 ${yt_cc}，未见大陆信号；Google 搜索定位尚未确认。"
     else
         echo "结论：Google 搜索证据不足，无法判定是否送中。"
     fi
