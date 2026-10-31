@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
-# 当前版本: v1.9.1-dev4
+# 当前版本: v1.9.1-dev5
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,11 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.9.1-dev5:
+#   - 服务器测试新增 Google 三项菜单：送中检测、尝试定位澳门、尝试拉回 VPS 所在地
+#   - IPv4/IPv6 分开检测；搜索 IP 定位为主，YouTube 为辅助；失败、冲突或缺失明确显示未知
+#   - 定位请求仅属实验尝试，可手动执行或每六小时运行，支持停止与卸载；不修改代理分流
 #
 # v1.9.1-dev4:
 #   - 新增 4GTV（台湾四季线上）分流预置，精确覆盖 4gtv.tv 与四个专属 Hinet CDN 主机
@@ -647,7 +652,7 @@
 # 注意: v1.9.0 为稳定正式版；Alpine 3.21 上 Snell v5 与 Cloudflare WARP 仍受官方组件兼容性限制。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.1-dev4"
+SCRIPT_VERSION="v1.9.1-dev5"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -746,6 +751,8 @@ DNS_MARKER="/etc/ss2022-ipv6-dns-managed"
 FORCE_IPV6_CONF="/etc/apt/apt.conf.d/99ss2022-force-ipv6"
 FORCE_IPV6_LEGACY_CONF="/etc/apt/apt.conf.d/99force-ipv6"
 STATE_DIR="/etc/ss2022"
+GOOGLE_LOCATION_WORKER="/usr/local/lib/ss2022/google-location-worker.sh"
+GOOGLE_LOCATION_UNIT_DIR="/etc/systemd/system"
 STATE_FILE="${STATE_DIR}/state.json"
 ROUTING_FILE="${STATE_DIR}/routing.json"
 WARP_DEFAULT_PORT=40000
@@ -8241,6 +8248,8 @@ full_uninstall() {
     read -rp "确认彻底卸载？请输入 DELETE: " yes
     [[ "$yes" == "DELETE" ]] || { echo "已取消。"; sleep 1; return; }
 
+    google_location_remove || return 1
+
     if [[ "$PLATFORM_INIT" == "systemd" ]]; then
         [[ $singbox_managed -eq 1 ]] && systemctl disable --now sing-box >/dev/null 2>&1 || true
         [[ $snell_managed -eq 1 ]] && systemctl disable --now snell-v5 >/dev/null 2>&1 || true
@@ -11841,6 +11850,450 @@ test_platform_media_ai_communication_unlock() {
     pause
 }
 
+# Google probes deliberately use fresh, unforced requests. A locale request is
+# never reused as evidence that Google's IP geolocation database has changed.
+google_test_dependencies() {
+    ensure_test_dependency curl curl && ensure_test_dependency python3 python3
+}
+
+google_fetch() {
+    local family="$1" url="$2" body="$3" meta
+    GOOGLE_CURL_RC=0
+    meta=$(curl -q "-$family" --noproxy '*' --proto '=https' --proto-redir '=https' \
+        -sS -L --max-redirs 3 --connect-timeout 5 --max-time 15 \
+        --max-filesize 2097152 --compressed \
+        -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36' \
+        -H 'Accept-Language: en-US,en;q=0.9' -o "$body" \
+        -w $'%{http_code}\t%{url_effective}' "$url" 2>/dev/null) || GOOGLE_CURL_RC=$?
+    GOOGLE_HTTP_CODE=${meta%%$'\t'*}
+    GOOGLE_HTTP_URL=${meta#*$'\t'}
+}
+
+google_parse_response() {
+    python3 - "$@" <<'PY_GOOGLE'
+import html, json, re, sys
+from html.parser import HTMLParser
+from urllib.parse import urlparse
+
+kind, path, code, url, rc = sys.argv[1:]
+if rc != '0':
+    print('UNKNOWN\tcurl ' + rc + '（DNS/连接/TLS/超时或响应过大）')
+    sys.exit()
+if code != '200':
+    print('UNKNOWN\tHTTP ' + code + '（未取得有效页面）')
+    sys.exit()
+body = open(path, encoding='utf-8', errors='replace').read()
+host, route = urlparse(url).hostname or '', urlparse(url).path
+expected = ('www.google.com', 'google.com') if kind == 'search' else ('www.youtube.com', 'youtube.com')
+if host.startswith('consent.') or '/sorry' in route or re.search(
+        r'unusual traffic|g-recaptcha|id=["\x27]captcha|before you continue to (?:google|youtube)', body, re.I):
+    print('UNKNOWN\t验证码/同意页面，无法判断地区')
+    sys.exit()
+if host not in expected:
+    print('UNKNOWN\t跳转到其他站点，不能据此判定送中')
+    sys.exit()
+if kind == 'youtube':
+    countries = set()
+    for match in re.finditer(r'"INNERTUBE_CONTEXT"\s*:\s*', body):
+        try:
+            obj, _ = json.JSONDecoder().raw_decode(body[match.end():])
+            value = obj.get('client', {}).get('gl', '')
+            if re.fullmatch('[A-Z]{2}', value):
+                countries.add(value)
+        except (ValueError, AttributeError, TypeError):
+            pass
+    countries.update(re.findall(r'"INNERTUBE_CONTEXT_GL"\s*:\s*"([A-Z]{2})"', body))
+    if len(countries) == 1:
+        print(next(iter(countries)) + '\tYouTube 客户端地区（辅助信号）')
+    else:
+        print('UNKNOWN\tYouTube 地区字段缺失或冲突')
+    sys.exit()
+
+class Footer(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.stack, self.chunks, self.hidden = [], [], 0
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        active = any(self.stack) or attrs.get('id', '') in ('fbar', 'footer', 'fsl', 'swml', 'Wprf1b') or attrs.get('role') == 'contentinfo' or tag == 'footer'
+        if tag not in ('br', 'hr', 'img', 'input', 'meta', 'link', 'source', 'wbr', 'area', 'base', 'embed', 'param', 'track', 'col'):
+            self.stack.append(active)
+        if tag in ('script', 'style'):
+            self.hidden += 1
+    def handle_endtag(self, tag):
+        if tag in ('script', 'style'):
+            self.hidden = max(0, self.hidden - 1)
+        if self.stack:
+            self.stack.pop()
+    def handle_data(self, data):
+        if any(self.stack) and not self.hidden:
+            self.chunks.append(data)
+
+parser = Footer()
+parser.feed(body)
+text = re.sub(r'\s+', ' ', html.unescape(' '.join(parser.chunks))).strip()
+text = ''.join(c for c in text if c.isprintable())
+# Only the Search footer, explicitly attributed to the IP, is primary evidence.
+ip_basis = re.search(r'(?:from your (?:internet|IP) address|based on your IP address)', text, re.I)
+if not ip_basis:
+    print('UNKNOWN\t搜索页未提供可确认的 IP 定位底栏')
+    sys.exit()
+# Limit to the location part, excluding footer links and result snippets.
+location = text[:ip_basis.start()].strip().rstrip(' -·—')
+names = {
+    'Hong Kong': 'HK', 'Macao': 'MO', 'Macau': 'MO', 'Taiwan': 'TW',
+    'United States': 'US', 'United Kingdom': 'GB', 'South Korea': 'KR',
+    'New Zealand': 'NZ', 'South Africa': 'ZA', 'United Arab Emirates': 'AE',
+    'China': 'CN', 'Japan': 'JP', 'Singapore': 'SG', 'Germany': 'DE',
+    'France': 'FR', 'Canada': 'CA', 'Australia': 'AU', 'Netherlands': 'NL',
+    'Sweden': 'SE', 'Switzerland': 'CH', 'Finland': 'FI', 'Norway': 'NO',
+    'Denmark': 'DK', 'Ireland': 'IE', 'Italy': 'IT', 'Spain': 'ES',
+    'Poland': 'PL', 'Austria': 'AT', 'Belgium': 'BE', 'Portugal': 'PT',
+    'India': 'IN', 'Indonesia': 'ID', 'Malaysia': 'MY', 'Thailand': 'TH',
+    'Vietnam': 'VN', 'Philippines': 'PH', 'Brazil': 'BR', 'Mexico': 'MX',
+    'Argentina': 'AR', 'Chile': 'CL', 'Turkey': 'TR', 'Türkiye': 'TR',
+    'Israel': 'IL', 'Russia': 'RU', 'Ukraine': 'UA', 'Romania': 'RO',
+    'Czechia': 'CZ', 'Iceland': 'IS', 'Luxembourg': 'LU', 'Saudi Arabia': 'SA',
+}
+found = [cc for name, cc in names.items() if re.search(r'\b' + re.escape(name) + r'\b', location, re.I)]
+# HK/MO/TW followed by China can be a territory name, not mainland China.
+if any(cc in found for cc in ('HK', 'MO', 'TW')):
+    found = [cc for cc in found if cc != 'CN']
+found = set(found)
+if len(found) == 1:
+    print(next(iter(found)) + '\tGoogle 搜索 IP 定位：' + location[:180])
+else:
+    print('UNKNOWN\tIP 定位底栏无法映射国家/地区：' + location[:180])
+PY_GOOGLE
+}
+
+google_probe_family() (
+    local family="$1" tmp search_result yt_result search_cc yt_cc
+    tmp=$(mktemp -d /tmp/ss2022-google.XXXXXX) || return 1
+    trap 'rm -rf "$tmp"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    echo "========== Google / IPv${family} =========="
+    google_fetch "$family" 'https://www.cloudflare.com/cdn-cgi/trace' "$tmp/trace"
+    if [[ "$GOOGLE_CURL_RC" == 0 && "$GOOGLE_HTTP_CODE" == 200 ]]; then
+        awk -F= '$1=="ip" && $2 ~ /^[0-9a-fA-F:.]+$/ {print "当前出口 IP: " $2} $1=="loc" && $2 ~ /^[A-Z][A-Z]$/ {print "出口地理库地区: " $2 "（非 Google）"}' "$tmp/trace"
+    else
+        echo "当前出口信息未取得，继续独立检测 Google。"
+    fi
+    google_fetch "$family" 'https://www.google.com/search?q=weather&hl=en&pws=0' "$tmp/search"
+    search_result=$(google_parse_response search "$tmp/search" "$GOOGLE_HTTP_CODE" "$GOOGLE_HTTP_URL" "$GOOGLE_CURL_RC") || return 1
+    google_fetch "$family" 'https://www.youtube.com/premium?hl=en' "$tmp/youtube"
+    yt_result=$(google_parse_response youtube "$tmp/youtube" "$GOOGLE_HTTP_CODE" "$GOOGLE_HTTP_URL" "$GOOGLE_CURL_RC") || return 1
+    search_cc=${search_result%%$'\t'*}; yt_cc=${yt_result%%$'\t'*}
+    printf 'Google 搜索: %s\nYouTube 辅助: %s\n' "$search_result" "$yt_result"
+    if [[ "$search_cc" == CN ]]; then
+        echo "结论：Google 搜索 IP 定位为中国大陆（送中）。"
+    elif [[ "$search_cc" != UNKNOWN && "$yt_cc" != UNKNOWN && "$search_cc" != "$yt_cc" ]]; then
+        echo "结论：Google 搜索与 YouTube 地区不一致，不能给出统一定位。"
+    elif [[ "$search_cc" != UNKNOWN ]]; then
+        echo "结论：本次 Google 搜索未发现送中（${search_cc}）；不代表 Gemini 或其他产品可用。"
+    elif [[ "$yt_cc" == CN ]]; then
+        echo "结论：YouTube 出现 CN 信号；Google 搜索证据不足，疑似送中。"
+    else
+        echo "结论：Google 搜索证据不足，无法判定是否送中。"
+    fi
+)
+
+google_test_run() {
+    google_test_dependencies || return 1
+    server_test_select_ip_mode || return
+    echo "检测系统当前出口；已绕过 curl 环境代理。全局 WARP/透明路由仍会影响出口。"
+    [[ "$SERVER_TEST_IP_MODE" == 6 ]] || google_probe_family 4
+    [[ "$SERVER_TEST_IP_MODE" == 4 ]] || google_probe_family 6
+    pause
+}
+
+google_location_validate() {
+    python3 - "$@" <<'PY_TARGET'
+import math, re, sys
+cc, lat, lon = sys.argv[1:]
+codes = 'AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI BJ BL BM BN BO BQ BR BS BT BV BW BY BZ CA CC CD CF CG CH CI CK CL CM CN CO CR CU CV CW CX CY CZ DE DJ DK DM DO DZ EC EE EG EH ER ES ET FI FJ FK FM FO FR GA GB GD GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY HK HM HN HR HT HU ID IE IL IM IN IO IQ IR IS IT JE JM JO JP KE KG KH KI KM KN KP KR KW KY KZ LA LB LC LI LK LR LS LT LU LV LY MA MC MD ME MF MG MH MK ML MM MN MO MP MQ MR MS MT MU MV MW MX MY MZ NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF PG PH PK PL PM PN PR PS PT PW PY QA RE RO RS RU RW SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SX SY SZ TC TD TF TG TH TJ TK TL TM TN TO TR TT TV TW TZ UA UG UM US UY UZ VA VC VE VG VI VN VU WF WS YE YT ZA ZM ZW'.split()
+try:
+    valid = cc in codes and all(re.fullmatch(r'-?\d{1,3}(?:\.\d{1,8})?', v) for v in (lat, lon))
+    valid = valid and math.isfinite(float(lat)) and math.isfinite(float(lon)) and -90 <= float(lat) <= 90 and -180 <= float(lon) <= 180
+except ValueError:
+    valid = False
+sys.exit(0 if valid else 1)
+PY_TARGET
+}
+
+google_location_round() (
+    local family="$1" cc="$2" lat="$3" lon="$4" tmp url ok=0 failed=0
+    google_location_validate "$cc" "$lat" "$lon" || return 1
+    [[ "$family" == 4 || "$family" == 6 ]] || return 1
+    tmp=$(mktemp -d /tmp/ss2022-google-location.XXXXXX) || return 1
+    trap 'rm -rf "$tmp"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    echo "IPv${family} 目标地区 ${cc}，参考坐标 ${lat},${lon}"
+    for url in \
+        "https://www.google.com/search?q=local+weather&hl=en&gl=${cc,,}&pws=0" \
+        "https://www.google.com/maps/search/?api=1&query=${lat}%2C${lon}&hl=en"; do
+        google_fetch "$family" "$url" "$tmp/body"
+        if [[ "$GOOGLE_CURL_RC" == 0 && "$GOOGLE_HTTP_CODE" == 200 && "$GOOGLE_HTTP_URL" == https://www.google.com/* ]] \
+            && ! grep -Eiq 'unusual traffic|g-recaptcha|before you continue|/sorry/' "$tmp/body" \
+            && [[ "$GOOGLE_HTTP_URL" != *'/sorry/'* ]]; then
+            ok=$((ok + 1))
+        else
+            failed=$((failed + 1))
+            printf '请求未完成：curl=%s HTTP=%s；停止本轮，避免重复触发风控。\n' "$GOOGLE_CURL_RC" "$GOOGLE_HTTP_CODE"
+            break
+        fi
+    done
+    echo "地区请求：完成 ${ok}/2，异常 ${failed}。HTTP 成功不代表 IP 定位已改变。"
+    [[ $failed -eq 0 ]]
+)
+
+google_location_worker() (
+    local cfg="${STATE_DIR}/google-location.json" tmp mode family cc lat lon result=0
+    [[ -f "$cfg" ]] || return 1
+    # Read structured data; never source a mutable configuration as shell code.
+    tmp=$(python3 - "$cfg" <<'PY_CONFIG'
+import json, sys
+try:
+    obj = json.load(open(sys.argv[1]))
+    fields = [obj[k] for k in ('mode', 'family', 'cc', 'lat', 'lon')]
+    if obj.get('owner') != 'vps-bootstrap-google-v1' or fields[0] not in ('macau', 'restore') or fields[1] not in ('4', '6', '0'):
+        raise ValueError()
+    if not all(isinstance(v, str) and not any(c.isspace() for c in v) for v in fields):
+        raise ValueError()
+    print('\t'.join(fields))
+except (ValueError, KeyError, TypeError):
+    sys.exit(1)
+PY_CONFIG
+    ) || return 1
+    IFS=$'\t' read -r mode family cc lat lon <<<"$tmp"
+    google_location_validate "$cc" "$lat" "$lon" || return 1
+    tmp=$(mktemp "${STATE_DIR}/.google-location-last.XXXXXX") || return 1
+    trap 'rm -f "$tmp"' EXIT
+    {
+        date -u '+执行时间：%Y-%m-%d %H:%M:%S UTC'
+        echo "任务：${mode}，目标 ${cc}；本记录仅表示请求结果。"
+        if [[ "$family" != 6 ]]; then
+            google_location_round 4 "$cc" "$lat" "$lon" || result=1
+        fi
+        if [[ "$family" != 4 ]]; then
+            google_location_round 6 "$cc" "$lat" "$lon" || result=1
+        fi
+    } >"$tmp" 2>&1
+    chmod 600 "$tmp" && mv -f "$tmp" "${STATE_DIR}/google-location-last.txt" || return 1
+    return "$result"
+)
+
+google_location_stop() {
+    if [[ "${PLATFORM_INIT:-}" == systemd ]]; then
+        if [[ -f "${GOOGLE_LOCATION_UNIT_DIR}/ss2022-google-location.timer" ]]; then
+            systemctl disable --now ss2022-google-location.timer >/dev/null 2>&1 || return 1
+            systemctl stop ss2022-google-location.service >/dev/null 2>&1 || return 1
+        fi
+    elif command -v crontab >/dev/null 2>&1; then
+        local tmp
+        tmp=$(mktemp /tmp/ss2022-google-cron.XXXXXX) || return 1
+        crontab -l 2>/dev/null | sed '/# ss2022-google-location$/d' >"$tmp"
+        crontab "$tmp"; local rc=$?
+        rm -f "$tmp"
+        [[ $rc -eq 0 ]] || return 1
+    fi
+    # Stop future schedules; a cron round already in progress finishes within 60s.
+    rm -f "${STATE_DIR}/google-location.json"
+}
+
+google_location_remove() {
+    # No task installed: do not touch cron or other service state on uninstall.
+    [[ -f "${STATE_DIR}/google-location.json" || -f "${GOOGLE_LOCATION_WORKER}" ]] || return 0
+    google_location_stop || { echo "[错误] Google 定时任务停止失败，保留文件以便重试。"; return 1; }
+    rm -f "${GOOGLE_LOCATION_UNIT_DIR}/ss2022-google-location.service" "${GOOGLE_LOCATION_UNIT_DIR}/ss2022-google-location.timer"
+    [[ "${PLATFORM_INIT:-}" != systemd ]] || systemctl daemon-reload
+    rm -f "${GOOGLE_LOCATION_WORKER}" "${STATE_DIR}/google-location-last.txt"
+}
+
+google_location_enable() {
+    local mode="$1" family="$2" cc="$3" lat="$4" lon="$5" tmp name
+    google_location_validate "$cc" "$lat" "$lon" || return 1
+    [[ "$mode" == macau || "$mode" == restore ]] || return 1
+    [[ "$family" == 0 || "$family" == 4 || "$family" == 6 ]] || return 1
+    if [[ "${PLATFORM_INIT:-}" != systemd ]]; then
+        command -v crontab >/dev/null 2>&1 && rc-service crond status >/dev/null 2>&1 || {
+            echo "[错误] 需要正在运行的 crond；未启用定时任务。"; return 1;
+        }
+    fi
+    google_location_stop || return 1
+    install -d -m 755 "$STATE_DIR" "$(dirname "$GOOGLE_LOCATION_WORKER")" "$GOOGLE_LOCATION_UNIT_DIR" || return 1
+    tmp=$(mktemp /tmp/ss2022-google-worker.XXXXXX) || return 1
+    {
+        echo '#!/bin/bash'
+        echo '# Managed by vps-bootstrap: Google location attempts only.'
+        printf 'STATE_DIR=%q\n' "$STATE_DIR"
+        for name in google_fetch google_location_validate google_location_round google_location_worker; do
+            declare -f "$name"
+        done
+        echo 'google_location_worker'
+    } >"$tmp"
+    bash -n "$tmp" && install -m 700 "$tmp" "$GOOGLE_LOCATION_WORKER" || { rm -f "$tmp"; return 1; }
+    rm -f "$tmp"
+    tmp=$(mktemp "${STATE_DIR}/.google-location-config.XXXXXX") || return 1
+    python3 - "$mode" "$family" "$cc" "$lat" "$lon" >"$tmp" <<'PY_SAVE'
+import json, sys
+print(json.dumps(dict(zip(('owner', 'mode', 'family', 'cc', 'lat', 'lon'),
+                         ['vps-bootstrap-google-v1'] + sys.argv[1:]))))
+PY_SAVE
+    chmod 600 "$tmp" && mv -f "$tmp" "${STATE_DIR}/google-location.json" || return 1
+    if [[ "${PLATFORM_INIT:-}" == systemd ]]; then
+        cat >"${GOOGLE_LOCATION_UNIT_DIR}/ss2022-google-location.service" <<GOOGLE_SERVICE
+[Unit]
+Description=vps-bootstrap Google location attempt (experimental)
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/bin/bash ${GOOGLE_LOCATION_WORKER}
+TimeoutStartSec=90
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=${STATE_DIR}
+GOOGLE_SERVICE
+        cat >"${GOOGLE_LOCATION_UNIT_DIR}/ss2022-google-location.timer" <<'GOOGLE_TIMER'
+[Unit]
+Description=vps-bootstrap Google location attempt every six hours
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=6h
+RandomizedDelaySec=15min
+[Install]
+WantedBy=timers.target
+GOOGLE_TIMER
+        if ! systemctl daemon-reload || ! systemctl enable --now ss2022-google-location.timer; then
+            google_location_stop
+            echo "[错误] 定时器启用失败。"; return 1
+        fi
+    else
+        tmp=$(mktemp /tmp/ss2022-google-cron.XXXXXX) || return 1
+        crontab -l 2>/dev/null >"$tmp" || true
+        echo "17 */6 * * * /bin/bash ${GOOGLE_LOCATION_WORKER} >/dev/null 2>&1 # ss2022-google-location" >>"$tmp"
+        crontab "$tmp"; local rc=$?
+        rm -f "$tmp"
+        [[ $rc -eq 0 ]] || { google_location_stop; return 1; }
+    fi
+    echo "已启用：每 6 小时尝试一次；澳门与拉回任务互相替换。"
+}
+
+google_location_suggest() (
+    local family="$1" tmp
+    tmp=$(mktemp -d /tmp/ss2022-google-geo.XXXXXX) || return 1
+    trap 'rm -rf "$tmp"' EXIT
+    google_fetch "$family" 'https://ipwho.is/' "$tmp/geo"
+    [[ "$GOOGLE_CURL_RC" == 0 && "$GOOGLE_HTTP_CODE" == 200 ]] || return 1
+    python3 - "$tmp/geo" <<'PY_GEO'
+import json, sys
+try:
+    obj = json.load(open(sys.argv[1]))
+    if obj.get('success') is not True:
+        raise ValueError()
+    print('\t'.join(str(obj[k]) for k in ('country_code', 'latitude', 'longitude')))
+except (ValueError, KeyError, TypeError):
+    sys.exit(1)
+PY_GEO
+)
+
+google_location_menu() {
+    local mode="$1" c cc lat lon suggestion family
+    while true; do
+        echo ""
+        [[ "$mode" == macau ]] && echo "尝试主动定位澳门（实验性）" || echo "尝试拉回 VPS 所在地（实验性）"
+        echo "  1. 手动执行一轮"
+        echo "  2. 启用每 6 小时定时尝试"
+        echo "  3. 查看当前任务与最近执行结果"
+        echo "  4. 停止定位任务（澳门 / 拉回共用）"
+        echo "  0. 返回"
+        read -rp "请选择 [0-4]: " c || return
+        case "$c" in
+            0) return ;;
+            3)
+                if [[ -f "${STATE_DIR}/google-location.json" ]]; then
+                    python3 - "${STATE_DIR}/google-location.json" <<'PY_STATUS'
+import json, sys
+obj = json.load(open(sys.argv[1]))
+print('已配置任务：{}，目标 {}，地址族 {}（0=双栈）'.format(obj.get('mode'), obj.get('cc'), obj.get('family')))
+PY_STATUS
+                    if [[ "${PLATFORM_INIT:-}" == systemd ]]; then
+                        systemctl is-active ss2022-google-location.timer || true
+                    else
+                        crontab -l 2>/dev/null | grep -q '# ss2022-google-location$' && echo 'cron 条目存在' || echo 'cron 条目缺失'
+                    fi
+                else
+                    echo "当前未配置定时任务。"
+                fi
+                [[ ! -f "${STATE_DIR}/google-location-last.txt" ]] || cat "${STATE_DIR}/google-location-last.txt"
+                continue ;;
+            4) google_location_stop && echo "定位定时调度已停止；已开始的 cron 请求最多 60 秒内结束。"; continue ;;
+            1|2) ;;
+            *) continue ;;
+        esac
+        server_test_select_ip_mode || continue
+        family="$SERVER_TEST_IP_MODE"
+        cc=MO; lat=22.1987; lon=113.5439
+        if [[ "$mode" == restore ]]; then
+            suggestion=""
+            [[ "$family" == 6 ]] || suggestion=$(google_location_suggest 4)
+            [[ -n "$suggestion" || "$family" == 4 ]] || suggestion=$(google_location_suggest 6)
+            if [[ -n "$suggestion" ]]; then
+                IFS=$'\t' read -r cc lat lon <<<"$suggestion"
+                google_location_validate "$cc" "$lat" "$lon" || { cc=""; lat=""; lon=""; }
+            else
+                cc=""; lat=""; lon=""
+            fi
+            echo "地理库建议：${cc:-未知} ${lat},${lon}；请按 VPS 实际机房位置核对，广播 IP/WARP 可能不准确。"
+            local value
+            read -rp "目标国家/地区代码 [${cc:-例如 US/JP/HK}]: " value || return
+            cc="${value:-$cc}"; cc="${cc^^}"
+            read -rp "目标纬度 [${lat:-例如 35.6762}]: " value || return
+            lat="${value:-$lat}"
+            read -rp "目标经度 [${lon:-例如 139.6503}]: " value || return
+            lon="${value:-$lon}"
+        fi
+        google_location_validate "$cc" "$lat" "$lon" || { echo "[错误] 国家代码或坐标无效，未执行。"; continue; }
+        echo "目标 ${cc}（${lat},${lon}）。地区请求无法保证 Google 更改 IP 定位。"
+        if [[ "$c" == 2 ]]; then
+            google_location_enable "$mode" "$family" "$cc" "$lat" "$lon"
+        else
+            [[ "$family" == 6 ]] || google_location_round 4 "$cc" "$lat" "$lon"
+            [[ "$family" == 4 ]] || google_location_round 6 "$cc" "$lat" "$lon"
+            echo "请返回 Google 送中检测，使用不带地区参数的新请求复测。"
+        fi
+        if [[ "$mode" == restore ]]; then
+            echo "Google 官方 IP 定位纠错（需在浏览器登录后提交）："
+            echo "https://support.google.com/websearch/workflow/9308722?hl=zh-Hans"
+        fi
+    done
+}
+
+google_test_management() {
+    local c
+    google_test_dependencies || return 1
+    while true; do
+        clear
+        echo "════════════════════ Google 测试 ════════════════════"
+        echo "  1. Google 送中检测（IPv4 / IPv6）"
+        echo "  2. 尝试主动定位澳门"
+        echo "  3. 尝试拉回 VPS 所在地"
+        echo "  0. 返回"
+        read -rp "请选择 [0-3]: " c || return
+        case "$c" in
+            1) google_test_run ;;
+            2) google_location_menu macau ;;
+            3) google_location_menu restore ;;
+            0) return ;;
+        esac
+    done
+}
+
 server_test_management() {
     while true; do
         clear
@@ -11848,13 +12301,15 @@ server_test_management() {
         echo "  1. IP 质量 / 风险测试"
         echo "  2. IPv4 / IPv6 三网逐跳回程"
         echo "  3. 平台流媒体AI通信软件解锁测试"
+        echo "  4. Google 测试（送中 / 澳门 / 拉回所在地）"
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0-3]: " c
+        read -rp "请选择 [0-4]: " c
         case "$c" in
             1) test_ip_quality ;;
             2) test_return_route ;;
             3) test_platform_media_ai_communication_unlock ;;
+            4) google_test_management ;;
             0) return ;;
             *) sleep 1 ;;
         esac
@@ -11961,3 +12416,4 @@ main() {
 if [[ "${SS2022_LIB_ONLY:-0}" != "1" ]]; then
     main
 fi
+
