@@ -7,6 +7,7 @@ on:
     paths:
       - "ss2022.sh"
       - "tests/test-google.sh"
+      - "tests/test-mktemp.sh"
       - "README.md"
       - ".github/workflows/ci.yml"
       - ".github/workflows/promote-ss2022.yml"
@@ -18,6 +19,7 @@ on:
     paths:
       - "ss2022.sh"
       - "tests/test-google.sh"
+      - "tests/test-mktemp.sh"
       - "README.md"
       - ".github/workflows/ci.yml"
 
@@ -46,6 +48,9 @@ jobs:
 
       - name: Google detection and location task regression
         run: bash tests/test-google.sh
+
+      - name: Portable mktemp and updater regression
+        run: bash tests/test-mktemp.sh
 
       - name: Check script version
         run: |
