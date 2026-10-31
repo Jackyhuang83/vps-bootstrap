@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
-# 当前版本: v1.9.1-dev5
+# 当前版本: v1.9.1-dev6
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,10 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.9.1-dev6:
+#   - 所有 mktemp 模板改为以 XXXXXX 结尾，修复 BusyBox/Alpine 更新、配置与测试临时文件创建失败
+#   - 保留原有校验、备份、失败回滚和临时文件清理；新增实际 BusyBox 自更新回归
 #
 # v1.9.1-dev5:
 #   - 服务器测试新增 Google 三项菜单：送中检测、尝试定位澳门、尝试拉回 VPS 所在地
@@ -652,7 +656,7 @@
 # 注意: v1.9.0 为稳定正式版；Alpine 3.21 上 Snell v5 与 Cloudflare WARP 仍受官方组件兼容性限制。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.1-dev5"
+SCRIPT_VERSION="v1.9.1-dev6"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -2352,7 +2356,7 @@ migrate_singbox_local_dns_prefer_go() {
         ((.prefer_go // false) != true))
     ' "$SINGBOX_CONF" >/dev/null 2>&1 || return 0
 
-    candidate=$(mktemp "/etc/sing-box/.ss2022-dns-migrate.XXXXXX.json") || {
+    candidate=$(mktemp "/etc/sing-box/.ss2022-dns-migrate.json.XXXXXX") || {
         echo -e "${RED}[错误] 无法创建 sing-box DNS 迁移候选配置；原配置保持不变。${PLAIN}"
         return 1
     }
@@ -2385,7 +2389,7 @@ migrate_singbox_local_dns_prefer_go() {
         return 1
     fi
 
-    backup=$(mktemp "/etc/sing-box/.ss2022-dns-rollback.XXXXXX.json") || {
+    backup=$(mktemp "/etc/sing-box/.ss2022-dns-rollback.json.XXXXXX") || {
         rm -f "$candidate"
         echo -e "${RED}[错误] 无法创建 DNS 迁移回滚备份；原配置保持不变。${PLAIN}"
         return 1
@@ -2509,7 +2513,7 @@ update_singbox_inbounds() {
 
     ensure_base_singbox_config || return 1
 
-    tmp=$(mktemp "/etc/sing-box/.ss2022-config.XXXXXX.json") || return 1
+    tmp=$(mktemp "/etc/sing-box/.ss2022-config.json.XXXXXX") || return 1
     chmod 600 "$tmp"
 
     if ! jq \
@@ -4074,7 +4078,7 @@ write_xray_vless_config() {
     mkdir -p "$conf_dir" || return 1
     chown root:"$XRAY_GROUP" "$conf_dir" 2>/dev/null || true
     chmod 750 "$conf_dir"
-    candidate=$(mktemp "${conf_dir}/config.tmp.XXXXXX.json") || return 1
+    candidate=$(mktemp "${conf_dir}/config.tmp.json.XXXXXX") || return 1
     jq -n --arg listen "$listen" --argjson port "$port" --arg uuid "$uuid" --arg sni "$sni" --arg private "$private" --arg sid "$short_id" '{
       log:{loglevel:"warning"},
       inbounds:[{
@@ -4091,7 +4095,7 @@ write_xray_vless_config() {
         echo -e "${RED}[错误] 新 Xray 配置未通过测试，原配置保持不变。${PLAIN}"; rm -f "$candidate"; return 1
     fi
     if [[ -f "$XRAY_CONF" ]]; then
-        had_old=1; backup=$(mktemp "$(dirname "$XRAY_CONF")/config.rollback.XXXXXX.json") || { rm -f "$candidate"; return 1; }; cp -a "$XRAY_CONF" "$backup"
+        had_old=1; backup=$(mktemp "$(dirname "$XRAY_CONF")/config.rollback.json.XXXXXX") || { rm -f "$candidate"; return 1; }; cp -a "$XRAY_CONF" "$backup"
     fi
     mv -f "$candidate" "$XRAY_CONF" || { rm -f "$candidate" "$backup"; return 1; }
     chown root:"$XRAY_GROUP" "$XRAY_CONF"; chmod 640 "$XRAY_CONF"
@@ -5667,7 +5671,7 @@ apply_routing_config() {
     local sb_tmp="" xr_tmp="" sb_backup="" xr_backup="" sb_active=0 xr_active=0 failed=0
 
     if [[ -f "$SINGBOX_CONF" && -x "$SINGBOX_BIN" ]]; then
-        sb_tmp=$(mktemp "/etc/sing-box/.ss2022-routing.XXXXXX.json") || return 1
+        sb_tmp=$(mktemp "/etc/sing-box/.ss2022-routing.json.XXXXXX") || return 1
         build_singbox_routing_candidate "$sb_tmp" || { rm -f "$sb_tmp"; return 1; }
         echo -e "${YELLOW}>> 校验 sing-box 分流配置...${PLAIN}"
         if ! "$SINGBOX_BIN" check -c "$sb_tmp"; then
@@ -5679,7 +5683,7 @@ apply_routing_config() {
     fi
 
     if [[ -f "$XRAY_CONF" && -x "$XRAY_BIN" ]]; then
-        xr_tmp=$(mktemp "/etc/ss2022-xray/config.routing.XXXXXX.json") || { rm -f "$sb_tmp"; return 1; }
+        xr_tmp=$(mktemp "/etc/ss2022-xray/config.routing.json.XXXXXX") || { rm -f "$sb_tmp"; return 1; }
         build_xray_routing_candidate "$xr_tmp" || { rm -f "$sb_tmp" "$xr_tmp"; return 1; }
         chown root:"$XRAY_GROUP" "$xr_tmp" 2>/dev/null || true
         chmod 640 "$xr_tmp"
@@ -5698,11 +5702,11 @@ apply_routing_config() {
     fi
 
     if [[ $sb_active -eq 1 ]]; then
-        sb_backup=$(mktemp "/etc/sing-box/.ss2022-routing-rollback.XXXXXX.json") || { rm -f "$sb_tmp" "$xr_tmp"; return 1; }
+        sb_backup=$(mktemp "/etc/sing-box/.ss2022-routing-rollback.json.XXXXXX") || { rm -f "$sb_tmp" "$xr_tmp"; return 1; }
         cp -a "$SINGBOX_CONF" "$sb_backup" || return 1
     fi
     if [[ $xr_active -eq 1 ]]; then
-        xr_backup=$(mktemp "/etc/ss2022-xray/config.routing.rollback.XXXXXX.json") || { rm -f "$sb_tmp" "$xr_tmp" "$sb_backup"; return 1; }
+        xr_backup=$(mktemp "/etc/ss2022-xray/config.routing.rollback.json.XXXXXX") || { rm -f "$sb_tmp" "$xr_tmp" "$sb_backup"; return 1; }
         cp -a "$XRAY_CONF" "$xr_backup" || return 1
     fi
 
@@ -6416,7 +6420,7 @@ test_shadowsocks_node_with_singbox() {
     chain_node_needs_warp_underlay "$node" && use_warp=true
     while ss -H -ltn 2>/dev/null | grep -q ":${n} "; do n=$((n+1)); [[ $n -lt 19150 ]] || return 1; done
     port=$n
-    cfg=$(mktemp /tmp/ss2022-chain-test.XXXXXX.json) || return 1
+    cfg=$(mktemp /tmp/ss2022-chain-test.json.XXXXXX) || return 1
     if [[ "$use_warp" == true ]]; then
         warp_port=$(warp_proxy_port)
         jq -n --arg server "$(jq -r '.server' <<<"$node")" --argjson sport "$(jq -r '.port' <<<"$node")" --arg method "$(jq -r '.method' <<<"$node")" --arg pass "$(jq -r '.password' <<<"$node")" --argjson lp "$port" --argjson wp "$warp_port" --arg ds "$sb_ds" \
@@ -6455,7 +6459,7 @@ test_shadowsocks_node_with_xray() {
     chain_node_needs_warp_underlay "$node" && use_warp=true
     while ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${n}$"; do n=$((n+1)); [[ $n -lt 19250 ]] || return 1; done
     port=$n
-    cfg=$(mktemp /tmp/ss2022-xray-chain-test.XXXXXX.json) || return 1
+    cfg=$(mktemp /tmp/ss2022-xray-chain-test.json.XXXXXX) || return 1
     if [[ "$use_warp" == true ]]; then
         warp_port=$(warp_proxy_port)
         jq -n --arg server "$(jq -r '.server' <<<"$node")" --argjson sport "$(jq -r '.port' <<<"$node")" --arg method "$method" --arg pass "$(jq -r '.password' <<<"$node")" --argjson lp "$port" --argjson wp "$warp_port" --arg ts "$strategy" --arg ss "$server_strategy" '{
@@ -6517,7 +6521,7 @@ test_vless_reality_node() {
     url=$(ip_echo_url_for_family "$family")
     while ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${n}$"; do n=$((n+1)); [[ $n -lt 19320 ]] || return 1; done
     port=$n
-    cfg=$(mktemp /tmp/ss2022-vless-chain-test.XXXXXX.json) || return 1
+    cfg=$(mktemp /tmp/ss2022-vless-chain-test.json.XXXXXX) || return 1
     outbound=$(xray_outbound_for_node "$node" "test-out" "$family") || { rm -f "$cfg"; return 1; }
     chain_node_needs_warp_underlay "$node" && warp=true
     if [[ "$warp" == true ]]; then
@@ -8793,7 +8797,7 @@ check_script_update() {
 
     running_hash=$(sha256sum "$running_file" 2>/dev/null | awk '{print $1}')
 
-    tmp=$(mktemp /tmp/ss2022-update.XXXXXX.sh) || {
+    tmp=$(mktemp /tmp/ss2022-update.sh.XXXXXX) || {
         echo -e "${RED}[错误] 无法创建临时文件。${PLAIN}"
         pause
         return
@@ -11131,7 +11135,7 @@ server_test_download_release_asset() {
     else
         api="https://api.github.com/repos/${repo}/releases/tags/${tag}"
     fi
-    meta=$(mktemp /tmp/ss2022-test-release.XXXXXX.json) || return 1
+    meta=$(mktemp /tmp/ss2022-test-release.json.XXXXXX) || return 1
     if ! curl -fsSL --retry 2 --retry-delay 1 --connect-timeout 10 --max-time 30 -H "Accept: application/vnd.github+json" "$api" -o "$meta"; then
         rm -f "$meta"
         echo -e "${RED}[错误] 无法获取 ${repo} Release 元数据。${PLAIN}"
@@ -11192,7 +11196,7 @@ run_external_curl_test() {
     shift 2
 
     local tmp=""
-    tmp=$(mktemp /tmp/ss2022-external-test.XXXXXX.sh) || {
+    tmp=$(mktemp /tmp/ss2022-external-test.sh.XXXXXX) || {
         echo -e "${RED}[错误] 无法创建临时测试文件。${PLAIN}"
         return 1
     }
@@ -11589,8 +11593,8 @@ server_test_download_rrc_source() {
 server_test_run_region_restriction_check() {
     local selection="$1" mode="${2:-0}"
     local source runner family run_mode
-    source=$(mktemp /tmp/ss2022-rrc-source.XXXXXX.sh) || return 1
-    runner=$(mktemp /tmp/ss2022-rrc-runner.XXXXXX.sh) || { rm -f "$source"; return 1; }
+    source=$(mktemp /tmp/ss2022-rrc-source.sh.XXXXXX) || return 1
+    runner=$(mktemp /tmp/ss2022-rrc-runner.sh.XXXXXX) || { rm -f "$source"; return 1; }
 
     ensure_test_dependency jq jq || { rm -f "$source" "$runner"; return 1; }
     ensure_test_dependency python3 python3 || { rm -f "$source" "$runner"; return 1; }

@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - "ss2022.sh"
+      - "tests/test-mktemp.sh"
       - ".github/workflows/alpine-smoke.yml"
 
   pull_request:
@@ -13,6 +14,7 @@ on:
       - main
     paths:
       - "ss2022.sh"
+      - "tests/test-mktemp.sh"
       - ".github/workflows/alpine-smoke.yml"
 
   workflow_dispatch:
@@ -41,6 +43,8 @@ jobs:
 
               export SS2022_LIB_ONLY=1
               bash -n ./ss2022.sh
+
+              SS2022_TEST_BUSYBOX=/bin/busybox bash tests/test-mktemp.sh
 
               bash <<'"'"'SMOKE'"'"'
               set -euo pipefail
@@ -130,3 +134,4 @@ jobs:
               echo "Alpine/OpenRC smoke test passed."
               SMOKE
             '
+
