@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
-# 当前版本: v1.9.1-dev10
+# 当前版本: v1.9.1-dev11
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,10 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.9.1-dev11:
+#   - Surge 官方 Snell v6.0.0 作为选装协议，独立服务，与 v5 并行
+#   - 官方安装包及延迟加载模块采用固定 SHA256 校验
 #
 # v1.9.1-dev10:
 #   - Realm 首页仅显示版本号、服务运行状态、转发规则数量
@@ -676,7 +680,7 @@
 # 注意: v1.9.0 为稳定正式版；Alpine 3.21 上 Snell v5 与 Cloudflare WARP 仍受官方组件兼容性限制。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.1-dev10"
+SCRIPT_VERSION="v1.9.1-dev11"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -752,6 +756,24 @@ SNELL_OPENRC_LOG="/var/log/ss2022/snell-v5.log"
 # Snell 官方 v5.0.1 固定资产 SHA256（参考成熟模板并固定到官方 dl.nssurge.com 资产）
 SNELL_SHA256_AMD64="9bea1c2b9e35b73b31634856c04d18c393072b9e5dcde6a32781d8b8f908c539"
 SNELL_SHA256_ARM64="2f178bf5ac468ce1a130454efa40a0603fbbe4e47ecc4880a989f4abc7f824cf"
+# Surge official Snell v6 (independent from v5)
+SNELL6_VERSION="6.0.0"
+SNELL6_BIN="/usr/local/bin/snell-server-v6"
+SNELL6_CONF_DIR="/etc/ss2022-snell-v6"
+SNELL6_CONF="$SNELL6_CONF_DIR/config.conf"
+SNELL6_SERVICE_NAME="snell-v6"
+SNELL6_SERVICE="/etc/systemd/system/snell-v6.service"
+SNELL6_USER="ss2022-snell6"
+SNELL6_GROUP="ss2022-snell6"
+SNELL6_USER_MARKER="/etc/ss2022-snell6-user-managed"
+SNELL6_GROUP_MARKER="/etc/ss2022-snell6-group-managed"
+SNELL6_DIR_MARKER="/etc/ss2022-snell6-dir-managed"
+SNELL6_MANAGED_MARKER="/etc/ss2022-snell6-install-managed"
+SNELL6_CANDIDATE_PREFIX="/usr/local/bin/.ss2022-snell-server-v6.new"
+SNELL6_SHA256_AMD64="8a9c4463ca87cfa5eaa37c6af0d37ab93ea275aa12391985bb2a375ca3abd7f2"
+SNELL6_SHA256_ARM64="a0b2915cbc77dc3baf8fa069e741c20808d8a10c3a8a93e709a0a580645c3bd7"
+SNELL6_MODULE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/modules/snell-v6.sh"
+SNELL6_MODULE_SHA256="7af4b12250323525f3ab10424ad225d2f3be02a5b91445cd84f2629fa6495beb"
 # ----------------------------- Realm L4 端口转发 -------------------------------
 # 固定官方稳定版本；下载后使用 GitHub Release API 返回的 asset digest 进行 SHA256 校验。
 REALM_VERSION="2.9.6"
@@ -8981,6 +9003,38 @@ check_script_update() {
 # [14] 菜单与程序入口
 # ==============================================================================
 
+
+snell6_load() {
+    [[ "${SNELL6_MODULE_LOADED:-0}" == 1 ]] && return 0
+    local tmp sha
+    tmp=$(mktemp /tmp/ss2022-snell6-module.XXXXXX) || return 1
+    if ! curl -4 -fsSL --connect-timeout 12 --max-time 50 -o "$tmp" "$SNELL6_MODULE_URL"; then
+        rm -f "$tmp"
+        tmp=$(mktemp /tmp/ss2022-snell6-module.XXXXXX) || return 1
+        if ! curl -6 -fsSL --connect-timeout 12 --max-time 50 -o "$tmp" "$SNELL6_MODULE_URL"; then
+            rm -f "$tmp"; echo "[错误] Snell v6 模块下载失败。"; return 1
+        fi
+    fi
+    sha=$(sha256sum "$tmp" | awk '{print $1}')
+    if [[ "$sha" != "$SNELL6_MODULE_SHA256" ]] ||
+       ! grep -Fqx '# MODULE: OFFICIAL_SURGE_SNELL6_V1' "$tmp" ||
+       ! bash -n "$tmp"; then
+        rm -f "$tmp"; echo "[错误] Snell v6 模块校验失败；拒绝执行。"; return 1
+    fi
+    # shellcheck disable=SC1090
+    source "$tmp"
+    rm -f "$tmp"
+    SNELL6_MODULE_LOADED=1
+}
+snell6_protocol_menu() {
+    if platform_is_alpine || [[ "$PLATFORM_INIT" != systemd ]]; then
+        echo "[提示] Surge 官方 Snell v6 当前仅开放 Debian/Ubuntu + systemd。"
+        pause; return
+    fi
+    snell6_load || { pause; return; }
+    protocol_action_menu "Snell v6（Surge 官方）" deploy_snell_v6 update_snell_v6 delete_snell_v6
+}
+
 protocol_management() {
     while true; do
         clear
@@ -8993,9 +9047,10 @@ protocol_management() {
         else
             echo "  4. Snell v5"
         fi
+        echo "  5. Snell v6（Surge 官方）"
         echo "  0. 返回"
         echo -e "$CYAN═══════════════════════════════════════════════════$PLAIN"
-        read -rp "请选择 [0-4]: " c
+        read -rp "请选择 [0-5]: " c
         case "$c" in
             1) protocol_action_menu "SS2022" deploy_ss2022 update_ss2022 delete_ss2022 ;;
             2) protocol_action_menu "SS2022 + ShadowTLS v3" deploy_shadowtls update_shadowtls delete_shadowtls ;;
@@ -9008,6 +9063,7 @@ protocol_management() {
                     protocol_action_menu "Snell v5" deploy_snell_v5 update_snell_v5 delete_snell_v5
                 fi
                 ;;
+            5) snell6_protocol_menu ;;
             0) return ;;
             *) sleep 1 ;;
         esac
