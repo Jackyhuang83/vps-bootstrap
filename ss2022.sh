@@ -4204,7 +4204,7 @@ install_snell_v5_core() {
     esac
 
     # 下载属于 VPS 主动外连，不能由 Snell IPv4/IPv6 入站监听模式强制选路。
-    # 交由 curl 自动协商下载服务器可达的 IPv4/IPv6 地址。
+    # IPv4 优先；仅下载失败时尝试 IPv6，以兼容 IPv6-only VPS。
 
     if [[ -x "$SNELL_BIN" ]]; then
         echo -e "${GREEN}✔ 已检测到 Snell v5 二进制；新文件通过完整校验与运行时自检后才会替换。${PLAIN}"
@@ -4216,11 +4216,16 @@ install_snell_v5_core() {
     url="https://dl.nssurge.com/snell/snell-server-v${SNELL_VERSION}-linux-${sarch}.zip"
 
     echo -e "${YELLOW}>> 从 Surge 官方下载 Snell v${SNELL_VERSION}...${PLAIN}"
-    if ! curl -fL --connect-timeout 20 --max-time 120 --retry 3 --retry-delay 2 \
+    if ! curl -fL -4 --connect-timeout 20 --max-time 120 --retry 3 --retry-delay 2 \
         -o "$zip" "$url"; then
-        rm -rf "$tmp"
-        echo -e "${RED}[错误] Snell v5 下载失败：${url}${PLAIN}"
-        return 1
+        echo -e "${YELLOW}[提示] IPv4 下载失败，正在尝试 IPv6...${PLAIN}"
+        rm -f "$zip"
+        if ! curl -fL -6 --connect-timeout 20 --max-time 120 --retry 3 --retry-delay 2 \
+            -o "$zip" "$url"; then
+            rm -rf "$tmp"
+            echo -e "${RED}[错误] Snell v5 IPv4/IPv6 下载均失败：${url}${PLAIN}"
+            return 1
+        fi
     fi
 
     actual=$(sha256sum "$zip" | awk '{print $1}')
