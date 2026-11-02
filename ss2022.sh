@@ -1429,6 +1429,11 @@ show_dashboard() {
         ((installed_count++))
         proto_list+="\n    • Snell v5 - 端口: ${CYAN}${p:-未知}${PLAIN}"
     fi
+    if [[ -f "$SNELL6_CONF" ]]; then
+        p=$(sed -nE 's/^[[:space:]]*listen[[:space:]]*=[[:space:]]*([^,]*).*/\1/p' "$SNELL6_CONF" | head -n1 | grep -oE '[0-9]+$' || true)
+        ((installed_count++))
+        proto_list+="\n    • Snell v6 - 端口: ${CYAN}${p:-未知}${PLAIN}"
+    fi
     echo -e "${CYAN}═════════════════════════════════════════════════════════════════${PLAIN}"
     echo -e "      SS2022 多协议管理脚本 ${SCRIPT_VERSION}"
     if proxy_shortcut_is_project_managed; then
@@ -1444,6 +1449,17 @@ show_dashboard() {
     echo -e "  Xray核心: ${xray_info} / ${xray_status}"
     echo -e "    节点: VLESS Reality ${xr_vless_node}"
     echo -e "  Snell核心: ${snell_info} / ${snell_status}"
+    if [[ -x "$SNELL6_BIN" ]]; then
+        if service_is_active "$SNELL6_SERVICE_NAME"; then
+            echo "  Snell v6: v$SNELL6_VERSION / ● 运行中"
+        elif [[ -f "$SNELL6_CONF" ]]; then
+            echo "  Snell v6: v$SNELL6_VERSION / ○ 已停止"
+        else
+            echo "  Snell v6: v$SNELL6_VERSION / ○ 仅安装核心"
+        fi
+    else
+        echo "  Snell v6: 未安装"
+    fi
     echo -e "    节点: Snell v5 ${sn_v5_node}"
     echo -e "  Realm转发: ${realm_info} / ${realm_status} / 规则 ${forwarding_count} 条"
     echo -e "  时间同步: ${time_sync_status}"
@@ -8285,6 +8301,8 @@ show_service_status() {
     echo ""
     echo -e "$YELLOW【Snell v5】$PLAIN"
     service_status_output snell-v5 | head -n 15 || echo "未安装/未加载"
+    echo "【Snell v6】"
+    service_status_output "$SNELL6_SERVICE_NAME" | head -n 15 || echo "未安装/未加载"
     echo ""
     echo -e "$YELLOW【Realm 端口转发】$PLAIN"
     service_status_output "$REALM_SERVICE_NAME" | head -n 15 || echo "未安装/未加载"
