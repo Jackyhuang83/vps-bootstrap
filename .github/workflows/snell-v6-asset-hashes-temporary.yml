@@ -2,6 +2,8 @@ name: Verify official Snell v6 release hashes (temporary)
 on:
   push:
     branches: [feat/snell-v6-official-20261102]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 permissions:
   contents: read
