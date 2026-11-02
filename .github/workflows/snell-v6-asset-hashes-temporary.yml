@@ -1,0 +1,24 @@
+name: Verify official Snell v6 release hashes (temporary)
+on:
+  push:
+    branches: [feat/snell-v6-official-20261102]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download official Snell 6.0.0 assets and calculate SHA256
+        shell: bash
+        run: |
+          set -euo pipefail
+          for arch in amd64 aarch64; do
+            url="https://dl.nssurge.com/snell/snell-server-v6.0.0-linux-${arch}.zip"
+            echo "Downloading verified official origin for ${arch}"
+            curl -4 -fLS --retry 2 --connect-timeout 20 --max-time 150 -o "/tmp/snell-${arch}.zip" "$url"
+            file "/tmp/snell-${arch}.zip"
+            unzip -tq "/tmp/snell-${arch}.zip"
+            if [[ "$(unzip -Z1 "/tmp/snell-${arch}.zip" | grep -xc 'snell-server')" -ne 1 ]]; then exit 1; fi
+            echo "SNELL_V6_RELEASE_SHA256_${arch}=$(sha256sum "/tmp/snell-${arch}.zip" | cut -d' ' -f1)"
+          done
