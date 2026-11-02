@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
-# 当前版本: v1.9.1-dev10
+# 当前版本: v1.9.1-dev11
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,10 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.9.1-dev11:
+#   - Surge 官方 Snell v6.0.0 作为选装协议，独立服务，与 v5 并行
+#   - 官方安装包及延迟加载模块采用固定 SHA256 校验
 #
 # v1.9.1-dev10:
 #   - Realm 首页仅显示版本号、服务运行状态、转发规则数量
@@ -676,7 +680,7 @@
 # 注意: v1.9.0 为稳定正式版；Alpine 3.21 上 Snell v5 与 Cloudflare WARP 仍受官方组件兼容性限制。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.1-dev10"
+SCRIPT_VERSION="v1.9.1-dev11"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -752,6 +756,24 @@ SNELL_OPENRC_LOG="/var/log/ss2022/snell-v5.log"
 # Snell 官方 v5.0.1 固定资产 SHA256（参考成熟模板并固定到官方 dl.nssurge.com 资产）
 SNELL_SHA256_AMD64="9bea1c2b9e35b73b31634856c04d18c393072b9e5dcde6a32781d8b8f908c539"
 SNELL_SHA256_ARM64="2f178bf5ac468ce1a130454efa40a0603fbbe4e47ecc4880a989f4abc7f824cf"
+# Surge official Snell v6 (independent from v5)
+SNELL6_VERSION="6.0.0"
+SNELL6_BIN="/usr/local/bin/snell-server-v6"
+SNELL6_CONF_DIR="/etc/ss2022-snell-v6"
+SNELL6_CONF="$SNELL6_CONF_DIR/config.conf"
+SNELL6_SERVICE_NAME="snell-v6"
+SNELL6_SERVICE="/etc/systemd/system/snell-v6.service"
+SNELL6_USER="ss2022-snell6"
+SNELL6_GROUP="ss2022-snell6"
+SNELL6_USER_MARKER="/etc/ss2022-snell6-user-managed"
+SNELL6_GROUP_MARKER="/etc/ss2022-snell6-group-managed"
+SNELL6_DIR_MARKER="/etc/ss2022-snell6-dir-managed"
+SNELL6_MANAGED_MARKER="/etc/ss2022-snell6-install-managed"
+SNELL6_CANDIDATE_PREFIX="/usr/local/bin/.ss2022-snell-server-v6.new"
+SNELL6_SHA256_AMD64="8a9c4463ca87cfa5eaa37c6af0d37ab93ea275aa12391985bb2a375ca3abd7f2"
+SNELL6_SHA256_ARM64="a0b2915cbc77dc3baf8fa069e741c20808d8a10c3a8a93e709a0a580645c3bd7"
+SNELL6_MODULE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/modules/snell-v6.sh"
+SNELL6_MODULE_SHA256="2cdc39d03c8349bf284d487ffdb12738e530510e2e8651371aff781ac2b55399"
 # ----------------------------- Realm L4 端口转发 -------------------------------
 # 固定官方稳定版本；下载后使用 GitHub Release API 返回的 asset digest 进行 SHA256 校验。
 REALM_VERSION="2.9.6"
@@ -1407,6 +1429,11 @@ show_dashboard() {
         ((installed_count++))
         proto_list+="\n    • Snell v5 - 端口: ${CYAN}${p:-未知}${PLAIN}"
     fi
+    if [[ -f "$SNELL6_CONF" ]]; then
+        p=$(sed -nE 's/^[[:space:]]*listen[[:space:]]*=[[:space:]]*([^,]*).*/\1/p' "$SNELL6_CONF" | head -n1 | grep -oE '[0-9]+$' || true)
+        ((installed_count++))
+        proto_list+="\n    • Snell v6 - 端口: ${CYAN}${p:-未知}${PLAIN}"
+    fi
     echo -e "${CYAN}═════════════════════════════════════════════════════════════════${PLAIN}"
     echo -e "      SS2022 多协议管理脚本 ${SCRIPT_VERSION}"
     if proxy_shortcut_is_project_managed; then
@@ -1422,6 +1449,17 @@ show_dashboard() {
     echo -e "  Xray核心: ${xray_info} / ${xray_status}"
     echo -e "    节点: VLESS Reality ${xr_vless_node}"
     echo -e "  Snell核心: ${snell_info} / ${snell_status}"
+    if [[ -x "$SNELL6_BIN" ]]; then
+        if service_is_active "$SNELL6_SERVICE_NAME"; then
+            echo "  Snell v6: v$SNELL6_VERSION / ● 运行中"
+        elif [[ -f "$SNELL6_CONF" ]]; then
+            echo "  Snell v6: v$SNELL6_VERSION / ○ 已停止"
+        else
+            echo "  Snell v6: v$SNELL6_VERSION / ○ 仅安装核心"
+        fi
+    else
+        echo "  Snell v6: 未安装"
+    fi
     echo -e "    节点: Snell v5 ${sn_v5_node}"
     echo -e "  Realm转发: ${realm_info} / ${realm_status} / 规则 ${forwarding_count} 条"
     echo -e "  时间同步: ${time_sync_status}"
@@ -1892,6 +1930,7 @@ default_node_name() {
         shadowtls) printf '%s' "Proxy-SS2022-ShadowTLS" ;;
         vless)     printf '%s' "Proxy-VLESS-Reality" ;;
         snell)     printf '%s' "Proxy-Snell-v5" ;;
+        snell6)    printf '%s' "Proxy-Snell-v6" ;;
         *)         printf '%s' "Proxy-Node" ;;
     esac
 }
@@ -4644,15 +4683,17 @@ view_config_menu() {
         echo "  3. VLESS Reality"
         echo "  4. Snell v5"
         echo "  5. 修改节点名称"
+        echo "  6. Snell v6"
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0-5]: " c
+        read -rp "请选择 [0-6]: " c
         case "$c" in
             1) view_ss2022_config; pause ;;
             2) view_shadowtls_config; pause ;;
             3) view_vless_config; pause ;;
             4) view_snell_config; pause ;;
             5) node_name_management ;;
+            6) snell6_load && view_snell_v6_config; pause ;;
             0) return ;;
             *) echo -e "${RED}输入无效。${PLAIN}"; sleep 1 ;;
         esac
@@ -8263,6 +8304,8 @@ show_service_status() {
     echo ""
     echo -e "$YELLOW【Snell v5】$PLAIN"
     service_status_output snell-v5 | head -n 15 || echo "未安装/未加载"
+    echo "【Snell v6】"
+    service_status_output "$SNELL6_SERVICE_NAME" | head -n 15 || echo "未安装/未加载"
     echo ""
     echo -e "$YELLOW【Realm 端口转发】$PLAIN"
     service_status_output "$REALM_SERVICE_NAME" | head -n 15 || echo "未安装/未加载"
@@ -8271,10 +8314,11 @@ show_service_status() {
     ss -lntup 2>/dev/null | grep -E 'sing-box|xray|snell-server|ss2022-realm|realm' || echo "未检测到相关监听"
 }
 full_uninstall() {
-    local yes="" singbox_managed=0 snell_managed=0 proxy_link_managed=0
+    local yes="" singbox_managed=0 snell_managed=0 snell6_managed=0 proxy_link_managed=0
     local warp_package_managed=0 warp_repo_managed=0
     singbox_is_project_managed && singbox_managed=1 || true
     snell_is_project_managed && snell_managed=1 || true
+    [[ -f "$SNELL6_MANAGED_MARKER" ]] && snell6_managed=1 || true
     proxy_shortcut_is_project_managed && proxy_link_managed=1 || true
     warp_package_is_project_managed && warp_package_managed=1 || true
     warp_repo_is_project_managed && warp_repo_managed=1 || true
@@ -8292,6 +8336,7 @@ full_uninstall() {
     if [[ "$PLATFORM_INIT" == "systemd" ]]; then
         [[ $singbox_managed -eq 1 ]] && systemctl disable --now sing-box >/dev/null 2>&1 || true
         [[ $snell_managed -eq 1 ]] && systemctl disable --now snell-v5 >/dev/null 2>&1 || true
+        [[ $snell6_managed -eq 1 ]] && systemctl disable --now snell-v6 >/dev/null 2>&1 || true
         systemctl disable --now "$XRAY_SERVICE_NAME" "$REALM_SERVICE_NAME" "${IPV6_KEEPALIVE_SYSTEMD_SERVICE_NAME}.timer" >/dev/null 2>&1 || true
         systemctl disable --now "$IP_FAMILY_SERVICE_NAME" ss2022-tg-monitor.timer >/dev/null 2>&1 || true
         systemctl stop "${IPV6_KEEPALIVE_SYSTEMD_SERVICE_NAME}.service" ss2022-tg-monitor.service >/dev/null 2>&1 || true
@@ -8348,6 +8393,10 @@ full_uninstall() {
             rm -f "$SNELL_DIR_MARKER"
         fi
     fi
+    if [[ $snell6_managed -eq 1 ]]; then
+        rm -f "$SNELL6_CONF" "$SNELL6_BIN" "$SNELL6_SERVICE" "$SNELL6_MANAGED_MARKER" "$SNELL6_CANDIDATE_PREFIX".*
+        [[ ! -f "$SNELL6_DIR_MARKER" ]] || { rmdir "$SNELL6_CONF_DIR" 2>/dev/null || true; rm -f "$SNELL6_DIR_MARKER"; }
+    fi
     rm -rf /etc/ss2022-xray /etc/ss2022-realm "$STATE_DIR" /usr/local/lib/ss2022 /var/log/ss2022
 
     [[ $proxy_link_managed -eq 1 ]] && rm -f "$SCRIPT_PROXY_LINK"
@@ -8385,6 +8434,8 @@ full_uninstall() {
     if [[ -f "$REALM_USER_MARKER" ]]; then delete_system_user "$REALM_USER"; rm -f "$REALM_USER_MARKER"; fi
     if [[ -f "$REALM_GROUP_MARKER" ]]; then delete_system_group "$REALM_GROUP"; rm -f "$REALM_GROUP_MARKER"; fi
 
+    if [[ -f "$SNELL6_USER_MARKER" ]]; then delete_system_user "$SNELL6_USER"; rm -f "$SNELL6_USER_MARKER"; fi
+    if [[ -f "$SNELL6_GROUP_MARKER" ]]; then delete_system_group "$SNELL6_GROUP"; rm -f "$SNELL6_GROUP_MARKER"; fi
     if [[ -f "$SNELL_USER_MARKER" ]]; then delete_system_user "$SNELL_USER"; rm -f "$SNELL_USER_MARKER"; fi
     if [[ -f "$SNELL_GROUP_MARKER" ]]; then delete_system_group "$SNELL_GROUP"; rm -f "$SNELL_GROUP_MARKER"; fi
 
@@ -8575,6 +8626,7 @@ show_component_versions() {
         printf '  Snell Server  已安装: %-12s 推荐: %s\n' "$sn" "$SNELL_VERSION"
     fi
     echo ""
+    printf '  Snell v6      已安装: %-12s 推荐: %s\n' "$([[ -x "$SNELL6_BIN" ]] && echo "$SNELL6_VERSION" || echo 未安装)" "$SNELL6_VERSION"
     echo "【网络组件】"
     printf '  Realm         已安装: %-12s 推荐: %s\n' "$re" "$REALM_VERSION"
     if command -v warp-cli >/dev/null 2>&1; then
@@ -8981,6 +9033,38 @@ check_script_update() {
 # [14] 菜单与程序入口
 # ==============================================================================
 
+
+snell6_load() {
+    [[ "${SNELL6_MODULE_LOADED:-0}" == 1 ]] && return 0
+    local tmp sha
+    tmp=$(mktemp /tmp/ss2022-snell6-module.XXXXXX) || return 1
+    if ! curl -4 -fsSL --connect-timeout 12 --max-time 50 -o "$tmp" "$SNELL6_MODULE_URL"; then
+        rm -f "$tmp"
+        tmp=$(mktemp /tmp/ss2022-snell6-module.XXXXXX) || return 1
+        if ! curl -6 -fsSL --connect-timeout 12 --max-time 50 -o "$tmp" "$SNELL6_MODULE_URL"; then
+            rm -f "$tmp"; echo "[错误] Snell v6 模块下载失败。"; return 1
+        fi
+    fi
+    sha=$(sha256sum "$tmp" | awk '{print $1}')
+    if [[ "$sha" != "$SNELL6_MODULE_SHA256" ]] ||
+       ! grep -Fqx '# MODULE: OFFICIAL_SURGE_SNELL6_V1' "$tmp" ||
+       ! bash -n "$tmp"; then
+        rm -f "$tmp"; echo "[错误] Snell v6 模块校验失败；拒绝执行。"; return 1
+    fi
+    # shellcheck disable=SC1090
+    source "$tmp"
+    rm -f "$tmp"
+    SNELL6_MODULE_LOADED=1
+}
+snell6_protocol_menu() {
+    if platform_is_alpine || [[ "$PLATFORM_INIT" != systemd ]]; then
+        echo "[提示] Surge 官方 Snell v6 当前仅开放 Debian/Ubuntu + systemd。"
+        pause; return
+    fi
+    snell6_load || { pause; return; }
+    protocol_action_menu "Snell v6（Surge 官方）" deploy_snell_v6 update_snell_v6 delete_snell_v6
+}
+
 protocol_management() {
     while true; do
         clear
@@ -8993,9 +9077,10 @@ protocol_management() {
         else
             echo "  4. Snell v5"
         fi
+        echo "  5. Snell v6（Surge 官方）"
         echo "  0. 返回"
         echo -e "$CYAN═══════════════════════════════════════════════════$PLAIN"
-        read -rp "请选择 [0-4]: " c
+        read -rp "请选择 [0-5]: " c
         case "$c" in
             1) protocol_action_menu "SS2022" deploy_ss2022 update_ss2022 delete_ss2022 ;;
             2) protocol_action_menu "SS2022 + ShadowTLS v3" deploy_shadowtls update_shadowtls delete_shadowtls ;;
@@ -9008,6 +9093,7 @@ protocol_management() {
                     protocol_action_menu "Snell v5" deploy_snell_v5 update_snell_v5 delete_snell_v5
                 fi
                 ;;
+            5) snell6_protocol_menu ;;
             0) return ;;
             *) sleep 1 ;;
         esac
@@ -12526,9 +12612,11 @@ protocol_operations_management() {
         echo "  8. 重启 Snell v5"
         echo "  9. 重启 Realm 转发"
         echo " 10. 查看 IPv6 Keepalive 状态"
+        echo " 11. 查看 Snell v6 日志"
+        echo " 12. 重启 Snell v6"
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0-10]: " c
+        read -rp "请选择 [0-12]: " c
         case "$c" in
             1) show_service_status; pause ;;
             2) follow_service_log sing-box ;;
@@ -12539,6 +12627,8 @@ protocol_operations_management() {
             7) restart_xray_safe; pause ;;
             8) restart_service_safe snell-v5 "Snell v5"; pause ;;
             9) restart_service_safe "$REALM_SERVICE_NAME" "Realm 转发"; pause ;;
+            11) follow_service_log "$SNELL6_SERVICE_NAME" ;;
+            12) restart_service_safe "$SNELL6_SERVICE_NAME" "Snell v6"; pause ;;
             10)
                 if service_is_active "$(keepalive_service_name)"; then
                     echo "IPv6 Keepalive: Running"

@@ -10,6 +10,8 @@ on:
       - "tests/test-mktemp.sh"
       - "tests/test-xray-restart.sh"
       - "tests/test-dashboard-nodes.sh"
+      - "tests/test-snell-v6.sh"
+      - "modules/snell-v6.sh"
       - "README.md"
       - ".github/workflows/ci.yml"
       - ".github/workflows/promote-ss2022.yml"
@@ -24,6 +26,8 @@ on:
       - "tests/test-mktemp.sh"
       - "tests/test-xray-restart.sh"
       - "tests/test-dashboard-nodes.sh"
+      - "tests/test-snell-v6.sh"
+      - "modules/snell-v6.sh"
       - "README.md"
       - ".github/workflows/ci.yml"
 
@@ -61,6 +65,18 @@ jobs:
 
       - name: Per-core dashboard node status regression
         run: bash tests/test-dashboard-nodes.sh
+
+      - name: Official Snell v6 module syntax and isolation
+        run: |
+          bash -n modules/snell-v6.sh
+          shellcheck --severity=error modules/snell-v6.sh
+          bash tests/test-snell-v6.sh
+          actual=$(sha256sum modules/snell-v6.sh | cut -d' ' -f1)
+          pinned=$(sed -nE 's/^SNELL6_MODULE_SHA256="([0-9a-f]{64})"$/\1/p' ss2022.sh)
+          [[ -n "$pinned" && "$actual" == "$pinned" ]] || {
+            echo "ERROR: Snell v6 module checksum does not match script pin"; exit 1;
+          }
+          echo "PASS: Snell v6 module SHA256 pin verified"
 
       - name: Check script version
         run: |
