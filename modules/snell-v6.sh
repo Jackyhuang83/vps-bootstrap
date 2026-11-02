@@ -48,6 +48,25 @@ snell6_port_free() {
     return 0
 }
 
+snell6_choose_network() {
+    local selection=""
+    echo "Snell v6 独立监听模式（不会修改系统 IPv6 Keepalive 或其它节点）："
+    echo "  1. IPv4"
+    echo "  2. IPv6-only"
+    echo "  3. IPv4 + IPv6 双栈"
+    echo "  0. 返回"
+    while true; do
+        read -rp "请选择 [0-3]: " selection || return 1
+        case "$selection" in
+            1) SNELL6_SELECTED_NETWORK=ipv4; return 0 ;;
+            2) SNELL6_SELECTED_NETWORK=ipv6; return 0 ;;
+            3) SNELL6_SELECTED_NETWORK=dual; return 0 ;;
+            0) return 1 ;;
+            *) echo "[错误] 请选择 0-3。" ;;
+        esac
+    done
+}
+
 snell6_candidate() {
     local tmp="$1" mode="$2" port="$3" psk="$4" listen ipv6
     case "$mode" in
@@ -214,7 +233,7 @@ view_snell_v6_config() {
 deploy_snell_v6() {
     local port="" psk="" tmp state
     [[ ! -f "$SNELL6_CONF" ]] || { echo "Snell v6 已部署，请选择更新。"; pause; return; }
-    select_network_mode no yes || return
+    snell6_choose_network || return
     snell6_install_binary || { pause; return; }
     while true; do
         read -rp "Snell v6 监听端口 [默认 64444]: " port
@@ -228,9 +247,9 @@ deploy_snell_v6() {
     snell6_service_install || { pause; return; }
     ensure_project_config_dir "$SNELL6_CONF_DIR" "$SNELL6_GROUP" "$SNELL6_DIR_MARKER" || { pause; return; }
     tmp=$(mktemp "$SNELL6_CONF_DIR/.ss2022-config.XXXXXX") || { pause; return; }
-    snell6_candidate "$tmp" "$NETWORK_MODE" "$port" "$psk" || { rm -f "$tmp"; pause; return; }
+    snell6_candidate "$tmp" "$SNELL6_SELECTED_NETWORK" "$port" "$psk" || { rm -f "$tmp"; pause; return; }
     if snell6_apply "$tmp"; then
-        state=$(jq -n --arg host "$SERVER_HOST" --arg network "$NETWORK_MODE" --arg name "$NODE_NAME" \
+        state=$(jq -n --arg host "$SERVER_HOST" --arg network "$SNELL6_SELECTED_NETWORK" --arg name "$NODE_NAME" \
             '{host:$host,network:$network,name:$name}')
         save_mode_state snell6 "$state" || true
         echo "✔ Snell v6 部署完成。未触碰 Snell v5。"
@@ -260,7 +279,7 @@ update_snell_v6() {
         read -rp "请选择 [0-5]: " choice
         nport="$port"; npsk="$psk"; nnetwork="$network"
         case "$choice" in
-            1) select_network_mode_for_update "$network" no yes || continue; nnetwork="$NETWORK_MODE" ;;
+            1) snell6_choose_network || continue; nnetwork="$SNELL6_SELECTED_NETWORK" ;;
             2) read -rp "新端口: " nport; validate_port_number "$nport" || continue ;;
             3) ask_server_host_with_default "$host"
                state=$(jq -n --arg host "$SERVER_HOST" --arg network "$network" --arg name "$name" \
