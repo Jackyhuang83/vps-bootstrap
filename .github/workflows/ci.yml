@@ -71,7 +71,12 @@ jobs:
           bash -n modules/snell-v6.sh
           shellcheck --severity=error modules/snell-v6.sh
           bash tests/test-snell-v6.sh
-          echo "SNELL6_MODULE_PIN_SHA256=$(sha256sum modules/snell-v6.sh | cut -d' ' -f1)"
+          actual=$(sha256sum modules/snell-v6.sh | cut -d' ' -f1)
+          pinned=$(sed -nE 's/^SNELL6_MODULE_SHA256="([0-9a-f]{64})"$/\1/p' ss2022.sh)
+          [[ -n "$pinned" && "$actual" == "$pinned" ]] || {
+            echo "ERROR: Snell v6 module checksum does not match script pin"; exit 1;
+          }
+          echo "PASS: Snell v6 module SHA256 pin verified"
 
       - name: Check script version
         run: |
