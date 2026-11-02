@@ -45,6 +45,17 @@ jobs:
         run: |
           bash -n ss2022.sh
 
+      - name: Temporary official Snell v6 SHA256 probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          for arch in amd64 aarch64; do
+            url="https://dl.nssurge.com/snell/snell-server-v6.0.0-linux-${arch}.zip"
+            curl -4 -fLS --retry 2 --connect-timeout 20 --max-time 150 -o "/tmp/snell-${arch}.zip" "$url"
+            unzip -tq "/tmp/snell-${arch}.zip"
+            echo "SNELL_V6_RELEASE_SHA256_${arch}=$(sha256sum "/tmp/snell-${arch}.zip" | cut -d' ' -f1)"
+          done
+
       - name: ShellCheck
         run: |
           shellcheck --version
