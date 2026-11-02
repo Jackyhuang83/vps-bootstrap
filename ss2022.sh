@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
-# 当前版本: v1.9.1-dev8
+# 当前版本: v1.9.1-dev9
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,11 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.9.1-dev9:
+#   - 首页三个核心分别列出 SS2022 / ShadowTLS v3、VLESS Reality、Snell v5 节点部署情况与端口
+#   - 仅有程序二进制但无对应配置时显示“仅安装核心”，不再混同服务停止
+#   - 保留独立运行状态与原有已部署协议汇总，未修改任何节点、路由和服务配置
 #
 # v1.9.1-dev8:
 #   - Xray 主页状态区分仅安装核心、已部署但停止、服务未注册
@@ -666,7 +671,7 @@
 # 注意: v1.9.0 为稳定正式版；Alpine 3.21 上 Snell v5 与 Cloudflare WARP 仍受官方组件兼容性限制。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.1-dev8"
+SCRIPT_VERSION="v1.9.1-dev9"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -1314,6 +1319,8 @@ show_dashboard() {
     realm_info="Realm 未安装"
     realm_status="${YELLOW}○ 未安装${PLAIN}"
     local proto_list="" installed_count=0
+    local sb_ss_node="${YELLOW}未部署${PLAIN}" sb_stls_node="${YELLOW}未部署${PLAIN}"
+    local xr_vless_node="${YELLOW}未部署${PLAIN}" sn_v5_node="${YELLOW}未部署${PLAIN}"
     local p=""
     sys_info=$(get_sys_info)
     singbox_info=$(get_singbox_version)
@@ -1334,8 +1341,10 @@ show_dashboard() {
     fi
     if service_is_active sing-box; then
         sb_status="${GREEN}● 运行中${PLAIN}"
-    elif [[ -f "$SINGBOX_CONF" || -x "$SINGBOX_BIN" ]]; then
+    elif [[ -f "$SINGBOX_CONF" ]]; then
         sb_status="${RED}○ 已停止${PLAIN}"
+    elif [[ -x "$SINGBOX_BIN" ]]; then
+        sb_status="${YELLOW}○ 仅安装核心${PLAIN}"
     fi
     if service_is_active "$XRAY_SERVICE_NAME"; then
         xray_status="${GREEN}● 运行中${PLAIN}"
@@ -1346,41 +1355,49 @@ show_dashboard() {
             xray_status="${RED}○ 服务未注册${PLAIN}"
         fi
     elif [[ -x "$XRAY_BIN" ]]; then
-        xray_status="${YELLOW}○ 仅安装核心（未部署节点）${PLAIN}"
+        xray_status="${YELLOW}○ 仅安装核心${PLAIN}"
     fi
     if service_is_active snell-v5; then
         snell_status="${GREEN}● 运行中${PLAIN}"
-    elif [[ -f "$SNELL_CONF" || -x "$SNELL_BIN" ]]; then
+    elif [[ -f "$SNELL_CONF" ]]; then
         snell_status="${RED}○ 已停止${PLAIN}"
+    elif [[ -x "$SNELL_BIN" ]]; then
+        snell_status="${YELLOW}○ 仅安装核心${PLAIN}"
     fi
     if service_is_active "$(keepalive_service_name)"; then
         keepalive_status="${GREEN}● 已激活 (5min轮询)${PLAIN}"
     fi
     if json_has_inbound_tag "$TAG_SS"; then
         p=$(get_inbound_port "$TAG_SS")
+        sb_ss_node="${GREEN}已部署${PLAIN} (端口 ${p:-未知})"
         ((installed_count++))
         proto_list+="\n    • SS2022 - 端口: ${CYAN}${p:-内部}${PLAIN}"
     fi
     if json_has_inbound_tag "$TAG_STLS"; then
         p=$(get_inbound_port "$TAG_STLS")
+        sb_stls_node="${GREEN}已部署${PLAIN} (TCP ${p:-未知})"
         ((installed_count++))
         proto_list+="\n    • SS2022 + ShadowTLS v3 - TCP端口: ${CYAN}${p}${PLAIN}"
         if json_has_inbound_tag "$TAG_STLS_UDP"; then
             p=$(get_inbound_port "$TAG_STLS_UDP")
+            sb_stls_node+=" / UDP ${p:-未知}"
             proto_list+=" / UDP: ${CYAN}${p}${PLAIN}"
         fi
     fi
     if xray_vless_exists; then
         p=$(get_xray_vless_port)
+        xr_vless_node="${GREEN}已部署${PLAIN} (端口 ${p:-未知})"
         ((installed_count++))
         proto_list+="\n    • VLESS Reality (Xray) - 端口: ${CYAN}${p}${PLAIN}"
     elif json_has_inbound_tag "$TAG_VLESS"; then
         p=$(get_inbound_port "$TAG_VLESS")
         ((installed_count++))
         proto_list+="\n    • VLESS Reality (旧 sing-box，待迁移) - 端口: ${YELLOW}${p}${PLAIN}"
+        xr_vless_node="${YELLOW}未部署（旧 sing-box 仍有 VLESS，待迁移）${PLAIN}"
     fi
     if [[ -f "$SNELL_CONF" ]]; then
         p=$(awk -F'[: ]+' '/^[[:space:]]*listen[[:space:]]*=/{gsub(/\[/,"",$0); gsub(/\]/,"",$0); print $NF; exit}' "$SNELL_CONF" 2>/dev/null)
+        sn_v5_node="${GREEN}已部署${PLAIN} (端口 ${p:-未知})"
         ((installed_count++))
         proto_list+="\n    • Snell v5 - 端口: ${CYAN}${p:-未知}${PLAIN}"
     fi
@@ -1395,8 +1412,11 @@ show_dashboard() {
     echo -e "  系统信息: ${sys_info}"
     echo -e "  运行环境: $(platform_label)"
     echo -e "  sing-box: ${singbox_info} / ${sb_status}"
+    echo -e "    节点: SS2022 ${sb_ss_node}；ShadowTLS v3 ${sb_stls_node}"
     echo -e "  Xray核心: ${xray_info} / ${xray_status}"
+    echo -e "    节点: VLESS Reality ${xr_vless_node}"
     echo -e "  Snell核心: ${snell_info} / ${snell_status}"
+    echo -e "    节点: Snell v5 ${sn_v5_node}"
     echo -e "  Realm转发: ${realm_info} / ${realm_status} / 规则 ${forwarding_count} 条"
     echo -e "  时间同步: ${time_sync_status}"
     echo -e "  IPv6链路保活: ${keepalive_status}"

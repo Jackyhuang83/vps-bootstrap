@@ -9,6 +9,7 @@ on:
       - "tests/test-google.sh"
       - "tests/test-mktemp.sh"
       - "tests/test-xray-restart.sh"
+      - "tests/test-dashboard-nodes.sh"
       - "README.md"
       - ".github/workflows/ci.yml"
       - ".github/workflows/promote-ss2022.yml"
@@ -22,6 +23,7 @@ on:
       - "tests/test-google.sh"
       - "tests/test-mktemp.sh"
       - "tests/test-xray-restart.sh"
+      - "tests/test-dashboard-nodes.sh"
       - "README.md"
       - ".github/workflows/ci.yml"
 
@@ -56,6 +58,9 @@ jobs:
 
       - name: Xray service restart safety regression
         run: bash tests/test-xray-restart.sh
+
+      - name: Per-core dashboard node status regression
+        run: bash tests/test-dashboard-nodes.sh
 
       - name: Check script version
         run: |
