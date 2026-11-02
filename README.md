@@ -4,7 +4,7 @@
 
 当前正式版本：**v1.9.0**
 
-当前开发版本：**v1.9.1-dev10**
+当前开发版本：**v1.9.1-dev11**
 
 项目以单一交互式 Bash 脚本 `ss2022.sh` 为入口，整合 **SS2022、SS2022 + ShadowTLS v3、VLESS Reality、Snell v5**，并提供 WARP 出口、链式落地、规则分流、Realm L4 端口转发、组件管理、服务器工具、服务器测试与脚本自更新。
 
@@ -162,6 +162,14 @@ ShadowTLS 主要用于增加 TLS-like 流量特征与主动探测抵抗能力，
 - 支持服务端分流
 
 ---
+
+## 5. Snell v6.0.0（独立可选）
+
+从 `协议管理 → 5. Snell v6` 进入，支持独立部署、更新网络模式和端口、更换 PSK、查看 Surge 节点参数、删除节点；在协议运维中有独立日志与重启入口。服务名 `snell-v6`，与旧 `snell-v5` 独立，不自动迁移、覆盖、重启旧节点。默认仅采用官方加密与流量混淆 `mode=default`，不开放 `unsafe-raw` 明文模式。
+
+支持 Debian / Ubuntu + systemd 的 amd64 / aarch64；Alpine 暂不开放。官方固定版本 `v6.0.0`，安装 ZIP 包固定 SHA256；Snell v6 管理代码作为 `modules/snell-v6.sh` 从本仓库加载，主脚本对模块执行固定 SHA256、文件标识和 Bash 语法检查后才允许运行。首次进入 v6 菜单需要能够访问 GitHub Raw 官方仓库路径。默认支持 IPv4、IPv6-only 和双栈监听。客户端需为支持 Snell v6 的 Surge，`version=6, mode=default`；**没有验证其它客户端时不生成 v6 假配置**。v6 已配置不等于已通过公网连通测试。
+
+官方文档：https://kb.nssurge.com/surge-knowledge-base/release-notes/snell
 
 ## 4. Snell v5
 
