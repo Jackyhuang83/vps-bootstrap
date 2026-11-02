@@ -773,7 +773,7 @@ SNELL6_CANDIDATE_PREFIX="/usr/local/bin/.ss2022-snell-server-v6.new"
 SNELL6_SHA256_AMD64="8a9c4463ca87cfa5eaa37c6af0d37ab93ea275aa12391985bb2a375ca3abd7f2"
 SNELL6_SHA256_ARM64="a0b2915cbc77dc3baf8fa069e741c20808d8a10c3a8a93e709a0a580645c3bd7"
 SNELL6_MODULE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/modules/snell-v6.sh"
-SNELL6_MODULE_SHA256="7af4b12250323525f3ab10424ad225d2f3be02a5b91445cd84f2629fa6495beb"
+SNELL6_MODULE_SHA256="2cdc39d03c8349bf284d487ffdb12738e530510e2e8651371aff781ac2b55399"
 # ----------------------------- Realm L4 端口转发 -------------------------------
 # 固定官方稳定版本；下载后使用 GitHub Release API 返回的 asset digest 进行 SHA256 校验。
 REALM_VERSION="2.9.6"
@@ -1930,6 +1930,7 @@ default_node_name() {
         shadowtls) printf '%s' "Proxy-SS2022-ShadowTLS" ;;
         vless)     printf '%s' "Proxy-VLESS-Reality" ;;
         snell)     printf '%s' "Proxy-Snell-v5" ;;
+        snell6)    printf '%s' "Proxy-Snell-v6" ;;
         *)         printf '%s' "Proxy-Node" ;;
     esac
 }
