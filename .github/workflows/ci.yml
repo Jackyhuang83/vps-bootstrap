@@ -8,6 +8,7 @@ on:
       - "ss2022.sh"
       - "tests/test-google.sh"
       - "tests/test-mktemp.sh"
+      - "tests/test-xray-restart.sh"
       - "README.md"
       - ".github/workflows/ci.yml"
       - ".github/workflows/promote-ss2022.yml"
@@ -20,6 +21,7 @@ on:
       - "ss2022.sh"
       - "tests/test-google.sh"
       - "tests/test-mktemp.sh"
+      - "tests/test-xray-restart.sh"
       - "README.md"
       - ".github/workflows/ci.yml"
 
@@ -51,6 +53,9 @@ jobs:
 
       - name: Portable mktemp and updater regression
         run: bash tests/test-mktemp.sh
+
+      - name: Xray service restart safety regression
+        run: bash tests/test-xray-restart.sh
 
       - name: Check script version
         run: |
