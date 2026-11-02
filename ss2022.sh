@@ -1333,8 +1333,14 @@ show_dashboard() {
     fi
     if service_is_active "$XRAY_SERVICE_NAME"; then
         xray_status="${GREEN}● 运行中${PLAIN}"
-    elif [[ -f "$XRAY_CONF" || -x "$XRAY_BIN" ]]; then
-        xray_status="${RED}○ 已停止${PLAIN}"
+    elif [[ -f "$XRAY_CONF" ]]; then
+        if service_exists "$XRAY_SERVICE_NAME"; then
+            xray_status="${RED}○ 已停止${PLAIN}"
+        else
+            xray_status="${RED}○ 服务未注册${PLAIN}"
+        fi
+    elif [[ -x "$XRAY_BIN" ]]; then
+        xray_status="${YELLOW}○ 仅安装核心（未部署节点）${PLAIN}"
     fi
     if service_is_active snell-v5; then
         snell_status="${GREEN}● 运行中${PLAIN}"
@@ -8988,6 +8994,80 @@ restart_service_safe() {
         return 1
     fi
 }
+# Xray 的二进制安装状态不等于 VLESS 节点已经部署；单独验收其启动生命周期。
+# 不操作系统可能已有的 xray.service，仅针对本项目 ss2022-xray。
+xray_restart_diagnostics() {
+    echo -e "${YELLOW}===== ss2022-xray 状态 =====${PLAIN}"
+    if [[ "$PLATFORM_INIT" == "systemd" ]]; then
+        systemctl show "$XRAY_SERVICE_NAME" \
+            -p LoadState -p ActiveState -p SubState -p Result --no-pager 2>/dev/null || true
+    else
+        service_status_output "$XRAY_SERVICE_NAME" || true
+    fi
+    echo -e "${YELLOW}===== 最近 20 条服务日志 =====${PLAIN}"
+    service_log_tail "$XRAY_SERVICE_NAME" 20 || true
+}
+
+restart_xray_safe() {
+    local confirm=""
+    if [[ ! -x "$XRAY_BIN" ]]; then
+        echo -e "${RED}[错误] Xray 核心不存在或不可执行：$XRAY_BIN${PLAIN}"
+        echo "[提示] 请先通过 VLESS Reality 部署功能安装核心。"
+        return 1
+    fi
+    if [[ ! -f "$XRAY_CONF" ]]; then
+        echo -e "${YELLOW}[提示] Xray 26.3.27 核心已安装，但尚无本工具箱的 VLESS 配置，不能通过重启创建节点。${PLAIN}"
+        if json_has_inbound_tag "$TAG_VLESS"; then
+            echo "[提示] 检测到旧版 sing-box VLESS，先确认节点迁移状态；不会自动切换核心。"
+        else
+            echo "[提示] 请使用：协议管理 → VLESS Reality → 部署。"
+        fi
+        return 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo -e "${RED}[错误] 缺少 jq，无法验证 Xray 的 VLESS 节点配置。${PLAIN}"
+        return 1
+    fi
+    if ! xray_vless_exists; then
+        echo -e "${RED}[错误] Xray 配置缺少 vless-reality-in 入口，拒绝盲目重启。${PLAIN}"
+        echo "[提示] 请检查 VLESS Reality 部署状态，不会自动改写配置。"
+        return 1
+    fi
+    if ! "$XRAY_BIN" run -test -format json -config "$XRAY_CONF" >/dev/null 2>&1; then
+        echo -e "${RED}[错误] Xray 配置预检失败，未执行重启。${PLAIN}"
+        echo "[提示] 可在 SSH 中运行 Xray 的 run -test 命令查看具体配置错误；不会覆盖现有配置。"
+        return 1
+    fi
+
+    if ! service_exists "$XRAY_SERVICE_NAME"; then
+        echo -e "${YELLOW}[提示] Xray 节点配置存在，但本工具箱的 $XRAY_SERVICE_NAME 服务未注册。${PLAIN}"
+        read -rp "是否重建本工具箱专用的 Xray 服务（不修改节点配置）？[y/N]: " confirm || return 1
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            echo "[提示] 未注册服务，已取消操作。"
+            return 1
+        fi
+        if ! write_xray_service; then
+            echo -e "${RED}[错误] Xray 服务注册失败。${PLAIN}"
+            xray_restart_diagnostics
+            return 1
+        fi
+    fi
+
+    echo -e "${YELLOW}>> 正在重启 $XRAY_SERVICE_NAME...${PLAIN}"
+    if ! service_restart "$XRAY_SERVICE_NAME"; then
+        echo -e "${RED}[错误] Xray 重启命令失败。${PLAIN}"
+        xray_restart_diagnostics
+        return 1
+    fi
+    sleep 2
+    if ! service_is_active "$XRAY_SERVICE_NAME"; then
+        echo -e "${RED}[错误] 重启命令已返回，但 Xray 未保持运行。${PLAIN}"
+        xray_restart_diagnostics
+        return 1
+    fi
+    echo -e "${GREEN}✔ ss2022-xray 已重启并确认处于运行状态。${PLAIN}"
+    return 0
+}
 server_tool_pkg_manager() {
     if command -v apt-get >/dev/null 2>&1; then
         echo "apt"
@@ -12424,7 +12504,7 @@ protocol_operations_management() {
             4) follow_service_log snell-v5 ;;
             5) follow_service_log "$REALM_SERVICE_NAME" ;;
             6) restart_service_safe sing-box "sing-box"; pause ;;
-            7) restart_service_safe "$XRAY_SERVICE_NAME" "ss2022-xray"; pause ;;
+            7) restart_xray_safe; pause ;;
             8) restart_service_safe snell-v5 "Snell v5"; pause ;;
             9) restart_service_safe "$REALM_SERVICE_NAME" "Realm 转发"; pause ;;
             10)
