@@ -4682,15 +4682,17 @@ view_config_menu() {
         echo "  3. VLESS Reality"
         echo "  4. Snell v5"
         echo "  5. 修改节点名称"
+        echo "  6. Snell v6"
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0-5]: " c
+        read -rp "请选择 [0-6]: " c
         case "$c" in
             1) view_ss2022_config; pause ;;
             2) view_shadowtls_config; pause ;;
             3) view_vless_config; pause ;;
             4) view_snell_config; pause ;;
             5) node_name_management ;;
+            6) snell6_load && view_snell_v6_config; pause ;;
             0) return ;;
             *) echo -e "${RED}输入无效。${PLAIN}"; sleep 1 ;;
         esac
@@ -8623,6 +8625,7 @@ show_component_versions() {
         printf '  Snell Server  已安装: %-12s 推荐: %s\n' "$sn" "$SNELL_VERSION"
     fi
     echo ""
+    printf '  Snell v6      已安装: %-12s 推荐: %s\n' "$([[ -x "$SNELL6_BIN" ]] && echo "$SNELL6_VERSION" || echo 未安装)" "$SNELL6_VERSION"
     echo "【网络组件】"
     printf '  Realm         已安装: %-12s 推荐: %s\n' "$re" "$REALM_VERSION"
     if command -v warp-cli >/dev/null 2>&1; then
@@ -12608,9 +12611,11 @@ protocol_operations_management() {
         echo "  8. 重启 Snell v5"
         echo "  9. 重启 Realm 转发"
         echo " 10. 查看 IPv6 Keepalive 状态"
+        echo " 11. 查看 Snell v6 日志"
+        echo " 12. 重启 Snell v6"
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0-10]: " c
+        read -rp "请选择 [0-12]: " c
         case "$c" in
             1) show_service_status; pause ;;
             2) follow_service_log sing-box ;;
@@ -12621,6 +12626,8 @@ protocol_operations_management() {
             7) restart_xray_safe; pause ;;
             8) restart_service_safe snell-v5 "Snell v5"; pause ;;
             9) restart_service_safe "$REALM_SERVICE_NAME" "Realm 转发"; pause ;;
+            11) follow_service_log "$SNELL6_SERVICE_NAME" ;;
+            12) restart_service_safe "$SNELL6_SERVICE_NAME" "Snell v6"; pause ;;
             10)
                 if service_is_active "$(keepalive_service_name)"; then
                     echo "IPv6 Keepalive: Running"
