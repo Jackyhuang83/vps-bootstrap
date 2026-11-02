@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
-# 当前版本: v1.9.1-dev9
+# 当前版本: v1.9.1-dev10
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,11 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.9.1-dev10:
+#   - Realm 首页仅显示版本号、服务运行状态、转发规则数量
+#   - 隐藏 brutal/batched-udp/proxy/balance/transport/multi-thread 编译功能标签，仅改变显示
+#   - 保留 Realm 原有诊断命令和服务、规则配置不变
 #
 # v1.9.1-dev9:
 #   - 首页三个核心分别列出 SS2022 / ShadowTLS v3、VLESS Reality、Snell v5 节点部署情况与端口
@@ -671,7 +676,7 @@
 # 注意: v1.9.0 为稳定正式版；Alpine 3.21 上 Snell v5 与 Cloudflare WARP 仍受官方组件兼容性限制。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.1-dev9"
+SCRIPT_VERSION="v1.9.1-dev10"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -1311,7 +1316,7 @@ get_inbound_port() {
 }
 show_dashboard() {
     clear
-    local sys_info singbox_info xray_info snell_info time_sync_status realm_info realm_status forwarding_count=0
+    local sys_info singbox_info xray_info snell_info time_sync_status realm_info realm_version realm_status forwarding_count=0
     local sb_status="${YELLOW}○ 未安装${PLAIN}"
     local xray_status="${YELLOW}○ 未安装${PLAIN}"
     local snell_status="${YELLOW}○ 未安装${PLAIN}"
@@ -1328,8 +1333,9 @@ show_dashboard() {
     snell_info=$(get_snell_version)
     time_sync_status=$(get_time_sync_status)
     if [[ -x "$REALM_BIN" ]]; then
-        realm_info=$("$REALM_BIN" --version 2>/dev/null | head -n1)
-        realm_info=${realm_info:-"Realm 已安装"}
+        # --version 同时携带编译功能标签；首页只保留版本号。
+        realm_version=$("$REALM_BIN" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)
+        realm_info="Realm ${realm_version:-已安装（版本未知）}"
         if service_is_active "$REALM_SERVICE_NAME"; then
             realm_status="${GREEN}● 运行中${PLAIN}"
         else

@@ -17,7 +17,7 @@ SNELL_BIN="$tmp/snell"
 REALM_BIN="$tmp/realm"
 FORWARDING_FILE="$tmp/forwarding.json"
 RED="" GREEN="" YELLOW="" CYAN="" PLAIN=""
-ACTIVE_SB=0 ACTIVE_XR=0 ACTIVE_SN=0
+ACTIVE_SB=0 ACTIVE_XR=0 ACTIVE_SN=0 ACTIVE_REALM=0
 
 clear() { :; }
 get_sys_info() { echo fixture; }
@@ -33,6 +33,7 @@ service_is_active() {
         sing-box) [[ "$ACTIVE_SB" == 1 ]] ;;
         "$XRAY_SERVICE_NAME") [[ "$ACTIVE_XR" == 1 ]] ;;
         snell-v5) [[ "$ACTIVE_SN" == 1 ]] ;;
+        "$REALM_SERVICE_NAME") [[ "$ACTIVE_REALM" == 1 ]] ;;
         *) return 1 ;;
     esac
 }
@@ -93,4 +94,25 @@ rm -f "$XRAY_CONF"
 jq -n --arg old "$TAG_VLESS" '{inbounds:[{tag:$old,listen_port:7443}]}' > "$SINGBOX_CONF"
 out=$(render)
 check_contains "$out" "节点: VLESS Reality 未部署（旧 sing-box 仍有 VLESS，待迁移）"
-echo "PASS: per-core protocol deployment states"
+# Realm output exposes build feature tags which must not appear on the homepage.
+cat > "$REALM_BIN" <<'REALM_MOCK'
+#!/bin/sh
+echo 'Realm 2.9.6 [brutal][batched-udp][proxy][balance][transport][multi-thread]'
+REALM_MOCK
+chmod 755 "$REALM_BIN"
+printf '%s\n' '{"rules":[{"listen":"0.0.0.0:9999","remote":"127.0.0.1:9999"}]}' > "$FORWARDING_FILE"
+ACTIVE_REALM=1
+out=$(render)
+check_contains "$out" "Realm转发: Realm 2.9.6 / ● 运行中 / 规则 1 条"
+if [[ "$out" == *"[brutal]"* || "$out" == *"[balance]"* || "$out" == *"[multi-thread]"* ]]; then
+    echo "FAIL: Realm feature flags leaked into dashboard" >&2
+    exit 1
+fi
+
+# Version probe failure remains safe and does not leak flags or break the menu.
+printf '#!/bin/sh\nexit 1\n' > "$REALM_BIN"
+chmod 755 "$REALM_BIN"
+out=$(render)
+check_contains "$out" "Realm转发: Realm 已安装（版本未知） / ● 运行中 / 规则 1 条"
+
+echo "PASS: per-core protocol deployment and concise Realm dashboard states"
