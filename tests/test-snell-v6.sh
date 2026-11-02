@@ -27,6 +27,13 @@ if snell6_ownership >/dev/null 2>&1; then
 fi
 rm -f "$SNELL6_BIN"
 
+snell6_choose_network <<<"3" >/dev/null
+[[ "$SNELL6_SELECTED_NETWORK" == dual ]]
+snell6_choose_network <<<"2" >/dev/null
+[[ "$SNELL6_SELECTED_NETWORK" == ipv6 ]]
+if grep -Eq '(^|[[:space:]])(select_network_mode|setup_keepalive|disable_keepalive_for_ipv4)([[:space:]]|$)' modules/snell-v6.sh; then
+    echo "FAIL: Snell v6 module changes global network/keepalive"; exit 1
+fi
 snell6_candidate "$tmp/dual.conf" dual 64444 0123456789abcdef0123456789abcdef
 grep -q '^listen = 0.0.0.0:64444,\[::\]:64444$' "$tmp/dual.conf"
 grep -q '^mode = default$' "$tmp/dual.conf"
