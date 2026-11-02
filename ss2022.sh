@@ -4176,7 +4176,7 @@ snell_binary_works() {
 }
 
 install_snell_v5_core() {
-    local arch sarch expected_sha url tmp zip actual curl_family candidate
+    local arch sarch expected_sha url tmp zip actual candidate
 
     if platform_is_alpine; then
         echo -e "${RED}[错误] Snell v5 官方 Linux 二进制无法在 Alpine 3.21 + gcompat 下正常启动。${PLAIN}"
@@ -4203,20 +4203,8 @@ install_snell_v5_core() {
             ;;
     esac
 
-    case "$NETWORK_MODE" in
-        ipv6) curl_family="-6" ;;
-        ipv4|dual) curl_family="-4" ;;
-        *)
-            if get_public_ipv4 >/dev/null 2>&1; then
-                curl_family="-4"
-            elif get_public_ipv6 >/dev/null 2>&1; then
-                curl_family="-6"
-            else
-                echo -e "${RED}[错误] 未检测到可用公网 IPv4 / IPv6，无法下载 Snell。${PLAIN}"
-                return 1
-            fi
-            ;;
-    esac
+    # 下载属于 VPS 主动外连，不能由 Snell IPv4/IPv6 入站监听模式强制选路。
+    # 交由 curl 自动协商下载服务器可达的 IPv4/IPv6 地址。
 
     if [[ -x "$SNELL_BIN" ]]; then
         echo -e "${GREEN}✔ 已检测到 Snell v5 二进制；新文件通过完整校验与运行时自检后才会替换。${PLAIN}"
@@ -4228,7 +4216,7 @@ install_snell_v5_core() {
     url="https://dl.nssurge.com/snell/snell-server-v${SNELL_VERSION}-linux-${sarch}.zip"
 
     echo -e "${YELLOW}>> 从 Surge 官方下载 Snell v${SNELL_VERSION}...${PLAIN}"
-    if ! curl -fL "$curl_family" --connect-timeout 20 --max-time 120 --retry 3 --retry-delay 2 \
+    if ! curl -fL --connect-timeout 20 --max-time 120 --retry 3 --retry-delay 2 \
         -o "$zip" "$url"; then
         rm -rf "$tmp"
         echo -e "${RED}[错误] Snell v5 下载失败：${url}${PLAIN}"
