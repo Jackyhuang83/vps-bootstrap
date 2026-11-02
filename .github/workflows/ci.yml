@@ -10,6 +10,8 @@ on:
       - "tests/test-mktemp.sh"
       - "tests/test-xray-restart.sh"
       - "tests/test-dashboard-nodes.sh"
+      - "tests/test-snell-v6.sh"
+      - "modules/snell-v6.sh"
       - "README.md"
       - ".github/workflows/ci.yml"
       - ".github/workflows/promote-ss2022.yml"
@@ -24,6 +26,8 @@ on:
       - "tests/test-mktemp.sh"
       - "tests/test-xray-restart.sh"
       - "tests/test-dashboard-nodes.sh"
+      - "tests/test-snell-v6.sh"
+      - "modules/snell-v6.sh"
       - "README.md"
       - ".github/workflows/ci.yml"
 
@@ -61,6 +65,13 @@ jobs:
 
       - name: Per-core dashboard node status regression
         run: bash tests/test-dashboard-nodes.sh
+
+      - name: Official Snell v6 module syntax and isolation
+        run: |
+          bash -n modules/snell-v6.sh
+          shellcheck --severity=error modules/snell-v6.sh
+          bash tests/test-snell-v6.sh
+          echo "SNELL6_MODULE_PIN_SHA256=$(sha256sum modules/snell-v6.sh | cut -d' ' -f1)"
 
       - name: Check script version
         run: |
