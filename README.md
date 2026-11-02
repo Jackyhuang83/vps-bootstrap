@@ -4,7 +4,7 @@
 
 当前正式版本：**v1.9.0**
 
-当前开发版本：**v1.9.1-dev9**
+当前开发版本：**v1.9.1-dev10**
 
 项目以单一交互式 Bash 脚本 `ss2022.sh` 为入口，整合 **SS2022、SS2022 + ShadowTLS v3、VLESS Reality、Snell v5**，并提供 WARP 出口、链式落地、规则分流、Realm L4 端口转发、组件管理、服务器工具、服务器测试与脚本自更新。
 
@@ -77,6 +77,10 @@ proxy
 进入管理面板。
 
 ---
+
+## 首页 Realm 信息精简（v1.9.1-dev10）
+
+Realm 首页只显示简短版本号、运行状态和规则数量，例如 `Realm 2.9.6 / ● 运行中 / 规则 1 条`。不再展示 `[brutal][batched-udp][proxy][balance][transport][multi-thread]` 等编译功能标签。原始 `realm --version` 信息与实际转发配置不变，功能没有被关闭。
 
 ## 首页协议状态（v1.9.1-dev9）
 
