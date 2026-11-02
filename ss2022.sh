@@ -8311,10 +8311,11 @@ show_service_status() {
     ss -lntup 2>/dev/null | grep -E 'sing-box|xray|snell-server|ss2022-realm|realm' || echo "未检测到相关监听"
 }
 full_uninstall() {
-    local yes="" singbox_managed=0 snell_managed=0 proxy_link_managed=0
+    local yes="" singbox_managed=0 snell_managed=0 snell6_managed=0 proxy_link_managed=0
     local warp_package_managed=0 warp_repo_managed=0
     singbox_is_project_managed && singbox_managed=1 || true
     snell_is_project_managed && snell_managed=1 || true
+    [[ -f "$SNELL6_MANAGED_MARKER" ]] && snell6_managed=1 || true
     proxy_shortcut_is_project_managed && proxy_link_managed=1 || true
     warp_package_is_project_managed && warp_package_managed=1 || true
     warp_repo_is_project_managed && warp_repo_managed=1 || true
@@ -8332,6 +8333,7 @@ full_uninstall() {
     if [[ "$PLATFORM_INIT" == "systemd" ]]; then
         [[ $singbox_managed -eq 1 ]] && systemctl disable --now sing-box >/dev/null 2>&1 || true
         [[ $snell_managed -eq 1 ]] && systemctl disable --now snell-v5 >/dev/null 2>&1 || true
+        [[ $snell6_managed -eq 1 ]] && systemctl disable --now snell-v6 >/dev/null 2>&1 || true
         systemctl disable --now "$XRAY_SERVICE_NAME" "$REALM_SERVICE_NAME" "${IPV6_KEEPALIVE_SYSTEMD_SERVICE_NAME}.timer" >/dev/null 2>&1 || true
         systemctl disable --now "$IP_FAMILY_SERVICE_NAME" ss2022-tg-monitor.timer >/dev/null 2>&1 || true
         systemctl stop "${IPV6_KEEPALIVE_SYSTEMD_SERVICE_NAME}.service" ss2022-tg-monitor.service >/dev/null 2>&1 || true
@@ -8388,6 +8390,10 @@ full_uninstall() {
             rm -f "$SNELL_DIR_MARKER"
         fi
     fi
+    if [[ $snell6_managed -eq 1 ]]; then
+        rm -f "$SNELL6_CONF" "$SNELL6_BIN" "$SNELL6_SERVICE" "$SNELL6_MANAGED_MARKER" "$SNELL6_CANDIDATE_PREFIX".*
+        [[ ! -f "$SNELL6_DIR_MARKER" ]] || { rmdir "$SNELL6_CONF_DIR" 2>/dev/null || true; rm -f "$SNELL6_DIR_MARKER"; }
+    fi
     rm -rf /etc/ss2022-xray /etc/ss2022-realm "$STATE_DIR" /usr/local/lib/ss2022 /var/log/ss2022
 
     [[ $proxy_link_managed -eq 1 ]] && rm -f "$SCRIPT_PROXY_LINK"
@@ -8425,6 +8431,8 @@ full_uninstall() {
     if [[ -f "$REALM_USER_MARKER" ]]; then delete_system_user "$REALM_USER"; rm -f "$REALM_USER_MARKER"; fi
     if [[ -f "$REALM_GROUP_MARKER" ]]; then delete_system_group "$REALM_GROUP"; rm -f "$REALM_GROUP_MARKER"; fi
 
+    if [[ -f "$SNELL6_USER_MARKER" ]]; then delete_system_user "$SNELL6_USER"; rm -f "$SNELL6_USER_MARKER"; fi
+    if [[ -f "$SNELL6_GROUP_MARKER" ]]; then delete_system_group "$SNELL6_GROUP"; rm -f "$SNELL6_GROUP_MARKER"; fi
     if [[ -f "$SNELL_USER_MARKER" ]]; then delete_system_user "$SNELL_USER"; rm -f "$SNELL_USER_MARKER"; fi
     if [[ -f "$SNELL_GROUP_MARKER" ]]; then delete_system_group "$SNELL_GROUP"; rm -f "$SNELL_GROUP_MARKER"; fi
 
