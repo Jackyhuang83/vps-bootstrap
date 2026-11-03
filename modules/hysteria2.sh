@@ -16,12 +16,16 @@ hy2_ownership() {
 }
 
 hy2_validate_domain() {
-    local domain="$1"
+    local domain="$1" tld label
+    local -a labels=()
     [[ ${#domain} -le 253 && "$domain" == *.* ]] || return 1
-    [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || return 1
-    [[ "$domain" != *..* && "$domain" != *.-* && "$domain" != *-.*
-       && "$domain" != *--.* ]] || return 1
-    [[ "$domain" != *.-* ]] || return 1
+    [[ "$domain" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
+    tld="${domain##*.}"
+    [[ "$tld" =~ ^[A-Za-z]{2,63}$ ]] || return 1
+    IFS=. read -r -a labels <<< "$domain"
+    for label in "${labels[@]}"; do
+        [[ ${#label} -le 63 && "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+    done
     return 0
 }
 
@@ -64,7 +68,9 @@ hy2_port_free() {
     # Existing HY2 may be listening on its own port; do not reject a safe update.
     [[ "$port" == "$previous" && -n "$previous" ]] && return 0
     command -v ss >/dev/null 2>&1 || { echo "[错误] 缺少 ss，不能检查 UDP 端口。"; return 1; }
-    if ss -H -lunp | awk -v p="$port" '{a=$5; sub(/^.*:/,"",a); if(a==p) found=1} END{exit !found}'; then
+    local sockets
+    sockets=$(ss -H -lunp) || { echo "[错误] UDP 监听端口检查失败。"; return 1; }
+    if awk -v p="$port" '{a=$5; sub(/^.*:/,"",a); if(a==p) found=1} END{exit !found}' <<< "$sockets"; then
         echo "[错误] UDP 端口 $port 已被占用（HY2 独立 UDP 监听）。"
         return 1
     fi
@@ -72,15 +78,17 @@ hy2_port_free() {
 }
 
 hy2_candidate() {
-    local dest="$1" network="$2" port="$3" domain="$4" password="$5" listen=""
+    local dest="$1" network="$2" port="$3" domain="$4" password="$5" listen="" acme_host=""
     hy2_validate_domain "$domain" || return 1
     [[ "$password" =~ ^[A-Za-z0-9_-]{32,128}$ ]] || return 1
     listen=$(hy2_listen "$network" "$port") || return 1
+    [[ "$network" != ipv6 ]] || acme_host="::"
     jq -n --arg listen "$listen" --arg domain "$domain" --arg password "$password" \
-        --arg acme_dir "$HY2_CONF_DIR/acme" \
+        --arg acme_dir "$HY2_CONF_DIR/acme" --arg acme_host "$acme_host" \
         '{
           listen:$listen,
-          acme:{domains:[$domain],type:"http",dir:$acme_dir},
+          acme:({domains:[$domain],type:"http",dir:$acme_dir} +
+            (if $acme_host == "" then {} else {listenHost:$acme_host} end)),
           auth:{type:"password",password:$password},
           masquerade:{type:"proxy",proxy:{url:"https://www.wikipedia.org/",rewriteHost:true}}
         }' > "$dest" || return 1
