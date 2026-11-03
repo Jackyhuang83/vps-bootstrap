@@ -790,7 +790,7 @@ HY2_MANAGED_MARKER="/etc/ss2022-hy2-install-managed"
 HY2_SHA256_AMD64="907ba8c9693edb104b20582681fb7dc15639d5b64a9cbb616a7b539190a86691"
 HY2_SHA256_ARM64="a68a61a84452ca250ce0368202521965ca9cc9d801a404f1dc9008ac6cf677a7"
 HY2_MODULE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/modules/hysteria2.sh"
-HY2_MODULE_SHA256="3f1f1a0318a967fe100f1723fff9f7428eb5e035033f95a623159f98d13f5a95"
+HY2_MODULE_SHA256="aa61a33793508a7a0ac897b5d54012b4561f72f5de14571354acd2906c82e7e3"
 # ----------------------------- Realm L4 端口转发 -------------------------------
 # 固定官方稳定版本；下载后使用 GitHub Release API 返回的 asset digest 进行 SHA256 校验。
 REALM_VERSION="2.9.6"
