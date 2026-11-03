@@ -4,11 +4,25 @@
 
 当前正式版本：**v1.9.0**
 
-当前开发版本：**v1.9.1-dev11**
+当前开发版本：**v1.9.1-dev12**
 
 项目以单一交互式 Bash 脚本 `ss2022.sh` 为入口，整合 **SS2022、SS2022 + ShadowTLS v3、VLESS Reality、Snell v5**，并提供 WARP 出口、链式落地、规则分流、Realm L4 端口转发、组件管理、服务器工具、服务器测试与脚本自更新。
 
 > v1.9.0 为当前稳定正式版。Debian / Ubuntu + systemd 正式支持；Alpine 3.21 + OpenRC 正式支持 SS2022、ShadowTLS v3、VLESS Reality、Realm 以及服务器管理/测试。Snell v5 与 Cloudflare WARP 在 Alpine 暂不开放。
+
+---
+
+## HY2（Hysteria 2）开发版：v1.9.1-dev12
+
+通过「协议管理 → 6. Hysteria 2（HY2 / QUIC-UDP）」部署，使用 Hysteria 官方 v2.13.0 独立核心（固定 SHA256 校验），基于 QUIC/UDP、TLS 加密与密码认证。首期仅开放 Debian / Ubuntu + systemd、amd64/arm64。
+
+- 支持 IPv4-only、IPv6-only、双栈独立监听；不修改现有 sing-box、Xray、Snell、Realm 和全局网络设置。
+- 提供部署、修改监听端口/地址族/TLS 域名/密码、查看配置、删除、运行日志与重启。
+- 生成 Surge Hysteria 2 配置及 `hysteria2://` URI。Surge 官方支持最低 iOS 5.8、macOS 5.4；默认不启用实验性混淆和端口跳跃。
+- 使用官方 ACME HTTP-01：需要域名 A/AAAA 能从公网解析至 VPS；服务器 TCP/80 与云平台防火墙必须允许证书验证；客户端连接需开放 HY2 UDP 端口（默认 34443）。不使用不安全 TLS 证书跳过选项。
+- CI 通过也不代表真实 VPS 已完成证书签发和客户端 QUIC 握手。首次部署需单独进行实机连通验收。
+
+官方文档：[Hysteria 2](https://v2.hysteria.network/docs/advanced/Full-Server-Config/) · [Surge Hysteria 2](https://manual.nssurge.com/policies/hysteria2.html)。
 
 ---
 
