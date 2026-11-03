@@ -12,6 +12,8 @@ on:
       - "tests/test-dashboard-nodes.sh"
       - "tests/test-snell-v6.sh"
       - "modules/snell-v6.sh"
+      - "modules/hysteria2.sh"
+      - "tests/test-hysteria2.sh"
       - "README.md"
       - ".github/workflows/ci.yml"
       - ".github/workflows/promote-ss2022.yml"
@@ -28,6 +30,8 @@ on:
       - "tests/test-dashboard-nodes.sh"
       - "tests/test-snell-v6.sh"
       - "modules/snell-v6.sh"
+      - "modules/hysteria2.sh"
+      - "tests/test-hysteria2.sh"
       - "README.md"
       - ".github/workflows/ci.yml"
 
@@ -77,6 +81,17 @@ jobs:
             echo "ERROR: Snell v6 module checksum does not match script pin"; exit 1;
           }
           echo "PASS: Snell v6 module SHA256 pin verified"
+
+      - name: Official Hysteria 2 module SHA256, syntax and isolation
+        run: |
+          bash -n modules/hysteria2.sh
+          shellcheck --severity=error modules/hysteria2.sh
+          bash tests/test-hysteria2.sh
+          actual=$(sha256sum modules/hysteria2.sh | cut -d' ' -f1)
+          pinned=$(sed -nE 's/^HY2_MODULE_SHA256="([0-9a-f]{64})"$/\1/p' ss2022.sh)
+          [[ -n "$pinned" && "$actual" == "$pinned" ]] || {
+            echo "HY2 module checksum mismatch"; exit 1;
+          }
 
       - name: Check script version
         run: |
