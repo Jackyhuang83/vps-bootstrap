@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
-# 当前版本: v1.9.1-dev11
+# 当前版本: v1.9.1-dev12
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,11 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.9.1-dev12:
+#   - 新增 Hysteria 2 v2.13.0 官方独立核心及基于 UDP/QUIC 的监听模式
+#   - 增加 ACME HTTP-01 证书、密码认证与 Surge 客户端配置导出
+#   - 独立部署、更新、删除、日志及运行状态，不触碰旧协议节点
 #
 # v1.9.1-dev11:
 #   - Surge 官方 Snell v6.0.0 作为选装协议，独立服务，与 v5 并行
@@ -680,7 +685,7 @@
 # 注意: v1.9.0 为稳定正式版；Alpine 3.21 上 Snell v5 与 Cloudflare WARP 仍受官方组件兼容性限制。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.1-dev11"
+SCRIPT_VERSION="v1.9.1-dev12"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -774,6 +779,23 @@ SNELL6_SHA256_AMD64="8a9c4463ca87cfa5eaa37c6af0d37ab93ea275aa12391985bb2a375ca3a
 SNELL6_SHA256_ARM64="a0b2915cbc77dc3baf8fa069e741c20808d8a10c3a8a93e709a0a580645c3bd7"
 SNELL6_MODULE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/modules/snell-v6.sh"
 SNELL6_MODULE_SHA256="2cdc39d03c8349bf284d487ffdb12738e530510e2e8651371aff781ac2b55399"
+# ----------------------------- Official Hysteria 2 ---------------------------
+HY2_VERSION="2.13.0"
+HY2_BIN="/usr/local/lib/ss2022/hysteria"
+HY2_CONF_DIR="/etc/ss2022-hy2"
+HY2_CONF="$HY2_CONF_DIR/config.json"
+HY2_SERVICE_NAME="ss2022-hy2"
+HY2_SERVICE="/etc/systemd/system/ss2022-hy2.service"
+HY2_USER="ss2022-hy2"
+HY2_GROUP="ss2022-hy2"
+HY2_USER_MARKER="/etc/ss2022-hy2-user-managed"
+HY2_GROUP_MARKER="/etc/ss2022-hy2-group-managed"
+HY2_DIR_MARKER="/etc/ss2022-hy2-dir-managed"
+HY2_MANAGED_MARKER="/etc/ss2022-hy2-install-managed"
+HY2_SHA256_AMD64="907ba8c9693edb104b20582681fb7dc15639d5b64a9cbb616a7b539190a86691"
+HY2_SHA256_ARM64="a68a61a84452ca250ce0368202521965ca9cc9d801a404f1dc9008ac6cf677a7"
+HY2_MODULE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/modules/hysteria2.sh"
+HY2_MODULE_SHA256="aa61a33793508a7a0ac897b5d54012b4561f72f5de14571354acd2906c82e7e3"
 # ----------------------------- Realm L4 端口转发 -------------------------------
 # 固定官方稳定版本；下载后使用 GitHub Release API 返回的 asset digest 进行 SHA256 校验。
 REALM_VERSION="2.9.6"
@@ -1429,6 +1451,11 @@ show_dashboard() {
         ((installed_count++))
         proto_list+="\n    • Snell v5 - 端口: ${CYAN}${p:-未知}${PLAIN}"
     fi
+    if [[ -f "$HY2_CONF" && -f "$HY2_MANAGED_MARKER" ]]; then
+        p=$(jq -r '.listen | capture(":(?<port>[0-9]+)$").port' "$HY2_CONF" 2>/dev/null || echo "未知")
+        ((installed_count++))
+        proto_list+="\n    • Hysteria 2 (UDP) - 端口: ${CYAN}${p}${PLAIN}"
+    fi
     if [[ -f "$SNELL6_CONF" ]]; then
         p=$(sed -nE 's/^[[:space:]]*listen[[:space:]]*=[[:space:]]*([^,]*).*/\1/p' "$SNELL6_CONF" | head -n1 | grep -oE '[0-9]+$' || true)
         ((installed_count++))
@@ -1461,6 +1488,17 @@ show_dashboard() {
         echo "  Snell v6: 未安装"
     fi
     echo -e "    节点: Snell v5 ${sn_v5_node}"
+    if [[ -x "$HY2_BIN" ]]; then
+        if service_is_active "$HY2_SERVICE_NAME"; then
+            echo "  HY2核心: v$HY2_VERSION / ● 运行中"
+        elif [[ -f "$HY2_CONF" ]]; then
+            echo "  HY2核心: v$HY2_VERSION / ○ 已停止"
+        else
+            echo "  HY2核心: v$HY2_VERSION / ○ 仅安装核心"
+        fi
+    else
+        echo "  HY2核心: 未安装"
+    fi
     echo -e "  Realm转发: ${realm_info} / ${realm_status} / 规则 ${forwarding_count} 条"
     echo -e "  时间同步: ${time_sync_status}"
     echo -e "  IPv6链路保活: ${keepalive_status}"
@@ -1931,6 +1969,7 @@ default_node_name() {
         vless)     printf '%s' "Proxy-VLESS-Reality" ;;
         snell)     printf '%s' "Proxy-Snell-v5" ;;
         snell6)    printf '%s' "Proxy-Snell-v6" ;;
+        hy2)       printf '%s' "Proxy-HY2" ;;
         *)         printf '%s' "Proxy-Node" ;;
     esac
 }
@@ -1976,6 +2015,7 @@ protocol_mode_exists() {
         shadowtls) json_has_inbound_tag "$TAG_STLS" ;;
         vless) xray_vless_exists ;;
         snell) protocol_exists_snell ;;
+        hy2) [[ -f "$HY2_CONF" && -f "$HY2_MANAGED_MARKER" ]] ;;
         *) return 1 ;;
     esac
 }
@@ -2022,14 +2062,20 @@ node_name_management() {
         else
             echo "  4. Snell v5                [未部署]"
         fi
+        if protocol_mode_exists hy2; then
+            echo -e "  5. HY2                    [${GREEN}$(get_node_name hy2)${PLAIN}]"
+        else
+            echo "  5. HY2                    [未部署]"
+        fi
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0-4]: " c
+        read -rp "请选择 [0-5]: " c
         case "$c" in
             1) rename_node_name "ss" "SS2022"; pause ;;
             2) rename_node_name "shadowtls" "SS2022 + ShadowTLS v3"; pause ;;
             3) rename_node_name "vless" "VLESS Reality"; pause ;;
             4) rename_node_name "snell" "Snell v5"; pause ;;
+            5) rename_node_name "hy2" "Hysteria 2"; pause ;;
             0) return ;;
             *) sleep 1 ;;
         esac
@@ -4684,9 +4730,10 @@ view_config_menu() {
         echo "  4. Snell v5"
         echo "  5. 修改节点名称"
         echo "  6. Snell v6"
+        echo "  7. Hysteria 2（HY2）"
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0-6]: " c
+        read -rp "请选择 [0-7]: " c
         case "$c" in
             1) view_ss2022_config; pause ;;
             2) view_shadowtls_config; pause ;;
@@ -4694,6 +4741,7 @@ view_config_menu() {
             4) view_snell_config; pause ;;
             5) node_name_management ;;
             6) snell6_load && view_snell_v6_config; pause ;;
+            7) hy2_load && view_hy2_config; pause ;;
             0) return ;;
             *) echo -e "${RED}输入无效。${PLAIN}"; sleep 1 ;;
         esac
@@ -8306,19 +8354,22 @@ show_service_status() {
     service_status_output snell-v5 | head -n 15 || echo "未安装/未加载"
     echo "【Snell v6】"
     service_status_output "$SNELL6_SERVICE_NAME" | head -n 15 || echo "未安装/未加载"
+    echo "【Hysteria 2】"
+    service_status_output "$HY2_SERVICE_NAME" | head -n 15 || echo "未安装/未加载"
     echo ""
     echo -e "$YELLOW【Realm 端口转发】$PLAIN"
     service_status_output "$REALM_SERVICE_NAME" | head -n 15 || echo "未安装/未加载"
     echo ""
     echo -e "$YELLOW【监听端口】$PLAIN"
-    ss -lntup 2>/dev/null | grep -E 'sing-box|xray|snell-server|ss2022-realm|realm' || echo "未检测到相关监听"
+    ss -lntup 2>/dev/null | grep -E 'sing-box|xray|snell-server|hysteria|ss2022-realm|realm' || echo "未检测到相关监听"
 }
 full_uninstall() {
-    local yes="" singbox_managed=0 snell_managed=0 snell6_managed=0 proxy_link_managed=0
+    local yes="" singbox_managed=0 snell_managed=0 snell6_managed=0 hy2_managed_flag=0 proxy_link_managed=0
     local warp_package_managed=0 warp_repo_managed=0
     singbox_is_project_managed && singbox_managed=1 || true
     snell_is_project_managed && snell_managed=1 || true
     [[ -f "$SNELL6_MANAGED_MARKER" ]] && snell6_managed=1 || true
+    [[ -f "$HY2_MANAGED_MARKER" ]] && hy2_managed_flag=1 || true
     proxy_shortcut_is_project_managed && proxy_link_managed=1 || true
     warp_package_is_project_managed && warp_package_managed=1 || true
     warp_repo_is_project_managed && warp_repo_managed=1 || true
@@ -8337,6 +8388,7 @@ full_uninstall() {
         [[ $singbox_managed -eq 1 ]] && systemctl disable --now sing-box >/dev/null 2>&1 || true
         [[ $snell_managed -eq 1 ]] && systemctl disable --now snell-v5 >/dev/null 2>&1 || true
         [[ $snell6_managed -eq 1 ]] && systemctl disable --now snell-v6 >/dev/null 2>&1 || true
+        [[ $hy2_managed_flag -eq 1 ]] && systemctl disable --now "$HY2_SERVICE_NAME" >/dev/null 2>&1 || true
         systemctl disable --now "$XRAY_SERVICE_NAME" "$REALM_SERVICE_NAME" "${IPV6_KEEPALIVE_SYSTEMD_SERVICE_NAME}.timer" >/dev/null 2>&1 || true
         systemctl disable --now "$IP_FAMILY_SERVICE_NAME" ss2022-tg-monitor.timer >/dev/null 2>&1 || true
         systemctl stop "${IPV6_KEEPALIVE_SYSTEMD_SERVICE_NAME}.service" ss2022-tg-monitor.service >/dev/null 2>&1 || true
@@ -8397,6 +8449,14 @@ full_uninstall() {
         rm -f "$SNELL6_CONF" "$SNELL6_BIN" "$SNELL6_SERVICE" "$SNELL6_MANAGED_MARKER" "$SNELL6_CANDIDATE_PREFIX".*
         [[ ! -f "$SNELL6_DIR_MARKER" ]] || { rmdir "$SNELL6_CONF_DIR" 2>/dev/null || true; rm -f "$SNELL6_DIR_MARKER"; }
     fi
+    if [[ $hy2_managed_flag -eq 1 ]]; then
+        rm -f "$HY2_CONF" "$HY2_BIN" "$HY2_SERVICE" "$HY2_MANAGED_MARKER" "$HY2_CONF_DIR"/.ss2022-*
+        rm -rf "$HY2_CONF_DIR/acme"
+        if [[ -f "$HY2_DIR_MARKER" ]]; then
+            rmdir "$HY2_CONF_DIR" 2>/dev/null || true
+            rm -f "$HY2_DIR_MARKER"
+        fi
+    fi
     rm -rf /etc/ss2022-xray /etc/ss2022-realm "$STATE_DIR" /usr/local/lib/ss2022 /var/log/ss2022
 
     [[ $proxy_link_managed -eq 1 ]] && rm -f "$SCRIPT_PROXY_LINK"
@@ -8434,6 +8494,8 @@ full_uninstall() {
     if [[ -f "$REALM_USER_MARKER" ]]; then delete_system_user "$REALM_USER"; rm -f "$REALM_USER_MARKER"; fi
     if [[ -f "$REALM_GROUP_MARKER" ]]; then delete_system_group "$REALM_GROUP"; rm -f "$REALM_GROUP_MARKER"; fi
 
+    if [[ -f "$HY2_USER_MARKER" ]]; then delete_system_user "$HY2_USER"; rm -f "$HY2_USER_MARKER"; fi
+    if [[ -f "$HY2_GROUP_MARKER" ]]; then delete_system_group "$HY2_GROUP"; rm -f "$HY2_GROUP_MARKER"; fi
     if [[ -f "$SNELL6_USER_MARKER" ]]; then delete_system_user "$SNELL6_USER"; rm -f "$SNELL6_USER_MARKER"; fi
     if [[ -f "$SNELL6_GROUP_MARKER" ]]; then delete_system_group "$SNELL6_GROUP"; rm -f "$SNELL6_GROUP_MARKER"; fi
     if [[ -f "$SNELL_USER_MARKER" ]]; then delete_system_user "$SNELL_USER"; rm -f "$SNELL_USER_MARKER"; fi
@@ -9056,6 +9118,36 @@ snell6_load() {
     rm -f "$tmp"
     SNELL6_MODULE_LOADED=1
 }
+hy2_load() {
+    [[ "${HY2_MODULE_LOADED:-0}" == 1 ]] && return 0
+    local tmp sha
+    tmp=$(mktemp /tmp/ss2022-hy2-module.XXXXXX) || return 1
+    if ! curl -4 -fsSL --connect-timeout 12 --max-time 50 -o "$tmp" "$HY2_MODULE_URL"; then
+        rm -f "$tmp"
+        tmp=$(mktemp /tmp/ss2022-hy2-module.XXXXXX) || return 1
+        if ! curl -6 -fsSL --connect-timeout 12 --max-time 50 -o "$tmp" "$HY2_MODULE_URL"; then
+            rm -f "$tmp"; echo "[错误] HY2 模块下载失败。"; return 1
+        fi
+    fi
+    sha=$(sha256sum "$tmp" | awk '{print $1}')
+    if [[ "$sha" != "$HY2_MODULE_SHA256" ]] ||
+       ! grep -Fqx '# MODULE: OFFICIAL_HYSTERIA2_V1' "$tmp" ||
+       ! bash -n "$tmp"; then
+        rm -f "$tmp"; echo "[错误] HY2 模块校验失败，拒绝执行。"; return 1
+    fi
+    # shellcheck disable=SC1090
+    source "$tmp"
+    rm -f "$tmp"
+    HY2_MODULE_LOADED=1
+}
+hy2_protocol_menu() {
+    if platform_is_alpine || [[ "$PLATFORM_INIT" != systemd ]]; then
+        echo "[提示] HY2 第一阶段仅开放 Debian/Ubuntu + systemd。"
+        pause; return
+    fi
+    hy2_load || { pause; return; }
+    protocol_action_menu "Hysteria 2（官方独立服务，UDP）" deploy_hy2 update_hy2 delete_hy2
+}
 snell6_protocol_menu() {
     if platform_is_alpine || [[ "$PLATFORM_INIT" != systemd ]]; then
         echo "[提示] Surge 官方 Snell v6 当前仅开放 Debian/Ubuntu + systemd。"
@@ -9078,9 +9170,10 @@ protocol_management() {
             echo "  4. Snell v5"
         fi
         echo "  5. Snell v6（Surge 官方）"
+        echo "  6. Hysteria 2（HY2 / QUIC-UDP）"
         echo "  0. 返回"
         echo -e "$CYAN═══════════════════════════════════════════════════$PLAIN"
-        read -rp "请选择 [0-5]: " c
+        read -rp "请选择 [0-6]: " c
         case "$c" in
             1) protocol_action_menu "SS2022" deploy_ss2022 update_ss2022 delete_ss2022 ;;
             2) protocol_action_menu "SS2022 + ShadowTLS v3" deploy_shadowtls update_shadowtls delete_shadowtls ;;
@@ -9094,6 +9187,7 @@ protocol_management() {
                 fi
                 ;;
             5) snell6_protocol_menu ;;
+            6) hy2_protocol_menu ;;
             0) return ;;
             *) sleep 1 ;;
         esac
@@ -12614,9 +12708,11 @@ protocol_operations_management() {
         echo " 10. 查看 IPv6 Keepalive 状态"
         echo " 11. 查看 Snell v6 日志"
         echo " 12. 重启 Snell v6"
+        echo " 13. 查看 HY2 日志"
+        echo " 14. 重启 HY2"
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0-12]: " c
+        read -rp "请选择 [0-14]: " c
         case "$c" in
             1) show_service_status; pause ;;
             2) follow_service_log sing-box ;;
@@ -12629,6 +12725,13 @@ protocol_operations_management() {
             9) restart_service_safe "$REALM_SERVICE_NAME" "Realm 转发"; pause ;;
             11) follow_service_log "$SNELL6_SERVICE_NAME" ;;
             12) restart_service_safe "$SNELL6_SERVICE_NAME" "Snell v6"; pause ;;
+            13) follow_service_log "$HY2_SERVICE_NAME" ;;
+            14) if [[ -f "$HY2_CONF" && -f "$HY2_MANAGED_MARKER" ]]; then
+                    restart_service_safe "$HY2_SERVICE_NAME" "HY2"
+                else
+                    echo "[提示] HY2 尚未部署，不能通过重启创建节点。"
+                fi
+                pause ;;
             10)
                 if service_is_active "$(keepalive_service_name)"; then
                     echo "IPv6 Keepalive: Running"
