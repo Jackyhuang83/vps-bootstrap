@@ -1,0 +1,34 @@
+name: Surge Node Health
+
+on:
+  push:
+    branches: [main, feat/surge-node-health]
+    paths:
+      - modules/surge/node-health/**
+      - .github/workflows/surge-node-health.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - modules/surge/node-health/**
+      - .github/workflows/surge-node-health.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check JavaScript syntax
+        run: |
+          node --check modules/surge/node-health/node-health.js
+          node --check modules/surge/node-health/settings.js
+      - name: Verify Surge runtime contracts
+        run: node --test modules/surge/node-health/tests/node-health.test.cjs
+
