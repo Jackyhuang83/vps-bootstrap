@@ -122,6 +122,27 @@ jobs:
           "$RUNNER_TEMP/snell-warp-sb/sing-box" version
           "$RUNNER_TEMP/snell-warp-sb/sing-box" check -c "$RUNNER_TEMP/snell-warp-sb/uid.json"
 
+      - name: Validate generated Snell WARP IPv6 systemd unit
+        shell: bash
+        run: |
+          set -euo pipefail
+          unit_template=$(awk '
+            /cat > "\$SNELL_WARP_UID_SERVICE" <<SERVICE/ { inside=1; next }
+            inside && /^SERVICE$/ { exit }
+            inside { print }
+          ' ss2022.sh)
+          [[ -n "$unit_template" ]] || { echo "Missing unit template"; exit 1; }
+          SINGBOX_BIN=/bin/true
+          SNELL_WARP_UID_CONF=/dev/null
+          ipbin=$(command -v ip)
+          uid=998
+          eval "cat <<SERVICE
+          $unit_template
+          SERVICE" > "$RUNNER_TEMP/ss2022-snell-warp-uid.service"
+          systemd-analyze verify "$RUNNER_TEMP/ss2022-snell-warp-uid.service"
+          grep -Fq 'uidrange 998-998 ipproto tcp to 2000::/3 lookup 16381' "$RUNNER_TEMP/ss2022-snell-warp-uid.service"
+          grep -Fq 'ExecStopPost=' "$RUNNER_TEMP/ss2022-snell-warp-uid.service"
+
       - name: Official Hysteria 2 module SHA256, syntax and isolation
         run: |
           bash -n modules/hysteria2.sh
