@@ -685,7 +685,7 @@
 # 注意: v1.9.0 为稳定正式版；Alpine 3.21 上 Snell v5 与 Cloudflare WARP 仍受官方组件兼容性限制。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.1-dev12"
+SCRIPT_VERSION="v1.9.1-dev13"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -3613,8 +3613,38 @@ update_vless_reality() {
     done
 }
 
+# Snell v5: inbound listen family and IPv6 destination egress are independent.
+# A dual-stack VPS may accept clients on IPv4 while forwarding to an IPv6-only
+# landing server. Detect a routable IPv6 source without sending network traffic.
+# Preserve an explicitly enabled value during updates (including a temporary
+# IPv6 route outage); never silently disable working IPv6 chaining.
+snell_v5_ipv6_egress_flag() {
+    local ingress_mode="$1" existing="${2:-false}" route="" src=""
+
+    if [[ "$ingress_mode" == "ipv6" || "$existing" == "true" ]]; then
+        printf 'true'
+        return 0
+    fi
+
+    if command -v ip >/dev/null 2>&1; then
+        route=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null) || route=""
+        if [[ "$route" != *unreachable* && "$route" != *blackhole* &&
+              "$route" != *prohibit* &&
+              " $route " =~ [[:space:]]src[[:space:]]([0-9a-fA-F:]+) ]]; then
+            src="${BASH_REMATCH[1]}"
+            # Public unicast only (2000::/3); link-local/ULA is insufficient.
+            if [[ "$src" == [23]* ]]; then
+                printf 'true'
+                return 0
+            fi
+        fi
+    fi
+
+    printf 'false'
+}
+
 update_snell_v5() {
-    local choice="" confirm="" current_port current_psk current_listen current_host current_network
+    local choice="" confirm="" current_port current_psk current_listen current_host current_network current_ipv6_flag
     local new_port new_psk new_network listen_value ipv6_flag tmp
 
     if ! protocol_exists_snell; then
@@ -3632,6 +3662,7 @@ update_snell_v5() {
         current_port=$(snell_port_from_config)
         current_psk=$(awk -F'=' '/^[[:space:]]*psk[[:space:]]*=/{sub(/^[[:space:]]*/,"",$2); sub(/[[:space:]]*$/,"",$2); print $2; exit}' "$SNELL_CONF")
         current_listen=$(awk -F'=' '/^[[:space:]]*listen[[:space:]]*=/{print $2; exit}' "$SNELL_CONF")
+        current_ipv6_flag=$(awk -F'=' '/^[[:space:]]*ipv6[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$SNELL_CONF")
         current_host=$(get_mode_state_field "snell" "host" 2>/dev/null || true)
         current_network=$(get_mode_state_field "snell" "network" 2>/dev/null || true)
         if [[ -z "$current_network" ]]; then
@@ -3691,10 +3722,11 @@ update_snell_v5() {
         esac
 
         if [[ "$new_network" == "ipv6" ]]; then
-            listen_value="[::]:${new_port}"; ipv6_flag="true"
+            listen_value="[::]:${new_port}"
         else
-            listen_value="0.0.0.0:${new_port}"; ipv6_flag="false"
+            listen_value="0.0.0.0:${new_port}"
         fi
+        ipv6_flag=$(snell_v5_ipv6_egress_flag "$new_network" "$current_ipv6_flag")
 
         ensure_snell_user || { pause; continue; }
         ensure_snell_config_dir || { pause; continue; }
@@ -4565,11 +4597,10 @@ deploy_snell_v5() {
 
     if [[ "$NETWORK_MODE" == "ipv6" ]]; then
         listen_value="[::]:${snell_port}"
-        ipv6_flag="true"
     else
         listen_value="0.0.0.0:${snell_port}"
-        ipv6_flag="false"
     fi
+    ipv6_flag=$(snell_v5_ipv6_egress_flag "$NETWORK_MODE")
 
     ask_server_host
     ask_node_name "snell" || return
