@@ -13007,15 +13007,14 @@ snell_warp_bridge_menu() {
     local choice
     while true; do
         echo "══════ Snell v5 → WARP IPv6 TCP 桥接 ══════"
-        echo "1. 部署独立桥接（不改原节点）"
-        echo "2. 查看桥接及 Surge 配置示例"
-        echo "3. 卸载独立桥接"
+        echo "旧版按落地 IP/端口绑定，已由菜单 16 的 Snell 通用 IPv6 出站取代。"
+        echo "1. 查看旧版桥接及 Surge 配置"
+        echo "2. 卸载旧版桥接"
         echo "0. 返回"
-        read -rp "请选择 [0-3]: " choice || return
+        read -rp "请选择 [0-2]: " choice || return
         case "$choice" in
-            1) snell_warp_bridge_deploy; pause ;;
-            2) snell_warp_bridge_show; pause ;;
-            3) read -rp "确认仅删除独立桥接？[y/N]: " choice
+            1) snell_warp_bridge_show; pause ;;
+            2) read -rp "确认仅删除旧版桥接？[y/N]: " choice
                [[ "$choice" =~ ^[Yy]$ ]] && snell_warp_bridge_remove
                pause ;;
             0) return ;;
@@ -13103,6 +13102,24 @@ snell_warp_uid_remove() {
     service_is_active "$SNELL_WARP_UID_SERVICE_NAME" && {
         echo "STOP: 独立服务未成功停止。"; return 1;
     }
+    # Preserve ownership evidence if systemd's scoped ExecStopPost cleanup failed.
+    # Never remove a rule or route belonging to another owner.
+    local uid current_rule
+    uid=$(id -u snell 2>/dev/null) || uid=""
+    current_rule=$(ip -6 rule show 2>/dev/null | grep '^16381:' || true)
+    if [[ -n "$current_rule" && -n "$uid" &&
+          "$current_rule" == *"uidrange $uid-$uid"* &&
+          "$current_rule" == *"ipproto tcp"* ]]; then
+        ip -6 rule del pref 16381 uidrange "$uid-$uid" ipproto tcp             to 2000::/3 lookup 16381 >/dev/null 2>&1 || true
+    fi
+    if ip -6 route show table 16381 2>/dev/null | grep -Eq '^2000::/3 dev swipv6tun([[:space:]]|$)'; then
+        ip -6 route del 2000::/3 dev swipv6tun table 16381 >/dev/null 2>&1 || true
+    fi
+    if ip -6 rule show 2>/dev/null | grep -q '^16381:' ||
+       [[ -n "$(ip -6 route show table 16381 2>/dev/null)" ]]; then
+        echo "STOP: 专用策略路由仍有残留；保留 ownership 和服务文件供排查。"
+        return 1
+    fi
     rm -f "$SNELL_WARP_UID_CONF" "$SNELL_WARP_UID_SERVICE" "$SNELL_WARP_UID_MARKER"
     rmdir "$SNELL_WARP_UID_DIR" 2>/dev/null || true
     service_daemon_reload || true
@@ -13269,7 +13286,7 @@ protocol_operations_management() {
         echo " 12. 重启 Snell v6"
         echo " 13. 查看 HY2 日志"
         echo " 14. 重启 HY2"
-        echo " 15. Snell v5 → WARP IPv6 TCP 桥接（旧版固定落地）"
+        echo " 15. 旧版 Snell 固定落地桥接（仅维护/卸载）"
         echo " 16. Snell 专用 WARP IPv6 TCP 自动出站（推荐）"
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
