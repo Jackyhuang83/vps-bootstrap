@@ -3621,7 +3621,7 @@ update_vless_reality() {
 snell_ipv6_egress_flag() {
     local ingress_mode="$1" existing="${2:-false}" route="" src=""
 
-    if [[ "$ingress_mode" == "ipv6" || "$existing" == "true" ]]; then
+    if [[ "$ingress_mode" == "ipv6" || "$ingress_mode" == "dual" || "$existing" == "true" ]]; then
         printf 'true'
         return 0
     fi
