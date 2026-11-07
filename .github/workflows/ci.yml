@@ -11,6 +11,7 @@ on:
       - "tests/test-xray-restart.sh"
       - "tests/test-dashboard-nodes.sh"
       - "tests/test-snell-v6.sh"
+      - "tests/test-ipv6-egress.sh"
       - "modules/snell-v6.sh"
       - "modules/hysteria2.sh"
       - "tests/test-hysteria2.sh"
@@ -29,6 +30,7 @@ on:
       - "tests/test-xray-restart.sh"
       - "tests/test-dashboard-nodes.sh"
       - "tests/test-snell-v6.sh"
+      - "tests/test-ipv6-egress.sh"
       - "modules/snell-v6.sh"
       - "modules/hysteria2.sh"
       - "tests/test-hysteria2.sh"
@@ -81,6 +83,12 @@ jobs:
             echo "ERROR: Snell v6 module checksum does not match script pin"; exit 1;
           }
           echo "PASS: Snell v6 module SHA256 pin verified"
+
+      - name: IPv6 outbound egress across proxy protocols
+        run: |
+          bash -n tests/test-ipv6-egress.sh
+          shellcheck --severity=error tests/test-ipv6-egress.sh
+          bash tests/test-ipv6-egress.sh
 
       - name: Official Hysteria 2 module SHA256, syntax and isolation
         run: |

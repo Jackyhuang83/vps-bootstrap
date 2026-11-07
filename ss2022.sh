@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
-# 当前版本: v1.9.1-dev12
+# 当前版本: v1.9.1-dev13
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,11 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.9.1-dev13:
+#   - 修复 Snell v5/v6 IPv4 入站与 IPv6 目标出站被错误绑定，双栈 VPS 可作为 IPv6 落地的前置
+#   - 首次部署检测公网 IPv6 源路由，更新保留已开启的 IPv6 出站能力
+#   - SS2022/ShadowTLS、VLESS Reality、HY2 使用已有官方双栈出站，增加统一链式只读诊断和回归测试
 #
 # v1.9.1-dev12:
 #   - 新增 Hysteria 2 v2.13.0 官方独立核心及基于 UDP/QUIC 的监听模式
@@ -685,7 +690,7 @@
 # 注意: v1.9.0 为稳定正式版；Alpine 3.21 上 Snell v5 与 Cloudflare WARP 仍受官方组件兼容性限制。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.1-dev12"
+SCRIPT_VERSION="v1.9.1-dev13"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -778,7 +783,7 @@ SNELL6_CANDIDATE_PREFIX="/usr/local/bin/.ss2022-snell-server-v6.new"
 SNELL6_SHA256_AMD64="8a9c4463ca87cfa5eaa37c6af0d37ab93ea275aa12391985bb2a375ca3abd7f2"
 SNELL6_SHA256_ARM64="a0b2915cbc77dc3baf8fa069e741c20808d8a10c3a8a93e709a0a580645c3bd7"
 SNELL6_MODULE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/modules/snell-v6.sh"
-SNELL6_MODULE_SHA256="2cdc39d03c8349bf284d487ffdb12738e530510e2e8651371aff781ac2b55399"
+SNELL6_MODULE_SHA256="9e77d0a245b630e70f6caac68f088331858155bf95ee4efd22147ba1cbd82029"
 # ----------------------------- Official Hysteria 2 ---------------------------
 HY2_VERSION="2.13.0"
 HY2_BIN="/usr/local/lib/ss2022/hysteria"
@@ -3613,8 +3618,38 @@ update_vless_reality() {
     done
 }
 
+# Snell v5: inbound listen family and IPv6 destination egress are independent.
+# A dual-stack VPS may accept clients on IPv4 while forwarding to an IPv6-only
+# landing server. Detect a routable IPv6 source without sending network traffic.
+# Preserve an explicitly enabled value during updates (including a temporary
+# IPv6 route outage); never silently disable working IPv6 chaining.
+snell_ipv6_egress_flag() {
+    local ingress_mode="$1" existing="${2:-false}" route="" src=""
+
+    if [[ "$ingress_mode" == "ipv6" || "$ingress_mode" == "dual" || "$existing" == "true" ]]; then
+        printf 'true'
+        return 0
+    fi
+
+    if command -v ip >/dev/null 2>&1; then
+        route=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null) || route=""
+        if [[ "$route" != *unreachable* && "$route" != *blackhole* &&
+              "$route" != *prohibit* &&
+              " $route " =~ [[:space:]]src[[:space:]]([0-9a-fA-F:]+) ]]; then
+            src="${BASH_REMATCH[1]}"
+            # Public unicast only (2000::/3); link-local/ULA is insufficient.
+            if [[ "$src" == [23]* ]]; then
+                printf 'true'
+                return 0
+            fi
+        fi
+    fi
+
+    printf 'false'
+}
+
 update_snell_v5() {
-    local choice="" confirm="" current_port current_psk current_listen current_host current_network
+    local choice="" confirm="" current_port current_psk current_listen current_host current_network current_ipv6_flag
     local new_port new_psk new_network listen_value ipv6_flag tmp
 
     if ! protocol_exists_snell; then
@@ -3632,6 +3667,7 @@ update_snell_v5() {
         current_port=$(snell_port_from_config)
         current_psk=$(awk -F'=' '/^[[:space:]]*psk[[:space:]]*=/{sub(/^[[:space:]]*/,"",$2); sub(/[[:space:]]*$/,"",$2); print $2; exit}' "$SNELL_CONF")
         current_listen=$(awk -F'=' '/^[[:space:]]*listen[[:space:]]*=/{print $2; exit}' "$SNELL_CONF")
+        current_ipv6_flag=$(awk -F'=' '/^[[:space:]]*ipv6[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$SNELL_CONF")
         current_host=$(get_mode_state_field "snell" "host" 2>/dev/null || true)
         current_network=$(get_mode_state_field "snell" "network" 2>/dev/null || true)
         if [[ -z "$current_network" ]]; then
@@ -3691,10 +3727,11 @@ update_snell_v5() {
         esac
 
         if [[ "$new_network" == "ipv6" ]]; then
-            listen_value="[::]:${new_port}"; ipv6_flag="true"
+            listen_value="[::]:${new_port}"
         else
-            listen_value="0.0.0.0:${new_port}"; ipv6_flag="false"
+            listen_value="0.0.0.0:${new_port}"
         fi
+        ipv6_flag=$(snell_ipv6_egress_flag "$new_network" "$current_ipv6_flag")
 
         ensure_snell_user || { pause; continue; }
         ensure_snell_config_dir || { pause; continue; }
@@ -4565,11 +4602,10 @@ deploy_snell_v5() {
 
     if [[ "$NETWORK_MODE" == "ipv6" ]]; then
         listen_value="[::]:${snell_port}"
-        ipv6_flag="true"
     else
         listen_value="0.0.0.0:${snell_port}"
-        ipv6_flag="false"
     fi
+    ipv6_flag=$(snell_ipv6_egress_flag "$NETWORK_MODE")
 
     ask_server_host
     ask_node_name "snell" || return
@@ -12670,6 +12706,103 @@ google_test_management() {
     done
 }
 
+# Read-only IPv6 egress audit for every managed proxy. An IPv4 listener is
+# not evidence of IPv4-only egress. Never rewrite existing routing preferences.
+test_proxy_ipv6_egress() {
+    local route_ready="false" cfg flag outbound family final mode target port answer
+    echo "===== 代理协议 IPv6 出站 / Surge 链式兼容性检查（只读） ====="
+    route_ready=$(snell_ipv6_egress_flag ipv4 false)
+    echo "宿主 IPv6 路由: $([[ "$route_ready" == true ]] && echo '检测到公网 IPv6 源地址（非远端连接证明）' || echo '未检测到可用公网 IPv6 源路由')"
+    echo "说明：入站 IPv4 / IPv6 与代理服务端实际出口是独立设置。"
+
+    for cfg in "$SNELL_CONF" "$SNELL6_CONF"; do
+        [[ -f "$cfg" ]] || continue
+        flag=$(sed -nE 's/^[[:space:]]*ipv6[[:space:]]*=[[:space:]]*(true|false)[[:space:]]*$/\1/p' "$cfg" | head -n1)
+        if [[ "$cfg" == "$SNELL_CONF" ]]; then
+            mode="Snell v5"
+        else
+            mode="Snell v6"
+        fi
+        if [[ "$flag" == true ]]; then
+            echo "PASS: $mode IPv6 出站已启用"
+        elif [[ "$route_ready" == true ]]; then
+            echo "WARN: $mode ipv6=${flag:-missing}；双栈 VPS 可能无法转发 IPv6 落地"
+            echo "      提示：在工具箱的该协议更新菜单重新应用配置（先备份原配置）。"
+        else
+            echo "INFO: $mode ipv6=${flag:-missing}；当前宿主无公网 IPv6 源路由"
+        fi
+    done
+
+    if [[ -f "$SINGBOX_CONF" ]] && command -v jq >/dev/null 2>&1; then
+        if jq -e 'any(.inbounds[]?; .type=="shadowsocks")' "$SINGBOX_CONF" >/dev/null 2>&1; then
+            echo "INFO: SS2022 / ShadowTLS 使用 sing-box；入站 listen 不限制 direct 的 IPv6 出站"
+        fi
+        outbound=$(jq -r '(.outbounds // []) | map(select(.tag=="direct")) | first | .type // "missing"' "$SINGBOX_CONF" 2>/dev/null || echo "invalid")
+        if [[ "$outbound" == direct ]]; then
+            echo "PASS: sing-box direct 出站存在，默认允许按目标地址族连接"
+        else
+            echo "WARN: sing-box tag=direct 类型异常：$outbound；检查自定义路由"
+        fi
+        final=$(jq -r '.route.final // "direct"' "$SINGBOX_CONF" 2>/dev/null || echo invalid)
+        if [[ "$final" != direct ]]; then
+            echo "INFO: sing-box 当前最终出口为 $final（链式第二跳可能经其他上游）"
+        fi
+        if jq -e 'any(.outbounds[]?; .type=="direct" and ((.inet4_bind_address // "") != ""))' "$SINGBOX_CONF" >/dev/null 2>&1; then
+            echo "INFO: sing-box 发现 direct 的 IPv4 本地绑定；需核实对应路由/接口配置"
+        fi
+    fi
+
+    if [[ -f "$ROUTING_FILE" ]] && command -v jq >/dev/null 2>&1; then
+        family=$(jq -r '.global_ip_family // "default"' "$ROUTING_FILE" 2>/dev/null || echo invalid)
+        echo "INFO: 自定义分流全局目标地址族：$family"
+        if [[ "$family" == ipv4 ]]; then
+            echo "WARN: 全局分流偏向 IPv4 解析；IPv6-only 落地域名需单独验证"
+        fi
+    fi
+
+    if [[ -f "$XRAY_CONF" ]] && command -v jq >/dev/null 2>&1; then
+        if jq -e 'any(.outbounds[]?; .protocol=="freedom" and ((.sendThrough // "") == "" or .sendThrough=="0.0.0.0"))' "$XRAY_CONF" >/dev/null 2>&1; then
+            echo "PASS: VLESS Reality / Xray 存在不限定 IPv4 的 freedom 出站"
+        else
+            echo "WARN: Xray freedom 出站不存在或绑定了指定地址，请检查出站"
+        fi
+    fi
+
+    if [[ -f "$HY2_CONF" ]] && command -v jq >/dev/null 2>&1; then
+        if jq -e 'any(.outbounds[]?; .type=="direct" and (.direct.mode // "auto") == "4")' "$HY2_CONF" >/dev/null 2>&1; then
+            echo "WARN: HY2 direct 强制 IPv4 模式，不能连接 IPv6-only 落地"
+        else
+            echo "PASS: HY2 未发现强制 IPv4 的 direct 出站（默认 auto）"
+        fi
+    fi
+
+    echo ""
+    echo "===== 可选：目标 SS2022 落地 IPv6 TCP 连通性 ====="
+    read -rp "落地 IPv6 地址（回车跳过）: " target || return 0
+    [[ -n "$target" ]] || return 0
+    read -rp "落地 TCP 端口: " port || return 0
+    if [[ ! "$target" =~ ^[0-9a-fA-F:]+$ || ! "$port" =~ ^[0-9]+$ ]] ||
+       (( port < 1 || port > 65535 )); then
+        echo "STOP: IPv6 地址或端口格式不正确"
+        return 0
+    fi
+    if command -v curl >/dev/null 2>&1; then
+        answer=$(curl -6 --noproxy '*' -g -v -sS --connect-timeout 5 --max-time 7 \
+            -o /dev/null "telnet://[$target]:$port" </dev/null 2>&1 || true)
+        if [[ "$answer" == *"Connected to "* ]]; then
+            echo "TCP_CONNECT=PASS（仅宿主路径，不代表代理转发已成功）"
+        elif [[ "$answer" == *"Protocol"*not*supported* || "$answer" == *"Unsupported protocol"* ]]; then
+            echo "TCP_CONNECT=UNTESTED（curl 无 telnet 支持）"
+        else
+            echo "TCP_CONNECT=FAIL（检查 VPS 路由、云防火墙、落地监听）"
+            printf '%s\n' "$answer" | grep -Ei 'failed|timed out|refused|unreachable' | tail -3 || true
+        fi
+    else
+        echo "TCP_CONNECT=UNTESTED（未安装 curl）"
+    fi
+    echo "===== 完成：未修改服务、路由、防火墙 ====="
+}
+
 server_test_management() {
     while true; do
         clear
@@ -12678,14 +12811,16 @@ server_test_management() {
         echo "  2. IPv4 / IPv6 三网逐跳回程"
         echo "  3. 平台流媒体AI通信软件解锁测试"
         echo "  4. Google 测试（送中 / 澳门 / 拉回所在地）"
+        echo "  5. 代理协议 IPv6 出站 / 链式兼容性检查"
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0-4]: " c
+        read -rp "请选择 [0-5]: " c
         case "$c" in
             1) test_ip_quality ;;
             2) test_return_route ;;
             3) test_platform_media_ai_communication_unlock ;;
             4) google_test_management ;;
+            5) test_proxy_ipv6_egress; pause ;;
             0) return ;;
             *) sleep 1 ;;
         esac
