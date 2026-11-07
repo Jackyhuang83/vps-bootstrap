@@ -68,13 +68,16 @@ snell6_choose_network() {
 }
 
 snell6_candidate() {
-    local tmp="$1" mode="$2" port="$3" psk="$4" listen ipv6
+    local tmp="$1" mode="$2" port="$3" psk="$4" previous_ipv6="${5:-false}" listen ipv6
     case "$mode" in
-        ipv4) listen="0.0.0.0:$port"; ipv6=false ;;
-        ipv6) listen="[::]:$port"; ipv6=true ;;
-        dual) listen="0.0.0.0:$port,[::]:$port"; ipv6=true ;;
+        ipv4) listen="0.0.0.0:$port" ;;
+        ipv6) listen="[::]:$port" ;;
+        dual) listen="0.0.0.0:$port,[::]:$port" ;;
         *) return 1 ;;
     esac
+    # IPv4 listening does not imply IPv4-only egress. Preserve a previously
+    # enabled IPv6 setting when updating a node during transient route loss.
+    ipv6=$(snell_ipv6_egress_flag "$mode" "$previous_ipv6")
     cat > "$tmp" <<CONFIG
 [snell-server]
 listen = $listen
@@ -259,12 +262,13 @@ deploy_snell_v6() {
 }
 
 update_snell_v6() {
-    local choice port psk network host name nport npsk nnetwork tmp state confirm
+    local choice port psk network host name nport npsk nnetwork tmp state confirm current_ipv6
     [[ -f "$SNELL6_CONF" && -x "$SNELL6_BIN" ]] ||
         { echo "Snell v6 尚未部署。"; pause; return; }
     while true; do
         port=$(snell6_port) || { echo "Snell v6 端口配置错误。"; pause; return; }
         psk=$(sed -nE 's/^[[:space:]]*psk[[:space:]]*=[[:space:]]*(.*)/\1/p' "$SNELL6_CONF" | head -n1)
+        current_ipv6=$(sed -nE 's/^[[:space:]]*ipv6[[:space:]]*=[[:space:]]*(true|false)[[:space:]]*$/\1/p' "$SNELL6_CONF" | head -n1)
         network=$(get_mode_state_field snell6 network 2>/dev/null || true)
         network=${network:-ipv4}
         host=$(get_mode_state_field snell6 host 2>/dev/null || true)
@@ -295,7 +299,7 @@ update_snell_v6() {
         esac
         snell6_port_free "$nport" || continue
         tmp=$(mktemp "$SNELL6_CONF_DIR/.ss2022-config.XXXXXX") || continue
-        snell6_candidate "$tmp" "$nnetwork" "$nport" "$npsk" || { rm -f "$tmp"; continue; }
+        snell6_candidate "$tmp" "$nnetwork" "$nport" "$npsk" "$current_ipv6" || { rm -f "$tmp"; continue; }
         if snell6_apply "$tmp"; then
             state=$(jq -n --arg host "$host" --arg network "$nnetwork" --arg name "$name" \
                 '{host:$host,network:$network,name:$name}')
