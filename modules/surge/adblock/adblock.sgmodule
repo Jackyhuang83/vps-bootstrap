@@ -1,0 +1,81 @@
+#!name=VPS Bootstrap · 去广告 Lite
+#!desc=按需启用的低干扰广告域名拦截；无 MITM、外部脚本、URL 改写或分流覆盖
+#!category=VPS Bootstrap
+
+# SPDX-License-Identifier: MIT
+# This module is an independently curated, opt-in denylist.
+# Inspiration and public indicator references:
+# https://github.com/thNylHx/Tools/blob/main/Surge/Module/Blockads.sgmodule
+# Do not directly copy that upstream module; it includes broad rules,
+# TLS MITM, dynamic external scripts and request/response rewriting.
+# Enable/disable this separate module from the Surge Modules interface.
+#
+# Guardrails:
+# - Advertiser-specific hostnames only (avoid shared API/CDN/push endpoints).
+# - DNS/domain matches only; no IP/ASN/port overrides.
+# - No DIRECT/PROXY routing changes or pre-matching.
+# - No TLS decryption, certificate installation, or remote scripts.
+# - Domain rejection cannot remove first-party/in-app video ad segments.
+
+[Rule]
+# 广告 SDK / 广告交易平台
+DOMAIN-SUFFIX,1rtb.com,REJECT
+DOMAIN-SUFFIX,1rtb.net,REJECT
+DOMAIN-SUFFIX,adhub.com.cn,REJECT
+DOMAIN-SUFFIX,adn-plus.com.cn,REJECT
+DOMAIN-SUFFIX,adnplus.com.cn,REJECT
+DOMAIN-SUFFIX,ad-scope.com.cn,REJECT
+DOMAIN-SUFFIX,adscope.cn,REJECT
+DOMAIN-SUFFIX,adscope.com.cn,REJECT
+DOMAIN-SUFFIX,adukwai.com,REJECT
+DOMAIN-SUFFIX,adkwai.com,REJECT
+DOMAIN-SUFFIX,appsad.cn,REJECT
+DOMAIN-SUFFIX,beizi.biz,REJECT
+DOMAIN-SUFFIX,byteadverts.com,REJECT
+DOMAIN-SUFFIX,doubleclick.net,REJECT
+DOMAIN-SUFFIX,googlesyndication.com,REJECT
+DOMAIN-SUFFIX,inmobi.cn,REJECT
+DOMAIN-SUFFIX,pangle.io,REJECT
+DOMAIN-SUFFIX,supersonicads.com,REJECT
+DOMAIN-SUFFIX,yfanads.com,REJECT
+
+# 百度广告网络（不拦截百度搜索/网盘主站）
+DOMAIN,cpro.baidustatic.com,REJECT
+DOMAIN,mobads.baidu.com,REJECT
+DOMAIN,wn.pos.baidu.com,REJECT
+DOMAIN-SUFFIX,union.baidu.com,REJECT
+
+# 腾讯展示广告及 QQ 音乐独立广告域名
+DOMAIN,adsmind.gdtimg.com,REJECT
+DOMAIN,adsmind.ugdtimg.com,REJECT
+DOMAIN,pgdt.gtimg.cn,REJECT
+DOMAIN,pgdt.ugdtimg.com,REJECT
+DOMAIN,ad.tencentmusic.com,REJECT
+DOMAIN,adcdn.tencentmusic.com,REJECT
+DOMAIN,adcdn6.tencentmusic.com,REJECT
+DOMAIN,adclick.tencentmusic.com,REJECT
+DOMAIN,adexpo.tencentmusic.com,REJECT
+DOMAIN,adstats.tencentmusic.com,REJECT
+DOMAIN,tmead.y.qq.com,REJECT
+DOMAIN,tmeadbak.y.qq.com,REJECT
+DOMAIN,tmeadquic.y.qq.com,REJECT
+
+# 字节及快手广告域名（保留内容 CDN、API 和通知）
+DOMAIN,ads3-normal.zijieapi.com,REJECT
+DOMAIN,ads5-normal.zijieapi.com,REJECT
+DOMAIN,lf-ad-ies.bytecdn.cn,REJECT
+DOMAIN,adtrack.e.kuaishou.com,REJECT
+
+# 国内常见 App 的独立广告接口
+DOMAIN,ad.chelaile.net.cn,REJECT
+DOMAIN,ad.cyapi.cn,REJECT
+DOMAIN,ad.maoyan.com,REJECT
+DOMAIN,ad.seeyouyima.com,REJECT
+DOMAIN,adui.tg.meitu.com,REJECT
+DOMAIN,adx-api.zdmimg.com,REJECT
+DOMAIN,kad.gotokeep.com,REJECT
+DOMAIN,sdk.ad.sfys365.com,REJECT
+
+# 电商广告统计专属域名，保留支付、购物车和订单接口
+DOMAIN,adashx.m.taobao.com,REJECT
+DOMAIN,h-adashx.ut.taobao.com,REJECT

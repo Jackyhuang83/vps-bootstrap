@@ -1,0 +1,32 @@
+name: Surge Adblock
+
+on:
+  push:
+    branches:
+      - main
+      - "feat/surge-adblock-*"
+    paths:
+      - "modules/surge/adblock/**"
+      - ".github/workflows/surge-adblock.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "modules/surge/adblock/**"
+      - ".github/workflows/surge-adblock.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate adblock safety
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+      - name: Node syntax
+        run: node --check modules/surge/adblock/tests/adblock.test.cjs
+      - name: Domain-only adblock regression tests
+        run: node --test modules/surge/adblock/tests/adblock.test.cjs
