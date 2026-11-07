@@ -12701,6 +12701,103 @@ google_test_management() {
     done
 }
 
+# Read-only IPv6 egress audit for every managed proxy. An IPv4 listener is
+# not evidence of IPv4-only egress. Never rewrite existing routing preferences.
+test_proxy_ipv6_egress() {
+    local route_ready="false" cfg flag outbound family final mode target port answer
+    echo "===== 代理协议 IPv6 出站 / Surge 链式兼容性检查（只读） ====="
+    route_ready=$(snell_ipv6_egress_flag ipv4 false)
+    echo "宿主 IPv6 路由: $([[ "$route_ready" == true ]] && echo '检测到公网 IPv6 源地址（非远端连接证明）' || echo '未检测到可用公网 IPv6 源路由')"
+    echo "说明：入站 IPv4 / IPv6 与代理服务端实际出口是独立设置。"
+
+    for cfg in "$SNELL_CONF" "$SNELL6_CONF"; do
+        [[ -f "$cfg" ]] || continue
+        flag=$(sed -nE 's/^[[:space:]]*ipv6[[:space:]]*=[[:space:]]*(true|false)[[:space:]]*$/\\1/p' "$cfg" | head -n1)
+        if [[ "$cfg" == "$SNELL_CONF" ]]; then
+            mode="Snell v5"
+        else
+            mode="Snell v6"
+        fi
+        if [[ "$flag" == true ]]; then
+            echo "PASS: $mode IPv6 出站已启用"
+        elif [[ "$route_ready" == true ]]; then
+            echo "WARN: $mode ipv6=${flag:-missing}；双栈 VPS 可能无法转发 IPv6 落地"
+            echo "      提示：在工具箱的该协议更新菜单重新应用配置（先备份原配置）。"
+        else
+            echo "INFO: $mode ipv6=${flag:-missing}；当前宿主无公网 IPv6 源路由"
+        fi
+    done
+
+    if [[ -f "$SINGBOX_CONF" ]] && command -v jq >/dev/null 2>&1; then
+        if jq -e 'any(.inbounds[]?; .type=="shadowsocks")' "$SINGBOX_CONF" >/dev/null 2>&1; then
+            echo "INFO: SS2022 / ShadowTLS 使用 sing-box；入站 listen 不限制 direct 的 IPv6 出站"
+        fi
+        outbound=$(jq -r '(.outbounds // []) | map(select(.tag=="direct")) | first | .type // "missing"' "$SINGBOX_CONF" 2>/dev/null || echo "invalid")
+        if [[ "$outbound" == direct ]]; then
+            echo "PASS: sing-box direct 出站存在，默认允许按目标地址族连接"
+        else
+            echo "WARN: sing-box tag=direct 类型异常：$outbound；检查自定义路由"
+        fi
+        final=$(jq -r '.route.final // "direct"' "$SINGBOX_CONF" 2>/dev/null || echo invalid)
+        if [[ "$final" != direct ]]; then
+            echo "INFO: sing-box 当前最终出口为 $final（链式第二跳可能经其他上游）"
+        fi
+        if jq -e 'any(.outbounds[]?; .type=="direct" and ((.inet4_bind_address // "") != ""))' "$SINGBOX_CONF" >/dev/null 2>&1; then
+            echo "INFO: sing-box 发现 direct 的 IPv4 本地绑定；需核实对应路由/接口配置"
+        fi
+    fi
+
+    if [[ -f "$ROUTING_FILE" ]] && command -v jq >/dev/null 2>&1; then
+        family=$(jq -r '.global_ip_family // "default"' "$ROUTING_FILE" 2>/dev/null || echo invalid)
+        echo "INFO: 自定义分流全局目标地址族：$family"
+        if [[ "$family" == ipv4 ]]; then
+            echo "WARN: 全局分流偏向 IPv4 解析；IPv6-only 落地域名需单独验证"
+        fi
+    fi
+
+    if [[ -f "$XRAY_CONF" ]] && command -v jq >/dev/null 2>&1; then
+        if jq -e 'any(.outbounds[]?; .protocol=="freedom" and ((.sendThrough // "") == "" or .sendThrough=="0.0.0.0"))' "$XRAY_CONF" >/dev/null 2>&1; then
+            echo "PASS: VLESS Reality / Xray 存在不限定 IPv4 的 freedom 出站"
+        else
+            echo "WARN: Xray freedom 出站不存在或绑定了指定地址，请检查出站"
+        fi
+    fi
+
+    if [[ -f "$HY2_CONF" ]] && command -v jq >/dev/null 2>&1; then
+        if jq -e 'any(.outbounds[]?; .type=="direct" and (.direct.mode // "auto") == "4")' "$HY2_CONF" >/dev/null 2>&1; then
+            echo "WARN: HY2 direct 强制 IPv4 模式，不能连接 IPv6-only 落地"
+        else
+            echo "PASS: HY2 未发现强制 IPv4 的 direct 出站（默认 auto）"
+        fi
+    fi
+
+    echo ""
+    echo "===== 可选：目标 SS2022 落地 IPv6 TCP 连通性 ====="
+    read -rp "落地 IPv6 地址（回车跳过）: " target || return 0
+    [[ -n "$target" ]] || return 0
+    read -rp "落地 TCP 端口: " port || return 0
+    if [[ ! "$target" =~ ^[0-9a-fA-F:]+$ || ! "$port" =~ ^[0-9]+$ ]] ||
+       (( port < 1 || port > 65535 )); then
+        echo "STOP: IPv6 地址或端口格式不正确"
+        return 0
+    fi
+    if command -v curl >/dev/null 2>&1; then
+        answer=$(curl -6 --noproxy '*' -g -v -sS --connect-timeout 5 --max-time 7 \
+            -o /dev/null "telnet://[$target]:$port" </dev/null 2>&1 || true)
+        if [[ "$answer" == *"Connected to "* ]]; then
+            echo "TCP_CONNECT=PASS（仅宿主路径，不代表代理转发已成功）"
+        elif [[ "$answer" == *"Protocol"*not*supported* || "$answer" == *"Unsupported protocol"* ]]; then
+            echo "TCP_CONNECT=UNTESTED（curl 无 telnet 支持）"
+        else
+            echo "TCP_CONNECT=FAIL（检查 VPS 路由、云防火墙、落地监听）"
+            printf '%s\\n' "$answer" | grep -Ei 'failed|timed out|refused|unreachable' | tail -3 || true
+        fi
+    else
+        echo "TCP_CONNECT=UNTESTED（未安装 curl）"
+    fi
+    echo "===== 完成：未修改服务、路由、防火墙 ====="
+}
+
 server_test_management() {
     while true; do
         clear
@@ -12709,14 +12806,16 @@ server_test_management() {
         echo "  2. IPv4 / IPv6 三网逐跳回程"
         echo "  3. 平台流媒体AI通信软件解锁测试"
         echo "  4. Google 测试（送中 / 澳门 / 拉回所在地）"
+        echo "  5. 代理协议 IPv6 出站 / 链式兼容性检查"
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0-4]: " c
+        read -rp "请选择 [0-5]: " c
         case "$c" in
             1) test_ip_quality ;;
             2) test_return_route ;;
             3) test_platform_media_ai_communication_unlock ;;
             4) google_test_management ;;
+            5) test_proxy_ipv6_egress; pause ;;
             0) return ;;
             *) sleep 1 ;;
         esac
