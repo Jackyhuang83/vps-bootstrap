@@ -12,6 +12,7 @@ on:
       - "tests/test-dashboard-nodes.sh"
       - "tests/test-snell-v6.sh"
       - "tests/test-ipv6-egress.sh"
+      - "tests/test-snell-warp-bridge.sh"
       - "modules/snell-v6.sh"
       - "modules/hysteria2.sh"
       - "tests/test-hysteria2.sh"
@@ -31,6 +32,7 @@ on:
       - "tests/test-dashboard-nodes.sh"
       - "tests/test-snell-v6.sh"
       - "tests/test-ipv6-egress.sh"
+      - "tests/test-snell-warp-bridge.sh"
       - "modules/snell-v6.sh"
       - "modules/hysteria2.sh"
       - "tests/test-hysteria2.sh"
@@ -89,6 +91,12 @@ jobs:
           bash -n tests/test-ipv6-egress.sh
           shellcheck --severity=error tests/test-ipv6-egress.sh
           bash tests/test-ipv6-egress.sh
+
+      - name: Snell WARP local IPv6 chain bridge regression
+        run: |
+          bash -n tests/test-snell-warp-bridge.sh
+          shellcheck --severity=error tests/test-snell-warp-bridge.sh
+          bash tests/test-snell-warp-bridge.sh
 
       - name: Official Hysteria 2 module SHA256, syntax and isolation
         run: |

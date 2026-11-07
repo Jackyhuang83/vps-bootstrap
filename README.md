@@ -4,11 +4,23 @@
 
 当前正式版本：**v1.9.0**
 
-当前开发版本：**v1.9.1-dev13**
+当前开发版本：**v1.9.1-dev14**
 
 项目以单一交互式 Bash 脚本 `ss2022.sh` 为入口，整合 **SS2022、SS2022 + ShadowTLS v3、VLESS Reality、Snell v5**，并提供 WARP 出口、链式落地、规则分流、Realm L4 端口转发、组件管理、服务器工具、服务器测试与脚本自更新。
 
 > v1.9.0 为当前稳定正式版。Debian / Ubuntu + systemd 正式支持；Alpine 3.21 + OpenRC 正式支持 SS2022、ShadowTLS v3、VLESS Reality、Realm 以及服务器管理/测试。Snell v5 与 Cloudflare WARP 在 Alpine 暂不开放。
+
+---
+
+## Snell → WARP IPv6 TCP 桥接：v1.9.1-dev14（开发版）
+
+IPv4-only VPS 上的 WARP Local Proxy 只提供本机 SOCKS5，不会给 Snell 创建原生 IPv6 路由。因此新增单独的桥接服务，在 **协议运维管理 → 15. Snell v5 → WARP IPv6 TCP 桥接** 中选装。
+
+- **适用**：IPv4-only 的 Snell v5 前置，WARP IPv6 已启用，需要访问 IPv6-only SS2022 落地 TCP 端口。
+- **路径**：Surge → Snell (IPv4) → 前置 VPS 本地 127.0.0.1:16001 → sing-box 独立 Direct TCP Inbound → WARP Local SOCKS5 → SS2022 IPv6:10000。
+- **Surge 第二跳必须新建**：`SS2022-WARP = ss, 127.0.0.1, 16001, encrypt-method=<原方法>, password=<原密钥>, underlying-proxy=<Snell策略名>, udp-relay=false`。旧的 SS2022 IPv6 节点保持不变；不能继续让 Snell 直接访问它的 IPv6 地址。
+- **隔离**：不开放公网端口，不修改系统 IPv6 默认路由、不切 WARP 全局模式，不改 Snell/SS2022 密钥或现有节点。独立 systemd unit、独立配置、独立卸载；对已有非托管文件拒绝覆盖。若本工具箱 sing-box 核心缺失，明确 STOP 而不安装或覆盖原有核心。
+- **边界**：只支持 TCP；尚未通过用户 Surge 实机完成 Snell → loopback → WARP → SS2022 全链路验证，需在 VPS 配置校验后再测试。WARP TCP 可达并不等于链式协议握手成功。
 
 ---
 
