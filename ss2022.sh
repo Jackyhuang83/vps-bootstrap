@@ -13064,9 +13064,24 @@ snell_warp_uid_show() {
 snell_warp_uid_restore() {
     local expected actual
     [[ -f "$SNELL_WARP_UID_BACKUP" ]] || return 0
-    [[ -f "$SNELL_WARP_UID_ACTIVE_SHA" ]] || {
-        echo "STOP: 缺少 Snell 备份校验文件，不覆盖当前配置。"; return 1;
-    }
+    if [[ ! -f "$SNELL_WARP_UID_ACTIVE_SHA" ]]; then
+        # Interrupted during install: never discard a valid original backup.
+        # If Snell is still byte-identical, no restart or restore is needed.
+        if cmp -s "$SNELL_WARP_UID_BACKUP" "$SNELL_CONF"; then
+            rm -f "$SNELL_WARP_UID_BACKUP"
+            return 0
+        fi
+        # Otherwise accept ONLY the deterministic ipv6=false -> true candidate.
+        # Reject later user edits even when the active checksum was never written.
+        expected=$(sed -E 's/^([[:space:]]*ipv6[[:space:]]*=[[:space:]]*)false([[:space:]]*)$/\1true\2/' "$SNELL_WARP_UID_BACKUP" | sha256sum | awk '{print $1}')
+        actual=$(sha256sum "$SNELL_CONF" | awk '{print $1}')
+        [[ "$expected" == "$actual" ]] || {
+            echo "STOP: Snell 当前配置与原始备份和安装候选均不同，拒绝覆盖。"
+            return 1
+        }
+        printf '%s\n' "$expected" > "$SNELL_WARP_UID_ACTIVE_SHA"
+        chmod 600 "$SNELL_WARP_UID_ACTIVE_SHA"
+    fi
     expected=$(cat "$SNELL_WARP_UID_ACTIVE_SHA")
     actual=$(sha256sum "$SNELL_CONF" | awk '{print $1}')
     [[ "$actual" == "$expected" ]] || {
@@ -13176,6 +13191,17 @@ SERVICE
        ! ip -6 rule show | grep -q '^16381:' ||
        ! ip -6 route show table 16381 | grep -Fq 'dev swipv6tun'; then
         echo "STOP: 独立 TUN 未启动，自动回滚。"
+        snell_warp_uid_remove || true
+        return 1
+    fi
+    # Verify kernel policy routing really resolves Snell's IPv6 TCP via this TUN.
+    # A failed lookup is not success even if the rule/table merely exist.
+    local snell_route other_route
+    snell_route=$(ip -6 route get 2606:4700:4700::1111 uid "$uid" ipproto tcp 2>&1) || snell_route=""
+    other_route=$(ip -6 route get 2606:4700:4700::1111 uid 0 ipproto tcp 2>&1) || other_route=""
+    if [[ "$snell_route" != *"dev swipv6tun"* ||
+          "$other_route" == *"dev swipv6tun"* ]]; then
+        echo "STOP: 内核 UID 路由隔离验收失败，清理独立 TUN；Snell 原配置未动。"
         snell_warp_uid_remove || true
         return 1
     fi
