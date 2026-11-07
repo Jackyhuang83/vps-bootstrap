@@ -3618,7 +3618,7 @@ update_vless_reality() {
 # landing server. Detect a routable IPv6 source without sending network traffic.
 # Preserve an explicitly enabled value during updates (including a temporary
 # IPv6 route outage); never silently disable working IPv6 chaining.
-snell_v5_ipv6_egress_flag() {
+snell_ipv6_egress_flag() {
     local ingress_mode="$1" existing="${2:-false}" route="" src=""
 
     if [[ "$ingress_mode" == "ipv6" || "$existing" == "true" ]]; then
@@ -3726,7 +3726,7 @@ update_snell_v5() {
         else
             listen_value="0.0.0.0:${new_port}"
         fi
-        ipv6_flag=$(snell_v5_ipv6_egress_flag "$new_network" "$current_ipv6_flag")
+        ipv6_flag=$(snell_ipv6_egress_flag "$new_network" "$current_ipv6_flag")
 
         ensure_snell_user || { pause; continue; }
         ensure_snell_config_dir || { pause; continue; }
@@ -4600,7 +4600,7 @@ deploy_snell_v5() {
     else
         listen_value="0.0.0.0:${snell_port}"
     fi
-    ipv6_flag=$(snell_v5_ipv6_egress_flag "$NETWORK_MODE")
+    ipv6_flag=$(snell_ipv6_egress_flag "$NETWORK_MODE")
 
     ask_server_host
     ask_node_name "snell" || return
