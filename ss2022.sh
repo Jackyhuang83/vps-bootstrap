@@ -12712,7 +12712,7 @@ test_proxy_ipv6_egress() {
 
     for cfg in "$SNELL_CONF" "$SNELL6_CONF"; do
         [[ -f "$cfg" ]] || continue
-        flag=$(sed -nE 's/^[[:space:]]*ipv6[[:space:]]*=[[:space:]]*(true|false)[[:space:]]*$/\\1/p' "$cfg" | head -n1)
+        flag=$(sed -nE 's/^[[:space:]]*ipv6[[:space:]]*=[[:space:]]*(true|false)[[:space:]]*$/\1/p' "$cfg" | head -n1)
         if [[ "$cfg" == "$SNELL_CONF" ]]; then
             mode="Snell v5"
         else
@@ -12790,7 +12790,7 @@ test_proxy_ipv6_egress() {
             echo "TCP_CONNECT=UNTESTED（curl 无 telnet 支持）"
         else
             echo "TCP_CONNECT=FAIL（检查 VPS 路由、云防火墙、落地监听）"
-            printf '%s\\n' "$answer" | grep -Ei 'failed|timed out|refused|unreachable' | tail -3 || true
+            printf '%s\n' "$answer" | grep -Ei 'failed|timed out|refused|unreachable' | tail -3 || true
         fi
     else
         echo "TCP_CONNECT=UNTESTED（未安装 curl）"
