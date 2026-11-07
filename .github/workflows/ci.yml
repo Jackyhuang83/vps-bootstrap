@@ -13,6 +13,7 @@ on:
       - "tests/test-snell-v6.sh"
       - "tests/test-ipv6-egress.sh"
       - "tests/test-snell-warp-bridge.sh"
+      - "tests/test-snell-warp-uid.sh"
       - "modules/snell-v6.sh"
       - "modules/hysteria2.sh"
       - "tests/test-hysteria2.sh"
@@ -33,6 +34,7 @@ on:
       - "tests/test-snell-v6.sh"
       - "tests/test-ipv6-egress.sh"
       - "tests/test-snell-warp-bridge.sh"
+      - "tests/test-snell-warp-uid.sh"
       - "modules/snell-v6.sh"
       - "modules/hysteria2.sh"
       - "tests/test-hysteria2.sh"
@@ -97,6 +99,49 @@ jobs:
           bash -n tests/test-snell-warp-bridge.sh
           shellcheck --severity=error tests/test-snell-warp-bridge.sh
           bash tests/test-snell-warp-bridge.sh
+
+      - name: Snell UID-scoped WARP IPv6 egress regression
+        run: |
+          bash -n tests/test-snell-warp-uid.sh
+          shellcheck --severity=error tests/test-snell-warp-uid.sh
+          bash tests/test-snell-warp-uid.sh
+
+      - name: Snell WARP IPv6 config check against pinned sing-box 1.13.20
+        shell: bash
+        run: |
+          set -euo pipefail
+          tarball="$RUNNER_TEMP/sing-box-1.13.20-linux-amd64.tar.gz"
+          url="https://github.com/SagerNet/sing-box/releases/download/v1.13.20/sing-box-1.13.20-linux-amd64.tar.gz"
+          curl -fL --retry 3 --connect-timeout 10 --max-time 120 "$url" -o "$tarball"
+          echo "646bc01bf128c32a12eb50d8690e387bba7504da7b1d65c704bd53916e38595a  $tarball" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/snell-warp-sb"
+          tar -xzf "$tarball" --strip-components=1 -C "$RUNNER_TEMP/snell-warp-sb"
+          export SS2022_LIB_ONLY=1
+          source ./ss2022.sh
+          snell_warp_uid_config_json 40000 > "$RUNNER_TEMP/snell-warp-sb/uid.json"
+          "$RUNNER_TEMP/snell-warp-sb/sing-box" version
+          "$RUNNER_TEMP/snell-warp-sb/sing-box" check -c "$RUNNER_TEMP/snell-warp-sb/uid.json"
+
+      - name: Validate generated Snell WARP IPv6 systemd unit
+        shell: bash
+        run: |
+          set -euo pipefail
+          unit_template=$(awk '
+            /cat > "\$SNELL_WARP_UID_SERVICE" <<SERVICE/ { inside=1; next }
+            inside && /^SERVICE$/ { exit }
+            inside { print }
+          ' ss2022.sh)
+          [[ -n "$unit_template" ]] || { echo "Missing unit template"; exit 1; }
+          SINGBOX_BIN=/bin/true
+          SNELL_WARP_UID_CONF=/dev/null
+          ipbin=$(command -v ip)
+          uid=998
+          eval "cat <<SERVICE
+          $unit_template
+          SERVICE" > "$RUNNER_TEMP/ss2022-snell-warp-uid.service"
+          systemd-analyze verify "$RUNNER_TEMP/ss2022-snell-warp-uid.service"
+          grep -Fq 'uidrange 998-998 ipproto tcp to 2000::/3 lookup 16381' "$RUNNER_TEMP/ss2022-snell-warp-uid.service"
+          grep -Fq 'ExecStopPost=' "$RUNNER_TEMP/ss2022-snell-warp-uid.service"
 
       - name: Official Hysteria 2 module SHA256, syntax and isolation
         run: |
