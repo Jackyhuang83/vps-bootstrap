@@ -12798,6 +12798,66 @@ test_proxy_ipv6_egress() {
     echo "===== 完成：未修改服务、路由、防火墙 ====="
 }
 
+# Read-only preflight for IPv6 chained second hop, no passwords or service changes.
+chain_ipv6_preflight() {
+    local target="" port="" route="" capture="" cfg="" listen="" ipv6="" version=""
+    echo "===== Surge 链式代理 IPv6 第二跳只读诊断 ====="
+    read -rp "落地节点 IPv6 地址（不带方括号）: " target || return 1
+    if [[ ! "$target" =~ ^[0-9a-fA-F:]+$ || "$target" != *:* ]]; then
+        echo "[错误] 请输入 IPv6 字面地址。"; return 1
+    fi
+    read -rp "落地节点 TCP 端口: " port || return 1
+    validate_port_number "$port" || return 1
+    echo "===== 系统 IPv6 路由 ====="
+    route=$(ip -6 route get "$target" 2>&1) && echo "ROUTE=PASS: $route" ||
+        echo "ROUTE=FAIL: $route"
+    echo "===== Snell v5/v6 出站配置（不显示 PSK） ====="
+    for cfg in "$SNELL_CONF" "$SNELL6_CONF" /etc/vless-reality/snell-v5.conf; do
+        [[ -f "$cfg" ]] || continue
+        listen=$(sed -nE 's/^[[:space:]]*listen[[:space:]]*=[[:space:]]*(.*)/\1/p' "$cfg" | head -n1)
+        ipv6=$(sed -nE 's/^[[:space:]]*ipv6[[:space:]]*=[[:space:]]*(true|false)[[:space:]]*$/\1/p' "$cfg" | head -n1)
+        version=$(sed -nE 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*([0-9]+)[[:space:]]*$/\1/p' "$cfg" | head -n1)
+        printf 'SNELL_FILE=%s VERSION=%s LISTEN=%s IPV6_EGRESS=%s\n' "$cfg" "$version" "$listen" "$ipv6"
+        if [[ "$ipv6" == "false" ]]; then
+            echo "WARNING: Snell IPv6 出站被禁用；即使 VPS TCP 可达也可能无法链式。"
+        fi
+    done
+    echo "===== sing-box SS2022 / ShadowTLS 出站（不显示密钥） ====="
+    if [[ -f "$SINGBOX_CONF" ]] && command -v jq >/dev/null 2>&1; then
+        jq -r '"INBOUNDS=" + ([.inbounds[]? | select(.type=="shadowsocks" or .type=="shadowtls") | .tag] | join(",")),
+            "DEFAULT_OUTBOUND=" + (.route.final // "unspecified"),
+            "DIRECT_OUTBOUNDS=" + ([.outbounds[]? | select(.type=="direct") | .tag] | join(",")),
+            "ROUTE_RULES=" + ((.route.rules // []) | length | tostring)' "$SINGBOX_CONF" || true
+    fi
+    if [[ -f "$ROUTING_FILE" ]] && command -v jq >/dev/null 2>&1; then
+        jq -r '"ROUTING_GLOBAL_IP_FAMILY=" + (.global_ip_family // "default"),
+            "ROUTING_DEFAULT=" + (.default_outbound // "direct")' "$ROUTING_FILE" || true
+    fi
+    echo "===== Xray VLESS Reality 出站（不显示 UUID） ====="
+    if [[ -f "$XRAY_CONF" ]] && command -v jq >/dev/null 2>&1; then
+        jq -r '"XRAY_DOMAIN_STRATEGY=" + (.routing.domainStrategy // "AsIs"),
+            (.outbounds[]? | select(.protocol=="freedom") |
+            "XRAY_DIRECT=" + (.tag // "unknown") +
+            " STRATEGY=" + (.settings.domainStrategy // "AsIs"))' "$XRAY_CONF" || true
+    fi
+    echo "===== 落地 IPv6 TCP 连通性 ====="
+    if command -v curl >/dev/null 2>&1; then
+        capture=$(curl --noproxy '*' -6 -g -v -sS --connect-timeout 5 --max-time 7 \
+            -o /dev/null "telnet://[$target]:$port" </dev/null 2>&1 || true)
+        if [[ "$capture" == *"Connected to "* ]]; then
+            echo "TCP_CONNECT=PASS"
+        elif [[ "$capture" == *"not supported"* || "$capture" == *"Unsupported protocol"* ]]; then
+            echo "TCP_CONNECT=UNTESTED (curl 不支持 telnet)"
+        else
+            echo "TCP_CONNECT=FAIL"
+            printf '%s\n' "$capture" | grep -Ei 'failed|timed out|refused|unreachable' | tail -3 || true
+        fi
+    else
+        echo "TCP_CONNECT=UNTESTED (curl 未安装)"
+    fi
+    echo "===== 完成：未修改任何配置或服务 ====="
+}
+
 server_test_management() {
     while true; do
         clear
@@ -12807,6 +12867,7 @@ server_test_management() {
         echo "  3. 平台流媒体AI通信软件解锁测试"
         echo "  4. Google 测试（送中 / 澳门 / 拉回所在地）"
         echo "  5. 代理协议 IPv6 出站 / 链式兼容性检查"
+        echo "  5. Surge 链式 IPv6 前置诊断（只读）"
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
         read -rp "请选择 [0-5]: " c
@@ -12815,6 +12876,7 @@ server_test_management() {
             2) test_return_route ;;
             3) test_platform_media_ai_communication_unlock ;;
             4) google_test_management ;;
+            5) chain_ipv6_preflight; pause ;;
             5) test_proxy_ipv6_egress; pause ;;
             0) return ;;
             *) sleep 1 ;;
