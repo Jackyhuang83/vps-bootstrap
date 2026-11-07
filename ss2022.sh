@@ -778,7 +778,7 @@ SNELL6_CANDIDATE_PREFIX="/usr/local/bin/.ss2022-snell-server-v6.new"
 SNELL6_SHA256_AMD64="8a9c4463ca87cfa5eaa37c6af0d37ab93ea275aa12391985bb2a375ca3abd7f2"
 SNELL6_SHA256_ARM64="a0b2915cbc77dc3baf8fa069e741c20808d8a10c3a8a93e709a0a580645c3bd7"
 SNELL6_MODULE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/modules/snell-v6.sh"
-SNELL6_MODULE_SHA256="2cdc39d03c8349bf284d487ffdb12738e530510e2e8651371aff781ac2b55399"
+SNELL6_MODULE_SHA256="9e77d0a245b630e70f6caac68f088331858155bf95ee4efd22147ba1cbd82029"
 # ----------------------------- Official Hysteria 2 ---------------------------
 HY2_VERSION="2.13.0"
 HY2_BIN="/usr/local/lib/ss2022/hysteria"
