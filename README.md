@@ -4,11 +4,24 @@
 
 当前正式版本：**v1.9.0**
 
-当前开发版本：**v1.9.1-dev14**
+当前开发版本：**v1.9.1-dev15**
 
 项目以单一交互式 Bash 脚本 `ss2022.sh` 为入口，整合 **SS2022、SS2022 + ShadowTLS v3、VLESS Reality、Snell v5**，并提供 WARP 出口、链式落地、规则分流、Realm L4 端口转发、组件管理、服务器工具、服务器测试与脚本自更新。
 
 > v1.9.0 为当前稳定正式版。Debian / Ubuntu + systemd 正式支持；Alpine 3.21 + OpenRC 正式支持 SS2022、ShadowTLS v3、VLESS Reality、Realm 以及服务器管理/测试。Snell v5 与 Cloudflare WARP 在 Alpine 暂不开放。
+
+---
+
+## Snell v5 专用 WARP IPv6 TCP 自动出站：v1.9.1-dev15（开发版）
+
+针对 **IPv4-only VPS + Snell v5 + WARP Local Proxy**：使用独立 sing-box TUN（不启用 auto_route），只将 `snell` 系统用户发起的 **公网 IPv6 TCP** 连接，通过私有路由表 `16381` 转发给 WARP SOCKS5（本机代理）。IPv4 流量、其他 UID、SSH 和全局默认路由不变，**任意 IPv6 TCP 落地无需逐个桥接**，Surge 保留原有 Snell 前置链式配置。
+
+- 菜单：`5. 协议运维管理 → 16. Snell 专用 WARP IPv6 TCP 自动出站`
+- 安全前提：Debian/Ubuntu systemd、工具箱托管的 Snell v5（systemd User=snell）、已有 sing-box 核心、可用 WARP Local SOCKS5 IPv6、/dev/net/tun、独占 TUN `swipv6tun` 与路由偏好/表 `16381`。
+- 启用前需输入 `YES`；若 Snell 原配置 `ipv6=false`，会备份并重启 Snell 一次（可能短暂断连）。卸载时仅在校验通过且用户未另行修改原配置的情况下恢复。
+- 本功能仅适用于 **IPv6 TCP**（IPv6 UDP/QUIC 不支持），不更改 Cloudflare WARP 模式、不添加 nftables/iptables 规则、不覆盖现有代理配置或系统默认路由。
+- 自动化测试验证配置/ownership/回滚逻辑；**尚未通过实际 VPS 上的 TUN + Surge 全链路测试**，不要将 CI 通过视为真实可用性保证。
+- 旧菜单 15 的 `dev14` 固定目标桥接保留为旧版兼容选项，不是新方案的必需组件。
 
 ---
 
