@@ -4,11 +4,23 @@
 
 当前正式版本：**v1.9.0**
 
-当前开发版本：**v1.9.1-dev12**
+当前开发版本：**v1.9.1-dev13**
 
 项目以单一交互式 Bash 脚本 `ss2022.sh` 为入口，整合 **SS2022、SS2022 + ShadowTLS v3、VLESS Reality、Snell v5**，并提供 WARP 出口、链式落地、规则分流、Realm L4 端口转发、组件管理、服务器工具、服务器测试与脚本自更新。
 
 > v1.9.0 为当前稳定正式版。Debian / Ubuntu + systemd 正式支持；Alpine 3.21 + OpenRC 正式支持 SS2022、ShadowTLS v3、VLESS Reality、Realm 以及服务器管理/测试。Snell v5 与 Cloudflare WARP 在 Alpine 暂不开放。
+
+---
+
+## IPv6 链式代理兼容性修复：v1.9.1-dev13
+
+已在 Surge 实机确认：Snell v5 采用 IPv4 入站监听且配置为 `ipv6=false` 时，双栈 VPS 无法转发到 IPv6-only SS2022 落地；开启 `ipv6=true` 后恢复。修复原则是将「客户端接入的监听地址族」与「服务端访问下一跳的目标地址族」分离，而不是强制所有服务器只用 IPv6。
+
+- **Snell v5 / v6**：首次部署和更新时，通过本地 IPv6 源路由判断双栈出站；即便监听 `0.0.0.0`，有可路由公网 IPv6 时仍生成 `ipv6=true`。更新时保留原来已经开启的 IPv6 能力，避免临时路由故障导致回退。真正 IPv4-only 的服务器继续采用 `ipv6=false`。
+- **SS2022 / SS2022 + ShadowTLS v3**：sing-box `direct` 默认支持 IPv4/IPv6，不因 `listen=0.0.0.0` 限制 IPv6 出站。已加入回归测试，不添加无效配置字段；如已有自定义分流强制 IPv4，将在诊断页给出提示，不擅自改用户分流。
+- **VLESS Reality（Xray）/ HY2**：官方 Freedom / direct 默认支持双栈出口，增加自动化回归检查；不修改现有密钥、端口或证书。
+- **诊断入口**：「服务器测试管理 → 5. 代理协议 IPv6 出站 / 链式兼容性检查」。只读检查各核心配置、默认出站与用户分流，并允许输入 IPv6 落地地址和 TCP 端口检查基础网络可达性。TCP 通不等于协议转发成功；需要 Surge 或实际客户端完成第二跳验收。
+- 不自动修改正在运行的 VPS 配置，不重启原有节点；新脚本只有在用户执行协议部署或更新时才应用配置。
 
 ---
 
