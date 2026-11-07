@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
-# 当前版本: v1.9.1-dev13
+# 当前版本: v1.9.1-dev14
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,11 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.9.1-dev14:
+#   - IPv4-only 前置通过 WARP SOCKS5 实现可选的 Snell → SS2022 IPv6 TCP 链式桥接
+#   - 桥接独立 systemd/loopback 监听；原 Snell、WARP、SS2022 和系统路由保持不变
+#   - Surge 第二跳必须使用 127.0.0.1 桥接端口并设置 underlying-proxy=Snell
 #
 # v1.9.1-dev13:
 #   - 修复 Snell v5/v6 IPv4 入站与 IPv6 目标出站被错误绑定，双栈 VPS 可作为 IPv6 落地的前置
@@ -690,7 +695,7 @@
 # 注意: v1.9.0 为稳定正式版；Alpine 3.21 上 Snell v5 与 Cloudflare WARP 仍受官方组件兼容性限制。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.1-dev13"
+SCRIPT_VERSION="v1.9.1-dev14"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -767,6 +772,11 @@ SNELL_OPENRC_LOG="/var/log/ss2022/snell-v5.log"
 SNELL_SHA256_AMD64="9bea1c2b9e35b73b31634856c04d18c393072b9e5dcde6a32781d8b8f908c539"
 SNELL_SHA256_ARM64="2f178bf5ac468ce1a130454efa40a0603fbbe4e47ecc4880a989f4abc7f824cf"
 # Surge official Snell v6 (independent from v5)
+SNELL_WARP_BRIDGE_CONF_DIR="/etc/ss2022-snell-warp-bridge"
+SNELL_WARP_BRIDGE_CONF="${SNELL_WARP_BRIDGE_CONF_DIR}/config.json"
+SNELL_WARP_BRIDGE_SERVICE_NAME="ss2022-snell-warp-bridge"
+SNELL_WARP_BRIDGE_SERVICE="/etc/systemd/system/${SNELL_WARP_BRIDGE_SERVICE_NAME}.service"
+SNELL_WARP_BRIDGE_MARKER="/etc/ss2022-snell-warp-bridge-managed"
 SNELL6_VERSION="6.0.0"
 SNELL6_BIN="/usr/local/bin/snell-server-v6"
 SNELL6_CONF_DIR="/etc/ss2022-snell-v6"
@@ -8419,6 +8429,9 @@ full_uninstall() {
     [[ "$yes" == "DELETE" ]] || { echo "已取消。"; sleep 1; return; }
 
     google_location_remove || return 1
+    if snell_warp_bridge_owned; then
+        snell_warp_bridge_remove || return 1
+    fi
 
     if [[ "$PLATFORM_INIT" == "systemd" ]]; then
         [[ $singbox_managed -eq 1 ]] && systemctl disable --now sing-box >/dev/null 2>&1 || true
@@ -12827,6 +12840,169 @@ server_test_management() {
     done
 }
 
+
+# Experimental isolated Snell -> WARP IPv6 TCP bridge.
+# This is not transparent routing. Surge must point its chained SS2022
+# server to 127.0.0.1:<bridge-port> via underlying-proxy=<Snell>.
+snell_warp_bridge_config_json() {
+    local local_port="$1" remote_ip="$2" remote_port="$3" warp_port="$4"
+    jq -n --argjson local_port "$local_port" --arg ip "$remote_ip" --argjson remote_port "$remote_port" --argjson warp_port "$warp_port" '
+      {log:{level:"warn"},
+       inbounds:[{type:"direct",tag:"bridge-in",listen:"127.0.0.1",
+         listen_port:$local_port,network:"tcp",override_address:$ip,override_port:$remote_port}],
+       outbounds:[{type:"socks",tag:"warp-out",server:"127.0.0.1",
+         server_port:$warp_port,version:"5",network:"tcp"}],
+       route:{final:"warp-out"}}'
+}
+
+snell_warp_bridge_owned() {
+    [[ -f "$SNELL_WARP_BRIDGE_MARKER" && -f "$SNELL_WARP_BRIDGE_SERVICE" ]] &&
+      grep -Fq "ExecStart=${SINGBOX_BIN} run -c ${SNELL_WARP_BRIDGE_CONF}" "$SNELL_WARP_BRIDGE_SERVICE"
+}
+
+snell_warp_bridge_show() {
+    if ! snell_warp_bridge_owned || [[ ! -f "$SNELL_WARP_BRIDGE_CONF" ]]; then
+        echo "尚未部署本工具箱管理的独立桥接。"
+        return 0
+    fi
+    local local_port remote_ip remote_port
+    local_port=$(jq -r '.inbounds[0].listen_port' "$SNELL_WARP_BRIDGE_CONF")
+    remote_ip=$(jq -r '.inbounds[0].override_address' "$SNELL_WARP_BRIDGE_CONF")
+    remote_port=$(jq -r '.inbounds[0].override_port' "$SNELL_WARP_BRIDGE_CONF")
+    if service_is_active "$SNELL_WARP_BRIDGE_SERVICE_NAME"; then
+        echo "桥接服务: 运行中"
+    else
+        echo "桥接服务: 未运行"
+    fi
+    echo "本机 TCP: 127.0.0.1:${local_port} → WARP SOCKS5 → [${remote_ip}]:${remote_port}"
+    echo "Surge: 保留原有 Snell，新增一条 SS2022 策略（沿用原加密算法/密钥）："
+    echo "SS2022-WARP = ss, 127.0.0.1, ${local_port}, encrypt-method=<原方法>, password=<原密钥>, underlying-proxy=<Snell策略名>, udp-relay=false"
+    echo "[警告] 只有使用 underlying-proxy=Snell 的 SS2022-WARP 策略才可连接此 VPS 本地端口。"
+    echo "[范围] 仅 TCP；原 Snell 和原 SS2022 配置均不修改。"
+}
+
+snell_warp_bridge_remove() {
+    if ! snell_warp_bridge_owned; then
+        echo "STOP: 不属于本工具箱的服务，拒绝删除。"
+        return 1
+    fi
+    service_disable_now "$SNELL_WARP_BRIDGE_SERVICE_NAME"
+    rm -f -- "$SNELL_WARP_BRIDGE_CONF" "$SNELL_WARP_BRIDGE_SERVICE" "$SNELL_WARP_BRIDGE_MARKER"
+    rmdir "$SNELL_WARP_BRIDGE_CONF_DIR" 2>/dev/null || true
+    service_daemon_reload || true
+    echo "✔ 独立 TCP 桥接已删除；没有修改 Snell/WARP/SS2022。"
+}
+
+snell_warp_bridge_deploy() {
+    local remote_ip remote_port local_port warp_port candidate
+    [[ "$PLATFORM_INIT" == "systemd" ]] || {
+        echo "STOP: 当前只支持 Debian/Ubuntu + systemd。"; return 1;
+    }
+    [[ -f "$SNELL_CONF" ]] && service_is_active snell-v5 || {
+        echo "STOP: Snell v5 前置尚未运行。"; return 1;
+    }
+    [[ -x "$SINGBOX_BIN" ]] || {
+        echo "STOP: 缺少 sing-box 核心。不会安装或覆盖已有代理核心。"; return 1;
+    }
+    if [[ -e "$SNELL_WARP_BRIDGE_CONF" || -e "$SNELL_WARP_BRIDGE_SERVICE" ||
+          -e "$SNELL_WARP_BRIDGE_MARKER" || -e "$SNELL_WARP_BRIDGE_CONF_DIR" ]]; then
+        echo "STOP: 桥接文件或同名服务已存在，为保护现有资源拒绝覆盖。"
+        snell_warp_bridge_show
+        return 1
+    fi
+    warp_proxy_ready && warp_family_allowed ipv6 && warp_test_family ipv6 >/dev/null 2>&1 || {
+        echo "STOP: WARP IPv6 Local Proxy 未就绪。"; return 1;
+    }
+    warp_port=$(warp_proxy_port)
+    read -rp "SS2022 落地 IPv6（不含方括号）: " remote_ip || return 1
+    [[ "$remote_ip" =~ ^[0-9a-fA-F:]+$ && "$remote_ip" == *:* ]] || {
+        echo "STOP: 不是 IPv6 地址。"; return 1;
+    }
+    read -rp "SS2022 落地 TCP 端口 [10000]: " remote_port || return 1
+    remote_port=${remote_port:-10000}
+    validate_port_number "$remote_port" || { echo "STOP: 端口不合法。"; return 1; }
+    read -rp "本地仅回环监听 TCP 端口 [16001]: " local_port || return 1
+    local_port=${local_port:-16001}
+    validate_port_number "$local_port" || { echo "STOP: 端口不合法。"; return 1; }
+    if ss -H -ltn 2>/dev/null | awk -v p=":$local_port" '$4 ~ p"$" {found=1} END{exit !found}'; then
+        echo "STOP: 本地端口被占用，未修改任何服务。"; return 1
+    fi
+    ensure_singbox_user || return 1
+    install -d -o root -g "$SINGBOX_GROUP" -m 750 "$SNELL_WARP_BRIDGE_CONF_DIR" || return 1
+    candidate=$(mktemp "$SNELL_WARP_BRIDGE_CONF_DIR/.candidate.XXXXXX") || return 1
+    if ! snell_warp_bridge_config_json "$local_port" "$remote_ip" "$remote_port" "$warp_port" > "$candidate" ||
+       ! "$SINGBOX_BIN" check -c "$candidate"; then
+        rm -f -- "$candidate"
+        rmdir "$SNELL_WARP_BRIDGE_CONF_DIR" 2>/dev/null || true
+        echo "STOP: 新桥接 sing-box 配置校验失败，没有修改旧服务。"
+        return 1
+    fi
+    if ! chown root:"$SINGBOX_GROUP" "$candidate" || ! chmod 640 "$candidate" ||
+       ! mv -- "$candidate" "$SNELL_WARP_BRIDGE_CONF"; then
+        rm -f -- "$candidate" "$SNELL_WARP_BRIDGE_CONF"
+        rmdir "$SNELL_WARP_BRIDGE_CONF_DIR" 2>/dev/null || true
+        echo "STOP: 候选配置写入失败。"; return 1
+    fi
+    cat > "$SNELL_WARP_BRIDGE_SERVICE" <<SERVICE
+[Unit]
+Description=vps-bootstrap Snell-WARP IPv6 loopback TCP bridge
+After=network-online.target warp-svc.service
+Wants=network-online.target
+[Service]
+Type=simple
+User=sing-box
+Group=sing-box
+ExecStart=${SINGBOX_BIN} run -c ${SNELL_WARP_BRIDGE_CONF}
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+[Install]
+WantedBy=multi-user.target
+SERVICE
+    chmod 644 "$SNELL_WARP_BRIDGE_SERVICE" || return 1
+    printf 'v1\n' > "$SNELL_WARP_BRIDGE_MARKER"
+    chmod 600 "$SNELL_WARP_BRIDGE_MARKER"
+    if ! service_daemon_reload || ! service_enable_now "$SNELL_WARP_BRIDGE_SERVICE_NAME"; then
+        echo "STOP: 新桥接服务启动失败，回滚独立资源。"
+        snell_warp_bridge_remove || true
+        return 1
+    fi
+    sleep 1
+    if ! service_is_active "$SNELL_WARP_BRIDGE_SERVICE_NAME" ||
+       ! ss -H -ltn 2>/dev/null | awk -v p=":$local_port" '$4 ~ p"$" {found=1} END{exit !found}'; then
+        echo "STOP: 桥接未保持监听，回滚独立资源。"
+        snell_warp_bridge_remove || true
+        return 1
+    fi
+    snell_warp_bridge_show
+    echo "[验收] 请在 Surge 对新增 TCP 链式 SS2022 节点进行实测。"
+}
+
+snell_warp_bridge_menu() {
+    local choice
+    while true; do
+        echo "══════ Snell v5 → WARP IPv6 TCP 桥接 ══════"
+        echo "1. 部署独立桥接（不改原节点）"
+        echo "2. 查看桥接及 Surge 配置示例"
+        echo "3. 卸载独立桥接"
+        echo "0. 返回"
+        read -rp "请选择 [0-3]: " choice || return
+        case "$choice" in
+            1) snell_warp_bridge_deploy; pause ;;
+            2) snell_warp_bridge_show; pause ;;
+            3) read -rp "确认仅删除独立桥接？[y/N]: " choice
+               [[ "$choice" =~ ^[Yy]$ ]] && snell_warp_bridge_remove
+               pause ;;
+            0) return ;;
+            *) echo "输入无效" ;;
+        esac
+    done
+}
+
 protocol_operations_management() {
     while true; do
         clear
@@ -12845,9 +13021,10 @@ protocol_operations_management() {
         echo " 12. 重启 Snell v6"
         echo " 13. 查看 HY2 日志"
         echo " 14. 重启 HY2"
+        echo " 15. Snell v5 → WARP IPv6 TCP 桥接（选装）"
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0-14]: " c
+        read -rp "请选择 [0-15]: " c
         case "$c" in
             1) show_service_status; pause ;;
             2) follow_service_log sing-box ;;
@@ -12861,6 +13038,7 @@ protocol_operations_management() {
             11) follow_service_log "$SNELL6_SERVICE_NAME" ;;
             12) restart_service_safe "$SNELL6_SERVICE_NAME" "Snell v6"; pause ;;
             13) follow_service_log "$HY2_SERVICE_NAME" ;;
+            15) snell_warp_bridge_menu ;;
             14) if [[ -f "$HY2_CONF" && -f "$HY2_MANAGED_MARKER" ]]; then
                     restart_service_safe "$HY2_SERVICE_NAME" "HY2"
                 else
