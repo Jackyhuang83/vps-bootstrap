@@ -57,12 +57,39 @@ if snell_warp_uid_restore >/dev/null 2>&1; then
 fi
 grep -Fq '# user changed configuration later' "$SNELL_CONF"
 
+# Interrupted install before checksum: if original is still unchanged,
+# cleanup must remove backup without unnecessarily restarting Snell.
+printf 'ipv6 = false\n' > "$SNELL_CONF"
+cp "$SNELL_CONF" "$SNELL_WARP_UID_BACKUP"
+rm -f "$SNELL_WARP_UID_ACTIVE_SHA"
+snell_warp_uid_restore
+[[ ! -e "$SNELL_WARP_UID_BACKUP" ]]
+
+# Interrupted install after candidate moved but before checksum write.
+printf 'ipv6 = false\n' > "$SNELL_WARP_UID_BACKUP"
+printf 'ipv6 = true\n' > "$SNELL_CONF"
+rm -f "$SNELL_WARP_UID_ACTIVE_SHA"
+snell_warp_uid_restore
+grep -Fq 'ipv6 = false' "$SNELL_CONF"
+[[ ! -e "$SNELL_WARP_UID_BACKUP" ]]
+
+# Never silently restore if another edit happened in the interrupted window.
+printf 'ipv6 = false\n' > "$SNELL_WARP_UID_BACKUP"
+printf 'ipv6 = true\n# local administrator edit\n' > "$SNELL_CONF"
+rm -f "$SNELL_WARP_UID_ACTIVE_SHA"
+if snell_warp_uid_restore >/dev/null 2>&1; then
+    echo "FAIL: interrupted install overwrote a subsequent edit"
+    exit 1
+fi
+grep -Fq 'local administrator edit' "$SNELL_CONF"
+
 # The isolated service must only add 2000::/3 to a private table for Snell UID.
 deploy=$(declare -f snell_warp_uid_deploy)
 grep -Fq 'table 16381' <<<"$deploy"
 grep -Fq 'uidrange $uid-$uid ipproto tcp' <<<"$deploy"
 grep -Fq 'to 2000::/3' <<<"$deploy"
 grep -Fq 'ip -6 rule show' <<<"$deploy"
+grep -Fq 'route get 2606:4700:4700::1111 uid "$uid" ipproto tcp' <<<"$deploy"
 grep -Fq 'snell_is_project_managed' <<<"$deploy"
 grep -Fq 'warp_proxy_ready' <<<"$deploy"
 ! grep -Eq 'ip -6 route (add|replace) default|nft add|iptables -' <<<"$deploy"
