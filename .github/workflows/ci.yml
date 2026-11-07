@@ -106,6 +106,22 @@ jobs:
           shellcheck --severity=error tests/test-snell-warp-uid.sh
           bash tests/test-snell-warp-uid.sh
 
+      - name: Snell WARP IPv6 config check against pinned sing-box 1.13.20
+        shell: bash
+        run: |
+          set -euo pipefail
+          tarball="$RUNNER_TEMP/sing-box-1.13.20-linux-amd64.tar.gz"
+          url="https://github.com/SagerNet/sing-box/releases/download/v1.13.20/sing-box-1.13.20-linux-amd64.tar.gz"
+          curl -fL --retry 3 --connect-timeout 10 --max-time 120 "$url" -o "$tarball"
+          echo "646bc01bf128c32a12eb50d8690e387bba7504da7b1d65c704bd53916e38595a  $tarball" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/snell-warp-sb"
+          tar -xzf "$tarball" --strip-components=1 -C "$RUNNER_TEMP/snell-warp-sb"
+          export SS2022_LIB_ONLY=1
+          source ./ss2022.sh
+          snell_warp_uid_config_json 40000 > "$RUNNER_TEMP/snell-warp-sb/uid.json"
+          "$RUNNER_TEMP/snell-warp-sb/sing-box" version
+          "$RUNNER_TEMP/snell-warp-sb/sing-box" check -c "$RUNNER_TEMP/snell-warp-sb/uid.json"
+
       - name: Official Hysteria 2 module SHA256, syntax and isolation
         run: |
           bash -n modules/hysteria2.sh
