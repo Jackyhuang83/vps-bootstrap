@@ -66,9 +66,19 @@ def transform(unit, raw):
     outs = data.get("outbounds", [])
     if unit == "sing-box":
         targets = [x for x in outs if x.get("type") == "direct" and x.get("tag") == "direct"]
-        tags = {x.get("tag") for x in data.get("dns", {}).get("servers", []) if isinstance(x, dict)}
-        if not targets or "local-dns" not in tags:
-            raise ValueError("找不到 direct / local-dns，跳过自定义配置")
+        if not targets:
+            raise ValueError("找不到 direct 出站，不修改")
+        dns = data.setdefault("dns", {})
+        if not isinstance(dns, dict):
+            raise ValueError("DNS 配置不是 object，不修改")
+        servers = dns.setdefault("servers", [])
+        if not isinstance(servers, list):
+            raise ValueError("DNS servers 不是数组，不修改")
+        local = [x for x in servers if isinstance(x, dict) and x.get("tag") == "local-dns"]
+        if not local:
+            servers.append({"type": "local", "tag": "local-dns", "prefer_go": True})
+        elif len(local) != 1 or local[0].get("type") != "local":
+            raise ValueError("local-dns 已被自定义或重复使用，拒绝覆盖")
         for x in targets:
             if x.get("detour") or x.get("inet4_bind_address") or x.get("inet6_bind_address"):
                 raise ValueError("direct 出站存在绑定，不覆盖")
