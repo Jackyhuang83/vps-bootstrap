@@ -24,6 +24,8 @@ precheck(){
  "$IP" -6 route show default | grep -q '^default ' || fail "没有原生 IPv6 路由"
  ! "$IP" link show "$N" >/dev/null 2>&1 || fail "TUN 名称占用"
  [[ ! -e "$D" && ! -e "$U" && ! -e "$SELF" ]] || fail "已有同名文件/组件"
+ ! "$IP" -4 route show table all | grep -Fq '172.31.254.0/30' || fail "TUN 私有网段与已有路由冲突"
+ [[ -z "$("$IP" -4 route get 1.1.1.1 2>/dev/null || true)" ]] || fail "检测到已有可用 IPv4 策略路由，拒绝接管"
  warp-cli --accept-tos settings 2>/dev/null | grep -qi proxy || fail "WARP 未设置 Local Proxy"
  trace_proxy || fail "WARP SOCKS5 IPv4 验收失败"
  v6_ok || fail "原生 IPv6 HTTPS 失败"
@@ -43,6 +45,14 @@ disable(){
  rm -f "$SELF"
  echo "DISABLED: 保留原生 IPv6 和 WARP Local Proxy"
 }
+wait_warp(){
+ local i
+ for ((i=0;i<30;i++)); do
+  if trace_proxy >/dev/null 2>&1; then return 0; fi
+  sleep 2
+ done
+ fail "WARP SOCKS5 未就绪，拒绝注入系统 IPv4 路由"
+}
 trial(){
  precheck
  install -m 755 "$0" "$SELF"
@@ -57,14 +67,16 @@ trial(){
 [Unit]
 Description=vps-bootstrap IPv4 TCP WARP via isolated TUN
 After=network-online.target warp-svc.service
-Wants=network-online.target
+Wants=network-online.target warp-svc.service
 [Service]
 Type=exec
+ExecStartPre=$SELF wait-warp
 ExecStart=$SB run -c $C
 ExecStartPost=/bin/sh -c 'n=0; until $IP link show $N >/dev/null 2>&1; do n=\$((n+1)); [ \$n -lt 50 ] || exit 1; sleep .2; done; $IP -4 route add default dev $N'
 ExecStopPost=-$IP -4 route del default dev $N
 Restart=on-failure
 RestartSec=5
+TimeoutStartSec=90
 NoNewPrivileges=true
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
@@ -73,13 +85,17 @@ WantedBy=multi-user.target
 EOF
  chmod 644 "$U"; echo v1 > "$D/owned"; chmod 600 "$D/owned"
  systemctl daemon-reload
- if ! systemd-run --quiet --unit=ss2022-warp-v4-rollback --on-active=120s "$SELF" disable; then disable || true; fail "无法设置自动回滚"; fi
- if ! systemctl start "$S" || ! route_owned || ! trace_system || ! v6_ok; then disable || true; fail "双栈验收失败，已请求回滚"; fi
- echo "TRIAL_PASS: 120 秒内运行 '$SELF confirm'；否则自动停止并清理路由"
+ if ! systemd-run --quiet --unit=ss2022-warp-v4-rollback --on-active=180s "$SELF" disable; then disable || true; fail "无法设置自动回滚"; fi
+ if ! systemctl start "$S" || ! route_owned ||
+   ! "$IP" -4 route get 1.1.1.1 | grep -q "dev $N" ||
+   ! trace_system || ! v6_ok; then disable || true; fail "双栈验收失败，已请求回滚"; fi
+ echo "TRIAL_PASS: 180 秒内运行 '$SELF confirm'；否则自动停止并清理路由"
 }
 confirm(){
  owned || fail "组件不属于工具箱"
- systemctl is-active --quiet "$S" && route_owned && trace_system && v6_ok || fail "验收失败，不持久化"
+ systemctl is-active --quiet "$S" && route_owned &&
+   "$IP" -4 route get 1.1.1.1 | grep -q "dev $N" &&
+   trace_system && v6_ok || fail "验收失败，不持久化"
  systemctl enable "$S" >/dev/null
  systemctl stop "$T" >/dev/null 2>&1 || true
  echo "CONFIRMED: IPv4 TCP 系统出口持久化，IPv6 不变"
@@ -88,8 +104,10 @@ status(){
  "$IP" -4 route show default; "$IP" -6 route show default
  systemctl is-active "$S" 2>/dev/null || true
  systemctl is-active "$T" 2>/dev/null || true
+ echo "IPv4 TCP over WARP SOCKS5: supported"
+ echo "IPv4 UDP/QUIC: NOT supported; native IPv6 DNS remains unchanged"
 }
 case "${1:-}" in
- precheck) precheck;; trial) trial;; confirm) confirm;; disable) disable;; status) status;;
+ precheck) precheck;; trial) trial;; confirm) confirm;; disable) disable;; status) status;; wait-warp) wait_warp;;
  *) echo "usage: $0 precheck|trial|confirm|status|disable"; exit 2;;
 esac
