@@ -6113,6 +6113,10 @@ warp_reregister() {
 
 warp_uninstall_client() {
     local package_managed=0 repo_managed=0
+    if [[ -e /etc/ss2022/warp-v4-system/owned || -e /etc/systemd/system/ss2022-warp-v4-system.service ]]; then
+        echo -e "${RED}[STOP] 先通过 WARP 菜单 7 停止系统 IPv4 出口，再卸载 WARP。${PLAIN}"
+        return 1
+    fi
     if warp_is_referenced; then
         echo -e "${RED}[错误] 当前默认出口或分流规则仍引用 WARP。请先修改这些规则再卸载。${PLAIN}"
         return 1
@@ -6137,6 +6141,177 @@ warp_uninstall_client() {
     fi
 }
 
+# IPv6-only system IPv4 TCP via existing WARP Local Proxy (isolated companion).
+# Helper is bundled inside ss2022.sh because the repository may be private.
+warp_v4_system_payload() {
+    cat <<'SS2022_WARP4_SYSTEM_HELPER'
+#!/usr/bin/env bash
+# DEV ONLY: IPv6-only VPS / WARP SOCKS5 -> system IPv4 TCP.
+set -euo pipefail
+D=/etc/ss2022/warp-v4-system
+C=$D/config.json
+U=/etc/systemd/system/ss2022-warp-v4-system.service
+S=ss2022-warp-v4-system.service
+T=ss2022-warp-v4-rollback.timer
+SELF=/usr/local/sbin/ss2022-warp-v4-system
+N=vbw4tun
+P=40000
+SB=/usr/local/bin/sing-box
+IP=$(command -v ip || true)
+fail(){ echo "STOP: $*" >&2; exit 1; }
+owned(){ [[ -f "$D/owned" && -f "$C" && -f "$U" ]] && grep -Fq "ExecStart=$SB run -c $C" "$U"; }
+route_owned(){ "$IP" -4 route show default | grep -Eq "^default dev $N([[:space:]]|$)"; }
+trace_proxy(){ curl -4fsS --noproxy '' --socks5-hostname "127.0.0.1:$P" --max-time 12 https://1.1.1.1/cdn-cgi/trace | grep -qx 'warp=on'; }
+trace_system(){ curl -4fsS --noproxy '*' --max-time 15 https://1.1.1.1/cdn-cgi/trace | grep -qx 'warp=on'; }
+v6_ok(){ curl -6fsS --noproxy '*' --max-time 12 https://www.cloudflare.com/cdn-cgi/trace >/dev/null; }
+precheck(){
+ [[ $EUID -eq 0 && -n "$IP" && -x "$SB" && -c /dev/net/tun ]] || fail "需要 root/ip/sing-box/TUN"
+ command -v jq >/dev/null && command -v systemd-run >/dev/null && [[ -d /run/systemd/system ]] || fail "需要 systemd/jq"
+ [[ -z "$("$IP" -4 route show default)" ]] || fail "已有 IPv4 默认路由，不覆盖"
+ "$IP" -6 route show default | grep -q '^default ' || fail "没有原生 IPv6 路由"
+ ! "$IP" link show "$N" >/dev/null 2>&1 || fail "TUN 名称占用"
+ [[ ! -e "$D" && ! -e "$U" && ! -e "$SELF" ]] || fail "已有同名文件/组件"
+ ! "$IP" -4 route show table all | grep -Fq '172.31.254.0/30' || fail "TUN 私有网段与已有路由冲突"
+ [[ -z "$("$IP" -4 route get 1.1.1.1 2>/dev/null || true)" ]] || fail "检测到已有可用 IPv4 策略路由，拒绝接管"
+ warp-cli --accept-tos settings 2>/dev/null | grep -qi proxy || fail "WARP 未设置 Local Proxy"
+ trace_proxy || fail "WARP SOCKS5 IPv4 验收失败"
+ v6_ok || fail "原生 IPv6 HTTPS 失败"
+ echo "PRECHECK_PASS: 不修改网络"
+}
+disable(){
+ [[ $EUID -eq 0 ]] || fail "需要 root"
+ if ! owned; then [[ ! -e "$U" && ! -e "$D/owned" ]] || fail "ownership 异常"; echo "Not installed"; return; fi
+ systemctl stop "$T" >/dev/null 2>&1 || true
+ systemctl disable "$S" >/dev/null 2>&1 || true
+ systemctl stop "$S" >/dev/null 2>&1 || true
+ if route_owned; then "$IP" -4 route del default dev "$N" || fail "route 清理失败"; fi
+ ! "$IP" link show "$N" >/dev/null 2>&1 || fail "TUN 仍存在"
+ rm -f "$U" "$C" "$D/owned"
+ rmdir "$D" || true
+ systemctl daemon-reload
+ rm -f "$SELF"
+ echo "DISABLED: 保留原生 IPv6 和 WARP Local Proxy"
+}
+wait_warp(){
+ local i
+ for ((i=0;i<30;i++)); do
+  if trace_proxy >/dev/null 2>&1; then return 0; fi
+  sleep 2
+ done
+ fail "WARP SOCKS5 未就绪，拒绝注入系统 IPv4 路由"
+}
+trial(){
+ precheck
+ install -m 755 "$0" "$SELF"
+ install -d -m 700 "$D"
+ jq -n --argjson p "$P" '{log:{level:"warn"},
+   inbounds:[{type:"tun",tag:"warp4-in",interface_name:"vbw4tun",address:["172.31.254.1/30"],mtu:1400,auto_route:false,auto_redirect:false,stack:"system"}],
+   outbounds:[{type:"socks",tag:"warp4-out",server:"127.0.0.1",server_port:$p,version:"5",network:"tcp"}],
+   route:{final:"warp4-out"}}' > "$C"
+ chmod 600 "$C"
+ if ! "$SB" check -c "$C"; then rm -rf "$D"; rm -f "$SELF"; fail "sing-box check 失败"; fi
+ cat > "$U" <<EOF
+[Unit]
+Description=vps-bootstrap IPv4 TCP WARP via isolated TUN
+After=network-online.target warp-svc.service
+Wants=network-online.target warp-svc.service
+[Service]
+Type=exec
+ExecStartPre=$SELF wait-warp
+ExecStart=$SB run -c $C
+ExecStartPost=/bin/sh -c 'n=0; until $IP link show $N >/dev/null 2>&1; do n=\$((n+1)); [ \$n -lt 50 ] || exit 1; sleep .2; done; $IP -4 route add default dev $N'
+ExecStopPost=-$IP -4 route del default dev $N
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=90
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+[Install]
+WantedBy=multi-user.target
+EOF
+ chmod 644 "$U"; echo v1 > "$D/owned"; chmod 600 "$D/owned"
+ systemctl daemon-reload
+ if ! systemd-run --quiet --unit=ss2022-warp-v4-rollback --on-active=180s "$SELF" disable; then disable || true; fail "无法设置自动回滚"; fi
+ if ! systemctl start "$S" || ! route_owned ||
+   ! "$IP" -4 route get 1.1.1.1 | grep -q "dev $N" ||
+   ! trace_system || ! v6_ok; then disable || true; fail "双栈验收失败，已请求回滚"; fi
+ echo "TRIAL_PASS: 180 秒内运行 '$SELF confirm'；否则自动停止并清理路由"
+}
+confirm(){
+ owned || fail "组件不属于工具箱"
+ systemctl is-active --quiet "$S" && route_owned &&
+   "$IP" -4 route get 1.1.1.1 | grep -q "dev $N" &&
+   trace_system && v6_ok || fail "验收失败，不持久化"
+ systemctl enable "$S" >/dev/null
+ systemctl stop "$T" >/dev/null 2>&1 || true
+ echo "CONFIRMED: IPv4 TCP 系统出口持久化，IPv6 不变"
+}
+status(){
+ "$IP" -4 route show default; "$IP" -6 route show default
+ systemctl is-active "$S" 2>/dev/null || true
+ systemctl is-active "$T" 2>/dev/null || true
+ echo "IPv4 TCP over WARP SOCKS5: supported"
+ echo "IPv4 UDP/QUIC: NOT supported; native IPv6 DNS remains unchanged"
+}
+case "${1:-}" in
+ precheck) precheck;; trial) trial;; confirm) confirm;; disable) disable;; status) status;; wait-warp) wait_warp;;
+ *) echo "usage: $0 precheck|trial|confirm|status|disable"; exit 2;;
+esac
+SS2022_WARP4_SYSTEM_HELPER
+}
+warp_v4_system_run() {
+    local action="$1" helper="/usr/local/sbin/ss2022-warp-v4-system" tmp rc=0
+    if [[ "$action" == "precheck" || "$action" == "trial" || ! -x "$helper" ]]; then
+        tmp=$(mktemp /tmp/ss2022-warp4.XXXXXX) || return 1
+        warp_v4_system_payload > "$tmp"
+        chmod 700 "$tmp"
+        "$tmp" "$action" || rc=$?
+        rm -f "$tmp"
+        return "$rc"
+    fi
+    "$helper" "$action"
+}
+warp_v4_system_menu() {
+    local c reply
+    while true; do
+        echo "══════ WARP 系统 IPv4 TCP 出口（IPv6-only）══════"
+        echo "WARP SOCKS5 :40000 → 独立 TUN → IPv4 TCP"
+        echo "IPv6 原生保持不变；IPv4 UDP/QUIC 不支持；DNS 继续使用现有 IPv6 解析。"
+        echo "1. 只读预检"
+        echo "2. 试运行（180 秒自动回滚）"
+        echo "3. 验收并启用开机自启动"
+        echo "4. 查看状态"
+        echo "5. 停止并清理独立 IPv4 出口"
+        echo "0. 返回"
+        read -rp "请选择 [0-5]: " c || return
+        case "$c" in
+            1) warp_v4_system_run precheck; pause ;;
+            2)
+                echo "警告：此操作会暂时添加系统 IPv4 默认路由，若验证失败自动回滚。"
+                read -rp "同意试运行请输入 YES: " reply || return
+                if [[ "$reply" == "YES" ]]; then
+                    if warp_v4_system_run trial; then
+                        echo "如果 IPv4 和 IPv6 均正常，请在 180 秒内确认。"
+                        read -rp "现在验收并持久化请输入 YES（否则自动回滚）: " reply || true
+                        [[ "$reply" == "YES" ]] && warp_v4_system_run confirm
+                    fi
+                fi
+                pause
+                ;;
+            3) warp_v4_system_run confirm; pause ;;
+            4) warp_v4_system_run status; pause ;;
+            5)
+                read -rp "确认清理独立 IPv4 出口，输入 YES: " reply || return
+                [[ "$reply" == YES ]] && warp_v4_system_run disable
+                pause
+                ;;
+            0) return ;;
+            *) echo "输入无效" ;;
+        esac
+    done
+}
+
 warp_management() {
     if platform_is_alpine; then
         platform_feature_unavailable "Cloudflare WARP 官方客户端"
@@ -6153,8 +6328,9 @@ warp_management() {
         echo "  4. 重连 WARP"
         echo "  5. 重新注册 WARP"
         echo "  6. 卸载 WARP"
+        echo "  7. 系统 IPv4 TCP 出口（IPv6-only，隔离 TUN）"
         echo "  0. 返回"
-        read -rp "请选择 [0-6]: " c
+        read -rp "请选择 [0-7]: " c
         case "$c" in
             1) warp_install_client; pause ;;
             2) warp_test_exit; pause ;;
@@ -6162,6 +6338,7 @@ warp_management() {
             4) if command -v warp-cli >/dev/null; then warp-cli --accept-tos disconnect >/dev/null 2>&1 || true; warp-cli --accept-tos connect; sleep 2; warp_test_exit; else echo "WARP 未安装。"; fi; pause ;;
             5) warp_reregister; pause ;;
             6) warp_uninstall_client; pause ;;
+            7) warp_v4_system_menu ;;
             0) return ;;
             *) sleep 1 ;;
         esac
@@ -8439,6 +8616,12 @@ full_uninstall() {
     read -rp "确认彻底卸载？请输入 DELETE: " yes
     [[ "$yes" == "DELETE" ]] || { echo "已取消。"; sleep 1; return; }
 
+    if [[ -e /etc/ss2022/warp-v4-system/owned || -e /etc/systemd/system/ss2022-warp-v4-system.service ]]; then
+        warp_v4_system_run disable || {
+            echo -e "${RED}[STOP] WARP 系统 IPv4 出口无法安全卸载；整个卸载流程暂停。${PLAIN}"
+            return 1
+        }
+    fi
     google_location_remove || return 1
     if snell_warp_uid_owned; then
         snell_warp_uid_remove || return 1
