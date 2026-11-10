@@ -211,6 +211,9 @@ def main():
             if baseline.get("dual") == "IPv6":
                 print("INFO: baseline already selects IPv6 in isolated test; production not changed.")
                 return 0
+            if baseline.get("dual") != "IPv4" or baseline.get("ipv4only") != "IPv4":
+                print("VERDICT: BASELINE_INCONCLUSIVE; refusing automatic apply")
+                return 2
             if "--apply" in sys.argv[1:]:
                 return apply_fix(conf, work)
             print("INFO: Candidate solves IPv6-first. Run with --apply to apply guarded fix.")
