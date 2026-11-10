@@ -12,9 +12,9 @@
 
 ---
 
-## SS2022 IPv6 优先 + WARP IPv4 补全：v1.9.1-dev17（开发版）
+## SS2022 IPv6 优先 + WARP IPv4 补全：v1.9.1（正式稳定基线）
 
-日本 IPv6-only VPS 已通过 A/B 和 Surge 实机验证：**双栈网站优先 VPS 原生 IPv6，IPv4-only 网站使用系统级 Cloudflare WARP IPv4**。
+日本 IPv6-only VPS 已通过 A/B 和 Surge 实机验证：**双栈网站优先 VPS 原生 IPv6，IPv4-only 网站使用系统级 Cloudflare WARP IPv4**。注意：fscarmen 菜单集成本身已通过 CI，但尚未在全新 VPS 上进行从零安装实测。
 
 - **菜单入口：** `ss2022 → 2 分流管理 → 6 SS2022 IPv6 优先 / WARP IPv4 补全（稳定基线）`。
 - **3. 安装系统 WARP IPv4（fscarmen 作者原版）**：直接调用 `https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh` 的 `4` 模式；无需另找下载命令。检测已有 WARP 或 IPv4 默认路由时拒绝覆盖。
@@ -24,7 +24,7 @@
 - 只控制 sing-box `direct` 出站，其他节点、链式转发、显式地址族分流以及 SSH/防火墙/系统路由保持不变。
 - 启用前要求**原生 IPv6、已存在的系统 WARP IPv4、sing-box 候选配置检查和真实双栈/IPv4-only 出口**全部通过，失败不应用。
 - 分流配置重建会保留已明确启用的 `prefer_ipv6`，但不会对其他 VPS 默认开启；高版本核心若不兼容旧参数会拒绝修改。
-- 详细安全边界与验收记录：[SS2022 IPv6-first 实机稳定基线](docs/SS2022-IPV6-FIRST-BASELINE.md)。此功能在 dev16 引入，不改变 v1.9.0 正式版。
+- 详细安全边界与验收记录：[SS2022 IPv6-first 实机稳定基线](docs/SS2022-IPV6-FIRST-BASELINE.md)。此功能自 dev16 开始验证，并在 v1.9.1 正式版中固定为可复用基线。
 
 ## Snell v5 专用 WARP IPv6 TCP 自动出站：v1.9.1-dev15（开发版）
 
@@ -827,7 +827,7 @@ v1.8.1 为上一稳定正式版。
 
 ## v1.9.0
 
-当前稳定正式版为 **v1.9.0**，本版本完成 Alpine / OpenRC 与卸载闭环收口：
+**v1.9.0 的发布记录：**该版本完成 Alpine / OpenRC 与卸载闭环收口：
 
 - SS2022、ShadowTLS v3、VLESS Reality、Realm 已接入 OpenRC
 - Snell v5 官方二进制已确认无法在 Alpine 3.21 + gcompat 下启动，因此 Alpine 暂不开放 Snell；Debian / Ubuntu 保持支持
@@ -844,7 +844,7 @@ v1.8.1 为上一稳定正式版。
 - IPv6-only 临时 DNS 使用 vps-bootstrap 专属备份路径；旧 /root/resolv.conf.orig 仅用于兼容历史版本恢复，不再由新版本创建
 - Debian / Ubuntu + systemd 路径继续保持兼容
 
-v1.9.0 已完成发布前收口并成为当前稳定正式版；后续优先处理 Bug、稳定性和兼容性问题。
+v1.9.0 已完成上一稳定阶段的收口；v1.9.1 在其基础上增加可复用的 SS2022 IPv6 优先基线和 WARP IPv4 接入。
 
 ---
 

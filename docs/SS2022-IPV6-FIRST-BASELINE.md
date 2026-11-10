@@ -15,7 +15,7 @@
 
 ## 使用菜单
 
-自 v1.9.1-dev17 起，**WARP 系统 IPv4 安装也在同一菜单内**，不需要另外访问 GitLab 查找命令。
+在 v1.9.1 正式版中，**WARP 系统 IPv4 安装也在同一菜单内**，不需要另外访问 GitLab 查找命令。
 
 
 在 VPS SSH 中执行 `ss2022`，进入：
@@ -47,3 +47,9 @@
 2026-11-10：独立 A/B `CANDIDATE_PASS`，正式 sing-box `APPLY_SUCCESS`；用户通过 Surge → 香港中转 → 日本 SS2022，访问 `https://api64.ipify.org` 返回原生 IPv6。系统 `curl -4` WARP 与 `curl -6` 原生 IPv6 均正常。
 
 此基线不代表将 WARP IPv4 用作 SS2022 本身的代理入口；WARP 仅承担服务器出站的 IPv4-only 目标。
+
+## 稳定范围与尚未覆盖场景
+
+- 已实机验证：日本 IPv6-only VPS，系统 WARP IPv4 已安装、sing-box 1.13.x，Surge SS2022 链路双栈 IPv6 优先。
+- 已通过自动测试：菜单 fscarmen 官方上游命令入口、冲突保护、临时文件与原生 IPv6 / WARP IPv4 检查；**在全新 VPS 上从菜单启动上游安装的全流程尚未实机验收**。
+- 其他 Snell / Hysteria 2、第三方线路和未来 sing-box 1.14+ 不自动继承本条出站策略的稳定性结论。迁移前继续使用预检和单独验收。
