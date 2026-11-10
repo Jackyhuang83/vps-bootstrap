@@ -40,6 +40,7 @@ disable(){
  rm -f "$U" "$C" "$D/owned"
  rmdir "$D" || true
  systemctl daemon-reload
+ rm -f "$SELF"
  echo "DISABLED: 保留原生 IPv6 和 WARP Local Proxy"
 }
 trial(){
