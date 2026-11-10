@@ -7800,7 +7800,7 @@ ss2022_fscarmen_warp_ipv4() {
     echo "模式: bash menu.sh 4（只添加系统 WARP IPv4，保留原生 IPv6）"
     echo "注意：第三方脚本可能修改系统路由、DNS，并安装软件/后台任务。"
     echo "请确认 VPS 厂商控制台可用于断网恢复；本工具不会自动卸载第三方 WARP。"
-    tmp=$(mktemp /tmp/ss2022-fscarmen-warp.XXXXXXXX.sh) || return 1
+    tmp=$(mktemp /tmp/ss2022-fscarmen-warp.XXXXXX) || return 1
     if ! curl -fsSL --retry 2 --connect-timeout 10 --max-time 90 "$src" -o "$tmp"; then
         echo "[STOP] 上游脚本下载失败，未执行。"
         rm -f "$tmp"
