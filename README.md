@@ -4,13 +4,24 @@
 
 当前正式版本：**v1.9.0**
 
-当前开发版本：**v1.9.1-dev15**
+当前开发版本：**v1.9.1-dev16**
 
 项目以单一交互式 Bash 脚本 `ss2022.sh` 为入口，整合 **SS2022、SS2022 + ShadowTLS v3、VLESS Reality、Snell v5**，并提供 WARP 出口、链式落地、规则分流、Realm L4 端口转发、组件管理、服务器工具、服务器测试与脚本自更新。
 
 > v1.9.0 为当前稳定正式版。Debian / Ubuntu + systemd 正式支持；Alpine 3.21 + OpenRC 正式支持 SS2022、ShadowTLS v3、VLESS Reality、Realm 以及服务器管理/测试。Snell v5 与 Cloudflare WARP 在 Alpine 暂不开放。
 
 ---
+
+## SS2022 IPv6 优先 + WARP IPv4 补全：v1.9.1-dev16（开发版）
+
+日本 IPv6-only VPS 已通过 A/B 和 Surge 实机验证：**双栈网站优先 VPS 原生 IPv6，IPv4-only 网站使用系统级 Cloudflare WARP IPv4**。
+
+- **菜单入口：** `ss2022 → 2 分流管理 → 6 SS2022 IPv6 优先 / WARP IPv4 补全（稳定基线）`。
+- 包含策略状态、独立只读 A/B 检测、一键启用、菜单备份恢复。重复启用已生效的配置时不重启服务。
+- 只控制 sing-box `direct` 出站，其他节点、链式转发、显式地址族分流以及 SSH/防火墙/系统路由保持不变。
+- 启用前要求**原生 IPv6、已存在的系统 WARP IPv4、sing-box 候选配置检查和真实双栈/IPv4-only 出口**全部通过，失败不应用。
+- 分流配置重建会保留已明确启用的 `prefer_ipv6`，但不会对其他 VPS 默认开启；高版本核心若不兼容旧参数会拒绝修改。
+- 详细安全边界与验收记录：[SS2022 IPv6-first 实机稳定基线](docs/SS2022-IPV6-FIRST-BASELINE.md)。此功能在 dev16 引入，不改变 v1.9.0 正式版。
 
 ## Snell v5 专用 WARP IPv6 TCP 自动出站：v1.9.1-dev15（开发版）
 

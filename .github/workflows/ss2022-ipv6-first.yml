@@ -1,0 +1,52 @@
+name: Preserve sing-box IPv6-first routing preference
+on:
+  push:
+    paths:
+      - 'ss2022.sh'
+      - 'scripts/ss2022-ipv6-first-stable.py'
+      - 'tests/test_ss2022_ipv6_first_stable.py'
+      - '.github/workflows/ss2022-ipv6-first.yml'
+  pull_request:
+    paths:
+      - 'ss2022.sh'
+      - 'scripts/ss2022-ipv6-first-stable.py'
+      - 'tests/test_ss2022_ipv6_first_stable.py'
+      - '.github/workflows/ss2022-ipv6-first.yml'
+
+jobs:
+  shell-and-jq:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate shell syntax
+        run: bash -n ss2022.sh
+      - name: Python syntax + embedded stable baseline unit tests
+        run: |
+          python3 -m py_compile scripts/ss2022-ipv6-first-stable.py tests/test_ss2022_ipv6_first_stable.py
+          python3 -m unittest discover -s tests -p test_ss2022_ipv6_first_stable.py -v
+      - name: Check explicit opt-in strategy is retained
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          source = Path('ss2022.sh').read_text()
+          fn = source.split('build_singbox_routing_candidate() {', 1)[1].split('\nxray_outbound_for_node() {', 1)[0]
+          assert 'existing_direct_strategy=$(jq -r' in fn
+          assert '"$existing_direct_strategy" == "prefer_ipv6"' in fn
+          assert '"domain_strategy":"prefer_ipv6"' in fn
+          assert 'port=$(warp_proxy_port)' in fn
+          print('PASS: generator preserves only explicitly enabled prefer_ipv6 direct strategy')
+          PY
+          for doc in \
+            '{"outbounds":[{"tag":"direct","type":"direct","domain_strategy":"prefer_ipv6"}]}' \
+            '{"outbounds":[{"tag":"direct","type":"direct"}]}' \
+            '{"outbounds":[{"tag":"direct","type":"direct","domain_strategy":"ipv4_only"}]}'; do
+            strategy=$(jq -r '(.outbounds // []) | map(select(.type=="direct" and .tag=="direct")) | first | .domain_strategy // ""' <<<"$doc")
+            case "$doc" in
+              *prefer_ipv6*) test "$strategy" = prefer_ipv6 ;;
+              *ipv4_only*) test "$strategy" = ipv4_only ;;
+              *) test -z "$strategy" ;;
+            esac
+          done
+          echo 'PASS: jq strategy extraction fixtures'
