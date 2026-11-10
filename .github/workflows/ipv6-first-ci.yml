@@ -24,8 +24,14 @@ jobs:
           spec.loader.exec_module(m)
           sb={'dns':{'servers':[{'type':'local','tag':'local-dns'}]},'outbounds':[{'type':'direct','tag':'direct'}, {'type':'socks','tag':'route-warp'}]}
           out=json.loads(m.transform('sing-box',json.dumps(sb)))
-          assert out['outbounds'][0]['domain_resolver']['strategy']=='prefer_ipv6'
+          assert 'domain_resolver' not in out['outbounds'][0]
+          assert out['dns']['strategy']=='prefer_ipv6'
+          assert out['route']['rules'][-1]=={'action':'resolve','server':'local-dns','strategy':'prefer_ipv6'}
           assert out['outbounds'][1]==sb['outbounds'][1]
+          bare={'outbounds':[{'type':'direct','tag':'direct'}]}
+          bare_out=json.loads(m.transform('sing-box',json.dumps(bare)))
+          assert bare_out['dns']['servers'][0]['type']=='local'
+          assert bare_out['route']['rules'][0]['strategy']=='prefer_ipv6'
           xr={'outbounds':[{'protocol':'freedom','tag':'route-direct','settings':{'domainStrategy':'AsIs'}}, {'protocol':'socks','tag':'route-warp'}]}
           out=json.loads(m.transform('ss2022-xray',json.dumps(xr)))
           assert out['outbounds'][0]['settings']['domainStrategy']=='UseIPv6v4'
