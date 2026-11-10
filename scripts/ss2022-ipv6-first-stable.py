@@ -237,21 +237,24 @@ def precheck():
         valid, error = check_config(path)
         if not valid:
             stop("正式候选配置语法检查失败（当前核心可能不支持此参数）：" + error)
+    baseline = run_trial(conf, False)
     test = run_trial(conf, True)
-    print("PASS: A/B 独立实例 IPv6-first 候选结果", test)
+    print("A/B: 当前规则", baseline, " / IPv6-first 候选", test)
     if test.get("dual") != "IPv6" or test.get("ipv4only") != "IPv4":
         stop("候选实例未同时通过双栈 IPv6 / IPv4-only IPv4，未修改")
     return conf, candidate
 
 
 def enable():
+    original = CONF.read_bytes() if CONF.is_file() else b""
     config = load_config()
     direct = direct_entry(config)
     if direct.get("domain_strategy") == "prefer_ipv6":
         print("STABLE_BASELINE: 该 VPS 已启用 IPv6 优先；没有修改配置或重启服务")
         return 0
+    if STATE.exists():
+        stop("已有菜单历史启用记录，且当前策略不匹配；请先人工核对原配置，拒绝覆盖旧备份")
     old_config, candidate = precheck()
-    original = CONF.read_bytes()
     if CONF.read_bytes() != original:
         stop("正式配置在预检期间已变化")
     new_bytes = (json.dumps(candidate, ensure_ascii=False, indent=2) + "\n").encode()
@@ -270,18 +273,10 @@ def enable():
         if restart.returncode or not service_active():
             stop("sing-box 重启失败")
         network_check()
-        # Mark only successful menu-managed changes; do not overwrite old records.
-        STATE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if STATE.is_file():
-            previous = json.loads(STATE.read_text())
-            if previous.get("applied_sha256") != sha(original):
-                print("NOTICE: 存在较旧回滚记录，已保留备份但不覆盖旧记录")
-            else:
-                STATE.unlink()
-        if not STATE.exists():
-            write_private(STATE, json.dumps({
-                "backup": str(backup), "applied_sha256": sha(new_bytes)
-            }, ensure_ascii=False).encode())
+        # Mark only successful menu-managed changes; preserve existing backups.
+        write_private(STATE, json.dumps({
+            "backup": str(backup), "applied_sha256": sha(new_bytes)
+        }, ensure_ascii=False).encode())
         print("APPLY_SUCCESS: SS2022 默认直连 IPv6 优先，IPv4-only 经系统 WARP")
         print("BACKUP:", backup)
         print("提示: 特殊分流规则仍按各自显式设置执行")
