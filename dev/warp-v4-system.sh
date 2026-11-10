@@ -16,7 +16,7 @@ owned(){ [[ -f "$D/owned" && -f "$C" && -f "$U" ]] && grep -Fq "ExecStart=$SB ru
 route_owned(){ "$IP" -4 route show default | grep -Eq "^default dev $N([[:space:]]|$)"; }
 trace_proxy(){ curl -4fsS --noproxy '' --socks5-hostname "127.0.0.1:$P" --max-time 12 https://1.1.1.1/cdn-cgi/trace | grep -qx 'warp=on'; }
 trace_system(){ curl -4fsS --noproxy '*' --max-time 15 https://1.1.1.1/cdn-cgi/trace | grep -qx 'warp=on'; }
-v6_ok(){ curl -6fsS --noproxy '*' --max-time 12 'https://[2606:4700:4700::1111]/cdn-cgi/trace' >/dev/null; }
+v6_ok(){ curl -6fsS --noproxy '*' --max-time 12 https://www.cloudflare.com/cdn-cgi/trace >/dev/null; }
 precheck(){
  [[ $EUID -eq 0 && -n "$IP" && -x "$SB" && -c /dev/net/tun ]] || fail "需要 root/ip/sing-box/TUN"
  command -v jq >/dev/null && command -v systemd-run >/dev/null && [[ -d /run/systemd/system ]] || fail "需要 systemd/jq"
@@ -88,7 +88,7 @@ status(){
  systemctl is-active "$S" 2>/dev/null || true
  systemctl is-active "$T" 2>/dev/null || true
 }
-case "$1" in
+case "${1:-}" in
  precheck) precheck;; trial) trial;; confirm) confirm;; disable) disable;; status) status;;
  *) echo "usage: $0 precheck|trial|confirm|status|disable"; exit 2;;
 esac
