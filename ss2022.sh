@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
-# 当前版本: v1.9.1-dev17
+# 当前版本: v1.9.1
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,17 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.9.1 Release:
+#   - 正式冻结 v1.9.1 稳定基线，在上一稳定版 v1.9.0 上保留已有协议和平台功能
+#   - 日本 IPv6-only VPS 实机验收：SS2022 经 Surge 香港前置链路，双栈域名优先日本原生 IPv6
+#   - sing-box 1.13.x direct.domain_strategy=prefer_ipv6 经 A/B 实测，IPv4-only 目标通过现有系统级 WARP IPv4
+#   - 分流重新生成时保留已经明确启用的 IPv6 优先设置；其他 VPS 不自动变更
+#   - 工具箱菜单直接调用 fscarmen 官方 WARP IPv4 上游安装及管理，先执行网络与冲突检查
+#   - 新 VPS 一键启用前经过 sing-box 配置校验、独立端口双栈 / IPv4-only 出口检测，修改前备份，失败回滚
+#   - 通过 ShellCheck、通用 CI、Alpine OpenRC、sing-box ownership 和 IPv6-first 专项回归
+#   - 验收边界：原有 WARP 的日本 VPS 已完成真实客户端验证；新 VPS 首次调用 fscarmen 安装菜单仅通过自动测试
+#   - Snell WARP IPv6 链式和其他尚未实机验收的实验功能仍按各自文档说明，不视为本基线的实机覆盖范围
 #
 # v1.9.1-dev17:
 #   - SS2022 IPv6-first 菜单直接调用 fscarmen 官方 WARP IPv4 安装与管理
@@ -711,7 +722,7 @@
 # 注意: v1.9.0 为稳定正式版；Alpine 3.21 上 Snell v5 与 Cloudflare WARP 仍受官方组件兼容性限制。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.1-dev17"
+SCRIPT_VERSION="v1.9.1"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"

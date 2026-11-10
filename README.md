@@ -2,9 +2,7 @@
 
 一体化 VPS 网络协议、服务端分流、端口转发与日常运维脚本。
 
-当前正式版本：**v1.9.0**
-
-当前开发版本：**v1.9.1-dev17**
+当前正式版本：**v1.9.1**
 
 项目以单一交互式 Bash 脚本 `ss2022.sh` 为入口，整合 **SS2022、SS2022 + ShadowTLS v3、VLESS Reality、Snell v5**，并提供 WARP 出口、链式落地、规则分流、Realm L4 端口转发、组件管理、服务器工具、服务器测试与脚本自更新。
 
@@ -96,7 +94,7 @@ IPv4-only VPS 上的 WARP Local Proxy 只提供本机 SOCKS5，不会给 Snell �
 
 | 维度 | 当前支持 |
 |---|---|
-| **稳定正式版** | v1.9.0：Debian / Ubuntu + systemd；Alpine 3.21 + OpenRC |
+| **稳定正式版** | v1.9.1：Debian / Ubuntu + systemd；Alpine 3.21 + OpenRC |
 | **CPU 架构** | x86_64 / amd64、aarch64 / arm64 |
 | **网络环境** | IPv4-only、IPv6-only、IPv4 + IPv6 双栈 |
 | **NAT VPS** | 可使用服务商映射端口部署节点 |
