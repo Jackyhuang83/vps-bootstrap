@@ -5,12 +5,14 @@ on:
       - 'ss2022.sh'
       - 'scripts/ss2022-ipv6-first-stable.py'
       - 'tests/test_ss2022_ipv6_first_stable.py'
+      - 'tests/test_fscarmen_warp_menu.py'
       - '.github/workflows/ss2022-ipv6-first.yml'
   pull_request:
     paths:
       - 'ss2022.sh'
       - 'scripts/ss2022-ipv6-first-stable.py'
       - 'tests/test_ss2022_ipv6_first_stable.py'
+      - 'tests/test_fscarmen_warp_menu.py'
       - '.github/workflows/ss2022-ipv6-first.yml'
 
 jobs:
@@ -22,8 +24,9 @@ jobs:
         run: bash -n ss2022.sh
       - name: Python syntax + embedded stable baseline unit tests
         run: |
-          python3 -m py_compile scripts/ss2022-ipv6-first-stable.py tests/test_ss2022_ipv6_first_stable.py
+          python3 -m py_compile scripts/ss2022-ipv6-first-stable.py tests/test_ss2022_ipv6_first_stable.py tests/test_fscarmen_warp_menu.py
           python3 -m unittest discover -s tests -p test_ss2022_ipv6_first_stable.py -v
+          python3 -m unittest discover -s tests -p test_fscarmen_warp_menu.py -v
       - name: Check explicit opt-in strategy is retained
         shell: bash
         run: |

@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
-# 当前版本: v1.9.1-dev16
+# 当前版本: v1.9.1-dev17
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,12 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.9.1-dev17:
+#   - SS2022 IPv6-first 菜单直接调用 fscarmen 官方 WARP IPv4 安装与管理
+#   - 安装前检查原生 IPv6、既有系统 IPv4、其他 WARP 客户端/接口冲突
+#   - 仅从作者 GitLab 下载并执行 bash menu.sh 4，保持上游独立维护
+#   - 不自动安装/卸载已有 WARP，不修改现有 sing-box/Surge/SSH 配置
 #
 # v1.9.1-dev16:
 #   - SS2022 代理直连出站 IPv6 优先，IPv4-only 通过现有系统 WARP IPv4 补全
@@ -705,7 +711,7 @@
 # 注意: v1.9.0 为稳定正式版；Alpine 3.21 上 Snell v5 与 Cloudflare WARP 仍受官方组件兼容性限制。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.1-dev16"
+SCRIPT_VERSION="v1.9.1-dev17"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
@@ -7749,6 +7755,112 @@ if __name__ == "__main__":
         sys.exit(1)
 SS2022_IPV6_FIRST_STABLE_PY
 }
+# Launch fscarmen's maintained upstream WARP IPv4 interface (NOT Cloudflare Local Proxy).
+# On an IPv6-only VPS, leave native IPv6 in place and add only WARP IPv4.
+# External installer owns its own files, services, DNS and routes. We do not
+# implement, modify or override its lifecycle.
+ss2022_fscarmen_warp_ipv4() {
+    local src="https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh" tmp output rc=0
+    if [[ "$PLATFORM_PKG" != "apt" || "$PLATFORM_INIT" != "systemd" ]]; then
+        echo "[STOP] 此菜单目前只对 Debian / Ubuntu + systemd 开放。"
+        return 1
+    fi
+    [[ "$EUID" == 0 ]] || { echo "[STOP] 需要 root 权限。"; return 1; }
+    for tool in curl ip bash sha256sum; do
+        command -v "$tool" >/dev/null 2>&1 || { echo "[STOP] 缺少依赖: $tool"; return 1; }
+    done
+    if ! ip -6 route get 2606:4700:4700::1111 >/dev/null 2>&1 ||
+       ! curl -6fsS --noproxy '*' --connect-timeout 5 --max-time 12 \
+            https://www.cloudflare.com/cdn-cgi/trace >/dev/null; then
+        echo "[STOP] 原生 IPv6 HTTPS 未通过。为避免 SSH/代理断联，不运行上游安装。"
+        return 1
+    fi
+    output=$(curl -4fsS --noproxy '*' --connect-timeout 4 --max-time 10 \
+        https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+    if grep -qx 'warp=on' <<<"$output"; then
+        echo "PASS: 系统 IPv4 已经是 WARP 出口；无需重复安装。"
+        echo "提示：可以返回本菜单执行“查看状态”或“启用 SS2022 IPv6 优先”。"
+        return 0
+    fi
+    if command -v warp-cli >/dev/null 2>&1 || command -v warp-svc >/dev/null 2>&1; then
+        echo "[STOP] 检测到 Cloudflare 官方 WARP Client，先通过原有菜单检查/卸载，"
+        echo "       避免其路由与 fscarmen WireGuard WARP 冲突；本次未修改系统。"
+        return 1
+    fi
+    if [[ -e /etc/wireguard/warp.conf ]] || command -v warp >/dev/null 2>&1; then
+        echo "[STOP] 检测到现有 fscarmen/WARP 组件，但当前 IPv4 尚未通过 WARP 校验。"
+        echo "       请先使用本菜单的“fscarmen 官方管理菜单”检查，不直接覆盖。"
+        return 1
+    fi
+    if [[ -n "$(ip -4 route show default 2>/dev/null)" ]]; then
+        echo "[STOP] 已存在 IPv4 默认路由，拒绝覆盖已有出口；请人工确认后再操作。"
+        return 1
+    fi
+    echo "来源: $src"
+    echo "模式: bash menu.sh 4（只添加系统 WARP IPv4，保留原生 IPv6）"
+    echo "注意：第三方脚本可能修改系统路由、DNS，并安装软件/后台任务。"
+    echo "请确认 VPS 厂商控制台可用于断网恢复；本工具不会自动卸载第三方 WARP。"
+    tmp=$(mktemp /tmp/ss2022-fscarmen-warp.XXXXXX) || return 1
+    if ! curl -fsSL --retry 2 --connect-timeout 10 --max-time 90 "$src" -o "$tmp"; then
+        echo "[STOP] 上游脚本下载失败，未执行。"
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! grep -Eiq 'fscarmen|wgcf' "$tmp" || ! bash -n "$tmp"; then
+        echo "[STOP] 下载内容未通过上游脚本身份特征/语法预检，已拒绝执行。"
+        rm -f "$tmp"
+        return 1
+    fi
+    echo "上游脚本 SHA256: $(sha256sum "$tmp" | awk '{print $1}')"
+    local yes
+    read -rp "确认授权执行 fscarmen 上游脚本并添加 WARP IPv4？输入 YES: " yes || { rm -f "$tmp"; return 1; }
+    if [[ "$yes" != YES ]]; then
+        rm -f "$tmp"
+        echo "已取消；未运行第三方脚本。"
+        return 0
+    fi
+    # Upstream is run in its own process; never source it into ss2022.
+    bash "$tmp" 4 || rc=$?
+    rm -f "$tmp"
+    if (( rc != 0 )); then
+        echo "[WARN] fscarmen 返回非零状态 ($rc)，未自动修改或回滚上游路由。"
+        return "$rc"
+    fi
+    output=$(curl -4fsS --noproxy '*' --connect-timeout 5 --max-time 15 \
+        https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+    if ! grep -qx 'warp=on' <<<"$output"; then
+        echo "[WARN] 上游脚本执行完毕，但 WARP IPv4 尚未通过 HTTPS 校验。"
+        echo "       请使用 fscarmen 官方菜单检查；不要立即切换 SS2022。"
+        return 1
+    fi
+    output=$(curl -6fsS --noproxy '*' --connect-timeout 5 --max-time 15 \
+        https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+    if ! grep -qx 'warp=off' <<<"$output"; then
+        echo "[WARN] 不能确认 IPv6 仍是原生出口，请检查 fscarmen 配置。"
+        return 1
+    fi
+    echo "PASS: fscarmen 系统 WARP IPv4 + 原生 IPv6 均已通过。"
+    echo "下一步：返回当前菜单选择“一键启用 SS2022 IPv6 优先”。"
+}
+ss2022_fscarmen_warp_manage() {
+    local warpbin
+    if [[ "$PLATFORM_PKG" != "apt" || "$PLATFORM_INIT" != "systemd" ]]; then
+        echo "[STOP] 此入口目前仅支持 Debian / Ubuntu + systemd。"
+        return 1
+    fi
+    warpbin=$(type -P warp || true)
+    if [[ -z "$warpbin" || ! -f /etc/wireguard/warp.conf ]]; then
+        echo "[提示] 未检测到已安装的 fscarmen 系统 WARP；请先选“一键安装”。"
+        return 1
+    fi
+    echo "即将进入 fscarmen 原生管理菜单：$warpbin"
+    echo "注意：上游菜单中的卸载/全局/双栈选项可能影响路由、DNS 和 SSH。"
+    local yes
+    read -rp "确认进入上游管理菜单？输入 YES: " yes || return 1
+    [[ "$yes" == YES ]] || return 0
+    "$warpbin"
+}
+
 ss2022_ipv6_first_stable_menu() {
     local c yes
     if platform_is_alpine; then
@@ -7760,23 +7872,27 @@ ss2022_ipv6_first_stable_menu() {
         clear
         echo -e "${CYAN}══════ SS2022 出站 IPv6 优先 · 稳定基线 ══════${PLAIN}"
         echo "适用：sing-box direct 出站 / 原生 IPv6 + 系统级 WARP IPv4"
-        echo "说明：仅更改 sing-box 出站拨号地址族，不修改节点、SSH、WARP 或系统路由。"
+        echo "说明：先由 fscarmen 官方脚本补全系统 IPv4，再启用 sing-box IPv6 优先。"
         echo "1. 查看当前策略状态（只读）"
         echo "2. 预检与独立 A/B 出口验证（只读）"
-        echo "3. 一键启用 IPv6 优先（验证通过后才应用）"
-        echo "4. 恢复菜单启用前配置（需要菜单创建的备份）"
+        echo "3. fscarmen 一键安装系统 WARP IPv4（官方上游）"
+        echo "4. fscarmen WARP 官方管理菜单（已安装时）"
+        echo "5. 一键启用 SS2022 IPv6 优先（验证通过后才应用）"
+        echo "6. 恢复菜单启用前配置（需要菜单创建的备份）"
         echo "0. 返回"
-        read -rp "请选择 [0-4]: " c || return
+        read -rp "请选择 [0-6]: " c || return
         case "$c" in
             1) ss2022_ipv6_first_stable_helper status; pause ;;
             2) ss2022_ipv6_first_stable_helper precheck; pause ;;
-            3)
+            3) ss2022_fscarmen_warp_ipv4; pause ;;
+            4) ss2022_fscarmen_warp_manage; pause ;;
+            5)
                 echo "注意：仅当核心配置检查和双栈实测通过后才会重启 sing-box。"
                 echo "使用独立临时 SOCKS 端口测试；正式服务可能短暂重连。"
                 read -rp "确定启用？输入 YES: " yes || return
                 [[ "$yes" == YES ]] && ss2022_ipv6_first_stable_helper enable
                 pause ;;
-            4)
+            6)
                 read -rp "确认从菜单备份恢复 sing-box？输入 YES: " yes || return
                 [[ "$yes" == YES ]] && ss2022_ipv6_first_stable_helper rollback
                 pause ;;
@@ -7810,7 +7926,7 @@ routing_management() {
         echo "落地节点 : ${count} 个"
         echo "规则     : ${rules} 条"
         echo ""
-        echo "  1. WARP 出口管理"
+        echo "  1. WARP Local Proxy 管理（旧 SOCKS 链式模式）"
         echo "  2. 落地节点管理"
         echo "  3. 分流规则管理"
         echo "  4. 查看当前分流配置"
