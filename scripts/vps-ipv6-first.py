@@ -65,9 +65,22 @@ def transform(unit, raw):
         raise ValueError("JSON 根节点不是 object")
     outs = data.get("outbounds", [])
     if unit == "sing-box":
+        # Compatible with cores which reject direct.domain_resolver.
+        # Route resolve is evaluated on domain destinations; existing route
+        # matches retain precedence, while unmatched requests use IPv6-first.
         targets = [x for x in outs if x.get("type") == "direct" and x.get("tag") == "direct"]
         if not targets:
             raise ValueError("找不到 direct 出站，不修改")
+        for x in targets:
+            if x.get("detour") or x.get("inet4_bind_address") or x.get("inet6_bind_address"):
+                raise ValueError("direct 存在自定义绑定，拒绝覆盖")
+            # Remove the invalid key only if it was produced by the previous helper.
+            resolver = x.get("domain_resolver")
+            if resolver is not None:
+                if resolver == {"server": "local-dns", "strategy": "prefer_ipv6"}:
+                    del x["domain_resolver"]
+                else:
+                    raise ValueError("direct 有自定义 domain_resolver，拒绝覆盖")
         dns = data.setdefault("dns", {})
         if not isinstance(dns, dict):
             raise ValueError("DNS 配置不是 object，不修改")
@@ -79,10 +92,17 @@ def transform(unit, raw):
             servers.append({"type": "local", "tag": "local-dns", "prefer_go": True})
         elif len(local) != 1 or local[0].get("type") != "local":
             raise ValueError("local-dns 已被自定义或重复使用，拒绝覆盖")
-        for x in targets:
-            if x.get("detour") or x.get("inet4_bind_address") or x.get("inet6_bind_address"):
-                raise ValueError("direct 出站存在绑定，不覆盖")
-            x["domain_resolver"] = {"server": "local-dns", "strategy": "prefer_ipv6"}
+        # Existing explicit per-rule address family decisions are untouched.
+        dns["strategy"] = "prefer_ipv6"
+        route = data.setdefault("route", {})
+        if not isinstance(route, dict):
+            raise ValueError("route 不是 object，不修改")
+        rules = route.setdefault("rules", [])
+        if not isinstance(rules, list):
+            raise ValueError("route.rules 不是数组，不修改")
+        has_resolve = any(isinstance(x, dict) and x.get("action") == "resolve" for x in rules)
+        if not has_resolve:
+            rules.append({"action": "resolve", "server": "local-dns", "strategy": "prefer_ipv6"})
     elif unit == "ss2022-xray":
         targets = [x for x in outs if x.get("protocol") == "freedom" and x.get("tag") in ("route-direct", "direct")]
         if not targets:
