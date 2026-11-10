@@ -3,7 +3,7 @@
 # 项目名称: vps-bootstrap / ss2022.sh
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
-# 当前版本: v1.9.1-dev16
+# 当前版本: v1.9.1-dev17
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -90,6 +90,12 @@
 #   - Realm 单独卸载补齐 OpenRC PID / 日志清理
 #   - Realm 组仅在 REALM_GROUP_MARKER 确认由本脚本创建时删除，不再无条件 delete group
 #   - 与完全卸载的服务账号 ownership 规则保持一致
+#
+# v1.9.1-dev17:
+#   - SS2022 IPv6-first 菜单直接调用 fscarmen 官方 WARP IPv4 安装与管理
+#   - 安装前检查原生 IPv6、既有系统 IPv4、其他 WARP 客户端/接口冲突
+#   - 仅从作者 GitLab 下载并执行 bash menu.sh 4，保持上游独立维护
+#   - 不自动安装/卸载已有 WARP，不修改现有 sing-box/Surge/SSH 配置
 #
 # v1.9.1-dev16:
 #   - SS2022 代理直连出站 IPv6 优先，IPv4-only 通过现有系统 WARP IPv4 补全
@@ -705,7 +711,7 @@
 # 注意: v1.9.0 为稳定正式版；Alpine 3.21 上 Snell v5 与 Cloudflare WARP 仍受官方组件兼容性限制。
 # ==============================================================================
 # [01] 常量与路径
-SCRIPT_VERSION="v1.9.1-dev16"
+SCRIPT_VERSION="v1.9.1-dev17"
 # ----------------------------- 脚本自更新 --------------------------------------
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/Jackyhuang83/vps-bootstrap/main/ss2022.sh"
 SCRIPT_INSTALL_PATH="/usr/local/bin/ss2022"
