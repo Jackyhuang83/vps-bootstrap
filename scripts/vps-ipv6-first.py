@@ -160,6 +160,7 @@ def backup_apply():
     if route.exists() and json.loads(route.read_text()).get("global_ip_family", "default") != "default":
         raise RuntimeError("工具箱全局地址族被强制指定，请先改回 default")
     changes = []
+    skipped = []
     for unit, (name, binary) in SERVICES.items():
         p = pl.Path(name)
         if not p.is_file() or not pl.Path(binary).is_file() or not active(unit):
@@ -169,6 +170,7 @@ def backup_apply():
             new = transform(unit, old.decode("utf-8")).encode("utf-8")
         except (ValueError, json.JSONDecodeError) as e:
             print("SKIP:", unit, e)
+            skipped.append(unit)
             continue
         if new == old:
             print("OK:", unit, "已采用目标策略")
@@ -178,12 +180,15 @@ def backup_apply():
         try:
             pl.Path(tmp).write_bytes(new)
             if not validate(unit, binary, pl.Path(tmp)):
+                skipped.append(unit)
                 continue
         finally:
             os.unlink(tmp)
         changes.append((unit, p, old, new))
     if not changes:
-        print("完成：没有需要修改的运行中服务")
+        if skipped:
+            raise RuntimeError("运行中服务未全部适配：{}；未修改配置或重启服务".format(", ".join(skipped)))
+        print("完成：运行中服务已无需修改")
         return
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     target = BACKUPS / stamp
@@ -213,7 +218,10 @@ def backup_apply():
             run("systemctl", "restart", unit)
             print("ROLLBACK:", unit)
         raise
-    print("SUCCESS: 代理 IPv6 优先；IPv4 通过系统 WARP")
+    if skipped:
+        print("PARTIAL: 以下服务因安全检查未修改：" + ", ".join(skipped))
+    else:
+        print("SUCCESS: 已完成配置更新；仍须通过真实客户端验证出站地址族")
     print("备份:", target)
     print("注意：Snell v5 仅开启 IPv6 支持，不能严格指定 IPv6 优先。")
 
