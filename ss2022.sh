@@ -5600,7 +5600,17 @@ build_singbox_routing_candidate() {
     routing_init_state || return 1
     global_family=$(routing_global_ip_family)
 
-    outbounds=$(jq -nc '[{"type":"direct","tag":"direct"}]')
+    # Preserve a verified, explicitly enabled IPv6-first direct dial strategy.
+    # This project currently pins sing-box 1.13.x, where direct.domain_strategy
+    # is supported. Do not impose it on servers which never opted into it.
+    # The existing sing-box config is already syntax-checked before being active.
+    local existing_direct_strategy
+    existing_direct_strategy=$(jq -r '(.outbounds // []) | map(select(.type=="direct" and .tag=="direct")) | first | .domain_strategy // ""' "$SINGBOX_CONF") || return 1
+    if [[ "$existing_direct_strategy" == "prefer_ipv6" ]]; then
+        outbounds=$(jq -nc '[{"type":"direct","tag":"direct","domain_strategy":"prefer_ipv6"}]')
+    else
+        outbounds=$(jq -nc '[{"type":"direct","tag":"direct"}]')
+    fi
     port=$(warp_proxy_port)
     outbounds=$(jq -c --argjson p "$port" '. + [{"type":"socks","tag":"route-warp","server":"127.0.0.1","server_port":$p}]' <<<"$outbounds")
 
