@@ -143,14 +143,14 @@ def write_atomic(path, data):
         if os.path.exists(tmp):
             os.unlink(tmp)
 
-def validate(unit, binary, path):
+def validate(unit, binary, path, verbose=True):
     if unit == "sing-box":
         p = run(binary, "check", "-c", str(path))
     elif unit == "ss2022-xray":
         p = run(binary, "run", "-test", "-config", str(path))
     else:
         return True
-    if p.returncode:
+    if p.returncode and verbose:
         print("SKIP:", unit, "语法检查失败", (p.stderr or p.stdout)[-400:])
     return p.returncode == 0
 
@@ -179,9 +179,28 @@ def backup_apply():
         os.close(fd)
         try:
             pl.Path(tmp).write_bytes(new)
-            if not validate(unit, binary, pl.Path(tmp)):
-                skipped.append(unit)
-                continue
+            if not validate(unit, binary, pl.Path(tmp), verbose=False):
+                if unit == "sing-box":
+                    # Some older cores only support the legacy local DNS form.
+                    candidate = json.loads(new)
+                    for server in candidate.get("dns", {}).get("servers", []):
+                        if isinstance(server, dict) and server.get("tag") == "local-dns" and server.get("type") == "local":
+                            server.clear()
+                            server.update({"tag": "local-dns", "address": "local"})
+                    fallback = (json.dumps(candidate, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+                    pl.Path(tmp).write_bytes(fallback)
+                    if validate(unit, binary, pl.Path(tmp), verbose=False):
+                        new = fallback
+                        print("PASS:", unit, "采用兼容旧版核心的 local DNS 格式")
+                    else:
+                        print("INFO: sing-box core", run(binary, "version").stdout.splitlines()[:1])
+                        validate(unit, binary, pl.Path(tmp))
+                        skipped.append(unit)
+                        continue
+                else:
+                    validate(unit, binary, pl.Path(tmp))
+                    skipped.append(unit)
+                    continue
         finally:
             os.unlink(tmp)
         changes.append((unit, p, old, new))
