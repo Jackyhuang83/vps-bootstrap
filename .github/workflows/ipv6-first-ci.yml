@@ -1,0 +1,40 @@
+name: IPv6 first helper checks
+on:
+  push:
+    paths:
+      - 'scripts/vps-ipv6-first.py'
+      - '.github/workflows/ipv6-first-ci.yml'
+  pull_request:
+    paths:
+      - 'scripts/vps-ipv6-first.py'
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check
+        run: python3 -m py_compile scripts/vps-ipv6-first.py
+      - name: Offline config transformation checks
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import importlib.util, json
+          spec=importlib.util.spec_from_file_location("v6", "scripts/vps-ipv6-first.py")
+          m=importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(m)
+          sb={'dns':{'servers':[{'type':'local','tag':'local-dns'}]},'outbounds':[{'type':'direct','tag':'direct'}, {'type':'socks','tag':'route-warp'}]}
+          out=json.loads(m.transform('sing-box',json.dumps(sb)))
+          assert out['outbounds'][0]['domain_resolver']['strategy']=='prefer_ipv6'
+          assert out['outbounds'][1]==sb['outbounds'][1]
+          xr={'outbounds':[{'protocol':'freedom','tag':'route-direct','settings':{'domainStrategy':'AsIs'}}, {'protocol':'socks','tag':'route-warp'}]}
+          out=json.loads(m.transform('ss2022-xray',json.dumps(xr)))
+          assert out['outbounds'][0]['settings']['domainStrategy']=='UseIPv6v4'
+          assert out['outbounds'][1]==xr['outbounds'][1]
+          hy={'outbounds':[{'type':'direct','direct':{'mode':'auto'}}]}
+          assert json.loads(m.transform('ss2022-hy2',json.dumps(hy)))['outbounds'][0]['direct']['mode']=='64'
+          snell='[snell-server]\nipv6 = false\n'
+          assert 'ipv6 = true' in m.transform('snell-v5',snell)
+          snell6='[snell-server]\ndns-ip-preference = default\n'
+          assert 'dns-ip-preference = prefer-ipv6' in m.transform('snell-v6',snell6)
+          print("All offline transforms PASS")
+          PY
