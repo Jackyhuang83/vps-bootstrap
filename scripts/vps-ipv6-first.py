@@ -37,7 +37,7 @@ def test_network():
     for fam, label, expected in (("-6", "IPv6 原生", "off"), ("-4", "IPv4 WARP", "on")):
         r = run("curl", fam, "--noproxy", "*", "-fsS", "--connect-timeout", "5",
                 "--max-time", "12", "https://www.cloudflare.com/cdn-cgi/trace")
-        if r.returncode != 0 or ("warp=" + expected) not in r.stdout.splitlines() or not re.search(r"^ip=\\S+", r.stdout, re.M):
+        if r.returncode != 0 or ("warp=" + expected) not in r.stdout.splitlines() or not re.search(r"^ip=\S+", r.stdout, re.M):
             raise RuntimeError(label + " 出口校验失败，未修改任何配置")
         print("PASS:", label, "HTTPS 正常")
 
@@ -50,10 +50,10 @@ def transform(unit, raw):
         in_section = False
         found = False
         for index, line in enumerate(lines):
-            match = re.match(r"^\\s*\\[([^]]+)\\]", line)
+            match = re.match(r"^\s*\[([^]]+)\]", line)
             if match:
                 in_section = match.group(1) == "snell-server"
-            if in_section and re.match(r"^\\s*" + re.escape(key) + r"\\s*=", line):
+            if in_section and re.match(r"^\s*" + re.escape(key) + r"\s*=", line):
                 lines[index] = key + " = " + value + "\n"
                 found = True
         if not found:
