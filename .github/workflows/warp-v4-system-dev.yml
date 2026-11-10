@@ -1,0 +1,25 @@
+name: WARP IPv4 System DEV static checks
+on:
+  pull_request:
+    paths:
+      - 'dev/warp-v4-system.sh'
+      - 'dev/WARP-V4-SYSTEM.md'
+      - '.github/workflows/warp-v4-system-dev.yml'
+  push:
+    branches:
+      - 'dev/warp-ipv4-system-egress'
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash syntax and safety contract
+        shell: bash
+        run: |
+          bash -n dev/warp-v4-system.sh
+          grep -Fq 'auto_route:false' dev/warp-v4-system.sh
+          grep -Fq 'network:"tcp"' dev/warp-v4-system.sh
+          grep -Fq 'systemd-run --quiet' dev/warp-v4-system.sh
+          grep -Fq 'v6_ok' dev/warp-v4-system.sh
+          grep -Fq 'route_owned' dev/warp-v4-system.sh
+          ! grep -Eq 'warp-cli.*mode.*(warp|tunnel)' dev/warp-v4-system.sh
