@@ -3,17 +3,19 @@ on:
   push:
     paths:
       - 'scripts/vps-ipv6-first.py'
+      - 'scripts/diagnose-ss2022-ipv6-target.py'
       - '.github/workflows/ipv6-first-ci.yml'
   pull_request:
     paths:
       - 'scripts/vps-ipv6-first.py'
+      - 'scripts/diagnose-ss2022-ipv6-target.py'
 jobs:
   python:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Syntax check
-        run: python3 -m py_compile scripts/vps-ipv6-first.py
+        run: python3 -m py_compile scripts/vps-ipv6-first.py scripts/diagnose-ss2022-ipv6-target.py
       - name: Offline config transformation checks
         shell: bash
         run: |
