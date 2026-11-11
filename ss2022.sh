@@ -1020,7 +1020,7 @@ pkg_update() {
             done
             echo "[错误] Alpine APK 软件源索引仍不可用或已过期；已停止安装依赖。" >&2
             echo "[提示] 请检查上述 WARNING 的具体原因（DNS/TLS/网络/软件源），以及系统 UTC 时间和 /etc/apk/repositories。" >&2
-            echo "[提示] 可单独执行：date -u; apk update; echo APK_EXIT_CODE=\\$?" >&2
+            echo "[提示] 可单独执行：date -u; apk update; echo APK_EXIT_CODE=\$?" >&2
             return 1
             ;;
         *) return 1 ;;
