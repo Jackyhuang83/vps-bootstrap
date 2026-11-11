@@ -4,6 +4,7 @@
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
 # 当前版本: v1.9.1
+# SNI 推荐：教育/公益机构 5 项；新增部署与变更选中后只读检测 TLS 兼容性。
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -3582,6 +3583,87 @@ update_shadowtls() {
     done
 }
 
+
+# Reality SNI 候选只提供选择，不代表全区域兼容。
+# 新建/变更 SNI 时在当前 VPS 探测 TLS 1.3、ALPN h2、X25519 和证书验证；
+# 已部署节点的原 SNI 无需重新验证，避免因临时外网故障阻断其它更新。
+reality_sni_precheck() {
+    local host="$1" output="" rc=0
+    local -a missing=()
+    if [[ ! "$host" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; then
+        echo -e "${RED}[错误] SNI 必须是合法的完整域名，不能填写 URL、IP 或端口。${PLAIN}"
+        return 1
+    fi
+    if ! command -v openssl >/dev/null 2>&1 || ! command -v timeout >/dev/null 2>&1; then
+        echo -e "${RED}[错误] 缺少 openssl 或 timeout，无法安全验证 Reality SNI。${PLAIN}"
+        return 1
+    fi
+    echo -e "${YELLOW}>> 从当前 VPS 检查 ${host}:443（TLS 1.3 / h2 / X25519 / 证书）...${PLAIN}"
+    output=$(timeout 12 openssl s_client -connect "${host}:443" -servername "$host" \
+        -tls1_3 -alpn h2 -groups X25519 -verify_hostname "$host" \
+        -verify_return_error -brief </dev/null 2>&1) || rc=$?
+    [[ "$output" == *"Protocol version: TLSv1.3"* ]] || missing+=("TLS 1.3")
+    [[ "$output" == *"ALPN protocol: h2"* ]] || missing+=("HTTP/2 (h2)")
+    [[ "$output" == *"Temp Key: X25519"* ]] || missing+=("X25519")
+    [[ "$output" == *"Verification: OK"* ]] || missing+=("证书/主机名验证")
+    if (( rc != 0 )) || (( ${#missing[@]} > 0 )); then
+        echo -e "${RED}[未通过] 当前 VPS 的 Reality SNI 握手预检失败；没有修改配置。${PLAIN}"
+        if (( rc == 124 )); then
+            echo "  原因: TLS 握手超时（12 秒）"
+        elif (( rc != 0 )); then
+            echo "  握手程序退出码: $rc"
+        fi
+        if (( ${#missing[@]} > 0 )); then
+            printf '  未确认: %s\n' "${missing[*]}"
+        fi
+        echo "  可改选其它候选；不同地区和时间的检测结果可能不同。"
+        return 1
+    fi
+    echo -e "${GREEN}[通过] TLS 1.3 / h2 / X25519 / 证书有效。${PLAIN}"
+    return 0
+}
+
+select_reality_sni() {
+    local current="${1:-}" choice="" candidate="" offset=0 custom=6 i=0
+    local -a hosts=(www.hku.hk www.nus.edu.sg www.u-tokyo.ac.jp www.unicef.org www.redcross.org)
+    local -a names=("香港大学 · 教育" "新加坡国立大学 · 教育" "东京大学 · 教育" "联合国儿童基金会 · 公益" "美国红十字会 · 公益")
+    REALITY_SELECTED_SNI=""
+    if [[ -n "$current" ]]; then
+        offset=1
+        custom=7
+    fi
+    while true; do
+        echo "请选择 Reality 握手/SNI（按 VPS 所在地区选择；选中后自动验证）："
+        if (( offset == 1 )); then
+            echo "  1. 保持当前 SNI: $current"
+        fi
+        for ((i=0; i<5; i++)); do
+            printf '  %d. %s（%s）\n' "$((i+offset+1))" "${hosts[i]}" "${names[i]}"
+        done
+        printf '  %d. 自定义域名\n' "$custom"
+        read -rp "请选择 [1-${custom}，默认 1]: " choice
+        choice="${choice:-1}"
+        if (( offset == 1 )) && [[ "$choice" == "1" ]]; then
+            REALITY_SELECTED_SNI="$current"
+            return 0
+        fi
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( 10#$choice > offset && 10#$choice < custom )); then
+            candidate="${hosts[10#$choice-offset-1]}"
+        elif [[ "$choice" == "$custom" ]]; then
+            read -rp "请输入 Reality 握手/SNI 域名（不含协议/端口）: " candidate
+        else
+            echo "无效选项，请重新选择。"
+            continue
+        fi
+        if reality_sni_precheck "$candidate"; then
+            REALITY_SELECTED_SNI="$candidate"
+            return 0
+        fi
+        read -rp "按回车重新选择，输入 q 取消: " choice
+        [[ "$choice" == "q" || "$choice" == "Q" ]] && return 1
+    done
+}
+
 update_vless_reality() {
     local choice="" confirm="" current_port uuid current_sni private short_id current_listen current_host current_network public
     local new_port new_uuid new_sni new_private new_short_id new_listen new_network new_public out
@@ -3633,14 +3715,8 @@ update_vless_reality() {
             2) ask_xray_port "请输入 VLESS Reality 监听端口" "$current_port" "$current_port" || continue; new_port="$PORT" ;;
             3)
                 echo "当前 Reality SNI: ${current_sni}"
-                echo "  1. 保持当前 SNI"
-                echo "  2. swdist.apple.com"
-                echo "  3. www.icloud.com"
-                echo "  4. speed.cloudflare.com"
-                echo "  5. 自定义域名"
-                read -rp "请选择 [1-5，默认 1]: " choice
-                case "${choice:-1}" in
-                    1) new_sni="$current_sni" ;; 2) new_sni="swdist.apple.com" ;; 3) new_sni="www.icloud.com" ;; 4) new_sni="speed.cloudflare.com" ;; 5) new_sni=""; while [[ -z "$new_sni" ]]; do read -rp "请输入 Reality 握手/SNI 域名: " new_sni; done ;; *) continue ;; esac
+                select_reality_sni "$current_sni" || continue
+                new_sni="$REALITY_SELECTED_SNI"
                 ;;
             4) ask_server_host_with_default "$current_host"; save_mode_state "vless" "$(jq -n --arg host "$SERVER_HOST" --arg network "$current_network" --arg public_key "$public" '{host:$host,network:$network,public_key:$public_key,core:"xray"}')" || true; echo -e "${GREEN}✔ 服务器地址已更新。${PLAIN}"; pause; continue ;;
             5)
@@ -4100,19 +4176,8 @@ deploy_vless_reality() {
     [[ -n "$uuid" ]] || uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)
     [[ -n "$uuid" ]] || { echo -e "${RED}[错误] UUID 生成失败。${PLAIN}"; pause; return; }
     short_id=$(openssl rand -hex 8) || { echo -e "${RED}[错误] Short ID 生成失败。${PLAIN}"; pause; return; }
-    echo "请选择 Reality 握手/SNI："
-    echo "  1. swdist.apple.com（本轮兼容性测试）"
-    echo "  2. www.icloud.com（本轮兼容性测试）"
-    echo "  3. speed.cloudflare.com（更适合作为长期默认候选）"
-    echo "  4. 自定义域名"
-    read -rp "请选择 [1-4，默认 1]: " reality_sni_choice
-    case "${reality_sni_choice:-1}" in
-        1) sni="swdist.apple.com" ;;
-        2) sni="www.icloud.com" ;;
-        3) sni="speed.cloudflare.com" ;;
-        4) while [[ -z "$sni" ]]; do read -rp "请输入 Reality 握手/SNI 域名: " sni; done ;;
-        *) sni="swdist.apple.com" ;;
-    esac
+    select_reality_sni "" || { echo "已取消 Reality SNI 选择。"; return; }
+    sni="$REALITY_SELECTED_SNI"
     ask_server_host
     ask_node_name "vless" || return
     if write_xray_vless_config "$LISTEN_ADDR" "$vless_port" "$uuid" "$sni" "$REALITY_PRIVATE_KEY" "$short_id"; then
