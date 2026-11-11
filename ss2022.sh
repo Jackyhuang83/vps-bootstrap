@@ -3633,7 +3633,8 @@ select_reality_sni() {
         custom=7
     fi
     while true; do
-        echo "请选择 Reality 握手/SNI（建议选与当前 VPS 地区/ASN 接近的站点）："\n        echo "  [说明] 候选域名需实测；TLS 预检不代表 ASN/CDN 相似性或抗探测保证。"
+        echo "请选择 Reality 握手/SNI（建议选与当前 VPS 地区/ASN 接近的站点）："
+        echo "  [说明] 候选域名需实测；TLS 预检不代表 ASN/CDN 相似性或抗探测保证。"
         if (( offset == 1 )); then
             echo "  1. 保持当前 SNI: $current"
         fi
