@@ -8,6 +8,7 @@ on:
       - "ss2022.sh"
       - "tests/test-google.sh"
       - "tests/test-mktemp.sh"
+      - "tests/test-apk-update.sh"
       - "tests/test-xray-restart.sh"
       - "tests/test-dashboard-nodes.sh"
       - "tests/test-snell-v6.sh"
@@ -29,6 +30,7 @@ on:
       - "ss2022.sh"
       - "tests/test-google.sh"
       - "tests/test-mktemp.sh"
+      - "tests/test-apk-update.sh"
       - "tests/test-xray-restart.sh"
       - "tests/test-dashboard-nodes.sh"
       - "tests/test-snell-v6.sh"
@@ -69,6 +71,9 @@ jobs:
 
       - name: Portable mktemp and updater regression
         run: bash tests/test-mktemp.sh
+
+      - name: Alpine APK stale index / retry regression
+        run: bash tests/test-apk-update.sh
 
       - name: Xray service restart safety regression
         run: bash tests/test-xray-restart.sh
