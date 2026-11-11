@@ -4,7 +4,7 @@
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
 # 当前版本: v1.9.1
-# SNI 推荐：教育/公益机构 5 项；新增部署与变更选中后只读检测 TLS 兼容性。
+# SNI 推荐：按地区筛选较少见的教育/公益站点，选中后只读检测 TLS；最终仍需客户端验证。
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -3625,15 +3625,15 @@ reality_sni_precheck() {
 
 select_reality_sni() {
     local current="${1:-}" choice="" candidate="" offset=0 custom=6 i=0
-    local -a hosts=(www.hku.hk www.nus.edu.sg www.u-tokyo.ac.jp www.unicef.org www.redcross.org)
-    local -a names=("香港大学 · 教育" "新加坡国立大学 · 教育" "东京大学 · 教育" "联合国儿童基金会 · 公益" "美国红十字会 · 公益")
+    local -a hosts=(worldrelief.org www.hkmu.edu.hk u-aizu.ac.jp www.ndhu.edu.tw www.beyond.org.sg)
+    local -a names=("美国 · World Relief 公益" "香港 · 都会大学教育" "日本 · 会津大学教育" "台湾 · 东华大学教育" "新加坡 · Beyond 公益")
     REALITY_SELECTED_SNI=""
     if [[ -n "$current" ]]; then
         offset=1
         custom=7
     fi
     while true; do
-        echo "请选择 Reality 握手/SNI（按 VPS 所在地区选择；选中后自动验证）："
+        echo "请选择 Reality 握手/SNI（建议选与当前 VPS 地区/ASN 接近的站点）："\n        echo "  [说明] 候选域名需实测；TLS 预检不代表 ASN/CDN 相似性或抗探测保证。"
         if (( offset == 1 )); then
             echo "  1. 保持当前 SNI: $current"
         fi
