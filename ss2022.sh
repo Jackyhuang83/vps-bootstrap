@@ -4,7 +4,7 @@
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
 # 当前版本: v1.9.1
-# SNI 推荐：按地区筛选较少见的教育/公益站点，选中后只读检测 TLS；最终仍需客户端验证。
+# SNI 推荐：按地区筛选教育/公益站点；香港候选批量只读检测，最终仍需客户端验证。
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -3588,7 +3588,7 @@ update_shadowtls() {
 # 新建/变更 SNI 时在当前 VPS 探测 TLS 1.3、ALPN h2、X25519 和证书验证；
 # 已部署节点的原 SNI 无需重新验证，避免因临时外网故障阻断其它更新。
 reality_sni_precheck() {
-    local host="$1" output="" rc=0
+    local host="$1" max_timeout="${2:-12}" output="" rc=0 alpn=""
     local -a missing=()
     if [[ ! "$host" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; then
         echo -e "${RED}[错误] SNI 必须是合法的完整域名，不能填写 URL、IP 或端口。${PLAIN}"
@@ -3599,9 +3599,11 @@ reality_sni_precheck() {
         return 1
     fi
     echo -e "${YELLOW}>> 从当前 VPS 检查 ${host}:443（TLS 1.3 / h2 / X25519 / 证书）...${PLAIN}"
-    output=$(timeout 12 openssl s_client -connect "${host}:443" -servername "$host" \
-        -tls1_3 -alpn h2 -groups X25519 -verify_hostname "$host" \
+    # 模拟主流浏览器的 ALPN 提议顺序，避免只提供 h2 导致特殊站点返回不同结果。
+    output=$(timeout "$max_timeout" openssl s_client -connect "${host}:443" -servername "$host" \
+        -tls1_3 -alpn 'h2,http/1.1' -groups X25519 -verify_hostname "$host" \
         -verify_return_error -brief </dev/null 2>&1) || rc=$?
+    alpn=$(printf '%s\n' "$output" | sed -n 's/^[[:space:]]*ALPN protocol: //p' | head -n 1)
     [[ "$output" == *"Protocol version: TLSv1.3"* ]] || missing+=("TLS 1.3")
     [[ "$output" == *"ALPN protocol: h2"* ]] || missing+=("HTTP/2 (h2)")
     [[ "$output" == *"Temp Key: X25519"* ]] || missing+=("X25519")
@@ -3609,13 +3611,14 @@ reality_sni_precheck() {
     if (( rc != 0 )) || (( ${#missing[@]} > 0 )); then
         echo -e "${RED}[未通过] 当前 VPS 的 Reality SNI 握手预检失败；没有修改配置。${PLAIN}"
         if (( rc == 124 )); then
-            echo "  原因: TLS 握手超时（12 秒）"
+            echo "  原因: TLS 握手超时（${max_timeout} 秒）"
         elif (( rc != 0 )); then
             echo "  握手程序退出码: $rc"
         fi
         if (( ${#missing[@]} > 0 )); then
             printf '  未确认: %s\n' "${missing[*]}"
         fi
+        echo "  实际协商 ALPN: ${alpn:-未协商（或握手未完成）}"
         echo "  可改选其它候选；不同地区和时间的检测结果可能不同。"
         return 1
     fi
@@ -3623,14 +3626,48 @@ reality_sni_precheck() {
     return 0
 }
 
+# 香港节点备用候选：仅列出确认属于真实教育或公益机构的网站。
+# 每个候选需要从当前 VPS 实机探测；通过 TLS 检查也不等同于 Reality 客户端实测通过。
+reality_sni_scan_hk() {
+    local host="" choice="" i=0
+    local -a hosts=(www.hkcss.org.hk www.poleungkuk.org.hk www.tungwah.org.hk thei.edu.hk www.hksyu.edu www.hku.hk)
+    local -a qualified=()
+    echo "===== 香港教育/公益 SNI 自动筛选（只读；单站最长 6 秒）====="
+    for host in "${hosts[@]}"; do
+        if reality_sni_precheck "$host" 6; then
+            qualified+=("$host")
+        fi
+    done
+    if (( ${#qualified[@]} == 0 )); then
+        echo -e "${YELLOW}[提示] 本次没有筛出符合基础 TLS 条件的香港候选，保持原配置。${PLAIN}"
+        return 1
+    fi
+    echo "===== 本 VPS 通过 TLS 基础预检的候选（仍需实际节点测试）====="
+    for ((i=0; i<${#qualified[@]}; i++)); do
+        printf '  %d. %s\n' "$((i+1))" "${qualified[i]}"
+    done
+    echo "  0. 取消"
+    while true; do
+        read -rp "请选择 [0-${#qualified[@]}，默认 1]: " choice
+        choice="${choice:-1}"
+        [[ "$choice" == "0" ]] && return 1
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( 10#$choice >= 1 && 10#$choice <= ${#qualified[@]} )); then
+            REALITY_SELECTED_SNI="${qualified[10#$choice-1]}"
+            return 0
+        fi
+        echo "无效选项，请重新选择。"
+    done
+}
+
 select_reality_sni() {
-    local current="${1:-}" choice="" candidate="" offset=0 custom=6 i=0
+    local current="${1:-}" choice="" candidate="" offset=0 scan=6 custom=7 i=0
     local -a hosts=(worldrelief.org www.hkmu.edu.hk u-aizu.ac.jp www.ndhu.edu.tw www.beyond.org.sg)
     local -a names=("美国 · World Relief 公益" "香港 · 都会大学教育" "日本 · 会津大学教育" "台湾 · 东华大学教育" "新加坡 · Beyond 公益")
     REALITY_SELECTED_SNI=""
     if [[ -n "$current" ]]; then
         offset=1
-        custom=7
+        scan=7
+        custom=8
     fi
     while true; do
         echo "请选择 Reality 握手/SNI（建议选与当前 VPS 地区/ASN 接近的站点）："
@@ -3641,6 +3678,7 @@ select_reality_sni() {
         for ((i=0; i<5; i++)); do
             printf '  %d. %s（%s）\n' "$((i+offset+1))" "${hosts[i]}" "${names[i]}"
         done
+        printf '  %d. 香港教育/公益候选批量实测（只读）\n' "$scan"
         printf '  %d. 自定义域名\n' "$custom"
         read -rp "请选择 [1-${custom}，默认 1]: " choice
         choice="${choice:-1}"
@@ -3650,6 +3688,9 @@ select_reality_sni() {
         fi
         if [[ "$choice" =~ ^[0-9]+$ ]] && (( 10#$choice > offset && 10#$choice < custom )); then
             candidate="${hosts[10#$choice-offset-1]}"
+        elif [[ "$choice" == "$scan" ]]; then
+            reality_sni_scan_hk || continue
+            return 0
         elif [[ "$choice" == "$custom" ]]; then
             read -rp "请输入 Reality 握手/SNI 域名（不含协议/端口）: " candidate
         else
