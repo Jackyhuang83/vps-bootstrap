@@ -4,7 +4,7 @@
 # 用途    : VPS 代理协议、服务端分流、Realm 端口转发的一体化管理脚本
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
 # 当前版本: v1.9.1
-# SNI 推荐：五个 GitHub 开源候选教育域名；仅供选择，保留当前 SNI 与自定义入口。
+# Reality SNI：从 10 个可信候选有限探测，优先显示最多 5 个 TLS 合规目标；不扫描公网，不依赖 ASN。
 # Surge VLESS Reality: 支持官方 [Proxy] 文本格式（Surge iOS 6.0.0+ / Mac 6.12.0+）。
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
@@ -3590,41 +3590,103 @@ update_shadowtls() {
 }
 
 
-# 五个来自开源 Reality SNI 候选清单的教育机构域名。
-# 此处只提供可选值；不在操作菜单中批量扫描或预先封锁 SNI。
-# 部署和更新继续使用现有 Xray 配置校验、服务重启与回滚保护。
-select_reality_sni() {
-    local current="${1:-}" choice="" selected="" offset=0 custom=6 i=0
-    local -a hosts=(www.hkust.edu.hk www.kyoto-u.ac.jp www.ntu.edu.sg www.epfl.ch www.utoronto.ca)
-    local -a names=("香港科技大学" "京都大学" "南洋理工大学" "洛桑联邦理工学院" "多伦多大学")
-    REALITY_SELECTED_SNI=""
-    if [[ -n "$current" ]]; then
-        offset=1
-        custom=7
+
+# Reality SNI: curated, bounded public HTTPS candidate pool.
+# No ASN dependency, IP-range scans, third-party script execution, or service changes here.
+# The selected host must be the same for REALITY target, serverNames, and client SNI.
+reality_sni_tls_ok() {
+    local report="${1:-}"
+    [[ "$report" == *"TLSv1.3"* ]] &&
+    [[ "$report" == *"ALPN protocol: h2"* ]] &&
+    { [[ "$report" == *"Server Temp Key: X25519"* ]] || [[ "$report" == *"Temp Key: X25519"* ]]; } &&
+    { [[ "$report" == *"Verify return code: 0 (ok)"* ]] || [[ "$report" == *"Verification: OK"* ]]; }
+}
+
+reality_sni_probe() {
+    local host="$1" report="" rc=0 start_ms="" end_ms=""
+    REALITY_SNI_PROBE_MS=99999
+    start_ms=$(date +%s%3N 2>/dev/null || true)
+    # Full s_client output is required: -brief can omit negotiated ALPN on some OpenSSL builds.
+    # Offering both protocols is closer to a normal HTTPS client than offering h2 alone.
+    report=$(timeout 4 openssl s_client -connect "${host}:443" -servername "$host" \
+        -tls1_3 -alpn 'h2,http/1.1' -groups X25519 \
+        -verify_hostname "$host" -verify_return_error </dev/null 2>&1) || rc=$?
+    (( rc == 0 )) || return 1
+    reality_sni_tls_ok "$report" || return 1
+    end_ms=$(date +%s%3N 2>/dev/null || true)
+    if [[ "$start_ms" =~ ^[0-9]{12,}$ && "$end_ms" =~ ^[0-9]{12,}$ ]] && (( end_ms >= start_ms )); then
+        REALITY_SNI_PROBE_MS=$((end_ms-start_ms))
     fi
+    return 0
+}
+
+select_reality_sni() {
+    local current="${1:-}" choice="" selected="" offset=0 custom=0 i=0 row="" ms="" host="" idx="" status="已验证"
+    local -a hosts=(addons.mozilla.org www.python.org cwiki.apache.org www.arm.com www.intel.com www.sony.com www.ana.co.jp www.ntu.edu.sg www.epfl.ch www.cathaypacific.com)
+    local -a names=("Mozilla 扩展" "Python 社区" "Apache 文档" "Arm 官网" "Intel 官网" "Sony 官网" "全日空" "南洋理工大学" "洛桑联邦理工" "国泰航空")
+    local -a passed=() sorted=() choices=() choices_names=() choices_ms=()
+    REALITY_SELECTED_SNI=""
+    if [[ -n "$current" ]]; then offset=1; fi
+
+    if command -v openssl >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
+        echo ">> 当前 VPS：检查 10 个公开 HTTPS 候选（每个最长 4 秒，不扫描 IP 网段）..."
+        for ((i=0; i<${#hosts[@]}; i++)); do
+            if reality_sni_probe "${hosts[i]}"; then
+                passed+=("${REALITY_SNI_PROBE_MS}|${i}")
+            fi
+        done
+    else
+        echo "[提示] 无 openssl/timeout，无法验证候选。"
+    fi
+
+    if (( ${#passed[@]} > 0 )); then
+        mapfile -t sorted < <(printf '%s\n' "${passed[@]}" | LC_ALL=C sort -t'|' -k1,1n -k2,2n)
+        for row in "${sorted[@]:0:5}"; do
+            ms="${row%%|*}"
+            idx="${row#*|}"
+            choices+=("${hosts[idx]}")
+            choices_names+=("${names[idx]}")
+            choices_ms+=("$ms")
+        done
+    else
+        # A network outage or missing CA store must not silently label an untested host as compatible.
+        status="未验证"
+        choices=("${hosts[@]:0:5}")
+        choices_names=("${names[@]:0:5}")
+        echo "[提示] 当前 VPS 未筛出 TLS 全通过的候选；下列五项仅供备用，不能保证可用。"
+    fi
+
+    custom=$(($offset+${#choices[@]}+1))
     while true; do
-        echo "请选择 Reality 握手/SNI："
+        echo "请选择 Reality SNI（TLS 1.3 / h2 / X25519 / 证书；ASN 不作为门槛）："
         if (( offset == 1 )); then
             echo "  1. 保持当前 SNI: $current"
         fi
-        for ((i=0; i<5; i++)); do
-            printf '  %d. %s（%s）\n' "$((i+offset+1))" "${hosts[i]}" "${names[i]}"
+        for ((i=0; i<${#choices[@]}; i++)); do
+            if [[ "$status" == "已验证" ]]; then
+                printf '  %d. %s（%s，TLS 基础通过，%s ms）\n' "$((i+offset+1))" "${choices[i]}" "${choices_names[i]}" "${choices_ms[i]}"
+            else
+                printf '  %d. %s（%s，未验证）\n' "$((i+offset+1))" "${choices[i]}" "${choices_names[i]}"
+            fi
         done
         printf '  %d. 自定义域名\n' "$custom"
-        read -rp "请选择 [1-$custom，默认 1]: " choice || return 1
+        echo "  0. 取消"
+        read -rp "请选择 [0-$custom，默认 1]: " choice || return 1
         choice="${choice:-1}"
+        [[ "$choice" == "0" ]] && return 1
         if (( offset == 1 )) && [[ "$choice" == "1" ]]; then
             REALITY_SELECTED_SNI="$current"
             return 0
         fi
         if [[ "$choice" =~ ^[0-9]+$ ]] && (( 10#$choice > offset && 10#$choice < custom )); then
-            selected="${hosts[10#$choice-offset-1]}"
+            selected="${choices[10#$choice-offset-1]}"
         elif [[ "$choice" == "$custom" ]]; then
-            read -rp "请输入 Reality 握手/SNI 域名（不含协议/端口）: " selected || return 1
+            read -rp "请输入 Reality SNI 域名（不含协议/端口）: " selected || return 1
             if [[ ! "$selected" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; then
                 echo "请输入正确的域名（不含 https:// 或端口）。"
                 continue
             fi
+            echo "[说明] 自定义域名未进入上述兼容性排序；需实际客户端验证。"
         else
             echo "无效选项，请重新选择。"
             continue
