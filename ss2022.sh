@@ -3686,7 +3686,7 @@ select_reality_sni() {
             REALITY_SELECTED_SNI="$current"
             return 0
         fi
-        if [[ "$choice" =~ ^[0-9]+$ ]] && (( 10#$choice > offset && 10#$choice < custom )); then
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( 10#$choice > offset && 10#$choice < scan )); then
             candidate="${hosts[10#$choice-offset-1]}"
         elif [[ "$choice" == "$scan" ]]; then
             reality_sni_scan_hk || continue
