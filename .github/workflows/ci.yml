@@ -8,6 +8,7 @@ on:
       - "ss2022.sh"
       - "tests/test-google.sh"
       - "tests/test-mktemp.sh"
+      - "tests/test-reality-sni.sh"
       - "tests/test-xray-restart.sh"
       - "tests/test-dashboard-nodes.sh"
       - "tests/test-snell-v6.sh"
@@ -29,6 +30,7 @@ on:
       - "ss2022.sh"
       - "tests/test-google.sh"
       - "tests/test-mktemp.sh"
+      - "tests/test-reality-sni.sh"
       - "tests/test-xray-restart.sh"
       - "tests/test-dashboard-nodes.sh"
       - "tests/test-snell-v6.sh"
@@ -66,6 +68,12 @@ jobs:
 
       - name: Google detection and location task regression
         run: bash tests/test-google.sh
+
+      - name: Reality SNI TLS and bounded selection regression
+        run: |
+          bash -n tests/test-reality-sni.sh
+          shellcheck --severity=error tests/test-reality-sni.sh
+          bash tests/test-reality-sni.sh
 
       - name: Portable mktemp and updater regression
         run: bash tests/test-mktemp.sh
