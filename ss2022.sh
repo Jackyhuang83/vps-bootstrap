@@ -5,6 +5,7 @@
 # 快捷命令: ss2022（proxy 仅在路径未被其它程序占用时创建）
 # 当前版本: v1.9.1
 # SNI 推荐：五个 GitHub 开源候选教育域名；仅供选择，保留当前 SNI 与自定义入口。
+# Surge VLESS Reality: 支持官方 [Proxy] 文本格式（Surge iOS 6.0.0+ / Mac 6.12.0+）。
 #
 # ┌──────────────────────────── 架构总览 ────────────────────────────┐
 # │ 用户菜单                                                         │
@@ -3143,8 +3144,13 @@ show_vless_details() {
     echo -e "${YELLOW}【通用 VLESS URI】${PLAIN}"
     echo -e "${GREEN}${vless_uri}${PLAIN}"
     echo ""
-    echo -e "${YELLOW}【Surge】${PLAIN}"
-    echo -e "${YELLOW}不支持 VLESS Reality，不生成伪配置。${PLAIN}"
+    echo -e "${YELLOW}【Surge iOS 6.0.0+ / Mac 6.12.0+】${PLAIN}"
+    # 官方 VLESS + REALITY + XTLS Vision: REALITY 公钥即隐含 TLS，
+    # Surge 使用自身 BoringSSL ClientHello，不能照搬分享链接的 fp 参数。
+    # VLESS 的 UDP/XUDP 原生支持，不需要附加 udp-relay=true。
+    local surge_vless_line="${tag} = vless, ${host}, ${port}, username=${uuid}, flow=xtls-rprx-vision, sni=${sni}, reality-public-key=${public_key}"
+    [[ -z "$short_id" ]] || surge_vless_line+=", reality-short-id=${short_id}"
+    echo -e "${GREEN}${surge_vless_line}${PLAIN}"
     echo ""
     echo -e "${YELLOW}【Loon】${PLAIN}"
     echo -e "${GREEN}${tag} = VLESS,${host},${port},\"${uuid}\",transport=tcp,flow=xtls-rprx-vision,public-key=\"${public_key}\",short-id=${short_id},over-tls=true,sni=${sni},udp=true${PLAIN}"
