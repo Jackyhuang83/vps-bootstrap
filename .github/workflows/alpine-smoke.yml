@@ -7,6 +7,7 @@ on:
     paths:
       - "ss2022.sh"
       - "tests/test-mktemp.sh"
+      - "tests/test-apk-update.sh"
       - ".github/workflows/alpine-smoke.yml"
 
   pull_request:
@@ -15,6 +16,7 @@ on:
     paths:
       - "ss2022.sh"
       - "tests/test-mktemp.sh"
+      - "tests/test-apk-update.sh"
       - ".github/workflows/alpine-smoke.yml"
 
   workflow_dispatch:
@@ -24,8 +26,12 @@ permissions:
 
 jobs:
   alpine-openrc:
-    name: Alpine 3.21 / OpenRC
+    name: Alpine ${{ matrix.alpine }} / OpenRC
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        alpine: ["3.21", "3.23"]
 
     steps:
       - name: Checkout repository
@@ -37,7 +43,7 @@ jobs:
           docker run --rm \
             -v "$PWD:/work" \
             -w /work \
-            alpine:3.21 \
+            alpine:${{ matrix.alpine }} \
             sh -euxc '
               apk add --no-cache bash openrc coreutils grep sed
 
@@ -45,6 +51,7 @@ jobs:
               bash -n ./ss2022.sh
 
               SS2022_TEST_BUSYBOX=/bin/busybox bash tests/test-mktemp.sh
+              bash tests/test-apk-update.sh
 
               bash <<'"'"'SMOKE'"'"'
               set -euo pipefail

@@ -989,7 +989,42 @@ platform_label() {
 pkg_update() {
     case "$PLATFORM_PKG" in
         apt) DEBIAN_FRONTEND=noninteractive apt-get update -y ;;
-        apk) apk update ;;
+        apk)
+            # apk-tools 3 may report stale/unavailable repositories even when its
+            # exit status is zero. A package count can come from cached indexes.
+            # Never fail open on stale metadata or change system repositories.
+            local attempt output exit_code unavailable_count stale_count unhealthy
+            for attempt in 1 2; do
+                if output="$(apk update 2>&1)"; then
+                    exit_code=0
+                else
+                    exit_code=$?
+                fi
+                printf '%s\n' "$output"
+                unhealthy=0
+                if [[ "$output" =~ ([0-9]+)[[:space:]]+unavailable,[[:space:]]+([0-9]+)[[:space:]]+stale ]]; then
+                    unavailable_count="${BASH_REMATCH[1]}"
+                    stale_count="${BASH_REMATCH[2]}"
+                    if (( unavailable_count > 0 || stale_count > 0 )); then
+                        unhealthy=1
+                    fi
+                fi
+                if [[ "$output" =~ WARNING:.*(updating|opening) ]]; then
+                    unhealthy=1
+                fi
+                if (( exit_code == 0 && unhealthy == 0 )); then
+                    return 0
+                fi
+                if (( attempt == 1 )); then
+                    echo "[提示] Alpine APK 索引刷新未成功，稍后重试一次（不修改系统软件源）。" >&2
+                    sleep 2
+                fi
+            done
+            echo "[错误] Alpine APK 软件源索引仍不可用或已过期；已停止安装依赖。" >&2
+            echo "[提示] 请检查上述 WARNING 的具体原因（DNS/TLS/网络/软件源），以及系统 UTC 时间和 /etc/apk/repositories。" >&2
+            echo "[提示] 可单独执行：date -u; apk update; echo APK_EXIT_CODE=\$?" >&2
+            return 1
+            ;;
         *) return 1 ;;
     esac
 }
