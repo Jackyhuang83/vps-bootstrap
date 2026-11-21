@@ -4988,7 +4988,7 @@ view_config_menu() {
         echo "  7. Hysteria 2（HY2）"
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0-7]: " c
+        read -rp "请选择 [0-6]: " c
         case "$c" in
             1) view_ss2022_config; pause ;;
             2) view_shadowtls_config; pause ;;
@@ -13693,7 +13693,7 @@ server_test_management() {
         echo "  7. HTTPS 直连检测（百度 / Google，IPv4 / IPv6）"
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0-6]: " c
+        read -rp "请选择 [0-7]: " c
         case "$c" in
             1) test_ip_quality ;;
             2) test_return_route ;;
