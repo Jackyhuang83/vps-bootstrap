@@ -10,6 +10,7 @@ on:
       - "tests/test-mktemp.sh"
       - "tests/test-dns-resolver.sh"
       - "tests/test-inbound-ipv4.sh"
+      - "tests/test-ip-family-status.sh"
       - "tests/test-reality-sni.sh"
       - "tests/test-xray-restart.sh"
       - "tests/test-dashboard-nodes.sh"
@@ -34,6 +35,7 @@ on:
       - "tests/test-mktemp.sh"
       - "tests/test-dns-resolver.sh"
       - "tests/test-inbound-ipv4.sh"
+      - "tests/test-ip-family-status.sh"
       - "tests/test-reality-sni.sh"
       - "tests/test-xray-restart.sh"
       - "tests/test-dashboard-nodes.sh"
@@ -90,6 +92,12 @@ jobs:
           bash -n tests/test-inbound-ipv4.sh
           shellcheck --severity=error tests/test-inbound-ipv4.sh
           bash tests/test-inbound-ipv4.sh
+
+      - name: IPv4 / IPv6 menu shows local, ingress and egress separately
+        run: |
+          bash -n tests/test-ip-family-status.sh
+          shellcheck --severity=error tests/test-ip-family-status.sh
+          bash tests/test-ip-family-status.sh
 
       - name: Portable mktemp and updater regression
         run: bash tests/test-mktemp.sh
