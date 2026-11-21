@@ -9,6 +9,7 @@ on:
       - "tests/test-google.sh"
       - "tests/test-mktemp.sh"
       - "tests/test-dns-resolver.sh"
+      - "tests/test-https-direct.sh"
       - "tests/test-inbound-ipv4.sh"
       - "tests/test-gfw-diagnostics.sh"
       - "tests/test-gfw-remote.sh"
@@ -37,6 +38,7 @@ on:
       - "tests/test-google.sh"
       - "tests/test-mktemp.sh"
       - "tests/test-dns-resolver.sh"
+      - "tests/test-https-direct.sh"
       - "tests/test-inbound-ipv4.sh"
       - "tests/test-gfw-diagnostics.sh"
       - "tests/test-gfw-remote.sh"
@@ -92,6 +94,12 @@ jobs:
           bash -n tests/test-dns-resolver.sh
           shellcheck --severity=error tests/test-dns-resolver.sh
           bash tests/test-dns-resolver.sh
+
+      - name: HTTPS IPv4/IPv6 DNS NODATA classification regression
+        run: |
+          bash -n tests/test-https-direct.sh
+          shellcheck --severity=error tests/test-https-direct.sh
+          bash tests/test-https-direct.sh
 
       - name: Distinguish proxy ingress IPv4 from WARP/SNAT egress
         run: |
