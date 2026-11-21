@@ -10,6 +10,7 @@ on:
       - "tests/test-mktemp.sh"
       - "tests/test-dns-resolver.sh"
       - "tests/test-inbound-ipv4.sh"
+      - "tests/test-gfw-diagnostics.sh"
       - "tests/test-ip-family-status.sh"
       - "tests/test-reality-sni.sh"
       - "tests/test-xray-restart.sh"
@@ -35,6 +36,7 @@ on:
       - "tests/test-mktemp.sh"
       - "tests/test-dns-resolver.sh"
       - "tests/test-inbound-ipv4.sh"
+      - "tests/test-gfw-diagnostics.sh"
       - "tests/test-ip-family-status.sh"
       - "tests/test-reality-sni.sh"
       - "tests/test-xray-restart.sh"
@@ -92,6 +94,12 @@ jobs:
           bash -n tests/test-inbound-ipv4.sh
           shellcheck --severity=error tests/test-inbound-ipv4.sh
           bash tests/test-inbound-ipv4.sh
+
+      - name: Read-only GFW diagnostics protocol discovery and listener regression
+        run: |
+          bash -n tests/test-gfw-diagnostics.sh
+          shellcheck --severity=error tests/test-gfw-diagnostics.sh
+          bash tests/test-gfw-diagnostics.sh
 
       - name: IPv4 / IPv6 menu shows local, ingress and egress separately
         run: |
