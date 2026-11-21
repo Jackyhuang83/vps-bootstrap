@@ -13685,23 +13685,23 @@ gfw_diag_local() {
 
 # Optional public Globalping measurements. No client credentials or private data sent.
 gfw_diag_payload() {
-    local target="$1" port="$2" country="$3" family="$4" transport="$5"
+    local target="$1" port="$2" country="$3" family="$4" transport="$5" asn="${6:-0}"
     if [[ "$transport" == TCP ]]; then
-        jq -n --arg target "$target" --arg country "$country" --argjson port "$port" --argjson fam "$family" \
-            '{type:"ping",target:$target,locations:[{country:$country,limit:1}],
+        jq -n --arg target "$target" --arg country "$country" --argjson port "$port" --argjson fam "$family" --argjson asn "$asn" \
+            '{type:"ping",target:$target,locations:[({country:$country,limit:1} + (if $asn>0 then {asn:$asn} else {} end))],
               measurementOptions:{protocol:"TCP",port:$port,packets:2,ipVersion:$fam}}'
     else
-        jq -n --arg target "$target" --arg country "$country" --argjson port "$port" --argjson fam "$family" \
-            '{type:"mtr",target:$target,locations:[{country:$country,limit:1}],
+        jq -n --arg target "$target" --arg country "$country" --argjson port "$port" --argjson fam "$family" --argjson asn "$asn" \
+            '{type:"mtr",target:$target,locations:[({country:$country,limit:1} + (if $asn>0 then {asn:$asn} else {} end))],
               measurementOptions:{protocol:"UDP",port:$port,packets:2,ipVersion:$fam}}'
     fi
 }
 
 # Output never claims UDP reachability: traceroute is PATH_ONLY at best.
 gfw_diag_parse_measurement() {
-    local result="$1" country="$2" transport="$3"
-    jq -r --arg country "$country" --arg transport "$transport" '
-       [.results[]? | select(.probe.country==$country)] as $p |
+    local result="$1" country="$2" transport="$3" asn="${4:-0}"
+    jq -r --arg country "$country" --arg transport "$transport" --argjson asn "$asn" '
+       [.results[]? | select(.probe.country==$country and ($asn==0 or ((.probe.asn | tonumber? // 0)==$asn)))] as $p |
        if ($p|length)==0 then "UNKNOWN"
        elif $transport=="UDP" then
          if any($p[]; .result.status=="finished") then "PATH_ONLY" else "UNKNOWN" end
@@ -13714,9 +13714,9 @@ gfw_diag_parse_measurement() {
 }
 
 gfw_diag_globalping() {
-    local target="$1" port="$2" country="$3" family="$4" transport="$5"
+    local target="$1" port="$2" country="$3" family="$4" transport="$5" asn="${6:-0}"
     local payload response id status="" i
-    payload=$(gfw_diag_payload "$target" "$port" "$country" "$family" "$transport") ||
+    payload=$(gfw_diag_payload "$target" "$port" "$country" "$family" "$transport" "$asn") ||
         { echo UNKNOWN; return 0; }
     response=$(curl -fsS --compressed --connect-timeout 5 --max-time 12 \
         -H 'User-Agent: vps-bootstrap-gfw-diagnostics/1.0' \
@@ -13735,7 +13735,7 @@ gfw_diag_globalping() {
         case "$status" in finished|failed) break ;; in-progress|in_progress) ;; *) break ;; esac
     done
     [[ "$status" == finished ]] || { echo UNKNOWN; return 0; }
-    gfw_diag_parse_measurement "$response" "$country" "$transport"
+    gfw_diag_parse_measurement "$response" "$country" "$transport" "$asn"
 }
 
 gfw_diag_tcp_verdict() {
@@ -13810,6 +13810,80 @@ gfw_diag_history_show() {
         "\(.time // "未知") | IPv\(.family // "?") \(.target // "?"):\(.port // "?")/\(.transport // "?") | CN=\(.cn // "UNKNOWN") US=\(.us // "UNKNOWN") | \(.verdict // "INSUFFICIENT_EVIDENCE")"
       else "记录格式异常" end' 2>/dev/null || echo "[提示] 历史文件部分记录无效。"
     echo "路径：$file（仅记录目标 IP、端口与检测结论，无节点密钥）"
+}
+
+# The official Globalping /v1/probes endpoint reports live probe country and ASN.
+# Only measured, country-confirmed ASNs can count as mainland carrier coverage.
+gfw_diag_probe_inventory() {
+    curl -fsS --compressed --connect-timeout 5 --max-time 12 \
+        -H 'User-Agent: vps-bootstrap-gfw-diagnostics/1.0' \
+        -H 'Accept: application/json' https://api.globalping.io/v1/probes
+}
+
+gfw_diag_carrier_asn() {
+    local inventory="$1" carrier="$2" asn
+    local candidates
+    case "$carrier" in
+        TELECOM) candidates="4134 4809 4812" ;;
+        UNICOM) candidates="4837 9929" ;;
+        MOBILE) candidates="9808 56040 56046" ;;
+        *) return 1 ;;
+    esac
+    for asn in $candidates; do
+        if jq -e --argjson a "$asn" 'any(.[]; .location.country=="CN" and .location.asn==$a)' <<<"$inventory" >/dev/null 2>&1; then
+            printf '%s' "$asn"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# One-shot automated tri-carrier TCP test; never opens a public port or changes
+# the local network. All measurement requests require explicit YES consent.
+gfw_diag_trinet_auto() {
+    local target confirmation inventory carrier label asn port name proto service state
+    local cn us seen="|" carriers=(TELECOM UNICOM MOBILE) found=0
+    command -v jq >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 || {
+        echo "[错误] 缺少 curl/jq；不自动安装。"; return 1;
+    }
+    target=$(gfw_diag_remote_target 4) || return 1
+    echo "检测目标：$target（只使用现有已部署 TCP 端口）"
+    echo "探针提供商：Globalping 官方 API；只发送公网入口 IP 和端口，不发送节点密钥。"
+    read -rp "确认执行大陆三网与美国 TCP 建连测试？输入 YES: " confirmation || return 1
+    [[ "$confirmation" == YES ]] || { echo "取消；未发送任何目标信息。"; return 0; }
+    inventory=$(gfw_diag_probe_inventory) || {
+        echo "PROBE_API_UNREACHABLE: 无法获取在线探针清单；这是检测服务问题，不是 IP 被封。"; return 0;
+    }
+    jq -e 'type=="array"' <<<"$inventory" >/dev/null 2>&1 || {
+        echo "PROBE_RESPONSE_INVALID: 探针清单格式异常，未发起目标测量。"; return 0;
+    }
+    echo "══════════ 中国电信 / 联通 / 移动 TCP 自动核验 ══════════"
+    echo "探针须实际位于 CN 且匹配 ASN；未找到探针即显示 NO_ONLINE_PROBE。"
+    while IFS='|' read -r name proto port service; do
+        [[ "$proto" == TCP ]] || continue
+        [[ "$seen" == *"|$port|"* ]] && continue
+        seen="${seen}$port|"; found=1
+        state=$(gfw_diag_listener_status "$proto" "$port")
+        printf '\n[%s] %s:%s TCP 本机=%s\n' "$name" "$target" "$port" "$state"
+        if [[ "$state" != BOUND ]]; then
+            echo "  LOCAL_ISSUE: 服务未对公网监听，不执行远端判断。"
+            continue
+        fi
+        for carrier in "${carriers[@]}"; do
+            case "$carrier" in TELECOM) label="中国电信" ;; UNICOM) label="中国联通" ;; MOBILE) label="中国移动" ;; esac
+            if ! asn=$(gfw_diag_carrier_asn "$inventory" "$carrier"); then
+                printf '  %-10s NO_ONLINE_PROBE（官方没有该运营商的在线合格探针）\n' "$label"
+                continue
+            fi
+            cn=$(gfw_diag_globalping "$target" "$port" CN 4 TCP "$asn")
+            printf '  %-10s %-7s CN / AS%s\n' "$label" "$cn" "$asn"
+        done
+        us=$(gfw_diag_globalping "$target" "$port" US 4 TCP)
+        printf '  %-10s %-7s US（不代表大陆可达）\n' "美国对照" "$us"
+        echo "  说明：只有 PASS 证明该探针 TCP 可建连；FAIL 可能是路由、防火墙或阻断，不可单凭本次认定 GFW。"
+    done < <(gfw_diag_ports)
+    [[ "$found" == 1 ]] || echo "没有已部署 TCP 协议端口。"
+    echo "三网检测不等于协议认证；UDP/HY2 另用真实客户端验证。"
 }
 
 gfw_diag_trinet_links() {
@@ -13887,7 +13961,7 @@ gfw_diag_menu() {
         echo "  5. 从 CN / US 远程测试 UDP 路径（IPv6，不能证明 UDP 放通）"
         echo "  6. 检测依据与判定边界"
         echo "  7. 查看最近 20 次检测历史"
-        echo "  8. 中国电信/联通/移动 TCP 核验链接"
+        echo "  8. 中国电信/联通/移动 TCP 一键自动检测"
         echo "  9. 清除本地检测历史（需确认）"
         echo "  0. 返回"
         read -rp "请选择 [0-9]: " choice || return 0
@@ -13904,7 +13978,7 @@ gfw_diag_menu() {
                 echo "所有外部检测都需要用户明确同意，且只发送公网目标地址和端口。"
                 pause ;;
             7) gfw_diag_history_show; pause ;;
-            8) gfw_diag_trinet_links; pause ;;
+            8) gfw_diag_trinet_auto; pause ;;
             9) gfw_diag_history_clear; pause ;;
             0) return ;;
             *) echo "无效选择"; sleep 1 ;;
