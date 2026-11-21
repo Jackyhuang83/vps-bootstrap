@@ -11,6 +11,7 @@ on:
       - "tests/test-dns-resolver.sh"
       - "tests/test-inbound-ipv4.sh"
       - "tests/test-gfw-diagnostics.sh"
+      - "tests/test-gfw-remote.sh"
       - "tests/test-ip-family-status.sh"
       - "tests/test-reality-sni.sh"
       - "tests/test-xray-restart.sh"
@@ -37,6 +38,7 @@ on:
       - "tests/test-dns-resolver.sh"
       - "tests/test-inbound-ipv4.sh"
       - "tests/test-gfw-diagnostics.sh"
+      - "tests/test-gfw-remote.sh"
       - "tests/test-ip-family-status.sh"
       - "tests/test-reality-sni.sh"
       - "tests/test-xray-restart.sh"
@@ -100,6 +102,12 @@ jobs:
           bash -n tests/test-gfw-diagnostics.sh
           shellcheck --severity=error tests/test-gfw-diagnostics.sh
           bash tests/test-gfw-diagnostics.sh
+
+      - name: CN/US TCP and UDP Globalping API offline regression
+        run: |
+          bash -n tests/test-gfw-remote.sh
+          shellcheck --severity=error tests/test-gfw-remote.sh
+          bash tests/test-gfw-remote.sh
 
       - name: IPv4 / IPv6 menu shows local, ingress and egress separately
         run: |
