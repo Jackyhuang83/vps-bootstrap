@@ -12,6 +12,7 @@ on:
       - "tests/test-inbound-ipv4.sh"
       - "tests/test-gfw-diagnostics.sh"
       - "tests/test-gfw-remote.sh"
+      - "tests/test-gfw-history.sh"
       - "tests/test-ip-family-status.sh"
       - "tests/test-reality-sni.sh"
       - "tests/test-xray-restart.sh"
@@ -39,6 +40,7 @@ on:
       - "tests/test-inbound-ipv4.sh"
       - "tests/test-gfw-diagnostics.sh"
       - "tests/test-gfw-remote.sh"
+      - "tests/test-gfw-history.sh"
       - "tests/test-ip-family-status.sh"
       - "tests/test-reality-sni.sh"
       - "tests/test-xray-restart.sh"
@@ -108,6 +110,12 @@ jobs:
           bash -n tests/test-gfw-remote.sh
           shellcheck --severity=error tests/test-gfw-remote.sh
           bash tests/test-gfw-remote.sh
+
+      - name: GFW official UDP MTR ports and bounded local history
+        run: |
+          bash -n tests/test-gfw-history.sh
+          shellcheck --severity=error tests/test-gfw-history.sh
+          bash tests/test-gfw-history.sh
 
       - name: IPv4 / IPv6 menu shows local, ingress and egress separately
         run: |
