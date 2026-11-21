@@ -13890,7 +13890,7 @@ gfw_diag_menu() {
         echo "  8. 中国电信/联通/移动 TCP 核验链接"
         echo "  9. 清除本地检测历史（需确认）"
         echo "  0. 返回"
-        read -rp "请选择 [0-8]: " choice || return 0
+        read -rp "请选择 [0-9]: " choice || return 0
         case "$choice" in
             1) gfw_diag_local; pause ;;
             2) gfw_diag_remote_scan 4 TCP; pause ;;
