@@ -25,7 +25,7 @@ done
 [[ "$(wc -l <"$file")" -eq 50 ]]
 out=$(gfw_diag_history_show)
 [[ "$out" == *'UDP_PATH_ONLY'* ]]
-[[ "$out" == *'路径'* || "$out" == *'检测记录'* ]]
+[[ "$out" == *'最近 20 条外部探测记录'* ]]
 [[ "$out" != *'password'* && "$out" != *'UUID'* ]]
 mv "$file" "$tmp/historical-backup"
 printf 'DO_NOT_OVERWRITE\n' >"$tmp/other-file"
