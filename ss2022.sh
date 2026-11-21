@@ -2866,9 +2866,9 @@ get_ss_cipher_and_key() {
 }
 
 get_public_ipv4() {
-    local ip=""
-    ip=$(curl -4fsS --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null) || true
-    [[ -z "$ip" ]] && ip=$(curl -4fsS --connect-timeout 5 --max-time 10 https://ip.sb 2>/dev/null) || true
+    local ip="" connect_timeout="${1:-5}" max_time="${2:-10}"
+    ip=$(curl -4fsS --connect-timeout "$connect_timeout" --max-time "$max_time" https://api.ipify.org 2>/dev/null) || true
+    [[ -z "$ip" ]] && ip=$(curl -4fsS --connect-timeout "$connect_timeout" --max-time "$max_time" https://ip.sb 2>/dev/null) || true
 
     if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
         printf '%s' "$ip"
@@ -11050,18 +11050,23 @@ server_tool_set_ip_family_mode() {
 }
 
 server_tool_ip_family_status() {
-    local v4="无" v6="无" mode global
-    v4=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | head -n1)
-    v6=$(ip -6 -o addr show scope global 2>/dev/null | awk '{print $4}' | head -n1)
-    v4=${v4:-无}
-    v6=${v6:-无}
+    local v4_local="" v4_inbound="" v4_egress="" v6_local="" mode global
+    # Linux 'scope global' includes RFC1918 and NAT addresses; it does not mean public.
+    v4_local=$(ip -4 -o addr show scope global 2>/dev/null | awk '$3=="inet" {print $4; exit}')
+    v6_local=$(ip -6 -o addr show scope global 2>/dev/null | awk '$3=="inet6" {print $4; exit}')
+    # A globally routed NIC address is only an inbound *candidate*: cloud NAT
+    # and multiple public addresses cannot be inferred from an outbound IP echo.
+    v4_inbound=$(get_inbound_ipv4 2>/dev/null || true)
+    v4_egress=$(get_public_ipv4 2 4 2>/dev/null || true)
     mode=$(server_tool_ip_family_mode)
     global=$(routing_global_ip_family)
-    echo "  IPv4 地址     : $v4"
-    echo "  IPv6 地址     : $v6"
-    echo "  系统协议族状态 : $(server_tool_ip_family_mode_label "$mode")"
-    echo "  业务出口地址族 : $(routing_ip_family_label "$global")"
-    echo "  地址优先级     : $(server_tool_ip_priority_status)"
+    echo "  IPv4 网卡地址   : ${v4_local:-无}（可能是私网/NAT）"
+    echo "  IPv4 公网入口候选: ${v4_inbound:-无法自动确认（云 NAT 请以 VPS 控制台为准）}"
+    echo "  IPv4 公网出口   : ${v4_egress:-检测失败}（可能是 WARP/NAT，不能直接作为节点入口）"
+    echo "  IPv6 网卡地址   : ${v6_local:-无}"
+    echo "  系统协议族状态  : $(server_tool_ip_family_mode_label "$mode")"
+    echo "  业务出口地址族  : $(routing_ip_family_label "$global")"
+    echo "  地址优先级      : $(server_tool_ip_priority_status)"
 }
 
 server_tool_ip_family_management() {
