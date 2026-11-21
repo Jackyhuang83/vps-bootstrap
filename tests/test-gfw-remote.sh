@@ -71,7 +71,7 @@ out=$(gfw_diag_remote_scan 4 TCP <<< $'\nNO\n')
 [[ ! -f "$tmp/requests" ]]
 
 
-# P1: API inventory must require a real mainland CN probe and matching ASN.
+# P1: live probe country and ASN must match China Telecom/Unicom/Mobile.
 carrier_probes='[
   {"location":{"country":"CN","asn":4134}},
   {"location":{"country":"CN","asn":4837}},
@@ -82,109 +82,30 @@ carrier_probes='[
 [[ "$(gfw_diag_carrier_asn "$carrier_probes" UNICOM)" == 4837 ]]
 [[ "$(gfw_diag_carrier_asn "$carrier_probes" MOBILE)" == 9808 ]]
 if gfw_diag_carrier_asn '[{"location":{"country":"US","asn":9808}}]' MOBILE; then
-    echo 'FAIL: a US probe was presented as mainland China Mobile'; exit 1
+    echo 'FAIL: US probe misclassified as mainland China Mobile'; exit 1
 fi
 payload=$(gfw_diag_payload 11.22.33.44 443 CN 4 TCP 4134)
 jq -e '.locations[0].country=="CN" and .locations[0].asn==4134 and .measurementOptions.port==443' <<<"$payload" >/dev/null
 [[ "$(gfw_diag_parse_measurement "$pass" CN TCP 4134)" == UNKNOWN ]]
 [[ "$(gfw_diag_parse_measurement "$pass" CN TCP 12345)" == PASS ]]
-
 gfw_diag_ports() { printf 'VLESS Reality|TCP|443|xray\n'; }
 gfw_diag_listener_status() { printf 'BOUND\n'; }
-gfw_diag_probe_inventory() { echo 'inventory-called' >> "$tmp/probe-calls"; printf '%s' "$carrier_probes"; }
+gfw_diag_probe_inventory() { echo inventory-called >> "$tmp/probe-calls"; printf '%s' "$carrier_probes"; }
 gfw_diag_globalping() {
     case "${6:-0}" in 4134|4837) echo PASS ;; 9808) echo FAIL ;; *) echo PASS ;; esac
 }
 rm -f "$tmp/probe-calls"
-out=$(gfw_diag_trinet_auto <<< 
+out=$(gfw_diag_trinet_auto <<< "$(printf '11.22.33.44\nNO\n')")
 [[ "$out" == *'取消；未发送任何目标信息'* ]]
 [[ ! -f "$tmp/probe-calls" ]]
-out=$(gfw_diag_trinet_auto <<< 
+out=$(gfw_diag_trinet_auto <<< "$(printf '11.22.33.44\nYES\n')")
 [[ "$out" == *'中国电信'*'PASS'*'AS4134'* ]]
 [[ "$out" == *'中国联通'*'PASS'*'AS4837'* ]]
 [[ "$out" == *'中国移动'*'FAIL'*'AS9808'* ]]
 [[ "$out" == *'美国对照'*'PASS'* ]]
 [[ -f "$tmp/probe-calls" ]]
 carrier_probes='[{"location":{"country":"US","asn":4134}}]'
-out=$(gfw_diag_trinet_auto <<< 
-11.22.33.44\nYES\n')
+out=$(gfw_diag_trinet_auto <<< "$(printf '11.22.33.44\nYES\n')")
 [[ "$out" == *'NO_ONLINE_PROBE'* ]]
 
-echo 'PASS: Globalping protocol payload, CN absent, TCP verdict, UDP path-only, opt-in security, ASN-backed tri-carrier TCP'
-11.22.33.44\nNO\n')
-[[ "$out" == *'取消；未发送任何目标信息'* ]]
-[[ ! -f "$tmp/probe-calls" ]]
-out=$(gfw_diag_trinet_auto <<< 
-11.22.33.44\nYES\n')
-[[ "$out" == *'中国电信'*'PASS'*'AS4134'* ]]
-[[ "$out" == *'中国联通'*'PASS'*'AS4837'* ]]
-[[ "$out" == *'中国移动'*'FAIL'*'AS9808'* ]]
-[[ "$out" == *'美国对照'*'PASS'* ]]
-[[ -f "$tmp/probe-calls" ]]
-carrier_probes='[{"location":{"country":"US","asn":4134}}]'
-out=$(gfw_diag_trinet_auto <<< 
-11.22.33.44\nYES\n')
-[[ "$out" == *'NO_ONLINE_PROBE'* ]]
-
-echo 'PASS: Globalping protocol payload, CN absent, TCP verdict, UDP path-only, opt-in security, ASN-backed tri-carrier TCP'
-11.22.33.44\nYES\n')
-[[ "$out" == *'中国电信'*'PASS'*'AS4134'* ]]
-[[ "$out" == *'中国联通'*'PASS'*'AS4837'* ]]
-[[ "$out" == *'中国移动'*'FAIL'*'AS9808'* ]]
-[[ "$out" == *'美国对照'*'PASS'* ]]
-[[ -f "$tmp/probe-calls" ]]
-carrier_probes='[{"location":{"country":"US","asn":4134}}]'
-out=$(gfw_diag_trinet_auto <<< 
-[[ "$out" == *'NO_ONLINE_PROBE'* ]]
-
-echo 'PASS: Globalping protocol payload, CN absent, TCP verdict, UDP path-only, opt-in security, ASN-backed tri-carrier TCP'
-11.22.33.44\nNO\n')
-[[ "$out" == *'取消；未发送任何目标信息'* ]]
-[[ ! -f "$tmp/probe-calls" ]]
-out=$(gfw_diag_trinet_auto <<< 
-11.22.33.44\nYES\n')
-[[ "$out" == *'中国电信'*'PASS'*'AS4134'* ]]
-[[ "$out" == *'中国联通'*'PASS'*'AS4837'* ]]
-[[ "$out" == *'中国移动'*'FAIL'*'AS9808'* ]]
-[[ "$out" == *'美国对照'*'PASS'* ]]
-[[ -f "$tmp/probe-calls" ]]
-carrier_probes='[{"location":{"country":"US","asn":4134}}]'
-out=$(gfw_diag_trinet_auto <<< 
-11.22.33.44\nYES\n')
-[[ "$out" == *'NO_ONLINE_PROBE'* ]]
-
-echo 'PASS: Globalping protocol payload, CN absent, TCP verdict, UDP path-only, opt-in security, ASN-backed tri-carrier TCP'
-11.22.33.44\nYES\n')
-[[ "$out" == *'NO_ONLINE_PROBE'* ]]
-
-echo 'PASS: Globalping protocol payload, CN absent, TCP verdict, UDP path-only, opt-in security, ASN-backed tri-carrier TCP'
-11.22.33.44\nNO\n')
-[[ "$out" == *'取消；未发送任何目标信息'* ]]
-[[ ! -f "$tmp/probe-calls" ]]
-out=$(gfw_diag_trinet_auto <<< 
-[[ "$out" == *'中国电信'*'PASS'*'AS4134'* ]]
-[[ "$out" == *'中国联通'*'PASS'*'AS4837'* ]]
-[[ "$out" == *'中国移动'*'FAIL'*'AS9808'* ]]
-[[ "$out" == *'美国对照'*'PASS'* ]]
-[[ -f "$tmp/probe-calls" ]]
-carrier_probes='[{"location":{"country":"US","asn":4134}}]'
-out=$(gfw_diag_trinet_auto <<< 
-11.22.33.44\nYES\n')
-[[ "$out" == *'NO_ONLINE_PROBE'* ]]
-
-echo 'PASS: Globalping protocol payload, CN absent, TCP verdict, UDP path-only, opt-in security, ASN-backed tri-carrier TCP'
-11.22.33.44\nYES\n')
-[[ "$out" == *'中国电信'*'PASS'*'AS4134'* ]]
-[[ "$out" == *'中国联通'*'PASS'*'AS4837'* ]]
-[[ "$out" == *'中国移动'*'FAIL'*'AS9808'* ]]
-[[ "$out" == *'美国对照'*'PASS'* ]]
-[[ -f "$tmp/probe-calls" ]]
-carrier_probes='[{"location":{"country":"US","asn":4134}}]'
-out=$(gfw_diag_trinet_auto <<< 
-[[ "$out" == *'NO_ONLINE_PROBE'* ]]
-
-echo 'PASS: Globalping protocol payload, CN absent, TCP verdict, UDP path-only, opt-in security, ASN-backed tri-carrier TCP'
-11.22.33.44\nYES\n')
-[[ "$out" == *'NO_ONLINE_PROBE'* ]]
-
-echo 'PASS: Globalping protocol payload, CN absent, TCP verdict, UDP path-only, opt-in security, ASN-backed tri-carrier TCP'
+echo 'PASS: Globalping protocol payload, CN absent, TCP verdict, UDP path-only, opt-in security, tri-carrier'
