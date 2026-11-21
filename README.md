@@ -860,17 +860,24 @@ v1.9.0 已完成上一稳定阶段的收口；v1.9.1 在其基础上增加可复
 
 先前 P0～P4 已完成合并与对应代码/CI 及 HTTPS 实机验收（GFW 三网真实探测仍待独立验收）；本轮增加 P5（1 个 PR，依赖 P1～P3）。交付官方测量超时参数、兼容 TCP/UDP 的有界结果轮询、晚到结果离线回归测试。验收：PR 与主线 CI 全绿，真实 VPS 三网探针可用性另行验证，**不将 API 超时当作 GFW 阻断**。本轮权重调整为 P0=7%、P1=40%、P2=15%、P3=11%、P4=17%、P5=10%。
 
+## GDGS P6：Globalping 官方参数与 HTTP 响应兼容（1 PR）
+
+P6 在已合并的 P0～P5 后追加，依赖 P1 远端测量与 P2 错误分类；本轮仅 1 个集中 PR，修正官方 API 的 IP 地址目标参数、HTTP 错误分类及对应离线 CI。完成条件：源码对齐官方 OpenAPI、覆盖 IPv4/IPv6/域名与 API 400/422/429/意外状态的离线回归，PR CI 全绿后合并，之后核对 main CI。三网真实连接另需实机验证，不能单凭 CI 宣布 VPS 被封或三网全通。
+
+按 GDGS 更新后的全阶段权重：P0 审计 6%（0 PR，已验收）；P1 三网测量 36%（PR #52，已合并）；P2 错误分类 14%（PR #53，已合并）；P3 历史与回归 10%（PR #54，已合并）；P4 HTTPS 双栈 14%（PR #55，已合并且实机功能通过）；P5 超时可靠性 10%（PR #56，已合并）；P6 IP 参数与 HTTP 诊断 10%（本 PR）。P6 只读且可回退，不修改 WARP、路由、防火墙或已部署的代理配置。
+
 ## GFW / TCP / UDP 连通性诊断（只读）
 
 入口：`ss2022` → `8. 服务器测试管理` → `6. GFW / TCP / UDP 连通性诊断`。
 
 - **本机检查**（菜单 1）：读取已部署的 SS2022、ShadowTLS v3、VLESS Reality、Snell v5/v6、Hysteria 2 真实配置与监听，不扫描其它端口；区分 TCP、UDP、服务运行、未监听及回环监听，不改变系统。
 - **中国电信 / 联通 / 移动自动 TCP 检测（菜单 8，IPv4）**：正式功能不再只是打印 ITDOG 链接。先调用官方 `GET /v1/probes` 查验在线探针的 `country=CN` 和 ASN，再按电信（AS4134/4809/4812）、联通（AS4837/9929）、移动（AS9808/56040/56046）选择可用探针，分别发起 Globalping TCP 测量并追加美国对照。输出具体 PASS/FAIL/UNKNOWN 和原因，实际返回 RTT 时显示毫秒数，记录在本地 0600 历史中；没有在线运营商探针显示 `NO_ONLINE_PROBE`，而不是假装测通或测不通。仅检测当前已部署 TCP 端口，严格要求输入 `YES` 才发送公网 IP 和端口。
+- **Globalping 参数兼容**：官方 OpenAPI 的 `measurementOptions.ipVersion` 仅允许目标为**域名**时使用。自动检测直接填写 VPS 公网 IPv4/IPv6 时不再提交此字段，由目标 IP 本身确定地址族；否则 API 可能拒绝测量请求。HTTP API 出错时报告状态码及经过格式过滤的 `error.type`（如 `API_HTTP_400_validation_error`），不输出可能含公网 IP 的原始响应，也不把 HTTP 错误当作 GFW 封锁。
 - **轮询可靠性**：遵循 Globalping 官方测量 `timeout` 定义：TCP 探针超时 10 秒，最多 12 次、每 2 秒一次结果轮询；UDP MTR 探针超时 30 秒，最多 22 次轮询。为服务端汇总及 API 通信预留不少于 10 秒，不再因旧版仅轮询约 12 秒而过早输出 `MEASUREMENT_TIMEOUT`。长时间未完成仍显示 `UNKNOWN`，不判定 GFW 阻断。轮询不增加探针目标或公开额外凭据。
 - **TCP 中国大陆 / 海外对照**（菜单 2、4）：仅在明确输入 `YES` 后，将你管理的 VPS **真实公网入口 IP 和端口**交给 [Globalping 官方 API](https://globalping.io/docs/api.globalping.io)。优先使用中国大陆（CN）和美国（US）公开探针各 1 台，显示 `PASS`、`FAIL`、`UNKNOWN` 及对照结论；海外可达、大陆失败仅标注 `CN_PATH_SUSPECT_NOT_PROVEN_GFW`，不能据此证明 GFW 封锁。
 - **UDP 中国大陆 / 海外路径**（菜单 3、5）：使用 Globalping 官方 UDP MTR（携带目标端口），**只提供路径线索**；`PATH_ONLY` **不表示** Hysteria 2 / SS2022 UDP 收发或认证成功，`UNKNOWN` 也不表示 UDP 被封。可靠的 UDP 判定仍需要真实客户端与服务端双向认证或收包证据。
 - **IPv4 / IPv6**：分别选择入口地址族；IPv4 候选来自 VPS 公网网卡而不是 WARP/SNAT 出口，云 NAT/多网卡时需要手填服务商分配的入口 IP。
-- **隐私与限制**：Globalping 测量 ID 和测量结果可能公开/被分享，提交前必须用户明确授权。工具不发送代理口令、UUID、Reality Key、Snell PSK；不自动安装组件、扫描全网、抓包、重启服务、修改 DNS/WARP/firewall。中国大陆公开探针可能不可用，不保证覆盖电信/联通/移动三网，API 超时、无可用探针、DNS 故障、配额限制仍属于 `UNKNOWN`，但将附带 `API_TIMEOUT` / `NO_ONLINE_PROBE` / `API_DNS_FAILURE` / `API_RATE_LIMIT_429` 等明确原因，不能解释为 TCP 被 GFW 封锁。
+- **隐私与限制**：Globalping 测量 ID 和测量结果可能公开/被分享，提交前必须用户明确授权。工具不发送代理口令、UUID、Reality Key、Snell PSK；不自动安装组件、扫描全网、抓包、重启服务、修改 DNS/WARP/firewall。中国大陆公开探针可能不可用，不保证覆盖电信/联通/移动三网，API 参数拒绝、API 超时、无可用探针、DNS 故障、配额限制仍属于 `UNKNOWN`，但将附带 `API_TIMEOUT` / `NO_ONLINE_PROBE` / `API_DNS_FAILURE` / `API_RATE_LIMIT_429` 等明确原因，不能解释为 TCP 被 GFW 封锁。
 - **验收边界**：CI 使用离线桩验证协议识别、真实运营商 ASN 筛选、TCP/UDP 结果分类、429/422/网络失败、无大陆探针和拒绝授权；某台 VPS 是否被拦截必须由目标公网入口、所在网络运营商和客户端真实连接验证。
 
 判定建议：`LOCAL_ISSUE` 优先核对服务和防火墙；`TCP_REACHABLE_FROM_CN` 表示**至少一个**中国大陆探针能进行 TCP 检测，不代表代理握手；`CN_PATH_SUSPECT_NOT_PROVEN_GFW` 需要不同 ASN、不同时间反复对照；`INSUFFICIENT_EVIDENCE` 不能下封锁结论。
