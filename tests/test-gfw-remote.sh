@@ -65,7 +65,9 @@ curl() {
             ;;
         *'/v1/measurements/abcDEF123456'*)
             case "$MOCK_SCENARIO" in
-                delayed) printf '{"status":"in-progress"}\nHTTP_STATUS:200\n' ;;
+                delayed)
+                    printf 'poll\n' >> "$tmp/delayed_polls"
+                    printf '{"status":"in-progress"}\nHTTP_STATUS:200\n' ;;
                 delayed_then_success)
                     count=$(cat "$tmp/polls" 2>/dev/null || echo 0)
                     count=$(( count + 1 ))
@@ -94,7 +96,12 @@ MOCK_SCENARIO=rate_limit
 MOCK_SCENARIO=api_dns_error
 [[ "$(gfw_diag_globalping_detailed 11.22.33.44 443 CN 4 TCP)" == 'UNKNOWN|API_DNS_FAILURE' ]]
 MOCK_SCENARIO=delayed
+rm -f "$tmp/delayed_polls"
 [[ "$(gfw_diag_globalping_detailed 11.22.33.44 443 CN 4 TCP)" == 'UNKNOWN|MEASUREMENT_TIMEOUT' ]]
+[[ "$(wc -l < "$tmp/delayed_polls")" -eq 12 ]]
+rm -f "$tmp/delayed_polls"
+[[ "$(gfw_diag_globalping_detailed 11.22.33.44 443 CN 4 UDP)" == 'UNKNOWN|MEASUREMENT_TIMEOUT' ]]
+[[ "$(wc -l < "$tmp/delayed_polls")" -eq 22 ]]
 MOCK_SCENARIO=delayed_then_success
 rm -f "$tmp/polls"
 [[ "$(gfw_diag_globalping_detailed 11.22.33.44 443 CN 4 TCP 4134)" == 'PASS|TCP_CONNECTED_RTT_77.5ms' ]]
