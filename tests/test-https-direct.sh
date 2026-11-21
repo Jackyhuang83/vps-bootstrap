@@ -86,4 +86,6 @@ out=$(https_direct_one Google www.google.com 6)
 
 sed -n '/^server_test_management() {/,/^}/p' ss2022.sh |
     grep -Fq '7) https_direct_run; pause ;;'
+sed -n '/^server_test_management() {/,/^}/p' ss2022.sh |
+    grep -Fq 'read -rp "请选择 [0-7]: " c'
 echo 'PASS: DNS NODATA AAAA skip, real DNS failures, curl outcome mapping, menu and opt-out proxies'
