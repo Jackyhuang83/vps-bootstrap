@@ -79,6 +79,11 @@ curl() {
         previous="$arg"
     done
     [[ "${FAIL_CURL:-0}" != 1 ]] || return 22
+    if [[ "${FAIL_RAW_ONLY:-0}" == 1 ]]; then
+        for arg in "$@"; do
+            [[ "$arg" != *raw.githubusercontent.com* ]] || return 28
+        done
+    fi
     cp "$remote" "$out"
 }
 install() {
@@ -129,9 +134,22 @@ assert cmp -s "$SCRIPT_INSTALL_PATH" "$running"
 assert cleaned
 
 cp "$fixture_dir/good-remote" "$remote"
+# Raw hostname fails to resolve; the official API alternate hostname succeeds.
+rm -f "$fixture_dir/downloads"
+out=$(FAIL_RAW_ONLY=1 check_script_update <<<y)
+assert contains "$out" 'GitHub 官方 API 备用源下载成功'
+assert contains "$out" '脚本安装 / 更新完成：v1.9.1-dev6'
+assert cmp -s "$SCRIPT_INSTALL_PATH" "$remote"
+assert test "$(wc -l < "$fixture_dir/downloads")" -eq 2
+assert cleaned
+cp "$running" "$SCRIPT_INSTALL_PATH"
+
+# Both official hostnames unavailable: preserve existing installation and clean up.
+rm -f "$fixture_dir/downloads"
 out=$(FAIL_CURL=1 check_script_update <<<y)
-assert contains "$out" '下载 GitHub 最新脚本失败'
+assert contains "$out" 'GitHub Raw 和官方 API 均无法下载'
 assert cmp -s "$SCRIPT_INSTALL_PATH" "$running"
+assert test "$(wc -l < "$fixture_dir/downloads")" -eq 2
 assert cleaned
 
 out=$(FAIL_INSTALL=1 check_script_update <<<y)

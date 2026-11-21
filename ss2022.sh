@@ -9651,13 +9651,35 @@ check_script_update() {
     cache_bust=$(date +%s)
 
     echo -e "${YELLOW}>> 正在从 GitHub main 获取最新脚本...${PLAIN}"
-    if ! curl -fsSL --retry 2 --retry-delay 1 --connect-timeout 8 --max-time 60 \
+    # GitHub Raw 与 GitHub REST Contents API 使用不同域名；只在 Raw 失败时尝试官方备用源。
+    # 公有仓库可匿名访问 API，不执行第三方镜像脚本，不绕过 TLS 验证。
+    local raw_rc=0 api_rc=0 api_url=""
+    if curl -fsSL --retry 0 --connect-timeout 8 --max-time 60 \
         -H 'Cache-Control: no-cache' \
         "${SCRIPT_UPDATE_URL}?t=${cache_bust}" -o "$tmp"; then
-        rm -f "$tmp"
-        echo -e "${RED}[错误] 下载 GitHub 最新脚本失败。${PLAIN}"
-        pause
-        return
+        :
+    else
+        raw_rc=$?
+        echo -e "${YELLOW}[提示] GitHub Raw 下载失败（curl $raw_rc），尝试 GitHub 官方 Contents API...${PLAIN}"
+        api_url="https://api.github.com/repos/Jackyhuang83/vps-bootstrap/contents/ss2022.sh?ref=main&t=${cache_bust}"
+        if curl -fsSL --retry 0 --connect-timeout 8 --max-time 60 \
+            -H 'Accept: application/vnd.github.raw+json' \
+            -H 'Cache-Control: no-cache' \
+            -H 'User-Agent: vps-bootstrap-updater' \
+            "$api_url" -o "$tmp"; then
+            echo -e "${GREEN}[通过] GitHub 官方 API 备用源下载成功。${PLAIN}"
+        else
+            api_rc=$?
+            rm -f "$tmp"
+            echo -e "${RED}[错误] GitHub Raw 和官方 API 均无法下载；旧脚本未修改。${PLAIN}"
+            echo "  Raw curl 退出码: $raw_rc；API curl 退出码: $api_rc"
+            if [[ "$raw_rc" == 6 || "$raw_rc" == 28 || "$api_rc" == 6 || "$api_rc" == 28 ]]; then
+                echo "  存在 DNS 解析/连接超时。可只读检查：getent ahosts raw.githubusercontent.com；getent ahosts api.github.com"
+                echo "  不建议通过关闭证书验证或替换未经验证的脚本来解决。"
+            fi
+            pause
+            return
+        fi
     fi
 
     # 只接受本项目脚本，避免 URL / CDN 异常返回 HTML 或其它内容后被直接执行。
