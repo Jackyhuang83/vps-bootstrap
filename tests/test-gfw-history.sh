@@ -52,4 +52,6 @@ output=$(gfw_diag_trinet_links <<<"")
 [[ "$output" != *':5000'* ]]
 [[ "$(grep -oF 'https://www.itdog.cn/tcping/11.22.33.44:443' <<<"$output" | wc -l)" -eq 1 ]]
 [[ "$output" == *'电信'* && "$output" == *'联通'* && "$output" == *'移动'* ]]
-echo 'PASS: official UDP MTR target port; JSONL retention and private mode; symlink protection; tri-net links'
+sed -n '/^gfw_diag_menu() {/,/^}/p' ss2022.sh |
+    grep -Fq 'read -rp "请选择 [0-9]: " choice || return 0'
+echo 'PASS: official UDP MTR target port; bounded history, tri-net links and submenu input range'
