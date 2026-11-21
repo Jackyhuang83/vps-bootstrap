@@ -866,12 +866,19 @@ P6 在已合并的 P0～P5 后追加，依赖 P1 远端测量与 P2 错误分类
 
 按 GDGS 更新后的全阶段权重：P0 审计 6%（0 PR，已验收）；P1 三网测量 36%（PR #52，已合并）；P2 错误分类 14%（PR #53，已合并）；P3 历史与回归 10%（PR #54，已合并）；P4 HTTPS 双栈 14%（PR #55，已合并且实机功能通过）；P5 超时可靠性 10%（PR #56，已合并）；P6 IP 参数与 HTTP 诊断 10%（本 PR）。P6 只读且可回退，不修改 WARP、路由、防火墙或已部署的代理配置。
 
+## GDGS P7：三网 TCP 无响应证据与跨区域归因（1 PR）
+
+承接已合并的 P0～P6，P7 单 PR 集中完善 Globalping 实测结果解释。依赖：P1 探针测量、P2/P6 错误分类。交付：将探针 finished 且统计 total>0、rcv=0 显示为 FAIL / TCP_NO_REPLY_0_OF_N；将探针 failed（target/resolver/internal）、offline 和统计缺失分离为 UNKNOWN；三网和美国对照都 FAIL 时显示 ALL_REGIONS_NO_REPLY，提示先核对公网入口 IP、云安全组、端口 NAT、访问控制，**不是 GFW 特有阻断证明**。所有输出均不泄露探针原始输出或节点凭据。验收：官方 Globalping-probe TCP Socket 源码对照、离线测试、PR 5 项 CI 与合并后 main CI 通过；用户真实 VPS 的可达性判定仍属独立验收。只读，不修改任何服务或网络设置。
+
+调整阶段权重（工程开发/CI 维度）：P0 6%、P1 32%、P2 13%、P3 9%、P4 13%、P5 9%、P6 8%、P7 10%（合计 100%）。P0 审计不占 PR；P1～P7 每阶段 1 个集中 PR，旧阶段不重复开发。
+
 ## GFW / TCP / UDP 连通性诊断（只读）
 
 入口：`ss2022` → `8. 服务器测试管理` → `6. GFW / TCP / UDP 连通性诊断`。
 
 - **本机检查**（菜单 1）：读取已部署的 SS2022、ShadowTLS v3、VLESS Reality、Snell v5/v6、Hysteria 2 真实配置与监听，不扫描其它端口；区分 TCP、UDP、服务运行、未监听及回环监听，不改变系统。
 - **中国电信 / 联通 / 移动自动 TCP 检测（菜单 8，IPv4）**：正式功能不再只是打印 ITDOG 链接。先调用官方 `GET /v1/probes` 查验在线探针的 `country=CN` 和 ASN，再按电信（AS4134/4809/4812）、联通（AS4837/9929）、移动（AS9808/56040/56046）选择可用探针，分别发起 Globalping TCP 测量并追加美国对照。输出具体 PASS/FAIL/UNKNOWN 和原因，实际返回 RTT 时显示毫秒数，记录在本地 0600 历史中；没有在线运营商探针显示 `NO_ONLINE_PROBE`，而不是假装测通或测不通。仅检测当前已部署 TCP 端口，严格要求输入 `YES` 才发送公网 IP 和端口。
+- **TCP 未连通证据解释（P7）**：官方 TCP 探针用 Socket `connect` 事件统计成功连接；`rcv=0` 且 `total>0` 仅证明该次探针 **0/N 次成功**（显示 `TCP_NO_REPLY_0_OF_N`），不能区分 RST/超时/网络丢包，也不代表 Reality/SS2022 协议握手。探针运行出错、离线或统计缺失则输出 `UNKNOWN`，不得伪装成 TCP 已失败；三网与美国都未连通时显示 `ALL_REGIONS_NO_REPLY`，优先核对正确公网入口地址及云侧 ACL/NAT。该提示不构成 GFW 封锁判断。
 - **Globalping 参数兼容**：官方 OpenAPI 的 `measurementOptions.ipVersion` 仅允许目标为**域名**时使用。自动检测直接填写 VPS 公网 IPv4/IPv6 时不再提交此字段，由目标 IP 本身确定地址族；否则 API 可能拒绝测量请求。HTTP API 出错时报告状态码及经过格式过滤的 `error.type`（如 `API_HTTP_400_validation_error`），不输出可能含公网 IP 的原始响应，也不把 HTTP 错误当作 GFW 封锁。
 - **轮询可靠性**：遵循 Globalping 官方测量 `timeout` 定义：TCP 探针超时 10 秒，最多 12 次、每 2 秒一次结果轮询；UDP MTR 探针超时 30 秒，最多 22 次轮询。为服务端汇总及 API 通信预留不少于 10 秒，不再因旧版仅轮询约 12 秒而过早输出 `MEASUREMENT_TIMEOUT`。长时间未完成仍显示 `UNKNOWN`，不判定 GFW 阻断。轮询不增加探针目标或公开额外凭据。
 - **TCP 中国大陆 / 海外对照**（菜单 2、4）：仅在明确输入 `YES` 后，将你管理的 VPS **真实公网入口 IP 和端口**交给 [Globalping 官方 API](https://globalping.io/docs/api.globalping.io)。优先使用中国大陆（CN）和美国（US）公开探针各 1 台，显示 `PASS`、`FAIL`、`UNKNOWN` 及对照结论；海外可达、大陆失败仅标注 `CN_PATH_SUSPECT_NOT_PROVEN_GFW`，不能据此证明 GFW 封锁。
