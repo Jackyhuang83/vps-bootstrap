@@ -13817,11 +13817,31 @@ gfw_diag_parse_measurement() {
        elif $transport=="UDP" then
          if any($p[]; .result.status=="finished") then "PATH_ONLY" else "UNKNOWN" end
        elif any($p[]; .result.status=="finished" and
-         ((.result.stats.rcv // 0)>0 or (.result.stats.loss // 100)<100)) then "PASS"
-       elif any($p[]; (.result.status=="finished" and
-         ((.result.stats.rcv // -1)==0 or (.result.stats.loss // -1)>=100)) or
-         (.result.status=="failed" and .result.failureSource=="target")) then "FAIL"
+         ((.result.stats.rcv // 0)>0)) then "PASS"
+       elif any($p[]; .result.status=="finished" and
+         ((.result.stats.total // 0)>0 and (.result.stats.rcv // -1)==0)) then "FAIL"
        else "UNKNOWN" end' <<<"$result" 2>/dev/null || echo UNKNOWN
+}
+
+# Node Socket TCP ping reports all socket errors and timeouts as "no reply".
+# Do not print rawOutput or infer a specific network/firewall cause.
+gfw_diag_tcp_probe_evidence() {
+    local response="$1" country="$2" asn="${3:-0}"
+    jq -r --arg c "$country" --argjson a "$asn" '
+        [.results[]? | select(.probe.country==$c and
+          ($a==0 or ((.probe.asn | tonumber? // 0)==$a)))] | first as $p |
+        if $p == null then "PROBE_RESULT_MISSING"
+        elif $p.result.status=="offline" then "PROBE_OFFLINE"
+        elif $p.result.status=="failed" then
+          if $p.result.failureSource=="target" then "PROBE_TARGET_FAILURE"
+          elif $p.result.failureSource=="resolver" then "PROBE_RESOLVER_FAILURE"
+          elif $p.result.failureSource=="internal" then "PROBE_INTERNAL_FAILURE"
+          else "PROBE_FAILURE_UNSPECIFIED" end
+        elif $p.result.status=="finished" and
+          ($p.result.stats.total // 0)>0 and ($p.result.stats.rcv // -1)==0 then
+          "TCP_NO_REPLY_0_OF_\( $p.result.stats.total | floor )"
+        else "PROBE_STATS_INCOMPLETE" end
+    ' <<<"$response" 2>/dev/null || echo PROBE_RESULT_MALFORMED
 }
 
 # Expose bounded HTTP code and validated API error.type without response-body leaks.
@@ -13930,11 +13950,17 @@ gfw_diag_globalping_detailed() {
             echo 'PASS|TCP_CONNECTED'
         fi
     elif [[ "$result" == FAIL ]]; then
-        echo 'FAIL|TCP_CONNECT_FAILED_NOT_PROOF_OF_GFW'
+        reason=$(gfw_diag_tcp_probe_evidence "$response" "$country" "$asn")
+        echo "FAIL|$reason"
     elif [[ "$result" == PATH_ONLY ]]; then
         echo 'PATH_ONLY|UDP_MTR_ONLY_NO_HANDSHAKE'
     else
-        echo 'UNKNOWN|PROBE_RESULT_INCOMPLETE_OR_MISMATCH'
+        if [[ "$transport" == TCP ]]; then
+            reason=$(gfw_diag_tcp_probe_evidence "$response" "$country" "$asn")
+            echo "UNKNOWN|$reason"
+        else
+            echo 'UNKNOWN|PROBE_RESULT_INCOMPLETE_OR_MISMATCH'
+        fi
     fi
 }
 
