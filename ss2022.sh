@@ -13649,8 +13649,8 @@ gfw_diag_listener_status() {
     command -v ss >/dev/null 2>&1 || { echo UNKNOWN; return 0; }
     sockets=$(ss -H "$flag" 2>/dev/null) || { echo UNKNOWN; return 0; }
     awk -v p="$port" '
-      $5 ~ (":" p "$") {
-        addr=$5; sub(":" p "$","",addr);
+      $4 ~ (":" p "$") {
+        addr=$4; sub(":" p "$","",addr);
         if (addr=="127.0.0.1" || addr=="[::1]" || addr=="::1") localonly=1;
         else external=1
       }
