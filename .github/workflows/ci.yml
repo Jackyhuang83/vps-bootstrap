@@ -11,6 +11,7 @@ on:
       - "tests/test-dns-resolver.sh"
       - "tests/test-inbound-ipv4.sh"
       - "tests/test-ip-family-status.sh"
+      - "tests/test-gfw-diagnostics.sh"
       - "tests/test-reality-sni.sh"
       - "tests/test-xray-restart.sh"
       - "tests/test-dashboard-nodes.sh"
@@ -36,6 +37,7 @@ on:
       - "tests/test-dns-resolver.sh"
       - "tests/test-inbound-ipv4.sh"
       - "tests/test-ip-family-status.sh"
+      - "tests/test-gfw-diagnostics.sh"
       - "tests/test-reality-sni.sh"
       - "tests/test-xray-restart.sh"
       - "tests/test-dashboard-nodes.sh"
@@ -98,6 +100,12 @@ jobs:
           bash -n tests/test-ip-family-status.sh
           shellcheck --severity=error tests/test-ip-family-status.sh
           bash tests/test-ip-family-status.sh
+
+      - name: GFW TCP UDP local-only diagnostics and menu regression
+        run: |
+          bash -n tests/test-gfw-diagnostics.sh
+          shellcheck --severity=error tests/test-gfw-diagnostics.sh
+          bash tests/test-gfw-diagnostics.sh
 
       - name: Portable mktemp and updater regression
         run: bash tests/test-mktemp.sh
