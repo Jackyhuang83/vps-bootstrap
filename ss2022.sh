@@ -14095,6 +14095,7 @@ gfw_diag_trinet_auto() {
     local target confirmation inventory carrier label asn port name proto service state
     local cn us seen="|" carriers=(TELECOM UNICOM MOBILE) found=0
     local carrier_records=() record hist_label hist_asn hist_status hist_evidence verdict
+    local cn_fail_count=0 cn_tested_count=0
     command -v jq >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 || {
         echo "[错误] 缺少 curl/jq；不自动安装。"; return 1;
     }
@@ -14116,6 +14117,7 @@ gfw_diag_trinet_auto() {
         [[ "$seen" == *"|$port|"* ]] && continue
         seen="${seen}$port|"; found=1
         carrier_records=()
+        cn_fail_count=0; cn_tested_count=0
         state=$(gfw_diag_listener_status "$proto" "$port")
         printf '\n[%s] %s:%s TCP 本机=%s\n' "$name" "$target" "$port" "$state"
         if [[ "$state" != BOUND ]]; then
@@ -14130,10 +14132,17 @@ gfw_diag_trinet_auto() {
             fi
             cn=$(gfw_diag_globalping_detailed "$target" "$port" CN 4 TCP "$asn")
             printf '  %-10s %-8s CN / AS%s | %s\n' "$label" "${cn%%|*}" "$asn" "${cn#*|}"
+            cn_tested_count=$((cn_tested_count + 1))
+            if [[ "${cn%%|*}" == FAIL ]]; then cn_fail_count=$((cn_fail_count + 1)); fi
             carrier_records+=("$label|$asn|${cn%%|*}|${cn#*|}")
         done
         us=$(gfw_diag_globalping_detailed "$target" "$port" US 4 TCP)
         printf '  %-10s %-8s US | %s\n' "美国对照" "${us%%|*}" "${us#*|}"
+        if [[ "${us%%|*}" == FAIL && "$cn_tested_count" -eq 3 && "$cn_fail_count" -eq 3 ]]; then
+            echo '  ALL_REGIONS_NO_REPLY: 三网与美国对照均未连通；优先核对公网入口 IP、云安全组、NAT 映射及端口访问控制，不是 GFW 封锁证明。'
+        elif [[ "${us%%|*}" == FAIL ]]; then
+            echo '  US_REFERENCE_FAILED: 美国对照也未成功；优先排查公网入口与网络 ACL，暂无法判断大陆特有阻断。'
+        fi
         for record in "${carrier_records[@]}"; do
             IFS='|' read -r hist_label hist_asn hist_status hist_evidence <<<"$record"
             verdict=$(gfw_diag_tcp_verdict "$state" "$hist_status" "${us%%|*}")
