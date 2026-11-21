@@ -8,6 +8,7 @@ on:
       - "ss2022.sh"
       - "tests/test-google.sh"
       - "tests/test-mktemp.sh"
+      - "tests/test-dns-resolver.sh"
       - "tests/test-reality-sni.sh"
       - "tests/test-xray-restart.sh"
       - "tests/test-dashboard-nodes.sh"
@@ -30,6 +31,7 @@ on:
       - "ss2022.sh"
       - "tests/test-google.sh"
       - "tests/test-mktemp.sh"
+      - "tests/test-dns-resolver.sh"
       - "tests/test-reality-sni.sh"
       - "tests/test-xray-restart.sh"
       - "tests/test-dashboard-nodes.sh"
@@ -74,6 +76,12 @@ jobs:
           bash -n tests/test-reality-sni.sh
           shellcheck --severity=error tests/test-reality-sni.sh
           bash tests/test-reality-sni.sh
+
+      - name: Resolver DNS IFS regression (isolated fixture)
+        run: |
+          bash -n tests/test-dns-resolver.sh
+          shellcheck --severity=error tests/test-dns-resolver.sh
+          bash tests/test-dns-resolver.sh
 
       - name: Portable mktemp and updater regression
         run: bash tests/test-mktemp.sh

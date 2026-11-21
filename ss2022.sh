@@ -10571,9 +10571,11 @@ server_tool_dns_apply() {
         [[ -n "$dns" ]] || continue
 
         if [[ "$dns" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-            local IFS=.
-            read -r a b c d <<<"$dns"
-            if (( a <= 255 && b <= 255 && c <= 255 && d <= 255 )); then
+            # 仅给 read 临时设置 IFS。local IFS=. 会影响后面的 for dns in $valid_list，
+            # 导致 1.1.1.1 被按点拆成多个无效 nameserver。
+            local a b c d
+            IFS=. read -r a b c d <<<"$dns"
+            if (( 10#$a <= 255 && 10#$b <= 255 && 10#$c <= 255 && 10#$d <= 255 )); then
                 valid_list+="${dns} "
             else
                 echo -e "${RED}[错误] 无效 IPv4 DNS: ${dns}${PLAIN}"
