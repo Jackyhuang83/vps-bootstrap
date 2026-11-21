@@ -6362,7 +6362,7 @@ warp_management() {
         echo "  5. 重新注册 WARP"
         echo "  6. 卸载 WARP"
         echo "  0. 返回"
-        read -rp "请选择 [0-6]: " c
+        read -rp "请选择 [0-7]: " c
         case "$c" in
             1) warp_install_client; pause ;;
             2) warp_test_exit; pause ;;
@@ -13578,6 +13578,108 @@ test_proxy_ipv6_egress() {
     echo "===== 完成：未修改服务、路由、防火墙 ====="
 }
 
+# Read-only HTTPS egress check. A CNAME-only NOERROR DNS reply must not be
+# reported as an IPv6 DNS/server failure when no AAAA record exists.
+https_direct_dns_result() {
+    local domain="$1" qtype="$2" response="" status=""
+    if ! command -v dig >/dev/null 2>&1; then
+        echo "UNKNOWN|DIG_NOT_INSTALLED"
+        return 0
+    fi
+    response=$(dig +time=2 +tries=1 +noall +comments +answer "$domain" "$qtype" 2>/dev/null) || {
+        echo "FAIL|DNS_QUERY_FAILED"
+        return 0
+    }
+    status=$(sed -nE 's/^;; ->>HEADER<<- .*status: ([A-Za-z]+),.*/\1/p' <<<"$response" | head -n1)
+    case "$status" in
+        NOERROR)
+            if awk -v qtype="$qtype" '$1 !~ /^;/ && $4 == qtype && NF >= 5 {found=1}
+                END {exit !found}' <<<"$response"; then
+                echo "PASS|RECORD_PRESENT"
+            elif [[ "$qtype" == AAAA ]]; then
+                echo "SKIP|NO_AAAA_RECORD"
+            else
+                echo "SKIP|NO_A_RECORD"
+            fi
+            ;;
+        NXDOMAIN) echo "FAIL|DNS_NXDOMAIN" ;;
+        SERVFAIL|REFUSED|FORMERR|NOTIMP) echo "FAIL|DNS_${status}" ;;
+        "") echo "UNKNOWN|DNS_STATUS_UNAVAILABLE" ;;
+        *) echo "FAIL|DNS_${status}" ;;
+    esac
+}
+
+https_direct_one() {
+    local label="$1" domain="$2" family="$3" flag="-4" qtype="A" dns_info dns_status dns_reason
+    local metrics="" curl_rc=0 http="000"
+    if [[ "$family" == 6 ]]; then flag="-6"; qtype="AAAA"; fi
+    echo "[$label / IPv$family]"
+    dns_info=$(https_direct_dns_result "$domain" "$qtype")
+    dns_status="${dns_info%%|*}"; dns_reason="${dns_info#*|}"
+    case "$dns_status" in
+        SKIP)
+            echo "  DNS=NOERROR $qtype=NONE"
+            echo "  RESULT=SKIP ($dns_reason)"
+            echo
+            return 0 ;;
+        FAIL)
+            echo "  DNS=$dns_reason"
+            echo "  RESULT=FAIL (DNS_FAILURE)"
+            echo
+            return 0 ;;
+        UNKNOWN)
+            echo "  DNS=$dns_reason"
+            echo "  RESULT=UNKNOWN (DNS_NOT_VERIFIED)"
+            echo
+            return 0 ;;
+    esac
+    echo "  DNS=NOERROR $qtype=PRESENT"
+    if ! command -v curl >/dev/null 2>&1; then
+        echo "  RESULT=UNKNOWN (CURL_NOT_INSTALLED)"
+        echo
+        return 0
+    fi
+    if metrics=$(curl "$flag" --noproxy '*' --silent --show-error --output /dev/null \
+        --connect-timeout 5 --max-time 12 \
+        --write-out 'HTTP=%{http_code} TCP=%{time_connect}s TLS=%{time_appconnect}s TOTAL=%{time_total}s REMOTE=%{remote_ip}' \
+        "https://$domain/" 2>/dev/null); then
+        curl_rc=0
+    else
+        curl_rc=$?
+    fi
+    echo "  ${metrics:-HTTP=000}"
+    http="${metrics#HTTP=}"
+    http="${http%% *}"
+    if (( curl_rc != 0 )); then
+        case "$curl_rc" in
+            6) echo "  RESULT=FAIL (DNS_FAILURE)" ;;
+            7) echo "  RESULT=FAIL (TCP_CONNECT_FAILED)" ;;
+            28) echo "  RESULT=FAIL (TIMEOUT)" ;;
+            35|51|60) echo "  RESULT=FAIL (TLS_FAILURE)" ;;
+            *) echo "  RESULT=FAIL (CURL_EXIT_$curl_rc)" ;;
+        esac
+    elif [[ "$http" =~ ^[23][0-9][0-9]$ ]]; then
+        echo "  RESULT=PASS"
+    elif [[ "$http" =~ ^[45][0-9][0-9]$ ]]; then
+        echo "  RESULT=WARN (HTTP_$http; TCP/TLS 可能已成功)"
+    else
+        echo "  RESULT=UNKNOWN (HTTP_$http)"
+    fi
+    echo
+}
+
+https_direct_run() {
+    echo "===== HTTPS 直连检测（IPv4 / IPv6，只读）====="
+    echo "不使用显式 HTTP 代理；系统级 WARP / TUN / 默认路由仍可能影响出口。"
+    echo "NOERROR 且无 AAAA 时报告 SKIP，不视为 VPS IPv6 故障。"
+    echo
+    https_direct_one Baidu www.baidu.com 4
+    https_direct_one Google www.google.com 4
+    https_direct_one Baidu www.baidu.com 6
+    https_direct_one Google www.google.com 6
+    echo "===== 检测完成：未修改 DNS、代理、路由或防火墙 ====="
+}
+
 server_test_management() {
     while true; do
         clear
@@ -13588,6 +13690,7 @@ server_test_management() {
         echo "  4. Google 测试（送中 / 澳门 / 拉回所在地）"
         echo "  5. 代理协议 IPv6 出站 / 链式兼容性检查"
         echo "  6. GFW / TCP / UDP 连通性诊断"
+        echo "  7. HTTPS 直连检测（百度 / Google，IPv4 / IPv6）"
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
         read -rp "请选择 [0-6]: " c
@@ -13598,6 +13701,7 @@ server_test_management() {
             4) google_test_management ;;
             5) test_proxy_ipv6_egress; pause ;;
             6) gfw_diag_menu ;;
+            7) https_direct_run; pause ;;
             0) return ;;
             *) sleep 1 ;;
         esac
