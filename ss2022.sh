@@ -13790,19 +13790,24 @@ gfw_diag_local() {
 # Optional public Globalping measurements. No client credentials or private data sent.
 gfw_diag_payload() {
     local target="$1" port="$2" country="$3" family="$4" transport="$5" asn="${6:-0}"
+    # Globalping OpenAPI ipVersion: allowed only for hostname targets.
+    # Literal IP targets already determine their address family.
+    local family_options='{}'
+    if [[ "$target" != *:* && "$target" =~ [[:alpha:]] ]]; then
+        family_options=$(jq -n --argjson fam "$family" '{ipVersion:$fam}') || return 1
+    fi
     if [[ "$transport" == TCP ]]; then
-        jq -n --arg target "$target" --arg country "$country" --argjson port "$port" --argjson fam "$family" --argjson asn "$asn" \
+        jq -n --arg target "$target" --arg country "$country" --argjson port "$port" --argjson asn "$asn" --argjson family_options "$family_options" \
             '{type:"ping",target:$target,locations:[({country:$country,limit:1} + (if $asn>0 then {asn:$asn} else {} end))],
               timeout:10,
-              measurementOptions:{protocol:"TCP",port:$port,packets:2,ipVersion:$fam}}'
+              measurementOptions:({protocol:"TCP",port:$port,packets:2} + $family_options)}'
     else
-        jq -n --arg target "$target" --arg country "$country" --argjson port "$port" --argjson fam "$family" --argjson asn "$asn" \
+        jq -n --arg target "$target" --arg country "$country" --argjson port "$port" --argjson asn "$asn" --argjson family_options "$family_options" \
             '{type:"mtr",target:$target,locations:[({country:$country,limit:1} + (if $asn>0 then {asn:$asn} else {} end))],
               timeout:30,
-              measurementOptions:{protocol:"UDP",port:$port,packets:2,ipVersion:$fam}}'
+              measurementOptions:({protocol:"UDP",port:$port,packets:2} + $family_options)}'
     fi
 }
-
 # Output never claims UDP reachability: traceroute is PATH_ONLY at best.
 gfw_diag_parse_measurement() {
     local result="$1" country="$2" transport="$3" asn="${4:-0}"
@@ -13817,6 +13822,30 @@ gfw_diag_parse_measurement() {
          ((.result.stats.rcv // -1)==0 or (.result.stats.loss // -1)>=100)) or
          (.result.status=="failed" and .result.failureSource=="target")) then "FAIL"
        else "UNKNOWN" end' <<<"$result" 2>/dev/null || echo UNKNOWN
+}
+
+# Expose bounded HTTP code and validated API error.type without response-body leaks.
+gfw_diag_http_failure_reason() {
+    local status_line="$1" body="$2" status="" kind=""
+    if [[ "$status_line" =~ ^HTTP_STATUS:([0-9]{3})$ ]]; then
+        status="${BASH_REMATCH[1]}"
+    else
+        echo 'API_HTTP_STATUS_INVALID'
+        return 0
+    fi
+    kind=$(jq -r '.error.type // empty | select(type == "string")' <<<"$body" 2>/dev/null || true)
+    [[ "$kind" =~ ^[A-Za-z0-9_-]{1,48}$ ]] || kind=""
+    case "$status" in
+        422) [[ "$kind" == no_probes_found ]] && { echo NO_ONLINE_PROBE; return 0; } ;;
+        429) echo API_RATE_LIMIT_429; return 0 ;;
+        403) echo API_REJECTED_403; return 0 ;;
+        500|502|503|504) echo API_SERVER_ERROR; return 0 ;;
+    esac
+    if [[ -n "$kind" ]]; then
+        printf 'API_HTTP_%s_%s\n' "$status" "$kind"
+    else
+        printf 'API_HTTP_%s\n' "$status"
+    fi
 }
 
 # Return STATUS|EVIDENCE. STATUS remains PASS / FAIL / UNKNOWN / PATH_ONLY.
@@ -13846,15 +13875,9 @@ gfw_diag_globalping_detailed() {
     response=$(sed '$d' <<<"$raw")
     case "$code" in
         HTTP_STATUS:202) ;;
-        HTTP_STATUS:422)
-            reason=$(jq -r '.error.type // empty' <<<"$response" 2>/dev/null || true)
-            if [[ "$reason" == no_probes_found ]]; then echo 'UNKNOWN|NO_ONLINE_PROBE'
-            else echo 'UNKNOWN|API_REJECTED_422'; fi
-            return 0 ;;
-        HTTP_STATUS:429) echo 'UNKNOWN|API_RATE_LIMIT_429'; return 0 ;;
-        HTTP_STATUS:403) echo 'UNKNOWN|API_REJECTED_403'; return 0 ;;
-        HTTP_STATUS:5??) echo 'UNKNOWN|API_SERVER_ERROR'; return 0 ;;
-        *) echo 'UNKNOWN|API_UNEXPECTED_HTTP'; return 0 ;;
+        *)
+            reason=$(gfw_diag_http_failure_reason "$code" "$response")
+            echo "UNKNOWN|$reason"; return 0 ;;
     esac
     id=$(jq -r '.id // empty' <<<"$response" 2>/dev/null || true)
     [[ "$id" =~ ^[A-Za-z0-9_-]{6,80}$ ]] ||
@@ -13883,8 +13906,9 @@ gfw_diag_globalping_detailed() {
         response=$(sed '$d' <<<"$raw")
         case "$code" in
             HTTP_STATUS:200) ;;
-            HTTP_STATUS:429) echo 'UNKNOWN|API_RATE_LIMIT_429'; return 0 ;;
-            *) echo 'UNKNOWN|API_RESULT_HTTP_ERROR'; return 0 ;;
+            *)
+                reason=$(gfw_diag_http_failure_reason "$code" "$response")
+                echo "UNKNOWN|$reason"; return 0 ;;
         esac
         status=$(jq -r '.status // empty' <<<"$response" 2>/dev/null || true)
         case "$status" in
