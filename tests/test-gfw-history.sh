@@ -35,6 +35,11 @@ if gfw_diag_history_append 11.22.33.44 4 TCP 443 BOUND PASS PASS TCP_REACHABLE_F
 fi
 grep -Fqx 'DO_NOT_OVERWRITE' "$tmp/other-file"
 rm -f "$file"
+mv "$tmp/historical-backup" "$file"
+gfw_diag_history_clear <<<"NO" >/dev/null
+[[ -f "$file" ]]
+gfw_diag_history_clear <<<"DELETE" >/dev/null
+[[ ! -e "$file" ]]
 get_inbound_ipv4() { printf '11.22.33.44'; }
 gfw_diag_ports() {
     printf '%s\n' 'VLESS Reality|TCP|443|ss2022-xray' \
