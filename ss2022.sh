@@ -13817,11 +13817,31 @@ gfw_diag_parse_measurement() {
        elif $transport=="UDP" then
          if any($p[]; .result.status=="finished") then "PATH_ONLY" else "UNKNOWN" end
        elif any($p[]; .result.status=="finished" and
-         ((.result.stats.rcv // 0)>0 or (.result.stats.loss // 100)<100)) then "PASS"
-       elif any($p[]; (.result.status=="finished" and
-         ((.result.stats.rcv // -1)==0 or (.result.stats.loss // -1)>=100)) or
-         (.result.status=="failed" and .result.failureSource=="target")) then "FAIL"
+         ((.result.stats.rcv // 0)>0)) then "PASS"
+       elif any($p[]; .result.status=="finished" and
+         ((.result.stats.total // 0)>0 and (.result.stats.rcv // -1)==0)) then "FAIL"
        else "UNKNOWN" end' <<<"$result" 2>/dev/null || echo UNKNOWN
+}
+
+# Node Socket TCP ping reports all socket errors and timeouts as "no reply".
+# Do not print rawOutput or infer a specific network/firewall cause.
+gfw_diag_tcp_probe_evidence() {
+    local response="$1" country="$2" asn="${3:-0}"
+    jq -r --arg c "$country" --argjson a "$asn" '
+        [.results[]? | select(.probe.country==$c and
+          ($a==0 or ((.probe.asn | tonumber? // 0)==$a)))] | first as $p |
+        if $p == null then "PROBE_RESULT_MISSING"
+        elif $p.result.status=="offline" then "PROBE_OFFLINE"
+        elif $p.result.status=="failed" then
+          if $p.result.failureSource=="target" then "PROBE_TARGET_FAILURE"
+          elif $p.result.failureSource=="resolver" then "PROBE_RESOLVER_FAILURE"
+          elif $p.result.failureSource=="internal" then "PROBE_INTERNAL_FAILURE"
+          else "PROBE_FAILURE_UNSPECIFIED" end
+        elif $p.result.status=="finished" and
+          ($p.result.stats.total // 0)>0 and ($p.result.stats.rcv // -1)==0 then
+          "TCP_NO_REPLY_0_OF_\( $p.result.stats.total | floor )"
+        else "PROBE_STATS_INCOMPLETE" end
+    ' <<<"$response" 2>/dev/null || echo PROBE_RESULT_MALFORMED
 }
 
 # Expose bounded HTTP code and validated API error.type without response-body leaks.
@@ -13930,11 +13950,17 @@ gfw_diag_globalping_detailed() {
             echo 'PASS|TCP_CONNECTED'
         fi
     elif [[ "$result" == FAIL ]]; then
-        echo 'FAIL|TCP_CONNECT_FAILED_NOT_PROOF_OF_GFW'
+        reason=$(gfw_diag_tcp_probe_evidence "$response" "$country" "$asn")
+        echo "FAIL|$reason"
     elif [[ "$result" == PATH_ONLY ]]; then
         echo 'PATH_ONLY|UDP_MTR_ONLY_NO_HANDSHAKE'
     else
-        echo 'UNKNOWN|PROBE_RESULT_INCOMPLETE_OR_MISMATCH'
+        if [[ "$transport" == TCP ]]; then
+            reason=$(gfw_diag_tcp_probe_evidence "$response" "$country" "$asn")
+            echo "UNKNOWN|$reason"
+        else
+            echo 'UNKNOWN|PROBE_RESULT_INCOMPLETE_OR_MISMATCH'
+        fi
     fi
 }
 
@@ -14069,6 +14095,7 @@ gfw_diag_trinet_auto() {
     local target confirmation inventory carrier label asn port name proto service state
     local cn us seen="|" carriers=(TELECOM UNICOM MOBILE) found=0
     local carrier_records=() record hist_label hist_asn hist_status hist_evidence verdict
+    local cn_fail_count=0 cn_tested_count=0
     command -v jq >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 || {
         echo "[错误] 缺少 curl/jq；不自动安装。"; return 1;
     }
@@ -14090,6 +14117,7 @@ gfw_diag_trinet_auto() {
         [[ "$seen" == *"|$port|"* ]] && continue
         seen="${seen}$port|"; found=1
         carrier_records=()
+        cn_fail_count=0; cn_tested_count=0
         state=$(gfw_diag_listener_status "$proto" "$port")
         printf '\n[%s] %s:%s TCP 本机=%s\n' "$name" "$target" "$port" "$state"
         if [[ "$state" != BOUND ]]; then
@@ -14104,10 +14132,17 @@ gfw_diag_trinet_auto() {
             fi
             cn=$(gfw_diag_globalping_detailed "$target" "$port" CN 4 TCP "$asn")
             printf '  %-10s %-8s CN / AS%s | %s\n' "$label" "${cn%%|*}" "$asn" "${cn#*|}"
+            cn_tested_count=$((cn_tested_count + 1))
+            if [[ "${cn%%|*}" == FAIL ]]; then cn_fail_count=$((cn_fail_count + 1)); fi
             carrier_records+=("$label|$asn|${cn%%|*}|${cn#*|}")
         done
         us=$(gfw_diag_globalping_detailed "$target" "$port" US 4 TCP)
         printf '  %-10s %-8s US | %s\n' "美国对照" "${us%%|*}" "${us#*|}"
+        if [[ "${us%%|*}" == FAIL && "$cn_tested_count" -eq 3 && "$cn_fail_count" -eq 3 ]]; then
+            echo '  ALL_REGIONS_NO_REPLY: 三网与美国对照均未连通；优先核对公网入口 IP、云安全组、NAT 映射及端口访问控制，不是 GFW 封锁证明。'
+        elif [[ "${us%%|*}" == FAIL ]]; then
+            echo '  US_REFERENCE_FAILED: 美国对照也未成功；优先排查公网入口与网络 ACL，暂无法判断大陆特有阻断。'
+        fi
         for record in "${carrier_records[@]}"; do
             IFS='|' read -r hist_label hist_asn hist_status hist_evidence <<<"$record"
             verdict=$(gfw_diag_tcp_verdict "$state" "$hist_status" "${us%%|*}")

@@ -34,11 +34,25 @@ payload=$(gfw_diag_payload 'example.org' 443 US 4 TCP)
 jq -e '.measurementOptions.ipVersion==4' <<<"$payload" >/dev/null
 
 pass='{"status":"finished","results":[{"probe":{"country":"CN","asn":12345},"result":{"status":"finished","stats":{"rcv":2,"loss":0}}}]}'
-fail='{"status":"finished","results":[{"probe":{"country":"CN","asn":12345},"result":{"status":"finished","stats":{"rcv":0,"loss":100}}}]}'
+fail='{"status":"finished","results":[{"probe":{"country":"CN","asn":12345},"result":{"status":"finished","stats":{"total":2,"rcv":0,"loss":100}}}]}'
 offline='{"status":"finished","results":[{"probe":{"country":"CN"},"result":{"status":"offline"}}]}'
 no_cn='{"status":"finished","results":[{"probe":{"country":"US"},"result":{"status":"finished","stats":{"rcv":2,"loss":0}}}]}'
 [[ "$(gfw_diag_parse_measurement "$pass" CN TCP)" == PASS ]]
 [[ "$(gfw_diag_parse_measurement "$fail" CN TCP)" == FAIL ]]
+
+# A failed probe operation is not equivalent to measured TCP no-reply.
+failed_target='{"status":"finished","results":[{"probe":{"country":"CN","asn":12345},"result":{"status":"failed","failureSource":"target"}}]}'
+failed_internal='{"status":"finished","results":[{"probe":{"country":"CN","asn":12345},"result":{"status":"failed","failureSource":"internal"}}]}'
+missing_stats='{"status":"finished","results":[{"probe":{"country":"CN","asn":12345},"result":{"status":"finished","stats":{"rcv":0,"loss":100}}}]}'
+[[ "$(gfw_diag_parse_measurement "$failed_target" CN TCP)" == UNKNOWN ]]
+[[ "$(gfw_diag_parse_measurement "$failed_internal" CN TCP)" == UNKNOWN ]]
+[[ "$(gfw_diag_parse_measurement "$missing_stats" CN TCP)" == UNKNOWN ]]
+[[ "$(gfw_diag_tcp_probe_evidence "$fail" CN 12345)" == 'TCP_NO_REPLY_0_OF_2' ]]
+[[ "$(gfw_diag_tcp_probe_evidence "$failed_target" CN 12345)" == 'PROBE_TARGET_FAILURE' ]]
+[[ "$(gfw_diag_tcp_probe_evidence "$failed_internal" CN 12345)" == 'PROBE_INTERNAL_FAILURE' ]]
+[[ "$(gfw_diag_tcp_probe_evidence "$offline" CN)" == 'PROBE_OFFLINE' ]]
+[[ "$(gfw_diag_tcp_probe_evidence "$pass" US)" == 'PROBE_RESULT_MISSING' ]]
+
 [[ "$(gfw_diag_parse_measurement "$offline" CN TCP)" == UNKNOWN ]]
 [[ "$(gfw_diag_parse_measurement "$no_cn" CN TCP)" == UNKNOWN ]]
 [[ "$(gfw_diag_parse_measurement "$pass" CN UDP)" == PATH_ONLY ]]
@@ -95,6 +109,9 @@ curl() {
                         printf '{"status":"finished","results":[{"probe":{"country":"CN","asn":4134},"result":{"status":"finished","stats":{"rcv":2,"loss":0,"avg":77.5}}}]}\nHTTP_STATUS:200\n'
                     fi
                     ;;
+                no_reply) printf '{"status":"finished","results":[{"probe":{"country":"CN","asn":4134},"result":{"status":"finished","stats":{"total":2,"rcv":0,"loss":100}}}]}\nHTTP_STATUS:200\n' ;;
+                failed_target) printf '{"status":"finished","results":[{"probe":{"country":"CN","asn":4134},"result":{"status":"failed","failureSource":"target"}}]}\nHTTP_STATUS:200\n' ;;
+                offline_probe) printf '{"status":"finished","results":[{"probe":{"country":"CN","asn":4134},"result":{"status":"offline"}}]}\nHTTP_STATUS:200\n' ;;
                 mismatch) printf '{"status":"finished","results":[{"probe":{"country":"CN","asn":9999},"result":{"status":"finished","stats":{"rcv":2,"loss":0}}}]}\nHTTP_STATUS:200\n' ;;
                 *) printf '{"status":"finished","results":[{"probe":{"country":"CN","asn":4134},"result":{"status":"finished","stats":{"rcv":2,"loss":0,"avg":42.6}}}]}\nHTTP_STATUS:200\n' ;;
             esac
@@ -140,8 +157,14 @@ rm -f "$tmp/polls"
 [[ "$(gfw_diag_globalping_detailed 11.22.33.44 443 CN 4 TCP 4134)" == 'PASS|TCP_CONNECTED_RTT_77.5ms' ]]
 [[ "$(cat "$tmp/polls")" -eq 8 ]]
 
+MOCK_SCENARIO=no_reply
+[[ "$(gfw_diag_globalping_detailed 11.22.33.44 443 CN 4 TCP 4134)" == 'FAIL|TCP_NO_REPLY_0_OF_2' ]]
+MOCK_SCENARIO=failed_target
+[[ "$(gfw_diag_globalping_detailed 11.22.33.44 443 CN 4 TCP 4134)" == 'UNKNOWN|PROBE_TARGET_FAILURE' ]]
+MOCK_SCENARIO=offline_probe
+[[ "$(gfw_diag_globalping_detailed 11.22.33.44 443 CN 4 TCP 4134)" == 'UNKNOWN|PROBE_OFFLINE' ]]
 MOCK_SCENARIO=mismatch
-[[ "$(gfw_diag_globalping_detailed 11.22.33.44 443 CN 4 TCP 4134)" == 'UNKNOWN|PROBE_RESULT_INCOMPLETE_OR_MISMATCH' ]]
+[[ "$(gfw_diag_globalping_detailed 11.22.33.44 443 CN 4 TCP 4134)" == 'UNKNOWN|PROBE_RESULT_MISSING' ]]
 MOCK_SCENARIO=success
 [[ "$(gfw_diag_globalping_detailed 11.22.33.44 443 CN 4 TCP 4134)" == 'PASS|TCP_CONNECTED_RTT_42.6ms' ]]
 
@@ -207,5 +230,18 @@ jq -e 'select(.carrier=="中国电信" and .asn=="4134" and .cn=="PASS" and .us=
 carrier_probes='[{"location":{"country":"US","asn":4134}}]'
 out=$(gfw_diag_trinet_auto <<< "$(printf '11.22.33.44\nYES\n')")
 [[ "$out" == *'NO_ONLINE_PROBE'* ]]
+
+
+# All three mainland carriers AND US failed: show ingress diagnosis, not GFW.
+carrier_probes='[
+  {"location":{"country":"CN","asn":4134}},
+  {"location":{"country":"CN","asn":4837}},
+  {"location":{"country":"CN","asn":9808}}
+]'
+gfw_diag_globalping_detailed() { echo 'FAIL|TCP_NO_REPLY_0_OF_2'; }
+out=$(gfw_diag_trinet_auto <<< "$(printf '11.22.33.44\nYES\n')")
+[[ "$out" == *'ALL_REGIONS_NO_REPLY'* ]]
+[[ "$out" == *'TCP_NO_REPLY_0_OF_2'* ]]
+[[ "$out" != *'CN_PATH_SUSPECT_NOT_PROVEN_GFW'* ]]
 
 echo 'PASS: Globalping protocol payload, CN absent, TCP verdict, UDP path-only, opt-in security, tri-carrier'
