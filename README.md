@@ -846,6 +846,23 @@ v1.9.0 已完成上一稳定阶段的收口；v1.9.1 在其基础上增加可复
 
 ---
 
+## GFW / TCP / UDP 连通性诊断（只读）
+
+入口：`ss2022` → `8. 服务器测试管理` → `6. GFW / TCP / UDP 连通性诊断`。
+
+- **本机检查**（菜单 1）：读取已部署的 SS2022、ShadowTLS v3、VLESS Reality、Snell v5/v6、Hysteria 2 真实配置与监听，不扫描其它端口；区分 TCP、UDP、服务运行、未监听及回环监听，不改变系统。
+- **TCP 中国大陆 / 海外对照**（菜单 2、4）：仅在明确输入 `YES` 后，将你管理的 VPS **真实公网入口 IP 和端口**交给 [Globalping 官方 API](https://globalping.io/docs/api.globalping.io)。优先使用中国大陆（CN）和美国（US）公开探针各 1 台，显示 `PASS`、`FAIL`、`UNKNOWN` 及对照结论；海外可达、大陆失败仅标注 `CN_PATH_SUSPECT_NOT_PROVEN_GFW`，不能据此证明 GFW 封锁。
+- **UDP 中国大陆 / 海外路径**（菜单 3、5）：使用 Globalping 官方 UDP traceroute，**只提供路径线索**；`PATH_ONLY` **不表示** Hysteria 2 / SS2022 UDP 收发或认证成功，`UNKNOWN` 也不表示 UDP 被封。可靠的 UDP 判定仍需要真实客户端与服务端双向认证或收包证据。
+- **IPv4 / IPv6**：分别选择入口地址族；IPv4 候选来自 VPS 公网网卡而不是 WARP/SNAT 出口，云 NAT/多网卡时需要手填服务商分配的入口 IP。
+- **隐私与限制**：Globalping 测量 ID 和测量结果可能公开/被分享，提交前必须用户明确授权。工具不发送代理口令、UUID、Reality Key、Snell PSK；不自动安装组件、扫描全网、抓包、重启服务、修改 DNS/WARP/firewall。中国大陆公开探针可能不可用，不保证覆盖电信/联通/移动三网，API 超时、无可用探针、配额限制均归类为 `UNKNOWN`。
+- **验收边界**：CI 使用离线桩验证协议识别、TCP/UDP 结果分类、无大陆探针和拒绝授权；某台 VPS 是否被拦截必须由目标公网入口、所在网络运营商和客户端真实连接验证。
+
+判定建议：`LOCAL_ISSUE` 优先核对服务和防火墙；`TCP_REACHABLE_FROM_CN` 表示**至少一个**中国大陆探针能进行 TCP 检测，不代表代理握手；`CN_PATH_SUSPECT_NOT_PROVEN_GFW` 需要不同 ASN、不同时间反复对照；`INSUFFICIENT_EVIDENCE` 不能下封锁结论。
+
+---
+
+
+
 # 说明
 
 本项目中的网络测试功能会调用第三方公开项目或服务。第三方项目的可用性、检测逻辑和结果准确性由对应项目维护者负责，本脚本仅提供调用入口。

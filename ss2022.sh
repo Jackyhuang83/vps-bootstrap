@@ -13683,22 +13683,154 @@ gfw_diag_local() {
     echo "不会更改防火墙、路由、WARP、SNI、代理配置或重启服务。"
 }
 
+# Optional public Globalping measurements. No client credentials or private data sent.
+gfw_diag_payload() {
+    local target="$1" port="$2" country="$3" family="$4" transport="$5"
+    if [[ "$transport" == TCP ]]; then
+        jq -n --arg target "$target" --arg country "$country" --argjson port "$port" --argjson fam "$family" \
+            '{type:"ping",target:$target,locations:[{country:$country,limit:1}],
+              measurementOptions:{protocol:"TCP",port:$port,packets:2,ipVersion:$fam}}'
+    else
+        jq -n --arg target "$target" --arg country "$country" --argjson port "$port" --argjson fam "$family" \
+            '{type:"traceroute",target:$target,locations:[{country:$country,limit:1}],
+              measurementOptions:{protocol:"UDP",port:$port,ipVersion:$fam}}'
+    fi
+}
+
+# Output never claims UDP reachability: traceroute is PATH_ONLY at best.
+gfw_diag_parse_measurement() {
+    local result="$1" country="$2" transport="$3"
+    jq -r --arg country "$country" --arg transport "$transport" '
+       [.results[]? | select(.probe.country==$country)] as $p |
+       if ($p|length)==0 then "UNKNOWN"
+       elif $transport=="UDP" then
+         if any($p[]; .result.status=="finished") then "PATH_ONLY" else "UNKNOWN" end
+       elif any($p[]; .result.status=="finished" and
+         ((.result.stats.rcv // 0)>0 or (.result.stats.loss // 100)<100)) then "PASS"
+       elif any($p[]; (.result.status=="finished" and
+         ((.result.stats.rcv // -1)==0 or (.result.stats.loss // -1)>=100)) or
+         (.result.status=="failed" and .result.failureSource=="target")) then "FAIL"
+       else "UNKNOWN" end' <<<"$result" 2>/dev/null || echo UNKNOWN
+}
+
+gfw_diag_globalping() {
+    local target="$1" port="$2" country="$3" family="$4" transport="$5"
+    local payload response id status="" i
+    payload=$(gfw_diag_payload "$target" "$port" "$country" "$family" "$transport") ||
+        { echo UNKNOWN; return 0; }
+    response=$(curl -fsS --compressed --connect-timeout 5 --max-time 12 \
+        -H 'User-Agent: vps-bootstrap-gfw-diagnostics/1.0' \
+        -H 'Accept: application/json' -H 'Content-Type: application/json' \
+        -X POST --data "$payload" https://api.globalping.io/v1/measurements 2>/dev/null) ||
+        { echo UNKNOWN; return 0; }
+    id=$(jq -r '.id // empty' <<<"$response" 2>/dev/null || true)
+    [[ "$id" =~ ^[A-Za-z0-9_-]{6,80}$ ]] || { echo UNKNOWN; return 0; }
+    for i in 1 2 3 4; do
+        sleep 2
+        response=$(curl -fsS --compressed --connect-timeout 5 --max-time 12 \
+            -H 'User-Agent: vps-bootstrap-gfw-diagnostics/1.0' \
+            -H 'Accept: application/json' \
+            "https://api.globalping.io/v1/measurements/$id" 2>/dev/null) || break
+        status=$(jq -r '.status // empty' <<<"$response" 2>/dev/null || true)
+        case "$status" in finished|failed) break ;; in-progress|in_progress) ;; *) break ;; esac
+    done
+    [[ "$status" == finished ]] || { echo UNKNOWN; return 0; }
+    gfw_diag_parse_measurement "$response" "$country" "$transport"
+}
+
+gfw_diag_tcp_verdict() {
+    local local_state="$1" cn="$2" us="$3"
+    if [[ "$local_state" != BOUND ]]; then echo "LOCAL_ISSUE"
+    elif [[ "$cn" == PASS ]]; then echo "TCP_REACHABLE_FROM_CN"
+    elif [[ "$cn" == FAIL && "$us" == PASS ]]; then echo "CN_PATH_SUSPECT_NOT_PROVEN_GFW"
+    elif [[ "$cn" == FAIL && "$us" == FAIL ]]; then echo "BOTH_FAIL_CHECK_FIREWALL_NAT"
+    else echo "INSUFFICIENT_EVIDENCE"
+    fi
+}
+
+gfw_diag_remote_target() {
+    local family="$1" suggestion="" input=""
+    if [[ "$family" == 4 ]]; then
+        suggestion=$(get_inbound_ipv4 2>/dev/null || true)
+        read -rp "VPS 公网入口 IPv4 [${suggestion:-请填写云平台地址，不能用 WARP 出口}]: " input || return 1
+        input=${input:-$suggestion}
+        ipv4_is_public_unicast "$input" ||
+            { echo "[错误] 非合法公网 IPv4，拒绝检测。" >&2; return 1; }
+    else
+        suggestion=$(get_global_ipv6 2>/dev/null || true)
+        read -rp "VPS 公网入口 IPv6 [${suggestion:-请填写}]: " input || return 1
+        input=${input:-$suggestion}
+        [[ "$input" == *:* && ${#input} -le 45 && "$input" =~ ^[0-9a-fA-F:.]+$ ]] ||
+            { echo "[错误] IPv6 格式无效。" >&2; return 1; }
+        case "${input,,}" in ::1|fe80:*|fc*|fd*|ff*) echo "[错误] 非公网 IPv6。" >&2; return 1 ;; esac
+    fi
+    printf '%s' "$input"
+}
+
+gfw_diag_remote_scan() {
+    local family="$1" wanted="$2" target confirmation name proto port service local_state cn us
+    local seen="|" found=0 verdict
+    command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 ||
+        { echo "[错误] 缺少 curl/jq；不会自动安装。"; return 1; }
+    target=$(gfw_diag_remote_target "$family") || return 1
+    echo "检测目标：$target（仅本机授权的 VPS 公网入口）"
+    echo "Globalping 将接收目标公网 IP 和端口，测试结果可能公开/可分享。"
+    echo "CN 公开探针不保证在线，也不等于电信/联通/移动三网覆盖。"
+    read -rp "确认授权第三方测量？请输入 YES: " confirmation || return 1
+    [[ "$confirmation" == YES ]] || { echo "取消；未发送任何目标信息。"; return 0; }
+    echo "══════ 中国大陆 CN / 美国 US 对照（IP 家族 IPv$family）══════"
+    while IFS='|' read -r name proto port service; do
+        [[ -n "$name" ]] || continue
+        [[ "$wanted" == "$proto" ]] || continue
+        [[ "$seen" == *"|${proto}:${port}|"* ]] && continue
+        seen="${seen}${proto}:${port}|"
+        found=1
+        local_state=$(gfw_diag_listener_status "$proto" "$port")
+        echo "[$name] $proto/$port 本机=$local_state"
+        if [[ "$local_state" != BOUND ]]; then
+            echo "  LOCAL_ISSUE: 本机未对公网监听；优先排查服务，跳过外部阻断判定。"
+            continue
+        fi
+        cn=$(gfw_diag_globalping "$target" "$port" CN "$family" "$proto")
+        us=$(gfw_diag_globalping "$target" "$port" US "$family" "$proto")
+        echo "  CN 单探针=$cn | US 单探针=$us"
+        if [[ "$proto" == TCP ]]; then
+            verdict=$(gfw_diag_tcp_verdict "$local_state" "$cn" "$us")
+            echo "  $verdict"
+        else
+            echo "  UDP_PATH_ONLY: traceroute 不能证明 HY2/SS2022 UDP 握手成功或被封。"
+            echo "  需要真实客户端的双向协议认证证据，单纯无响应无法判定 GFW。"
+        fi
+    done < <(gfw_diag_ports)
+    [[ "$found" == 1 ]] || echo "没有已部署的 $wanted 协议端口。"
+    echo "注意：TCP 建连成功不等于 VLESS/Reality/ShadowTLS/Snell 等协议握手成功。"
+    echo "CN/US 单次不一致只表示疑似路径问题；要结合多 ASN/多时段复测。"
+}
+
 gfw_diag_menu() {
     local choice
     while true; do
         clear
         echo -e "${CYAN}════════════ GFW / TCP / UDP 连通性诊断 ════════════${PLAIN}"
-        echo "  1. 一键本机全协议 TCP/UDP 监听与服务检查"
-        echo "  2. 查看检测依据与判定边界"
+        echo "  1. 本机全部已部署协议 TCP/UDP 检查（只读）"
+        echo "  2. 从 CN / US 远程测试全部 TCP 端口（IPv4）"
+        echo "  3. 从 CN / US 远程测试 UDP 路径（IPv4，不能证明 UDP 放通）"
+        echo "  4. 从 CN / US 远程测试全部 TCP 端口（IPv6）"
+        echo "  5. 从 CN / US 远程测试 UDP 路径（IPv6，不能证明 UDP 放通）"
+        echo "  6. 检测依据与判定边界"
         echo "  0. 返回"
-        read -rp "请选择 [0-2]: " choice || return 0
+        read -rp "请选择 [0-6]: " choice || return 0
         case "$choice" in
             1) gfw_diag_local; pause ;;
-            2)
-                echo "本机监听通过不代表中国大陆可达；网络异常也不等于 GFW 封锁。"
-                echo "TCP 建连成功不代表 TLS/Reality/Snell/SS2022 协议握手成功。"
-                echo "UDP 必须有服务响应或双向收包证据，不能以 nc -u/路由探测当作放通。"
-                echo "应比较中国大陆不同 ASN/运营商与海外对照、历史时段和真实客户端日志。"
+            2) gfw_diag_remote_scan 4 TCP; pause ;;
+            3) gfw_diag_remote_scan 4 UDP; pause ;;
+            4) gfw_diag_remote_scan 6 TCP; pause ;;
+            5) gfw_diag_remote_scan 6 UDP; pause ;;
+            6)
+                echo "本机服务正常不等于大陆可达，UDP traceroute 无法证明 HY2 UDP 双向可达。"
+                echo "Globalping CN/US 单探针不能替代电信/联通/移动各 ASN 实测。"
+                echo "CN 失败、US 成功只能说大陆方向疑似干扰，不等于 GFW 封锁证明。"
+                echo "所有外部检测都需要用户明确同意，且只发送公网目标地址和端口。"
                 pause ;;
             0) return ;;
             *) echo "无效选择"; sleep 1 ;;
