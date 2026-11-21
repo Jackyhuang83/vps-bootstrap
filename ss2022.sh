@@ -13713,29 +13713,102 @@ gfw_diag_parse_measurement() {
        else "UNKNOWN" end' <<<"$result" 2>/dev/null || echo UNKNOWN
 }
 
-gfw_diag_globalping() {
+# Return STATUS|EVIDENCE. STATUS remains PASS / FAIL / UNKNOWN / PATH_ONLY.
+# Never turn API errors, probe absence or measurement timeouts into TCP FAIL.
+gfw_diag_globalping_detailed() {
     local target="$1" port="$2" country="$3" family="$4" transport="$5" asn="${6:-0}"
-    local payload response id status="" i
+    local payload raw response code id status="" result="" reason="" rtt="" rc=0 i
     payload=$(gfw_diag_payload "$target" "$port" "$country" "$family" "$transport" "$asn") ||
-        { echo UNKNOWN; return 0; }
-    response=$(curl -fsS --compressed --connect-timeout 5 --max-time 12 \
-        -H 'User-Agent: vps-bootstrap-gfw-diagnostics/1.0' \
+        { echo 'UNKNOWN|PAYLOAD_INVALID'; return 0; }
+    if raw=$(curl -sS --compressed --connect-timeout 5 --max-time 12 \
+        --write-out '\nHTTP_STATUS:%{http_code}' \
+        -H 'User-Agent: vps-bootstrap-gfw-diagnostics/1.1' \
         -H 'Accept: application/json' -H 'Content-Type: application/json' \
-        -X POST --data "$payload" https://api.globalping.io/v1/measurements 2>/dev/null) ||
-        { echo UNKNOWN; return 0; }
+        -X POST --data "$payload" https://api.globalping.io/v1/measurements 2>/dev/null); then
+        :
+    else
+        rc=$?
+        case "$rc" in
+            6) reason=API_DNS_FAILURE ;; 7) reason=API_CONNECT_FAILURE ;;
+            28) reason=API_TIMEOUT ;; 35|60) reason=API_TLS_FAILURE ;;
+            *) reason="API_CURL_ERROR_$rc" ;;
+        esac
+        echo "UNKNOWN|$reason"; return 0
+    fi
+    code=$(tail -n 1 <<<"$raw")
+    response=$(sed '$d' <<<"$raw")
+    case "$code" in
+        HTTP_STATUS:202) ;;
+        HTTP_STATUS:422)
+            reason=$(jq -r '.error.type // empty' <<<"$response" 2>/dev/null || true)
+            if [[ "$reason" == no_probes_found ]]; then echo 'UNKNOWN|NO_ONLINE_PROBE'
+            else echo 'UNKNOWN|API_REJECTED_422'; fi
+            return 0 ;;
+        HTTP_STATUS:429) echo 'UNKNOWN|API_RATE_LIMIT_429'; return 0 ;;
+        HTTP_STATUS:403) echo 'UNKNOWN|API_REJECTED_403'; return 0 ;;
+        HTTP_STATUS:5??) echo 'UNKNOWN|API_SERVER_ERROR'; return 0 ;;
+        *) echo 'UNKNOWN|API_UNEXPECTED_HTTP'; return 0 ;;
+    esac
     id=$(jq -r '.id // empty' <<<"$response" 2>/dev/null || true)
-    [[ "$id" =~ ^[A-Za-z0-9_-]{6,80}$ ]] || { echo UNKNOWN; return 0; }
-    for i in 1 2 3 4; do
+    [[ "$id" =~ ^[A-Za-z0-9_-]{6,80}$ ]] ||
+        { echo 'UNKNOWN|API_RESULT_MALFORMED'; return 0; }
+    for i in 1 2 3 4 5 6; do
         sleep 2
-        response=$(curl -fsS --compressed --connect-timeout 5 --max-time 12 \
-            -H 'User-Agent: vps-bootstrap-gfw-diagnostics/1.0' \
+        if raw=$(curl -sS --compressed --connect-timeout 5 --max-time 12 \
+            --write-out '\nHTTP_STATUS:%{http_code}' \
+            -H 'User-Agent: vps-bootstrap-gfw-diagnostics/1.1' \
             -H 'Accept: application/json' \
-            "https://api.globalping.io/v1/measurements/$id" 2>/dev/null) || break
+            "https://api.globalping.io/v1/measurements/$id" 2>/dev/null); then
+            :
+        else
+            rc=$?
+            case "$rc" in
+                6) reason=API_DNS_FAILURE ;; 7) reason=API_CONNECT_FAILURE ;;
+                28) reason=API_TIMEOUT ;; 35|60) reason=API_TLS_FAILURE ;;
+                *) reason="API_CURL_ERROR_$rc" ;;
+            esac
+            echo "UNKNOWN|$reason"; return 0
+        fi
+        code=$(tail -n 1 <<<"$raw")
+        response=$(sed '$d' <<<"$raw")
+        case "$code" in
+            HTTP_STATUS:200) ;;
+            HTTP_STATUS:429) echo 'UNKNOWN|API_RATE_LIMIT_429'; return 0 ;;
+            *) echo 'UNKNOWN|API_RESULT_HTTP_ERROR'; return 0 ;;
+        esac
         status=$(jq -r '.status // empty' <<<"$response" 2>/dev/null || true)
-        case "$status" in finished|failed) break ;; in-progress|in_progress) ;; *) break ;; esac
+        case "$status" in
+            finished) break ;;
+            failed) echo 'UNKNOWN|MEASUREMENT_FAILED'; return 0 ;;
+            in-progress|in_progress) ;;
+            *) echo 'UNKNOWN|API_RESULT_MALFORMED'; return 0 ;;
+        esac
     done
-    [[ "$status" == finished ]] || { echo UNKNOWN; return 0; }
-    gfw_diag_parse_measurement "$response" "$country" "$transport" "$asn"
+    [[ "$status" == finished ]] || { echo 'UNKNOWN|MEASUREMENT_TIMEOUT'; return 0; }
+    result=$(gfw_diag_parse_measurement "$response" "$country" "$transport" "$asn")
+    if [[ "$result" == PASS ]]; then
+        rtt=$(jq -r --arg c "$country" --argjson a "$asn" \
+          '[.results[]? | select(.probe.country==$c and ($a==0 or ((.probe.asn | tonumber? // 0)==$a))) | .result.stats.avg // empty] | first // empty' \
+          <<<"$response" 2>/dev/null || true)
+        if [[ "$rtt" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+            echo "PASS|TCP_CONNECTED_RTT_${rtt}ms"
+        else
+            echo 'PASS|TCP_CONNECTED'
+        fi
+    elif [[ "$result" == FAIL ]]; then
+        echo 'FAIL|TCP_CONNECT_FAILED_NOT_PROOF_OF_GFW'
+    elif [[ "$result" == PATH_ONLY ]]; then
+        echo 'PATH_ONLY|UDP_MTR_ONLY_NO_HANDSHAKE'
+    else
+        echo 'UNKNOWN|PROBE_RESULT_INCOMPLETE_OR_MISMATCH'
+    fi
+}
+
+# Backward-compatible helper used by the historic CN/US verdict and fixtures.
+gfw_diag_globalping() {
+    local detail
+    detail=$(gfw_diag_globalping_detailed "$@")
+    printf '%s\n' "${detail%%|*}"
 }
 
 gfw_diag_tcp_verdict() {
@@ -13875,11 +13948,11 @@ gfw_diag_trinet_auto() {
                 printf '  %-10s NO_ONLINE_PROBE（官方没有该运营商的在线合格探针）\n' "$label"
                 continue
             fi
-            cn=$(gfw_diag_globalping "$target" "$port" CN 4 TCP "$asn")
-            printf '  %-10s %-7s CN / AS%s\n' "$label" "$cn" "$asn"
+            cn=$(gfw_diag_globalping_detailed "$target" "$port" CN 4 TCP "$asn")
+            printf '  %-10s %-8s CN / AS%s | %s\n' "$label" "${cn%%|*}" "$asn" "${cn#*|}"
         done
-        us=$(gfw_diag_globalping "$target" "$port" US 4 TCP)
-        printf '  %-10s %-7s US（不代表大陆可达）\n' "美国对照" "$us"
+        us=$(gfw_diag_globalping_detailed "$target" "$port" US 4 TCP)
+        printf '  %-10s %-8s US | %s\n' "美国对照" "${us%%|*}" "${us#*|}"
         echo "  说明：只有 PASS 证明该探针 TCP 可建连；FAIL 可能是路由、防火墙或阻断，不可单凭本次认定 GFW。"
     done < <(gfw_diag_ports)
     [[ "$found" == 1 ]] || echo "没有已部署 TCP 协议端口。"
@@ -13904,7 +13977,7 @@ gfw_diag_trinet_links() {
 
 gfw_diag_remote_scan() {
     local family="$1" wanted="$2" target confirmation name proto port service local_state cn us
-    local seen="|" found=0 verdict
+    local seen="|" found=0 verdict cn_detail="" us_detail=""
     command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 ||
         { echo "[错误] 缺少 curl/jq；不会自动安装。"; return 1; }
     target=$(gfw_diag_remote_target "$family") || return 1
@@ -13926,9 +13999,10 @@ gfw_diag_remote_scan() {
             echo "  LOCAL_ISSUE: 本机未对公网监听；优先排查服务，跳过外部阻断判定。"
             continue
         fi
-        cn=$(gfw_diag_globalping "$target" "$port" CN "$family" "$proto")
-        us=$(gfw_diag_globalping "$target" "$port" US "$family" "$proto")
-        echo "  CN 单探针=$cn | US 单探针=$us"
+        cn_detail=$(gfw_diag_globalping_detailed "$target" "$port" CN "$family" "$proto")
+        us_detail=$(gfw_diag_globalping_detailed "$target" "$port" US "$family" "$proto")
+        cn="${cn_detail%%|*}"; us="${us_detail%%|*}"
+        echo "  CN 单探针=$cn（${cn_detail#*|}）| US 单探针=$us（${us_detail#*|}）"
         if [[ "$proto" == TCP ]]; then
             verdict=$(gfw_diag_tcp_verdict "$local_state" "$cn" "$us")
             echo "  $verdict"

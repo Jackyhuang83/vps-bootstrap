@@ -48,11 +48,19 @@ curl() {
     case "$*" in
         *'-X POST'*)
             printf '%s\n' "$*" >> "$tmp/requests"
-            if [[ "$MOCK_SCENARIO" == no_probe ]]; then echo '{"error":{"type":"no_probes_found"}}'
-            else echo '{"id":"abcDEF123456"}'; fi
+            case "$MOCK_SCENARIO" in
+                no_probe) printf '{"error":{"type":"no_probes_found"}}\nHTTP_STATUS:422\n' ;;
+                rate_limit) printf '{"error":{"type":"rate_limit"}}\nHTTP_STATUS:429\n' ;;
+                api_dns_error) return 6 ;;
+                *) printf '{"id":"abcDEF123456"}\nHTTP_STATUS:202\n' ;;
+            esac
             ;;
         *'/v1/measurements/abcDEF123456'*)
-            echo '{"status":"finished","results":[{"probe":{"country":"CN"},"result":{"status":"finished","stats":{"rcv":2,"loss":0}}}]}'
+            case "$MOCK_SCENARIO" in
+                delayed) printf '{"status":"in-progress"}\nHTTP_STATUS:200\n' ;;
+                mismatch) printf '{"status":"finished","results":[{"probe":{"country":"CN","asn":9999},"result":{"status":"finished","stats":{"rcv":2,"loss":0}}}]}\nHTTP_STATUS:200\n' ;;
+                *) printf '{"status":"finished","results":[{"probe":{"country":"CN","asn":4134},"result":{"status":"finished","stats":{"rcv":2,"loss":0,"avg":42.6}}}]}\nHTTP_STATUS:200\n' ;;
+            esac
             ;;
         *) echo "FAIL: unexpected request" >&2; return 1 ;;
     esac
@@ -62,6 +70,18 @@ sleep() { :; }
 grep -Fq -- 'https://api.globalping.io/v1/measurements' "$tmp/requests"
 MOCK_SCENARIO=no_probe
 [[ "$(gfw_diag_globalping 11.22.33.44 443 CN 4 TCP)" == UNKNOWN ]]
+[[ "$(gfw_diag_globalping_detailed 11.22.33.44 443 CN 4 TCP)" == 'UNKNOWN|NO_ONLINE_PROBE' ]]
+MOCK_SCENARIO=rate_limit
+[[ "$(gfw_diag_globalping_detailed 11.22.33.44 443 CN 4 TCP)" == 'UNKNOWN|API_RATE_LIMIT_429' ]]
+MOCK_SCENARIO=api_dns_error
+[[ "$(gfw_diag_globalping_detailed 11.22.33.44 443 CN 4 TCP)" == 'UNKNOWN|API_DNS_FAILURE' ]]
+MOCK_SCENARIO=delayed
+[[ "$(gfw_diag_globalping_detailed 11.22.33.44 443 CN 4 TCP)" == 'UNKNOWN|MEASUREMENT_TIMEOUT' ]]
+MOCK_SCENARIO=mismatch
+[[ "$(gfw_diag_globalping_detailed 11.22.33.44 443 CN 4 TCP 4134)" == 'UNKNOWN|PROBE_RESULT_INCOMPLETE_OR_MISMATCH' ]]
+MOCK_SCENARIO=success
+[[ "$(gfw_diag_globalping_detailed 11.22.33.44 443 CN 4 TCP 4134)" == 'PASS|TCP_CONNECTED_RTT_42.6ms' ]]
+
 
 # Refusing explicit consent must never invoke any external measurement.
 rm -f "$tmp/requests"
@@ -91,8 +111,12 @@ jq -e '.locations[0].country=="CN" and .locations[0].asn==4134 and .measurementO
 gfw_diag_ports() { printf 'VLESS Reality|TCP|443|xray\n'; }
 gfw_diag_listener_status() { printf 'BOUND\n'; }
 gfw_diag_probe_inventory() { echo inventory-called >> "$tmp/probe-calls"; printf '%s' "$carrier_probes"; }
-gfw_diag_globalping() {
-    case "${6:-0}" in 4134|4837) echo PASS ;; 9808) echo FAIL ;; *) echo PASS ;; esac
+gfw_diag_globalping_detailed() {
+    case "${6:-0}" in
+        4134|4837) echo 'PASS|TCP_CONNECTED' ;;
+        9808) echo 'FAIL|TCP_CONNECT_FAILED_NOT_PROOF_OF_GFW' ;;
+        *) echo 'PASS|TCP_CONNECTED' ;;
+    esac
 }
 rm -f "$tmp/probe-calls"
 out=$(gfw_diag_trinet_auto <<< "$(printf '11.22.33.44\nNO\n')")
