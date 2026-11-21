@@ -13578,7 +13578,21 @@ test_proxy_ipv6_egress() {
     echo "===== 完成：未修改服务、路由、防火墙 ====="
 }
 
-server_test_management() {
+
+# Read-only connectivity evidence. An open local socket does NOT prove China reachability.
+gfw_diag_valid_port() {
+    local port="$1"
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] && (( 10#$port > 0 && 10#$port <= 65535 ))
+}
+gfw_diag_emit_port() {
+    local name="$1" transport="$2" port="$3" service="$4"
+    gfw_diag_valid_port "$port" || return 0
+    printf '%s\t%s\t%s\t%s\n' "$name" "$transport" "$port" "$service"
+}
+gfw_diag_configured_ports() {
+    local tag port
+    if [[ -f "$SINGBOX_CONF" ]] && command -v jq >/dev/null 2>&1; then
+        while IFS=
     while true; do
         clear
         echo -e "${CYAN}════════════════════ 服务器测试管理 ════════════════════${PLAIN}"
@@ -13596,6 +13610,1203 @@ server_test_management() {
             3) test_platform_media_ai_communication_unlock ;;
             4) google_test_management ;;
             5) test_proxy_ipv6_egress; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+
+# Experimental isolated Snell -> WARP IPv6 TCP bridge.
+# This is not transparent routing. Surge must point its chained SS2022
+# server to 127.0.0.1:<bridge-port> via underlying-proxy=<Snell>.
+snell_warp_bridge_config_json() {
+    local local_port="$1" remote_ip="$2" remote_port="$3" warp_port="$4"
+    jq -n --argjson local_port "$local_port" --arg ip "$remote_ip" --argjson remote_port "$remote_port" --argjson warp_port "$warp_port" '
+      {log:{level:"warn"},
+       inbounds:[{type:"direct",tag:"bridge-in",listen:"127.0.0.1",
+         listen_port:$local_port,network:"tcp",override_address:$ip,override_port:$remote_port}],
+       outbounds:[{type:"socks",tag:"warp-out",server:"127.0.0.1",
+         server_port:$warp_port,version:"5",network:"tcp"}],
+       route:{final:"warp-out"}}'
+}
+
+snell_warp_bridge_owned() {
+    [[ -f "$SNELL_WARP_BRIDGE_MARKER" && -f "$SNELL_WARP_BRIDGE_SERVICE" ]] &&
+      grep -Fq "ExecStart=${SINGBOX_BIN} run -c ${SNELL_WARP_BRIDGE_CONF}" "$SNELL_WARP_BRIDGE_SERVICE"
+}
+
+snell_warp_bridge_show() {
+    if ! snell_warp_bridge_owned || [[ ! -f "$SNELL_WARP_BRIDGE_CONF" ]]; then
+        echo "尚未部署本工具箱管理的独立桥接。"
+        return 0
+    fi
+    local local_port remote_ip remote_port
+    local_port=$(jq -r '.inbounds[0].listen_port' "$SNELL_WARP_BRIDGE_CONF")
+    remote_ip=$(jq -r '.inbounds[0].override_address' "$SNELL_WARP_BRIDGE_CONF")
+    remote_port=$(jq -r '.inbounds[0].override_port' "$SNELL_WARP_BRIDGE_CONF")
+    if service_is_active "$SNELL_WARP_BRIDGE_SERVICE_NAME"; then
+        echo "桥接服务: 运行中"
+    else
+        echo "桥接服务: 未运行"
+    fi
+    echo "本机 TCP: 127.0.0.1:${local_port} → WARP SOCKS5 → [${remote_ip}]:${remote_port}"
+    echo "Surge: 保留原有 Snell，新增一条 SS2022 策略（沿用原加密算法/密钥）："
+    echo "SS2022-WARP = ss, 127.0.0.1, ${local_port}, encrypt-method=<原方法>, password=<原密钥>, underlying-proxy=<Snell策略名>, udp-relay=false"
+    echo "[警告] 只有使用 underlying-proxy=Snell 的 SS2022-WARP 策略才可连接此 VPS 本地端口。"
+    echo "[范围] 仅 TCP；原 Snell 和原 SS2022 配置均不修改。"
+}
+
+snell_warp_bridge_remove() {
+    if ! snell_warp_bridge_owned; then
+        echo "STOP: 不属于本工具箱的服务，拒绝删除。"
+        return 1
+    fi
+    service_disable_now "$SNELL_WARP_BRIDGE_SERVICE_NAME"
+    rm -f -- "$SNELL_WARP_BRIDGE_CONF" "$SNELL_WARP_BRIDGE_SERVICE" "$SNELL_WARP_BRIDGE_MARKER"
+    rmdir "$SNELL_WARP_BRIDGE_CONF_DIR" 2>/dev/null || true
+    service_daemon_reload || true
+    echo "✔ 独立 TCP 桥接已删除；没有修改 Snell/WARP/SS2022。"
+}
+
+snell_warp_bridge_deploy() {
+    local remote_ip remote_port local_port warp_port candidate
+    [[ "$PLATFORM_INIT" == "systemd" ]] || {
+        echo "STOP: 当前只支持 Debian/Ubuntu + systemd。"; return 1;
+    }
+    [[ -f "$SNELL_CONF" ]] && service_is_active snell-v5 || {
+        echo "STOP: Snell v5 前置尚未运行。"; return 1;
+    }
+    [[ -x "$SINGBOX_BIN" ]] || {
+        echo "STOP: 缺少 sing-box 核心。不会安装或覆盖已有代理核心。"; return 1;
+    }
+    if [[ -e "$SNELL_WARP_BRIDGE_CONF" || -e "$SNELL_WARP_BRIDGE_SERVICE" ||
+          -e "$SNELL_WARP_BRIDGE_MARKER" || -e "$SNELL_WARP_BRIDGE_CONF_DIR" ]]; then
+        echo "STOP: 桥接文件或同名服务已存在，为保护现有资源拒绝覆盖。"
+        snell_warp_bridge_show
+        return 1
+    fi
+    warp_proxy_ready && warp_family_allowed ipv6 && warp_test_family ipv6 >/dev/null 2>&1 || {
+        echo "STOP: WARP IPv6 Local Proxy 未就绪。"; return 1;
+    }
+    warp_port=$(warp_proxy_port)
+    read -rp "SS2022 落地 IPv6（不含方括号）: " remote_ip || return 1
+    [[ "$remote_ip" =~ ^[0-9a-fA-F:]+$ && "$remote_ip" == *:* ]] || {
+        echo "STOP: 不是 IPv6 地址。"; return 1;
+    }
+    read -rp "SS2022 落地 TCP 端口 [10000]: " remote_port || return 1
+    remote_port=${remote_port:-10000}
+    validate_port_number "$remote_port" || { echo "STOP: 端口不合法。"; return 1; }
+    read -rp "本地仅回环监听 TCP 端口 [16001]: " local_port || return 1
+    local_port=${local_port:-16001}
+    validate_port_number "$local_port" || { echo "STOP: 端口不合法。"; return 1; }
+    if ss -H -ltn 2>/dev/null | awk -v p=":$local_port" '$4 ~ p"$" {found=1} END{exit !found}'; then
+        echo "STOP: 本地端口被占用，未修改任何服务。"; return 1
+    fi
+    ensure_singbox_user || return 1
+    install -d -o root -g "$SINGBOX_GROUP" -m 750 "$SNELL_WARP_BRIDGE_CONF_DIR" || return 1
+    candidate=$(mktemp "$SNELL_WARP_BRIDGE_CONF_DIR/.candidate.XXXXXX") || return 1
+    if ! snell_warp_bridge_config_json "$local_port" "$remote_ip" "$remote_port" "$warp_port" > "$candidate" ||
+       ! "$SINGBOX_BIN" check -c "$candidate"; then
+        rm -f -- "$candidate"
+        rmdir "$SNELL_WARP_BRIDGE_CONF_DIR" 2>/dev/null || true
+        echo "STOP: 新桥接 sing-box 配置校验失败，没有修改旧服务。"
+        return 1
+    fi
+    if ! chown root:"$SINGBOX_GROUP" "$candidate" || ! chmod 640 "$candidate" ||
+       ! mv -- "$candidate" "$SNELL_WARP_BRIDGE_CONF"; then
+        rm -f -- "$candidate" "$SNELL_WARP_BRIDGE_CONF"
+        rmdir "$SNELL_WARP_BRIDGE_CONF_DIR" 2>/dev/null || true
+        echo "STOP: 候选配置写入失败。"; return 1
+    fi
+    cat > "$SNELL_WARP_BRIDGE_SERVICE" <<SERVICE
+[Unit]
+Description=vps-bootstrap Snell-WARP IPv6 loopback TCP bridge
+After=network-online.target warp-svc.service
+Wants=network-online.target
+[Service]
+Type=simple
+User=sing-box
+Group=sing-box
+ExecStart=${SINGBOX_BIN} run -c ${SNELL_WARP_BRIDGE_CONF}
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+[Install]
+WantedBy=multi-user.target
+SERVICE
+    chmod 644 "$SNELL_WARP_BRIDGE_SERVICE" || return 1
+    printf 'v1\n' > "$SNELL_WARP_BRIDGE_MARKER"
+    chmod 600 "$SNELL_WARP_BRIDGE_MARKER"
+    if ! service_daemon_reload || ! service_enable_now "$SNELL_WARP_BRIDGE_SERVICE_NAME"; then
+        echo "STOP: 新桥接服务启动失败，回滚独立资源。"
+        snell_warp_bridge_remove || true
+        return 1
+    fi
+    sleep 1
+    if ! service_is_active "$SNELL_WARP_BRIDGE_SERVICE_NAME" ||
+       ! ss -H -ltn 2>/dev/null | awk -v p=":$local_port" '$4 ~ p"$" {found=1} END{exit !found}'; then
+        echo "STOP: 桥接未保持监听，回滚独立资源。"
+        snell_warp_bridge_remove || true
+        return 1
+    fi
+    snell_warp_bridge_show
+    echo "[验收] 请在 Surge 对新增 TCP 链式 SS2022 节点进行实测。"
+}
+
+snell_warp_bridge_menu() {
+    local choice
+    while true; do
+        echo "══════ Snell v5 → WARP IPv6 TCP 桥接 ══════"
+        echo "旧版按落地 IP/端口绑定，已由菜单 16 的 Snell 通用 IPv6 出站取代。"
+        echo "1. 查看旧版桥接及 Surge 配置"
+        echo "2. 卸载旧版桥接"
+        echo "0. 返回"
+        read -rp "请选择 [0-2]: " choice || return
+        case "$choice" in
+            1) snell_warp_bridge_show; pause ;;
+            2) read -rp "确认仅删除旧版桥接？[y/N]: " choice
+               [[ "$choice" =~ ^[Yy]$ ]] && snell_warp_bridge_remove
+               pause ;;
+            0) return ;;
+            *) echo "输入无效" ;;
+        esac
+    done
+}
+
+
+# Snell-specific IPv6 TCP path via WARP Local SOCKS5. No global auto_route.
+snell_warp_uid_config_json() {
+    local warp_port="$1"
+    jq -n --argjson port "$warp_port" '{
+      log:{level:"warn"},
+      inbounds:[{type:"tun",tag:"snell-warp-in",interface_name:"swipv6tun",
+        address:["fd7e:5e11:2022::1/64"],mtu:1400,
+        auto_route:false,auto_redirect:false,stack:"system"}],
+      outbounds:[{type:"socks",tag:"warp-v6",server:"127.0.0.1",
+        server_port:$port,version:"5",network:"tcp"}],
+      route:{final:"warp-v6"}}'
+}
+
+snell_warp_uid_owned() {
+    [[ -f "$SNELL_WARP_UID_MARKER" && -f "$SNELL_WARP_UID_SERVICE" ]] &&
+        grep -Fq "ExecStart=$SINGBOX_BIN run -c $SNELL_WARP_UID_CONF" "$SNELL_WARP_UID_SERVICE"
+}
+
+snell_warp_uid_show() {
+    echo "===== Snell v5 → WARP 专用 IPv6 TCP 出站 ====="
+    if ! snell_warp_uid_owned; then
+        echo "状态: 未部署"; return 0
+    fi
+    if service_is_active "$SNELL_WARP_UID_SERVICE_NAME"; then
+        echo "独立 TUN: RUNNING"
+    else
+        echo "独立 TUN: NOT_RUNNING"
+    fi
+    echo "仅匹配 Snell UID 的公网 IPv6 TCP，其他流量保持原状。"
+    echo "WARP: 127.0.0.1:$(warp_proxy_port)"
+    ip -6 rule show 2>/dev/null | grep '^16381:' || true
+    ip -6 route show table 16381 2>/dev/null || true
+    sed -nE '/^[[:space:]]*ipv6[[:space:]]*=/p' "$SNELL_CONF" 2>/dev/null | head -1
+    echo "Surge 不需要配置专属桥接端口；IPv6 UDP/QUIC 不支持。"
+}
+
+snell_warp_uid_restore() {
+    local expected actual
+    [[ -f "$SNELL_WARP_UID_BACKUP" ]] || return 0
+    if [[ ! -f "$SNELL_WARP_UID_ACTIVE_SHA" ]]; then
+        # Interrupted during install: never discard a valid original backup.
+        # If Snell is still byte-identical, no restart or restore is needed.
+        if cmp -s "$SNELL_WARP_UID_BACKUP" "$SNELL_CONF"; then
+            rm -f "$SNELL_WARP_UID_BACKUP"
+            return 0
+        fi
+        # Otherwise accept ONLY the deterministic ipv6=false -> true candidate.
+        # Reject later user edits even when the active checksum was never written.
+        expected=$(sed -E 's/^([[:space:]]*ipv6[[:space:]]*=[[:space:]]*)false([[:space:]]*)$/\1true\2/' "$SNELL_WARP_UID_BACKUP" | sha256sum | awk '{print $1}')
+        actual=$(sha256sum "$SNELL_CONF" | awk '{print $1}')
+        [[ "$expected" == "$actual" ]] || {
+            echo "STOP: Snell 当前配置与原始备份和安装候选均不同，拒绝覆盖。"
+            return 1
+        }
+        printf '%s\n' "$expected" > "$SNELL_WARP_UID_ACTIVE_SHA"
+        chmod 600 "$SNELL_WARP_UID_ACTIVE_SHA"
+    fi
+    expected=$(cat "$SNELL_WARP_UID_ACTIVE_SHA")
+    actual=$(sha256sum "$SNELL_CONF" | awk '{print $1}')
+    [[ "$actual" == "$expected" ]] || {
+        echo "STOP: Snell 已被后续修改，拒绝覆盖；备份保留在 $SNELL_WARP_UID_BACKUP。"
+        return 1
+    }
+    cp -a "$SNELL_WARP_UID_BACKUP" "$SNELL_CONF" || return 1
+    if ! service_restart snell-v5 || ! service_is_active snell-v5; then
+        echo "STOP: Snell 原配置已写回，但服务未恢复；独立出站保持运行供人工检查。"
+        return 1
+    fi
+    rm -f "$SNELL_WARP_UID_BACKUP" "$SNELL_WARP_UID_ACTIVE_SHA"
+}
+
+snell_warp_uid_remove() {
+    snell_warp_uid_owned || { echo "STOP: 未托管的服务不允许删除。"; return 1; }
+    snell_warp_uid_restore || return 1
+    service_disable_now "$SNELL_WARP_UID_SERVICE_NAME"
+    service_is_active "$SNELL_WARP_UID_SERVICE_NAME" && {
+        echo "STOP: 独立服务未成功停止。"; return 1;
+    }
+    # Preserve ownership evidence if systemd's scoped ExecStopPost cleanup failed.
+    # Never remove a rule or route belonging to another owner.
+    local uid current_rule
+    uid=$(id -u snell 2>/dev/null) || uid=""
+    current_rule=$(ip -6 rule show 2>/dev/null | grep '^16381:' || true)
+    if [[ -n "$current_rule" && -n "$uid" &&
+          "$current_rule" == *"uidrange $uid-$uid"* &&
+          "$current_rule" == *"ipproto tcp"* ]]; then
+        ip -6 rule del pref 16381 uidrange "$uid-$uid" ipproto tcp             to 2000::/3 lookup 16381 >/dev/null 2>&1 || true
+    fi
+    if ip -6 route show table 16381 2>/dev/null | grep -Eq '^2000::/3 dev swipv6tun([[:space:]]|$)'; then
+        ip -6 route del 2000::/3 dev swipv6tun table 16381 >/dev/null 2>&1 || true
+    fi
+    if ip -6 rule show 2>/dev/null | grep -q '^16381:' ||
+       [[ -n "$(ip -6 route show table 16381 2>/dev/null)" ]]; then
+        echo "STOP: 专用策略路由仍有残留；保留 ownership 和服务文件供排查。"
+        return 1
+    fi
+    rm -f "$SNELL_WARP_UID_CONF" "$SNELL_WARP_UID_SERVICE" "$SNELL_WARP_UID_MARKER"
+    rmdir "$SNELL_WARP_UID_DIR" 2>/dev/null || true
+    service_daemon_reload || true
+    echo "PASS: Snell 专用 IPv6 出站及策略路由已卸载。"
+}
+
+snell_warp_uid_deploy() {
+    local uid warp_port flag confirm="" candidate="" ipbin="" snell_temp="" sha=""
+    [[ "$PLATFORM_INIT" == "systemd" ]] || {
+        echo "STOP: 仅支持 Debian/Ubuntu systemd。"; return 1;
+    }
+    snell_is_project_managed && service_is_active snell-v5 &&
+        [[ -f "$SNELL_CONF" && -x "$SINGBOX_BIN" ]] || {
+        echo "STOP: 需要本工具箱管理的运行中 Snell v5 与现有 sing-box 核心。"; return 1;
+    }
+    command -v ip >/dev/null && command -v jq >/dev/null &&
+        [[ -c /dev/net/tun ]] || {
+        echo "STOP: 缺少 ip、jq 或 /dev/net/tun。"; return 1;
+    }
+    uid=$(id -u snell 2>/dev/null) || return 1
+    [[ "$uid" =~ ^[0-9]+$ && "$uid" -gt 0 ]] || return 1
+    [[ "$(systemctl show snell-v5 -p User --value 2>/dev/null)" == snell ]] || {
+        echo "STOP: Snell 服务 User 不是 snell，不能安全隔离路由。"; return 1;
+    }
+    [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" == 0 ]] || {
+        echo "STOP: 系统禁用了 IPv6，不修改 sysctl。"; return 1;
+    }
+    if [[ -e "$SNELL_WARP_UID_DIR" || -e "$SNELL_WARP_UID_SERVICE" ||
+          -e "$SNELL_WARP_UID_MARKER" ]] ||
+       ip link show dev swipv6tun >/dev/null 2>&1 ||
+       ip -6 rule show | grep -q '^16381:' ||
+       [[ -n "$(ip -6 route show table 16381)" ]]; then
+        echo "STOP: 服务/TUN/策略路由表已存在，不覆盖。"; return 1;
+    fi
+    warp_proxy_ready && warp_family_allowed ipv6 &&
+        warp_test_family ipv6 >/dev/null 2>&1 || {
+        echo "STOP: WARP IPv6 SOCKS5 不可用。"; return 1;
+    }
+    flag=$(sed -nE 's/^[[:space:]]*ipv6[[:space:]]*=[[:space:]]*(true|false)[[:space:]]*$/\1/p' "$SNELL_CONF" | head -1)
+    [[ "$flag" == true || "$flag" == false ]] || {
+        echo "STOP: Snell ipv6 配置不可识别。"; return 1;
+    }
+    echo "范围: Snell UID $uid 的公网 IPv6 TCP → WARP，IPv4/SSH/其他服务不变。"
+    [[ "$flag" == false ]] && echo "Snell ipv6=false：会备份原配置并重启 Snell 一次，现有连接可能短暂中断。"
+    read -rp "确认部署并接受可能的短暂断连？输入 YES: " confirm || return 1
+    [[ "$confirm" == YES ]] || { echo "已取消。"; return 0; }
+
+    warp_port=$(warp_proxy_port)
+    ipbin=$(command -v ip)
+    install -d -m 700 "$SNELL_WARP_UID_DIR" || return 1
+    candidate=$(mktemp "$SNELL_WARP_UID_DIR/.new.XXXXXX") || return 1
+    if ! snell_warp_uid_config_json "$warp_port" > "$candidate" ||
+       ! "$SINGBOX_BIN" check -c "$candidate"; then
+        rm -f "$candidate"; rmdir "$SNELL_WARP_UID_DIR" 2>/dev/null || true
+        echo "STOP: sing-box 配置校验失败，未改现有服务。"; return 1;
+    fi
+    mv "$candidate" "$SNELL_WARP_UID_CONF" || return 1
+    chmod 600 "$SNELL_WARP_UID_CONF"
+    cat > "$SNELL_WARP_UID_SERVICE" <<SERVICE
+[Unit]
+Description=vps-bootstrap Snell UID-scoped WARP IPv6 TCP egress
+After=network-online.target warp-svc.service snell-v5.service
+Wants=network-online.target
+[Service]
+Type=exec
+ExecStart=$SINGBOX_BIN run -c $SNELL_WARP_UID_CONF
+ExecStartPost=/usr/bin/timeout 10 /bin/sh -c 'until $ipbin link show dev swipv6tun >/dev/null 2>&1; do sleep 0.2; done'
+ExecStartPost=$ipbin -6 route add 2000::/3 dev swipv6tun table 16381
+ExecStartPost=$ipbin -6 rule add pref 16381 uidrange $uid-$uid ipproto tcp to 2000::/3 lookup 16381
+ExecStopPost=-$ipbin -6 rule del pref 16381 uidrange $uid-$uid ipproto tcp to 2000::/3 lookup 16381
+ExecStopPost=-$ipbin -6 route del 2000::/3 dev swipv6tun table 16381
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+[Install]
+WantedBy=multi-user.target
+SERVICE
+    chmod 644 "$SNELL_WARP_UID_SERVICE"
+    printf 'v1\n' > "$SNELL_WARP_UID_MARKER"
+    chmod 600 "$SNELL_WARP_UID_MARKER"
+    if ! service_daemon_reload ||
+       ! service_enable_now "$SNELL_WARP_UID_SERVICE_NAME" ||
+       ! service_is_active "$SNELL_WARP_UID_SERVICE_NAME" ||
+       ! ip -6 rule show | grep -q '^16381:' ||
+       ! ip -6 route show table 16381 | grep -Fq 'dev swipv6tun'; then
+        echo "STOP: 独立 TUN 未启动，自动回滚。"
+        snell_warp_uid_remove || true
+        return 1
+    fi
+    # Verify kernel policy routing really resolves Snell's IPv6 TCP via this TUN.
+    # A failed lookup is not success even if the rule/table merely exist.
+    local snell_route other_route
+    snell_route=$(ip -6 route get 2606:4700:4700::1111 uid "$uid" ipproto tcp 2>&1) || snell_route=""
+    other_route=$(ip -6 route get 2606:4700:4700::1111 uid 0 ipproto tcp 2>&1) || other_route=""
+    if [[ "$snell_route" != *"dev swipv6tun"* ||
+          "$other_route" == *"dev swipv6tun"* ]]; then
+        echo "STOP: 内核 UID 路由隔离验收失败，清理独立 TUN；Snell 原配置未动。"
+        snell_warp_uid_remove || true
+        return 1
+    fi
+    if [[ "$flag" == false ]]; then
+        if ! cp -a "$SNELL_CONF" "$SNELL_WARP_UID_BACKUP"; then
+            snell_warp_uid_remove || true; return 1
+        fi
+        snell_temp=$(mktemp "$SNELL_CONF.swipv6.XXXXXX") || {
+            snell_warp_uid_remove || true; return 1;
+        }
+        sed -E 's/^([[:space:]]*ipv6[[:space:]]*=[[:space:]]*)false([[:space:]]*)$/\1true\2/'             "$SNELL_CONF" > "$snell_temp"
+        chown --reference="$SNELL_CONF" "$snell_temp"
+        chmod --reference="$SNELL_CONF" "$snell_temp"
+        mv "$snell_temp" "$SNELL_CONF"
+        sha=$(sha256sum "$SNELL_CONF" | awk '{print $1}')
+        printf '%s\n' "$sha" > "$SNELL_WARP_UID_ACTIVE_SHA"
+        chmod 600 "$SNELL_WARP_UID_ACTIVE_SHA"
+        if ! service_restart snell-v5 || ! service_is_active snell-v5; then
+            echo "STOP: Snell 重启失败，自动恢复原配置与路由。"
+            snell_warp_uid_remove || true
+            return 1
+        fi
+    fi
+    snell_warp_uid_show
+    echo "PASS: 出站策略已生效。请在 Surge 用原 Snell 链式测试多个 IPv6 TCP 落地。"
+    echo "注意：这是配置与路由验收，不代表 Surge 实际链式已验证。"
+}
+
+snell_warp_uid_menu() {
+    local choice=""
+    while true; do
+        echo "════ Snell 专用 WARP IPv6 TCP 自动出站（所有落地）════"
+        echo "1. 部署（必要时重启 Snell 一次）"
+        echo "2. 查看状态与路由"
+        echo "3. 卸载并恢复原 Snell 配置"
+        echo "0. 返回"
+        read -rp "请选择 [0-3]: " choice || return 0
+        case "$choice" in
+            1) snell_warp_uid_deploy; pause ;;
+            2) snell_warp_uid_show; pause ;;
+            3) read -rp "确定卸载？输入 YES: " choice
+               [[ "$choice" == YES ]] && snell_warp_uid_remove
+               pause ;;
+            0) return ;;
+            *) echo "无效输入" ;;
+        esac
+    done
+}
+
+protocol_operations_management() {
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ 协议运维管理 ════════════════════${PLAIN}"
+        echo "  1. 查看全部服务状态与监听端口"
+        echo "  2. 查看 sing-box 实时日志"
+        echo "  3. 查看 ss2022-xray 实时日志"
+        echo "  4. 查看 Snell v5 实时日志"
+        echo "  5. 查看 Realm 转发实时日志"
+        echo "  6. 重启 sing-box"
+        echo "  7. 重启 ss2022-xray"
+        echo "  8. 重启 Snell v5"
+        echo "  9. 重启 Realm 转发"
+        echo " 10. 查看 IPv6 Keepalive 状态"
+        echo " 11. 查看 Snell v6 日志"
+        echo " 12. 重启 Snell v6"
+        echo " 13. 查看 HY2 日志"
+        echo " 14. 重启 HY2"
+        echo " 15. 旧版 Snell 固定落地桥接（仅维护/卸载）"
+        echo " 16. Snell 专用 WARP IPv6 TCP 自动出站（推荐）"
+        echo "  0. 返回"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-16]: " c
+        case "$c" in
+            1) show_service_status; pause ;;
+            2) follow_service_log sing-box ;;
+            3) follow_service_log "$XRAY_SERVICE_NAME" ;;
+            4) follow_service_log snell-v5 ;;
+            5) follow_service_log "$REALM_SERVICE_NAME" ;;
+            6) restart_service_safe sing-box "sing-box"; pause ;;
+            7) restart_xray_safe; pause ;;
+            8) restart_service_safe snell-v5 "Snell v5"; pause ;;
+            9) restart_service_safe "$REALM_SERVICE_NAME" "Realm 转发"; pause ;;
+            11) follow_service_log "$SNELL6_SERVICE_NAME" ;;
+            12) restart_service_safe "$SNELL6_SERVICE_NAME" "Snell v6"; pause ;;
+            13) follow_service_log "$HY2_SERVICE_NAME" ;;
+            15) snell_warp_bridge_menu ;;
+            16) snell_warp_uid_menu ;;
+            14) if [[ -f "$HY2_CONF" && -f "$HY2_MANAGED_MARKER" ]]; then
+                    restart_service_safe "$HY2_SERVICE_NAME" "HY2"
+                else
+                    echo "[提示] HY2 尚未部署，不能通过重启创建节点。"
+                fi
+                pause ;;
+            10)
+                if service_is_active "$(keepalive_service_name)"; then
+                    echo "IPv6 Keepalive: Running"
+                    service_status_output "$(keepalive_service_name)" 2>/dev/null || true
+                else
+                    echo "IPv6 Keepalive: 未运行"
+                fi
+                pause
+                ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+main() {
+    check_root
+    detect_platform || exit 1
+    if platform_is_alpine; then
+        echo "[v1.9.0] 已检测到 Alpine / OpenRC；核心协议、服务管理、服务器工具与测试已接入稳定支持范围。"
+        echo "[提示] Snell v5 官方二进制与 Cloudflare WARP 官方客户端暂不在 Alpine 开放。"
+    fi
+
+    # 兼容旧安装：已有 local-dns 缺少 prefer_go:true 时执行一次安全迁移。
+    # 失败不会覆盖旧配置，也不会阻断管理面板。
+    migrate_singbox_local_dns_prefer_go || true
+
+    while true; do
+        show_dashboard
+        echo "  1. 协议管理"
+        echo "  2. 分流管理"
+        echo "  3. 端口转发（Realm）"
+        echo "  4. 查看当前节点参数与客户端配置"
+        echo "  5. 协议运维管理"
+        echo "  6. 组件版本管理"
+        echo "  - - - - - - - - - - - - - - - -"
+        echo "  7. 服务器管理工具"
+        echo "  8. 服务器测试管理"
+        echo "  - - - - - - - - - - - - - - - -"
+        echo "  9. 检查脚本更新"
+        echo -e "${RED} 10. 完全卸载脚本${PLAIN}"
+        echo "  0. 退出管理面板"
+        echo -e "${CYAN}═════════════════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请输入选项编号 [0-10]: " choice
+
+        case "$choice" in
+            1) protocol_management ;;
+            2) routing_management ;;
+            3) forwarding_management ;;
+            4) view_config_menu ;;
+            5) protocol_operations_management ;;
+            6) component_version_management ;;
+            7) server_management_tools ;;
+            8) server_test_management ;;
+            9) check_script_update ;;
+            10) full_uninstall ;;
+            0)
+                echo "已安全退出。随时输入 ss2022 唤出！"
+                exit 0
+                ;;
+            *)
+                echo -e "${RED}请输入有效编号！${PLAIN}"
+                sleep 1
+                ;;
+        esac
+    done
+} 
+
+# CI / smoke test can load the function library without entering the interactive UI.
+# Normal users never need to set this variable.
+if [[ "${SS2022_LIB_ONLY:-0}" != "1" ]]; then
+    main
+fi
+
+\t' read -r tag port; do
+            case "$tag" in
+                ss-in)
+                    gfw_diag_emit_port "SS2022" tcp "$port" sing-box
+                    gfw_diag_emit_port "SS2022" udp "$port" sing-box ;;
+                ss-shadowtls-in) gfw_diag_emit_port "ShadowTLS" tcp "$port" sing-box ;;
+                ss-shadowtls-udp) gfw_diag_emit_port "ShadowTLS" udp "$port" sing-box ;;
+            esac
+        done < <(jq -r '.inbounds[]? | select(.tag=="ss-in" or .tag=="ss-shadowtls-in" or .tag=="ss-shadowtls-udp") | [.tag, (.listen_port // 0 | tostring)] | @tsv' "$SINGBOX_CONF" 2>/dev/null)
+    fi
+    if [[ -f "$XRAY_CONF" ]] && command -v jq >/dev/null 2>&1; then
+        while IFS= read -r port; do
+            gfw_diag_emit_port "VLESS Reality" tcp "$port" "$XRAY_SERVICE_NAME"
+        done < <(jq -r '.inbounds[]? | select(.protocol=="vless" and .tag=="vless-reality-in") | .port // empty' "$XRAY_CONF" 2>/dev/null)
+    fi
+    if [[ -f "$SNELL_CONF" ]]; then
+        port=$(snell_port_from_config 2>/dev/null || true)
+        gfw_diag_emit_port "Snell v5" tcp "$port" snell-v5
+    fi
+    if [[ -f "$SNELL6_CONF" ]]; then
+        port=$(awk -F'[: ]+' '/^[[:space:]]*listen[[:space:]]*=/{gsub(/[\[\]]/,"",$0);print $NF;exit}' "$SNELL6_CONF")
+        gfw_diag_emit_port "Snell v6" tcp "$port" "$SNELL6_SERVICE_NAME"
+    fi
+    if [[ -f "$HY2_CONF" && -f "$HY2_MANAGED_MARKER" ]] && command -v jq >/dev/null 2>&1; then
+        port=$(jq -r '.listen // "" | capture(":(?<port>[0-9]+)$").port // empty' "$HY2_CONF" 2>/dev/null || true)
+        gfw_diag_emit_port "Hysteria 2" udp "$port" "$HY2_SERVICE_NAME"
+    fi
+}
+gfw_diag_socket_status() {
+    local transport="$1" port="$2" sockets=""
+    gfw_diag_valid_port "$port" || { echo INVALID_PORT; return 0; }
+    command -v ss >/dev/null 2>&1 || { echo NO_SS; return 0; }
+    if [[ "$transport" == tcp ]]; then
+        sockets=$(ss -H -lnt 2>/dev/null) || { echo SS_ERROR; return 0; }
+    else
+        sockets=$(ss -H -lnu 2>/dev/null) || { echo SS_ERROR; return 0; }
+    fi
+    awk -v target="$port" '
+      {local_addr=$4; last=local_addr; sub(/^.*:/,"",last);
+       if (last==target) {
+           found=1;
+           if (local_addr !~ /^127[.]/ && local_addr !~ /^\[::1\]:/ &&
+               local_addr !~ /^::1:/) nonloop=1;
+       }}
+      END {
+          if (!found) print "NOT_LISTENING";
+          else if (nonloop) print "LISTEN_NON_LOOPBACK";
+          else print "LOOPBACK_ONLY";
+      }' <<<"$sockets"
+}
+gfw_diag_local_report() {
+    local name transport port service socket_state service_state count=0
+    echo "════ TCP / UDP 与全部代理协议：本机只读检查 ════"
+    while IFS=
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ 服务器测试管理 ════════════════════${PLAIN}"
+        echo "  1. IP 质量 / 风险测试"
+        echo "  2. IPv4 / IPv6 三网逐跳回程"
+        echo "  3. 平台流媒体AI通信软件解锁测试"
+        echo "  4. Google 测试（送中 / 澳门 / 拉回所在地）"
+        echo "  5. 代理协议 IPv6 出站 / 链式兼容性检查"
+        echo "  0. 返回"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-5]: " c
+        case "$c" in
+            1) test_ip_quality ;;
+            2) test_return_route ;;
+            3) test_platform_media_ai_communication_unlock ;;
+            4) google_test_management ;;
+            5) test_proxy_ipv6_egress; pause ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+
+# Experimental isolated Snell -> WARP IPv6 TCP bridge.
+# This is not transparent routing. Surge must point its chained SS2022
+# server to 127.0.0.1:<bridge-port> via underlying-proxy=<Snell>.
+snell_warp_bridge_config_json() {
+    local local_port="$1" remote_ip="$2" remote_port="$3" warp_port="$4"
+    jq -n --argjson local_port "$local_port" --arg ip "$remote_ip" --argjson remote_port "$remote_port" --argjson warp_port "$warp_port" '
+      {log:{level:"warn"},
+       inbounds:[{type:"direct",tag:"bridge-in",listen:"127.0.0.1",
+         listen_port:$local_port,network:"tcp",override_address:$ip,override_port:$remote_port}],
+       outbounds:[{type:"socks",tag:"warp-out",server:"127.0.0.1",
+         server_port:$warp_port,version:"5",network:"tcp"}],
+       route:{final:"warp-out"}}'
+}
+
+snell_warp_bridge_owned() {
+    [[ -f "$SNELL_WARP_BRIDGE_MARKER" && -f "$SNELL_WARP_BRIDGE_SERVICE" ]] &&
+      grep -Fq "ExecStart=${SINGBOX_BIN} run -c ${SNELL_WARP_BRIDGE_CONF}" "$SNELL_WARP_BRIDGE_SERVICE"
+}
+
+snell_warp_bridge_show() {
+    if ! snell_warp_bridge_owned || [[ ! -f "$SNELL_WARP_BRIDGE_CONF" ]]; then
+        echo "尚未部署本工具箱管理的独立桥接。"
+        return 0
+    fi
+    local local_port remote_ip remote_port
+    local_port=$(jq -r '.inbounds[0].listen_port' "$SNELL_WARP_BRIDGE_CONF")
+    remote_ip=$(jq -r '.inbounds[0].override_address' "$SNELL_WARP_BRIDGE_CONF")
+    remote_port=$(jq -r '.inbounds[0].override_port' "$SNELL_WARP_BRIDGE_CONF")
+    if service_is_active "$SNELL_WARP_BRIDGE_SERVICE_NAME"; then
+        echo "桥接服务: 运行中"
+    else
+        echo "桥接服务: 未运行"
+    fi
+    echo "本机 TCP: 127.0.0.1:${local_port} → WARP SOCKS5 → [${remote_ip}]:${remote_port}"
+    echo "Surge: 保留原有 Snell，新增一条 SS2022 策略（沿用原加密算法/密钥）："
+    echo "SS2022-WARP = ss, 127.0.0.1, ${local_port}, encrypt-method=<原方法>, password=<原密钥>, underlying-proxy=<Snell策略名>, udp-relay=false"
+    echo "[警告] 只有使用 underlying-proxy=Snell 的 SS2022-WARP 策略才可连接此 VPS 本地端口。"
+    echo "[范围] 仅 TCP；原 Snell 和原 SS2022 配置均不修改。"
+}
+
+snell_warp_bridge_remove() {
+    if ! snell_warp_bridge_owned; then
+        echo "STOP: 不属于本工具箱的服务，拒绝删除。"
+        return 1
+    fi
+    service_disable_now "$SNELL_WARP_BRIDGE_SERVICE_NAME"
+    rm -f -- "$SNELL_WARP_BRIDGE_CONF" "$SNELL_WARP_BRIDGE_SERVICE" "$SNELL_WARP_BRIDGE_MARKER"
+    rmdir "$SNELL_WARP_BRIDGE_CONF_DIR" 2>/dev/null || true
+    service_daemon_reload || true
+    echo "✔ 独立 TCP 桥接已删除；没有修改 Snell/WARP/SS2022。"
+}
+
+snell_warp_bridge_deploy() {
+    local remote_ip remote_port local_port warp_port candidate
+    [[ "$PLATFORM_INIT" == "systemd" ]] || {
+        echo "STOP: 当前只支持 Debian/Ubuntu + systemd。"; return 1;
+    }
+    [[ -f "$SNELL_CONF" ]] && service_is_active snell-v5 || {
+        echo "STOP: Snell v5 前置尚未运行。"; return 1;
+    }
+    [[ -x "$SINGBOX_BIN" ]] || {
+        echo "STOP: 缺少 sing-box 核心。不会安装或覆盖已有代理核心。"; return 1;
+    }
+    if [[ -e "$SNELL_WARP_BRIDGE_CONF" || -e "$SNELL_WARP_BRIDGE_SERVICE" ||
+          -e "$SNELL_WARP_BRIDGE_MARKER" || -e "$SNELL_WARP_BRIDGE_CONF_DIR" ]]; then
+        echo "STOP: 桥接文件或同名服务已存在，为保护现有资源拒绝覆盖。"
+        snell_warp_bridge_show
+        return 1
+    fi
+    warp_proxy_ready && warp_family_allowed ipv6 && warp_test_family ipv6 >/dev/null 2>&1 || {
+        echo "STOP: WARP IPv6 Local Proxy 未就绪。"; return 1;
+    }
+    warp_port=$(warp_proxy_port)
+    read -rp "SS2022 落地 IPv6（不含方括号）: " remote_ip || return 1
+    [[ "$remote_ip" =~ ^[0-9a-fA-F:]+$ && "$remote_ip" == *:* ]] || {
+        echo "STOP: 不是 IPv6 地址。"; return 1;
+    }
+    read -rp "SS2022 落地 TCP 端口 [10000]: " remote_port || return 1
+    remote_port=${remote_port:-10000}
+    validate_port_number "$remote_port" || { echo "STOP: 端口不合法。"; return 1; }
+    read -rp "本地仅回环监听 TCP 端口 [16001]: " local_port || return 1
+    local_port=${local_port:-16001}
+    validate_port_number "$local_port" || { echo "STOP: 端口不合法。"; return 1; }
+    if ss -H -ltn 2>/dev/null | awk -v p=":$local_port" '$4 ~ p"$" {found=1} END{exit !found}'; then
+        echo "STOP: 本地端口被占用，未修改任何服务。"; return 1
+    fi
+    ensure_singbox_user || return 1
+    install -d -o root -g "$SINGBOX_GROUP" -m 750 "$SNELL_WARP_BRIDGE_CONF_DIR" || return 1
+    candidate=$(mktemp "$SNELL_WARP_BRIDGE_CONF_DIR/.candidate.XXXXXX") || return 1
+    if ! snell_warp_bridge_config_json "$local_port" "$remote_ip" "$remote_port" "$warp_port" > "$candidate" ||
+       ! "$SINGBOX_BIN" check -c "$candidate"; then
+        rm -f -- "$candidate"
+        rmdir "$SNELL_WARP_BRIDGE_CONF_DIR" 2>/dev/null || true
+        echo "STOP: 新桥接 sing-box 配置校验失败，没有修改旧服务。"
+        return 1
+    fi
+    if ! chown root:"$SINGBOX_GROUP" "$candidate" || ! chmod 640 "$candidate" ||
+       ! mv -- "$candidate" "$SNELL_WARP_BRIDGE_CONF"; then
+        rm -f -- "$candidate" "$SNELL_WARP_BRIDGE_CONF"
+        rmdir "$SNELL_WARP_BRIDGE_CONF_DIR" 2>/dev/null || true
+        echo "STOP: 候选配置写入失败。"; return 1
+    fi
+    cat > "$SNELL_WARP_BRIDGE_SERVICE" <<SERVICE
+[Unit]
+Description=vps-bootstrap Snell-WARP IPv6 loopback TCP bridge
+After=network-online.target warp-svc.service
+Wants=network-online.target
+[Service]
+Type=simple
+User=sing-box
+Group=sing-box
+ExecStart=${SINGBOX_BIN} run -c ${SNELL_WARP_BRIDGE_CONF}
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+[Install]
+WantedBy=multi-user.target
+SERVICE
+    chmod 644 "$SNELL_WARP_BRIDGE_SERVICE" || return 1
+    printf 'v1\n' > "$SNELL_WARP_BRIDGE_MARKER"
+    chmod 600 "$SNELL_WARP_BRIDGE_MARKER"
+    if ! service_daemon_reload || ! service_enable_now "$SNELL_WARP_BRIDGE_SERVICE_NAME"; then
+        echo "STOP: 新桥接服务启动失败，回滚独立资源。"
+        snell_warp_bridge_remove || true
+        return 1
+    fi
+    sleep 1
+    if ! service_is_active "$SNELL_WARP_BRIDGE_SERVICE_NAME" ||
+       ! ss -H -ltn 2>/dev/null | awk -v p=":$local_port" '$4 ~ p"$" {found=1} END{exit !found}'; then
+        echo "STOP: 桥接未保持监听，回滚独立资源。"
+        snell_warp_bridge_remove || true
+        return 1
+    fi
+    snell_warp_bridge_show
+    echo "[验收] 请在 Surge 对新增 TCP 链式 SS2022 节点进行实测。"
+}
+
+snell_warp_bridge_menu() {
+    local choice
+    while true; do
+        echo "══════ Snell v5 → WARP IPv6 TCP 桥接 ══════"
+        echo "旧版按落地 IP/端口绑定，已由菜单 16 的 Snell 通用 IPv6 出站取代。"
+        echo "1. 查看旧版桥接及 Surge 配置"
+        echo "2. 卸载旧版桥接"
+        echo "0. 返回"
+        read -rp "请选择 [0-2]: " choice || return
+        case "$choice" in
+            1) snell_warp_bridge_show; pause ;;
+            2) read -rp "确认仅删除旧版桥接？[y/N]: " choice
+               [[ "$choice" =~ ^[Yy]$ ]] && snell_warp_bridge_remove
+               pause ;;
+            0) return ;;
+            *) echo "输入无效" ;;
+        esac
+    done
+}
+
+
+# Snell-specific IPv6 TCP path via WARP Local SOCKS5. No global auto_route.
+snell_warp_uid_config_json() {
+    local warp_port="$1"
+    jq -n --argjson port "$warp_port" '{
+      log:{level:"warn"},
+      inbounds:[{type:"tun",tag:"snell-warp-in",interface_name:"swipv6tun",
+        address:["fd7e:5e11:2022::1/64"],mtu:1400,
+        auto_route:false,auto_redirect:false,stack:"system"}],
+      outbounds:[{type:"socks",tag:"warp-v6",server:"127.0.0.1",
+        server_port:$port,version:"5",network:"tcp"}],
+      route:{final:"warp-v6"}}'
+}
+
+snell_warp_uid_owned() {
+    [[ -f "$SNELL_WARP_UID_MARKER" && -f "$SNELL_WARP_UID_SERVICE" ]] &&
+        grep -Fq "ExecStart=$SINGBOX_BIN run -c $SNELL_WARP_UID_CONF" "$SNELL_WARP_UID_SERVICE"
+}
+
+snell_warp_uid_show() {
+    echo "===== Snell v5 → WARP 专用 IPv6 TCP 出站 ====="
+    if ! snell_warp_uid_owned; then
+        echo "状态: 未部署"; return 0
+    fi
+    if service_is_active "$SNELL_WARP_UID_SERVICE_NAME"; then
+        echo "独立 TUN: RUNNING"
+    else
+        echo "独立 TUN: NOT_RUNNING"
+    fi
+    echo "仅匹配 Snell UID 的公网 IPv6 TCP，其他流量保持原状。"
+    echo "WARP: 127.0.0.1:$(warp_proxy_port)"
+    ip -6 rule show 2>/dev/null | grep '^16381:' || true
+    ip -6 route show table 16381 2>/dev/null || true
+    sed -nE '/^[[:space:]]*ipv6[[:space:]]*=/p' "$SNELL_CONF" 2>/dev/null | head -1
+    echo "Surge 不需要配置专属桥接端口；IPv6 UDP/QUIC 不支持。"
+}
+
+snell_warp_uid_restore() {
+    local expected actual
+    [[ -f "$SNELL_WARP_UID_BACKUP" ]] || return 0
+    if [[ ! -f "$SNELL_WARP_UID_ACTIVE_SHA" ]]; then
+        # Interrupted during install: never discard a valid original backup.
+        # If Snell is still byte-identical, no restart or restore is needed.
+        if cmp -s "$SNELL_WARP_UID_BACKUP" "$SNELL_CONF"; then
+            rm -f "$SNELL_WARP_UID_BACKUP"
+            return 0
+        fi
+        # Otherwise accept ONLY the deterministic ipv6=false -> true candidate.
+        # Reject later user edits even when the active checksum was never written.
+        expected=$(sed -E 's/^([[:space:]]*ipv6[[:space:]]*=[[:space:]]*)false([[:space:]]*)$/\1true\2/' "$SNELL_WARP_UID_BACKUP" | sha256sum | awk '{print $1}')
+        actual=$(sha256sum "$SNELL_CONF" | awk '{print $1}')
+        [[ "$expected" == "$actual" ]] || {
+            echo "STOP: Snell 当前配置与原始备份和安装候选均不同，拒绝覆盖。"
+            return 1
+        }
+        printf '%s\n' "$expected" > "$SNELL_WARP_UID_ACTIVE_SHA"
+        chmod 600 "$SNELL_WARP_UID_ACTIVE_SHA"
+    fi
+    expected=$(cat "$SNELL_WARP_UID_ACTIVE_SHA")
+    actual=$(sha256sum "$SNELL_CONF" | awk '{print $1}')
+    [[ "$actual" == "$expected" ]] || {
+        echo "STOP: Snell 已被后续修改，拒绝覆盖；备份保留在 $SNELL_WARP_UID_BACKUP。"
+        return 1
+    }
+    cp -a "$SNELL_WARP_UID_BACKUP" "$SNELL_CONF" || return 1
+    if ! service_restart snell-v5 || ! service_is_active snell-v5; then
+        echo "STOP: Snell 原配置已写回，但服务未恢复；独立出站保持运行供人工检查。"
+        return 1
+    fi
+    rm -f "$SNELL_WARP_UID_BACKUP" "$SNELL_WARP_UID_ACTIVE_SHA"
+}
+
+snell_warp_uid_remove() {
+    snell_warp_uid_owned || { echo "STOP: 未托管的服务不允许删除。"; return 1; }
+    snell_warp_uid_restore || return 1
+    service_disable_now "$SNELL_WARP_UID_SERVICE_NAME"
+    service_is_active "$SNELL_WARP_UID_SERVICE_NAME" && {
+        echo "STOP: 独立服务未成功停止。"; return 1;
+    }
+    # Preserve ownership evidence if systemd's scoped ExecStopPost cleanup failed.
+    # Never remove a rule or route belonging to another owner.
+    local uid current_rule
+    uid=$(id -u snell 2>/dev/null) || uid=""
+    current_rule=$(ip -6 rule show 2>/dev/null | grep '^16381:' || true)
+    if [[ -n "$current_rule" && -n "$uid" &&
+          "$current_rule" == *"uidrange $uid-$uid"* &&
+          "$current_rule" == *"ipproto tcp"* ]]; then
+        ip -6 rule del pref 16381 uidrange "$uid-$uid" ipproto tcp             to 2000::/3 lookup 16381 >/dev/null 2>&1 || true
+    fi
+    if ip -6 route show table 16381 2>/dev/null | grep -Eq '^2000::/3 dev swipv6tun([[:space:]]|$)'; then
+        ip -6 route del 2000::/3 dev swipv6tun table 16381 >/dev/null 2>&1 || true
+    fi
+    if ip -6 rule show 2>/dev/null | grep -q '^16381:' ||
+       [[ -n "$(ip -6 route show table 16381 2>/dev/null)" ]]; then
+        echo "STOP: 专用策略路由仍有残留；保留 ownership 和服务文件供排查。"
+        return 1
+    fi
+    rm -f "$SNELL_WARP_UID_CONF" "$SNELL_WARP_UID_SERVICE" "$SNELL_WARP_UID_MARKER"
+    rmdir "$SNELL_WARP_UID_DIR" 2>/dev/null || true
+    service_daemon_reload || true
+    echo "PASS: Snell 专用 IPv6 出站及策略路由已卸载。"
+}
+
+snell_warp_uid_deploy() {
+    local uid warp_port flag confirm="" candidate="" ipbin="" snell_temp="" sha=""
+    [[ "$PLATFORM_INIT" == "systemd" ]] || {
+        echo "STOP: 仅支持 Debian/Ubuntu systemd。"; return 1;
+    }
+    snell_is_project_managed && service_is_active snell-v5 &&
+        [[ -f "$SNELL_CONF" && -x "$SINGBOX_BIN" ]] || {
+        echo "STOP: 需要本工具箱管理的运行中 Snell v5 与现有 sing-box 核心。"; return 1;
+    }
+    command -v ip >/dev/null && command -v jq >/dev/null &&
+        [[ -c /dev/net/tun ]] || {
+        echo "STOP: 缺少 ip、jq 或 /dev/net/tun。"; return 1;
+    }
+    uid=$(id -u snell 2>/dev/null) || return 1
+    [[ "$uid" =~ ^[0-9]+$ && "$uid" -gt 0 ]] || return 1
+    [[ "$(systemctl show snell-v5 -p User --value 2>/dev/null)" == snell ]] || {
+        echo "STOP: Snell 服务 User 不是 snell，不能安全隔离路由。"; return 1;
+    }
+    [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" == 0 ]] || {
+        echo "STOP: 系统禁用了 IPv6，不修改 sysctl。"; return 1;
+    }
+    if [[ -e "$SNELL_WARP_UID_DIR" || -e "$SNELL_WARP_UID_SERVICE" ||
+          -e "$SNELL_WARP_UID_MARKER" ]] ||
+       ip link show dev swipv6tun >/dev/null 2>&1 ||
+       ip -6 rule show | grep -q '^16381:' ||
+       [[ -n "$(ip -6 route show table 16381)" ]]; then
+        echo "STOP: 服务/TUN/策略路由表已存在，不覆盖。"; return 1;
+    fi
+    warp_proxy_ready && warp_family_allowed ipv6 &&
+        warp_test_family ipv6 >/dev/null 2>&1 || {
+        echo "STOP: WARP IPv6 SOCKS5 不可用。"; return 1;
+    }
+    flag=$(sed -nE 's/^[[:space:]]*ipv6[[:space:]]*=[[:space:]]*(true|false)[[:space:]]*$/\1/p' "$SNELL_CONF" | head -1)
+    [[ "$flag" == true || "$flag" == false ]] || {
+        echo "STOP: Snell ipv6 配置不可识别。"; return 1;
+    }
+    echo "范围: Snell UID $uid 的公网 IPv6 TCP → WARP，IPv4/SSH/其他服务不变。"
+    [[ "$flag" == false ]] && echo "Snell ipv6=false：会备份原配置并重启 Snell 一次，现有连接可能短暂中断。"
+    read -rp "确认部署并接受可能的短暂断连？输入 YES: " confirm || return 1
+    [[ "$confirm" == YES ]] || { echo "已取消。"; return 0; }
+
+    warp_port=$(warp_proxy_port)
+    ipbin=$(command -v ip)
+    install -d -m 700 "$SNELL_WARP_UID_DIR" || return 1
+    candidate=$(mktemp "$SNELL_WARP_UID_DIR/.new.XXXXXX") || return 1
+    if ! snell_warp_uid_config_json "$warp_port" > "$candidate" ||
+       ! "$SINGBOX_BIN" check -c "$candidate"; then
+        rm -f "$candidate"; rmdir "$SNELL_WARP_UID_DIR" 2>/dev/null || true
+        echo "STOP: sing-box 配置校验失败，未改现有服务。"; return 1;
+    fi
+    mv "$candidate" "$SNELL_WARP_UID_CONF" || return 1
+    chmod 600 "$SNELL_WARP_UID_CONF"
+    cat > "$SNELL_WARP_UID_SERVICE" <<SERVICE
+[Unit]
+Description=vps-bootstrap Snell UID-scoped WARP IPv6 TCP egress
+After=network-online.target warp-svc.service snell-v5.service
+Wants=network-online.target
+[Service]
+Type=exec
+ExecStart=$SINGBOX_BIN run -c $SNELL_WARP_UID_CONF
+ExecStartPost=/usr/bin/timeout 10 /bin/sh -c 'until $ipbin link show dev swipv6tun >/dev/null 2>&1; do sleep 0.2; done'
+ExecStartPost=$ipbin -6 route add 2000::/3 dev swipv6tun table 16381
+ExecStartPost=$ipbin -6 rule add pref 16381 uidrange $uid-$uid ipproto tcp to 2000::/3 lookup 16381
+ExecStopPost=-$ipbin -6 rule del pref 16381 uidrange $uid-$uid ipproto tcp to 2000::/3 lookup 16381
+ExecStopPost=-$ipbin -6 route del 2000::/3 dev swipv6tun table 16381
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+[Install]
+WantedBy=multi-user.target
+SERVICE
+    chmod 644 "$SNELL_WARP_UID_SERVICE"
+    printf 'v1\n' > "$SNELL_WARP_UID_MARKER"
+    chmod 600 "$SNELL_WARP_UID_MARKER"
+    if ! service_daemon_reload ||
+       ! service_enable_now "$SNELL_WARP_UID_SERVICE_NAME" ||
+       ! service_is_active "$SNELL_WARP_UID_SERVICE_NAME" ||
+       ! ip -6 rule show | grep -q '^16381:' ||
+       ! ip -6 route show table 16381 | grep -Fq 'dev swipv6tun'; then
+        echo "STOP: 独立 TUN 未启动，自动回滚。"
+        snell_warp_uid_remove || true
+        return 1
+    fi
+    # Verify kernel policy routing really resolves Snell's IPv6 TCP via this TUN.
+    # A failed lookup is not success even if the rule/table merely exist.
+    local snell_route other_route
+    snell_route=$(ip -6 route get 2606:4700:4700::1111 uid "$uid" ipproto tcp 2>&1) || snell_route=""
+    other_route=$(ip -6 route get 2606:4700:4700::1111 uid 0 ipproto tcp 2>&1) || other_route=""
+    if [[ "$snell_route" != *"dev swipv6tun"* ||
+          "$other_route" == *"dev swipv6tun"* ]]; then
+        echo "STOP: 内核 UID 路由隔离验收失败，清理独立 TUN；Snell 原配置未动。"
+        snell_warp_uid_remove || true
+        return 1
+    fi
+    if [[ "$flag" == false ]]; then
+        if ! cp -a "$SNELL_CONF" "$SNELL_WARP_UID_BACKUP"; then
+            snell_warp_uid_remove || true; return 1
+        fi
+        snell_temp=$(mktemp "$SNELL_CONF.swipv6.XXXXXX") || {
+            snell_warp_uid_remove || true; return 1;
+        }
+        sed -E 's/^([[:space:]]*ipv6[[:space:]]*=[[:space:]]*)false([[:space:]]*)$/\1true\2/'             "$SNELL_CONF" > "$snell_temp"
+        chown --reference="$SNELL_CONF" "$snell_temp"
+        chmod --reference="$SNELL_CONF" "$snell_temp"
+        mv "$snell_temp" "$SNELL_CONF"
+        sha=$(sha256sum "$SNELL_CONF" | awk '{print $1}')
+        printf '%s\n' "$sha" > "$SNELL_WARP_UID_ACTIVE_SHA"
+        chmod 600 "$SNELL_WARP_UID_ACTIVE_SHA"
+        if ! service_restart snell-v5 || ! service_is_active snell-v5; then
+            echo "STOP: Snell 重启失败，自动恢复原配置与路由。"
+            snell_warp_uid_remove || true
+            return 1
+        fi
+    fi
+    snell_warp_uid_show
+    echo "PASS: 出站策略已生效。请在 Surge 用原 Snell 链式测试多个 IPv6 TCP 落地。"
+    echo "注意：这是配置与路由验收，不代表 Surge 实际链式已验证。"
+}
+
+snell_warp_uid_menu() {
+    local choice=""
+    while true; do
+        echo "════ Snell 专用 WARP IPv6 TCP 自动出站（所有落地）════"
+        echo "1. 部署（必要时重启 Snell 一次）"
+        echo "2. 查看状态与路由"
+        echo "3. 卸载并恢复原 Snell 配置"
+        echo "0. 返回"
+        read -rp "请选择 [0-3]: " choice || return 0
+        case "$choice" in
+            1) snell_warp_uid_deploy; pause ;;
+            2) snell_warp_uid_show; pause ;;
+            3) read -rp "确定卸载？输入 YES: " choice
+               [[ "$choice" == YES ]] && snell_warp_uid_remove
+               pause ;;
+            0) return ;;
+            *) echo "无效输入" ;;
+        esac
+    done
+}
+
+protocol_operations_management() {
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ 协议运维管理 ════════════════════${PLAIN}"
+        echo "  1. 查看全部服务状态与监听端口"
+        echo "  2. 查看 sing-box 实时日志"
+        echo "  3. 查看 ss2022-xray 实时日志"
+        echo "  4. 查看 Snell v5 实时日志"
+        echo "  5. 查看 Realm 转发实时日志"
+        echo "  6. 重启 sing-box"
+        echo "  7. 重启 ss2022-xray"
+        echo "  8. 重启 Snell v5"
+        echo "  9. 重启 Realm 转发"
+        echo " 10. 查看 IPv6 Keepalive 状态"
+        echo " 11. 查看 Snell v6 日志"
+        echo " 12. 重启 Snell v6"
+        echo " 13. 查看 HY2 日志"
+        echo " 14. 重启 HY2"
+        echo " 15. 旧版 Snell 固定落地桥接（仅维护/卸载）"
+        echo " 16. Snell 专用 WARP IPv6 TCP 自动出站（推荐）"
+        echo "  0. 返回"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-16]: " c
+        case "$c" in
+            1) show_service_status; pause ;;
+            2) follow_service_log sing-box ;;
+            3) follow_service_log "$XRAY_SERVICE_NAME" ;;
+            4) follow_service_log snell-v5 ;;
+            5) follow_service_log "$REALM_SERVICE_NAME" ;;
+            6) restart_service_safe sing-box "sing-box"; pause ;;
+            7) restart_xray_safe; pause ;;
+            8) restart_service_safe snell-v5 "Snell v5"; pause ;;
+            9) restart_service_safe "$REALM_SERVICE_NAME" "Realm 转发"; pause ;;
+            11) follow_service_log "$SNELL6_SERVICE_NAME" ;;
+            12) restart_service_safe "$SNELL6_SERVICE_NAME" "Snell v6"; pause ;;
+            13) follow_service_log "$HY2_SERVICE_NAME" ;;
+            15) snell_warp_bridge_menu ;;
+            16) snell_warp_uid_menu ;;
+            14) if [[ -f "$HY2_CONF" && -f "$HY2_MANAGED_MARKER" ]]; then
+                    restart_service_safe "$HY2_SERVICE_NAME" "HY2"
+                else
+                    echo "[提示] HY2 尚未部署，不能通过重启创建节点。"
+                fi
+                pause ;;
+            10)
+                if service_is_active "$(keepalive_service_name)"; then
+                    echo "IPv6 Keepalive: Running"
+                    service_status_output "$(keepalive_service_name)" 2>/dev/null || true
+                else
+                    echo "IPv6 Keepalive: 未运行"
+                fi
+                pause
+                ;;
+            0) return ;;
+            *) sleep 1 ;;
+        esac
+    done
+}
+
+main() {
+    check_root
+    detect_platform || exit 1
+    if platform_is_alpine; then
+        echo "[v1.9.0] 已检测到 Alpine / OpenRC；核心协议、服务管理、服务器工具与测试已接入稳定支持范围。"
+        echo "[提示] Snell v5 官方二进制与 Cloudflare WARP 官方客户端暂不在 Alpine 开放。"
+    fi
+
+    # 兼容旧安装：已有 local-dns 缺少 prefer_go:true 时执行一次安全迁移。
+    # 失败不会覆盖旧配置，也不会阻断管理面板。
+    migrate_singbox_local_dns_prefer_go || true
+
+    while true; do
+        show_dashboard
+        echo "  1. 协议管理"
+        echo "  2. 分流管理"
+        echo "  3. 端口转发（Realm）"
+        echo "  4. 查看当前节点参数与客户端配置"
+        echo "  5. 协议运维管理"
+        echo "  6. 组件版本管理"
+        echo "  - - - - - - - - - - - - - - - -"
+        echo "  7. 服务器管理工具"
+        echo "  8. 服务器测试管理"
+        echo "  - - - - - - - - - - - - - - - -"
+        echo "  9. 检查脚本更新"
+        echo -e "${RED} 10. 完全卸载脚本${PLAIN}"
+        echo "  0. 退出管理面板"
+        echo -e "${CYAN}═════════════════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请输入选项编号 [0-10]: " choice
+
+        case "$choice" in
+            1) protocol_management ;;
+            2) routing_management ;;
+            3) forwarding_management ;;
+            4) view_config_menu ;;
+            5) protocol_operations_management ;;
+            6) component_version_management ;;
+            7) server_management_tools ;;
+            8) server_test_management ;;
+            9) check_script_update ;;
+            10) full_uninstall ;;
+            0)
+                echo "已安全退出。随时输入 ss2022 唤出！"
+                exit 0
+                ;;
+            *)
+                echo -e "${RED}请输入有效编号！${PLAIN}"
+                sleep 1
+                ;;
+        esac
+    done
+} 
+
+# CI / smoke test can load the function library without entering the interactive UI.
+# Normal users never need to set this variable.
+if [[ "${SS2022_LIB_ONLY:-0}" != "1" ]]; then
+    main
+fi
+
+\t' read -r name transport port service; do
+        [[ -n "$name" ]] || continue
+        ((count+=1))
+        socket_state=$(gfw_diag_socket_status "$transport" "$port")
+        if service_is_active "$service"; then service_state=ACTIVE
+        else service_state=INACTIVE_OR_UNKNOWN; fi
+        printf '%-15s %-3s %-5s 监听=%-20s 服务=%s\n' "$name" "$transport" "$port" "$socket_state" "$service_state"
+        case "$socket_state" in
+            NOT_LISTENING) echo "  [本机故障候选] 无监听，不应认定被墙。" ;;
+            LOOPBACK_ONLY) echo "  [本机受限] 仅回环监听，不是公网可达监听。" ;;
+            NO_SS|SS_ERROR) echo "  [未检测] 无法读取 socket 状态。" ;;
+        esac
+    done < <(gfw_diag_configured_ports)
+    ((count > 0)) || echo "未发现项目管理的代理协议；其他进程未扫描。"
+    echo "说明：监听正常≠大陆可达；UDP 必须经服务端真实响应验证；"
+    echo "VLESS/ShadowTLS/Snell/HY2 完整协议握手需真实客户端。"
+}
+gfw_diag_custom_port() {
+    local choice="" transport="" port=""
+    read -rp "传输层 [1 TCP / 2 UDP / 0 返回]: " choice || return 0
+    case "$choice" in 1) transport=tcp ;; 2) transport=udp ;; 0) return ;; *) echo "无效选项"; return ;; esac
+    read -rp "端口 [1-65535]: " port || return 0
+    gfw_diag_valid_port "$port" || { echo "端口无效"; return 0; }
+    echo "本机 $transport:$port = $(gfw_diag_socket_status "$transport" "$port")"
+    echo "仅是本机只读检测，不等于中国大陆入站连接。"
+}
+gfw_diagnostics_menu() {
+    local choice=""
+    while true; do
+        clear
+        echo "════ GFW / TCP / UDP 连通性诊断 ════"
+        echo "  1. 全部已部署协议 TCP / UDP 与服务检查"
+        echo "  2. 指定 TCP / UDP 端口"
+        echo "  0. 返回服务器测试管理"
+        read -rp "请选择 [0-2]: " choice || return 0
+        case "$choice" in
+            1) gfw_diag_local_report; pause ;;
+            2) gfw_diag_custom_port; pause ;;
+            0) return ;;
+            *) echo "无效选项"; sleep 1 ;;
+        esac
+    done
+}
+
+server_test_management() {
+    while true; do
+        clear
+        echo -e "${CYAN}════════════════════ 服务器测试管理 ════════════════════${PLAIN}"
+        echo "  1. IP 质量 / 风险测试"
+        echo "  2. IPv4 / IPv6 三网逐跳回程"
+        echo "  3. 平台流媒体AI通信软件解锁测试"
+        echo "  4. Google 测试（送中 / 澳门 / 拉回所在地）"
+        echo "  5. 代理协议 IPv6 出站 / 链式兼容性检查"
+        echo "  6. GFW / TCP / UDP 连通性诊断"
+        echo "  0. 返回"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
+        read -rp "请选择 [0-6]: " c
+        case "$c" in
+            1) test_ip_quality ;;
+            2) test_return_route ;;
+            3) test_platform_media_ai_communication_unlock ;;
+            4) google_test_management ;;
+            5) test_proxy_ipv6_egress; pause ;;
+            6) gfw_diagnostics_menu ;;
             0) return ;;
             *) sleep 1 ;;
         esac
