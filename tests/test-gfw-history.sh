@@ -19,6 +19,10 @@ gfw_diag_history_append 11.22.33.44 4 TCP 443 BOUND FAIL PASS CN_PATH_SUSPECT_NO
 jq -e '.source=="globalping" and .target=="11.22.33.44" and
        .family=="4" and .port=="443" and
        .verdict=="CN_PATH_SUSPECT_NOT_PROVEN_GFW"' "$file" >/dev/null
+gfw_diag_history_append 11.22.33.44 4 TCP 443 BOUND PASS PASS TCP_REACHABLE_FROM_CN \
+    中国电信 4134 TCP_CONNECTED_RTT_42.6ms
+jq -e 'select(.source=="globalping" and .carrier=="中国电信" and .asn=="4134" and .evidence=="TCP_CONNECTED_RTT_42.6ms")' "$file" >/dev/null
+[[ "$(gfw_diag_history_show)" == *'中国电信 AS4134 TCP_CONNECTED_RTT_42.6ms'* ]]
 for i in $(seq 1 55); do
     gfw_diag_history_append 11.22.33.44 4 UDP "$i" BOUND UNKNOWN PATH_ONLY UDP_PATH_ONLY
 done

@@ -13844,6 +13844,7 @@ gfw_diag_remote_target() {
 gfw_diag_history_append() {
     local target="$1" family="$2" proto="$3" port="$4" local_state="$5"
     local cn="$6" us="$7" verdict="$8" file="$STATE_DIR/gfw-diagnostics-history.jsonl"
+    local carrier="${9:-}" asn="${10:-}" evidence="${11:-}"
     local tmp="" entry=""
     [[ -L "$file" ]] && { echo "[历史记录] 拒绝写入符号链接" >&2; return 1; }
     [[ ! -e "$file" || -f "$file" ]] || return 1
@@ -13852,9 +13853,11 @@ gfw_diag_history_append() {
     entry=$(jq -cn --arg time "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
       --arg target "$target" --arg family "$family" --arg transport "$proto" \
       --arg port "$port" --arg local "$local_state" --arg cn "$cn" \
-      --arg us "$us" --arg verdict "$verdict" \
-      '{time:$time,source:"globalping",target:$target,family:$family,
-        transport:$transport,port:$port,local:$local,cn:$cn,us:$us,verdict:$verdict}') ||
+      --arg us "$us" --arg verdict "$verdict" --arg carrier "$carrier" \
+      --arg asn "$asn" --arg evidence "$evidence" \
+      '({time:$time,source:"globalping",target:$target,family:$family,
+        transport:$transport,port:$port,local:$local,cn:$cn,us:$us,verdict:$verdict}
+        + (if $carrier != "" then {carrier:$carrier,asn:$asn,evidence:$evidence} else {} end))') ||
         { rm -f "$tmp"; return 1; }
     if ! (umask 077; { [[ ! -f "$file" ]] || tail -n 49 "$file"; printf '%s\n' "$entry"; } > "$tmp"); then
         rm -f "$tmp"; return 1
@@ -13880,7 +13883,9 @@ gfw_diag_history_show() {
     echo "════ 最近 20 条外部探测记录（本地存储，非 GFW 封锁证明）════"
     tail -n 20 "$file" | jq -r '
       if type=="object" then
-        "\(.time // "未知") | IPv\(.family // "?") \(.target // "?"):\(.port // "?")/\(.transport // "?") | CN=\(.cn // "UNKNOWN") US=\(.us // "UNKNOWN") | \(.verdict // "INSUFFICIENT_EVIDENCE")"
+        "\(.time // "未知") | IPv\(.family // "?") \(.target // "?"):\(.port // "?")/\(.transport // "?")"
+        + (if (.carrier // "") != "" then " | \(.carrier) AS\(.asn) \(.evidence)" else "" end)
+        + " | CN=\(.cn // "UNKNOWN") US=\(.us // "UNKNOWN") | \(.verdict // "INSUFFICIENT_EVIDENCE")"
       else "记录格式异常" end' 2>/dev/null || echo "[提示] 历史文件部分记录无效。"
     echo "路径：$file（仅记录目标 IP、端口与检测结论，无节点密钥）"
 }
@@ -13888,9 +13893,22 @@ gfw_diag_history_show() {
 # The official Globalping /v1/probes endpoint reports live probe country and ASN.
 # Only measured, country-confirmed ASNs can count as mainland carrier coverage.
 gfw_diag_probe_inventory() {
-    curl -fsS --compressed --connect-timeout 5 --max-time 12 \
+    local probes="" rc=0
+    if probes=$(curl -fsS --compressed --connect-timeout 5 --max-time 12 \
         -H 'User-Agent: vps-bootstrap-gfw-diagnostics/1.0' \
-        -H 'Accept: application/json' https://api.globalping.io/v1/probes
+        -H 'Accept: application/json' https://api.globalping.io/v1/probes 2>/dev/null); then
+        printf '%s' "$probes"; return 0
+    else
+        rc=$?
+        case "$rc" in
+            6) echo "PROBE_API_DNS_FAILURE：VPS 无法解析 api.globalping.io" >&2 ;;
+            7) echo "PROBE_API_CONNECT_FAILURE：VPS 无法连接 Globalping" >&2 ;;
+            28) echo "PROBE_API_TIMEOUT：连接 Globalping 超时" >&2 ;;
+            22) echo "PROBE_API_HTTP_ERROR：获取清单被 API 拒绝" >&2 ;;
+            *) echo "PROBE_API_ERROR：curl 退出码 $rc" >&2 ;;
+        esac
+        return 1
+    fi
 }
 
 gfw_diag_carrier_asn() {
@@ -13916,6 +13934,7 @@ gfw_diag_carrier_asn() {
 gfw_diag_trinet_auto() {
     local target confirmation inventory carrier label asn port name proto service state
     local cn us seen="|" carriers=(TELECOM UNICOM MOBILE) found=0
+    local carrier_records=() record hist_label hist_asn hist_status hist_evidence verdict
     command -v jq >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 || {
         echo "[错误] 缺少 curl/jq；不自动安装。"; return 1;
     }
@@ -13936,6 +13955,7 @@ gfw_diag_trinet_auto() {
         [[ "$proto" == TCP ]] || continue
         [[ "$seen" == *"|$port|"* ]] && continue
         seen="${seen}$port|"; found=1
+        carrier_records=()
         state=$(gfw_diag_listener_status "$proto" "$port")
         printf '\n[%s] %s:%s TCP 本机=%s\n' "$name" "$target" "$port" "$state"
         if [[ "$state" != BOUND ]]; then
@@ -13950,9 +13970,17 @@ gfw_diag_trinet_auto() {
             fi
             cn=$(gfw_diag_globalping_detailed "$target" "$port" CN 4 TCP "$asn")
             printf '  %-10s %-8s CN / AS%s | %s\n' "$label" "${cn%%|*}" "$asn" "${cn#*|}"
+            carrier_records+=("$label|$asn|${cn%%|*}|${cn#*|}")
         done
         us=$(gfw_diag_globalping_detailed "$target" "$port" US 4 TCP)
         printf '  %-10s %-8s US | %s\n' "美国对照" "${us%%|*}" "${us#*|}"
+        for record in "${carrier_records[@]}"; do
+            IFS='|' read -r hist_label hist_asn hist_status hist_evidence <<<"$record"
+            verdict=$(gfw_diag_tcp_verdict "$state" "$hist_status" "${us%%|*}")
+            gfw_diag_history_append "$target" 4 TCP "$port" "$state" "$hist_status" "${us%%|*}" "$verdict" \
+                "$hist_label" "$hist_asn" "$hist_evidence" || \
+                echo "  [提示] 三网历史写入失败；本次探测结果不受影响。"
+        done
         echo "  说明：只有 PASS 证明该探针 TCP 可建连；FAIL 可能是路由、防火墙或阻断，不可单凭本次认定 GFW。"
     done < <(gfw_diag_ports)
     [[ "$found" == 1 ]] || echo "没有已部署 TCP 协议端口。"
