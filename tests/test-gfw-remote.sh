@@ -8,6 +8,8 @@ source ./ss2022.sh
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
+STATE_DIR="$tmp/state"
+mkdir -p "$STATE_DIR"
 payload=$(gfw_diag_payload 11.22.33.44 443 CN 4 TCP)
 jq -e '.type=="ping" and .target=="11.22.33.44" and
        .locations[0].country=="CN" and .locations[0].limit==1 and
@@ -55,6 +57,12 @@ curl() {
                 *) printf '{"id":"abcDEF123456"}\nHTTP_STATUS:202\n' ;;
             esac
             ;;
+        *'/v1/probes'*)
+            case "$MOCK_SCENARIO" in
+                api_dns_error) return 6 ;;
+                *) printf '[{"location":{"country":"CN","asn":4134}}]\n' ;;
+            esac
+            ;;
         *'/v1/measurements/abcDEF123456'*)
             case "$MOCK_SCENARIO" in
                 delayed) printf '{"status":"in-progress"}\nHTTP_STATUS:200\n' ;;
@@ -82,6 +90,15 @@ MOCK_SCENARIO=mismatch
 MOCK_SCENARIO=success
 [[ "$(gfw_diag_globalping_detailed 11.22.33.44 443 CN 4 TCP 4134)" == 'PASS|TCP_CONNECTED_RTT_42.6ms' ]]
 
+
+# API probe discovery distinguishes network failure from GFW blocking.
+MOCK_SCENARIO=api_dns_error
+if out=$(gfw_diag_probe_inventory 2>&1); then
+    echo 'FAIL: DNS-error probe inventory reported success'; exit 1
+fi
+[[ "$out" == *'PROBE_API_DNS_FAILURE'* ]]
+MOCK_SCENARIO=success
+jq -e '.[0].location.asn==4134' <<<"$(gfw_diag_probe_inventory)" >/dev/null
 
 # Refusing explicit consent must never invoke any external measurement.
 rm -f "$tmp/requests"
@@ -122,12 +139,16 @@ rm -f "$tmp/probe-calls"
 out=$(gfw_diag_trinet_auto <<< "$(printf '11.22.33.44\nNO\n')")
 [[ "$out" == *'取消；未发送任何目标信息'* ]]
 [[ ! -f "$tmp/probe-calls" ]]
+[[ ! -e "$STATE_DIR/gfw-diagnostics-history.jsonl" ]]
 out=$(gfw_diag_trinet_auto <<< "$(printf '11.22.33.44\nYES\n')")
 [[ "$out" == *'中国电信'*'PASS'*'AS4134'* ]]
 [[ "$out" == *'中国联通'*'PASS'*'AS4837'* ]]
 [[ "$out" == *'中国移动'*'FAIL'*'AS9808'* ]]
 [[ "$out" == *'美国对照'*'PASS'* ]]
 [[ -f "$tmp/probe-calls" ]]
+[[ "$(wc -l < "$STATE_DIR/gfw-diagnostics-history.jsonl")" -eq 3 ]]
+jq -e 'select(.carrier=="中国电信" and .asn=="4134" and .cn=="PASS" and .us=="PASS" and .evidence=="TCP_CONNECTED")' "$STATE_DIR/gfw-diagnostics-history.jsonl" >/dev/null
+[[ "$(stat -c '%a' "$STATE_DIR/gfw-diagnostics-history.jsonl")" == 600 ]]
 carrier_probes='[{"location":{"country":"US","asn":4134}}]'
 out=$(gfw_diag_trinet_auto <<< "$(printf '11.22.33.44\nYES\n')")
 [[ "$out" == *'NO_ONLINE_PROBE'* ]]
