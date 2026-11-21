@@ -552,7 +552,7 @@ SSH 端口修改采用安全方式：
 
 # 服务器测试管理
 
-当前服务器测试提供四个入口：
+当前服务器测试入口如下（均由主菜单 8「服务器测试管理」调用）：
 
 | 测试 | 使用项目 / 方式 |
 |---|---|
@@ -560,6 +560,16 @@ SSH 端口修改采用安全方式：
 | IPv4 / IPv6 三网逐跳回程 | nxtrace / NTrace-core（NextTrace 逐跳 traceroute） |
 | 平台流媒体AI通信软件解锁测试 | 流媒体：1-stream / RegionRestrictionCheck；AI：oneclickvirt / UnlockTests；通信：curl 可达性检测 |
 | Google 测试 | Google 搜索 IP 定位 / YouTube 地区辅助；澳门与所在地定位尝试 |
+| 代理 IPv6 出站 / 链式兼容性检查 | 只读查询协议出站配置和可选的落地 TCP 连接 |
+| GFW / TCP / UDP 连通性诊断 | 中国电信/联通/移动 ASN 远程测量、US 对照及本地监听 |
+| HTTPS 直连检测 | 百度 / Google 双栈 DNS + TCP + TLS + HTTP 结果；区分无 AAAA 与 DNS 故障 |
+
+
+## HTTPS 直连检测（IPv4 / IPv6）
+
+入口：`ss2022 → 8. 服务器测试管理 → 7. HTTPS 直连检测`。只对 `www.baidu.com`、`www.google.com` 执行固定目标的 DNS + HTTPS 检查，使用 `curl --noproxy '*'` 排除显式 HTTP 代理，但系统级 WARP / TUN 仍按现有路由工作。测试不会修改系统配置，也不会自动安装 `dig` 或 `curl`。
+
+当 DNS 返回 `NOERROR` 但只有 CNAME、没有最终 AAAA 时显示 `DNS=NOERROR AAAA=NONE` 和 `RESULT=SKIP (NO_AAAA_RECORD)`，而不是误报 VPS IPv6 故障。真实 SERVFAIL / NXDOMAIN / 查询超时按 DNS 故障处理；若有地址则尝试 TCP/TLS/HTTPS，显示 HTTP 状态码、TCP/TLS/总耗时和远端地址。HTTP 4xx/5xx 显示 WARN（站点响应失败，不等于 TCP 被 GFW 阻断）。
 
 ## Google 测试（v1.9.1-dev7）
 
