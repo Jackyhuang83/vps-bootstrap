@@ -1917,9 +1917,14 @@ prepare_dualstack_env() {
         ensure_time_sync || return 1
     fi
 
-    SERVER_HOST_V4="$ip4"
+    SERVER_HOST_V4=$(get_inbound_ipv4 2>/dev/null || true)
     SERVER_HOST_V6="$ip6"
-    echo -e "${GREEN}✔ 双栈入站环境可用：IPv4=${ip4} / IPv6=${ip6}${PLAIN}"
+    echo -e "${GREEN}✔ 双栈出站网络可用：出口 IPv4=${ip4} / 出口 IPv6=${ip6}${PLAIN}"
+    if [[ -n "$SERVER_HOST_V4" ]]; then
+        echo "  入站 IPv4 网卡候选：$SERVER_HOST_V4"
+    else
+        echo -e "${YELLOW}[提示] 未能唯一确认入站 IPv4（云 NAT / 多公网地址 / IPv4 未直接绑定）；部署节点时须填写真实入口 IP 或域名。${PLAIN}"
+    fi
     return 0
 }
 
@@ -2872,6 +2877,53 @@ get_public_ipv4() {
     return 1
 }
 
+# An IP-echo service measures outbound SNAT/WARP, never a proxy's inbound address.
+ipv4_is_public_unicast() {
+    local ip="${1:-}" a b c d
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS=. read -r a b c d <<<"$ip"
+    a=$((10#$a)); b=$((10#$b)); c=$((10#$c)); d=$((10#$d))
+    (( a >= 1 && a <= 223 && b <= 255 && c <= 255 && d <= 255 )) || return 1
+    (( a != 10 && a != 127 )) || return 1
+    (( a != 100 || b < 64 || b > 127 )) || return 1
+    (( a != 169 || b != 254 )) || return 1
+    (( a != 172 || b < 16 || b > 31 )) || return 1
+    (( a != 192 || b != 168 )) || return 1
+    (( a != 192 || b != 0 || c != 0 )) || return 1
+    (( a != 192 || b != 0 || c != 2 )) || return 1
+    (( a != 198 || (b != 18 && b != 19) )) || return 1
+    (( a != 198 || b != 51 || c != 100 )) || return 1
+    (( a != 203 || b != 0 || c != 113 )) || return 1
+    return 0
+}
+
+get_inbound_ipv4() {
+    local nic cidr address
+    local -a candidates=()
+    # A VPS behind cloud NAT, or one with multiple IPv4 addresses, needs explicit input.
+    while read -r nic cidr; do
+        case "${nic%%@*}" in
+            lo|wg*|tun*|tap*|warp*|WARP*|tailscale*|docker*|veth*|br-*) continue ;;
+        esac
+        address="${cidr%%/*}"
+        ipv4_is_public_unicast "$address" || continue
+        if [[ ! " ${candidates[*]} " == *" $address "* ]]; then
+            candidates+=("$address")
+        fi
+    done < <(ip -o -4 addr show scope global 2>/dev/null | awk '$3=="inet" {print $2, $4}')
+    (( ${#candidates[@]} == 1 )) || return 1
+    printf '%s' "${candidates[0]}"
+}
+
+warn_ingress_ipv4_mismatch() {
+    local saved="${1:-}" detected=""
+    ipv4_is_public_unicast "$saved" || return 0
+    detected=$(get_inbound_ipv4 2>/dev/null || true)
+    if [[ -n "$detected" && "$saved" != "$detected" ]]; then
+        echo -e "${YELLOW}[请核对] 节点保存的入口 IPv4=$saved；本机公网网卡候选=$detected。可能存在 NAT / 旧版误填出口 IP；不自动改写节点。${PLAIN}"
+    fi
+}
+
 get_public_ipv6() {
     local ip=""
     ip=$(curl -6fsS --connect-timeout 5 --max-time 10 https://api6.ipify.org 2>/dev/null) || true
@@ -2903,28 +2955,36 @@ ask_server_host() {
             SERVER_HOST_V6="$detected"
             ;;
         dual)
-            SERVER_HOST_V4=$(get_public_ipv4 2>/dev/null || true)
+            SERVER_HOST_V4=$(get_inbound_ipv4 2>/dev/null || true)
             SERVER_HOST_V6=$(get_public_ipv6 2>/dev/null || get_global_ipv6 2>/dev/null || true)
             detected="$SERVER_HOST_V4"
-            echo -e "${GREEN}检测到双栈公网地址：${PLAIN}"
+            echo -e "${GREEN}检测到双栈入站候选地址（网卡）：${PLAIN}"
             echo -e "  IPv4: ${CYAN}${SERVER_HOST_V4:-未检测到}${PLAIN}"
             echo -e "  IPv6: ${CYAN}${SERVER_HOST_V6:-未检测到}${PLAIN}"
             ;;
         *)
-            detected=$(get_public_ipv4 2>/dev/null || true)
+            detected=$(get_inbound_ipv4 2>/dev/null || true)
             SERVER_HOST_V4="$detected"
             ;;
     esac
 
     if [[ -n "$detected" ]]; then
+        echo "  自动候选来自本机网卡，不是 ipify/WARP 出口；若 VPS 使用 NAT，请按控制台实际入口地址覆盖。"
         read -rp "服务器地址/域名 [回车默认使用: ${detected}]: " input
         SERVER_HOST=${input:-$detected}
     else
         while [[ -z "$input" ]]; do
-            read -rp "自动获取公网地址失败，请输入服务器地址/域名: " input
+            echo -e "${YELLOW}[提示] 无法唯一确认本机入口 IPv4（可能是云 NAT 或多地址）；请使用 VPS 控制台分配的入口公网 IP/域名，切勿填写 WARP 出口 IP。${PLAIN}"
+            read -rp "请输入真实入站服务器地址/域名: " input
         done
         SERVER_HOST="$input"
     fi
+
+    # Preserve explicitly entered cloud-NAT/public hostname in dual-stack IPv4 exports.
+    case "$NETWORK_MODE" in
+        ipv6) SERVER_HOST_V6="$SERVER_HOST" ;;
+        *) SERVER_HOST_V4="$SERVER_HOST" ;;
+    esac
 }
 urlencode() {
     local value="$1"
@@ -3426,8 +3486,11 @@ update_ss2022() {
         add_json=$(jq -n --argjson a "$inbound" '[$a]')
         if update_singbox_inbounds "$excluded_tags" "$add_json"; then
             if [[ "$new_network" == "dual" ]]; then
-                SERVER_HOST_V4=$(get_public_ipv4 2>/dev/null || true)
-                SERVER_HOST_V6=$(get_public_ipv6 2>/dev/null || get_global_ipv6 2>/dev/null || true)
+                # Do not overwrite an explicitly saved NAT/cloud entry with a new guess.
+                SERVER_HOST_V4=$(get_mode_state_field "ss" "host_v4" 2>/dev/null || true)
+                [[ -n "$SERVER_HOST_V4" ]] || SERVER_HOST_V4=$(get_inbound_ipv4 2>/dev/null || true)
+                SERVER_HOST_V6=$(get_mode_state_field "ss" "host_v6" 2>/dev/null || true)
+                [[ -n "$SERVER_HOST_V6" ]] || SERVER_HOST_V6=$(get_public_ipv6 2>/dev/null || get_global_ipv6 2>/dev/null || true)
             else
                 SERVER_HOST_V4=""
                 SERVER_HOST_V6=""
@@ -3573,8 +3636,11 @@ update_shadowtls() {
 
         if update_singbox_inbounds "$excluded_tags" "$add_json"; then
             if [[ "$new_network" == "dual" ]]; then
-                SERVER_HOST_V4=$(get_public_ipv4 2>/dev/null || true)
-                SERVER_HOST_V6=$(get_public_ipv6 2>/dev/null || get_global_ipv6 2>/dev/null || true)
+                # Do not overwrite an explicitly saved NAT/cloud entry with a new guess.
+                SERVER_HOST_V4=$(get_mode_state_field "shadowtls" "host_v4" 2>/dev/null || true)
+                [[ -n "$SERVER_HOST_V4" ]] || SERVER_HOST_V4=$(get_inbound_ipv4 2>/dev/null || true)
+                SERVER_HOST_V6=$(get_mode_state_field "shadowtls" "host_v6" 2>/dev/null || true)
+                [[ -n "$SERVER_HOST_V6" ]] || SERVER_HOST_V6=$(get_public_ipv6 2>/dev/null || get_global_ipv6 2>/dev/null || true)
             else
                 SERVER_HOST_V4=""
                 SERVER_HOST_V6=""
@@ -4794,14 +4860,16 @@ view_ss2022_config() {
         if [[ "$listen" == "::" ]]; then
             host=$(get_global_ipv6 2>/dev/null || echo "请填写IPv6地址")
         else
-            host=$(get_public_ipv4 2>/dev/null || echo "请填写服务器地址")
+            host=$(get_inbound_ipv4 2>/dev/null || echo "请填写服务器地址")
         fi
     fi
     network=$(get_mode_state_field "ss" "network" 2>/dev/null || true)
     if [[ "$network" == "dual" ]]; then
-        host_v4=$(get_mode_state_field "ss" "host_v4" 2>/dev/null || get_public_ipv4 2>/dev/null || true)
+        host_v4=$(get_mode_state_field "ss" "host_v4" 2>/dev/null || get_inbound_ipv4 2>/dev/null || true)
         host_v6=$(get_mode_state_field "ss" "host_v6" 2>/dev/null || get_public_ipv6 2>/dev/null || get_global_ipv6 2>/dev/null || true)
     fi
+    warn_ingress_ipv4_mismatch "$host"
+    [[ -z "$host_v4" || "$host_v4" == "$host" ]] || warn_ingress_ipv4_mismatch "$host_v4"
     name=$(get_node_name "ss")
     show_ss_details "$host" "$port" "$method" "$pass" "$name" "$host_v4" "$host_v6"
 }
@@ -4831,14 +4899,16 @@ view_shadowtls_config() {
         if [[ "$listen" == "::" ]]; then
             host=$(get_global_ipv6 2>/dev/null || echo "请填写IPv6地址")
         else
-            host=$(get_public_ipv4 2>/dev/null || echo "请填写服务器地址")
+            host=$(get_inbound_ipv4 2>/dev/null || echo "请填写服务器地址")
         fi
     fi
     network=$(get_mode_state_field "shadowtls" "network" 2>/dev/null || true)
     if [[ "$network" == "dual" ]]; then
-        host_v4=$(get_mode_state_field "shadowtls" "host_v4" 2>/dev/null || get_public_ipv4 2>/dev/null || true)
+        host_v4=$(get_mode_state_field "shadowtls" "host_v4" 2>/dev/null || get_inbound_ipv4 2>/dev/null || true)
         host_v6=$(get_mode_state_field "shadowtls" "host_v6" 2>/dev/null || get_public_ipv6 2>/dev/null || get_global_ipv6 2>/dev/null || true)
     fi
+    warn_ingress_ipv4_mismatch "$host"
+    [[ -z "$host_v4" || "$host_v4" == "$host" ]] || warn_ingress_ipv4_mismatch "$host_v4"
     name=$(get_node_name "shadowtls")
     show_shadowtls_details "$host" "$port" "$method" "$ss_pass" "$stls_pass" "$sni" "$udp_enabled" "$udp_port" "$name" "$host_v4" "$host_v6"
 }
@@ -4868,7 +4938,14 @@ view_vless_config() {
         [[ -n "$public" ]] || public=$(printf '%s
 ' "$out" | awk -F': *' '/^Public key:/ {print $2; exit}')
     fi
-    if [[ -z "$host" ]]; then if [[ "$listen" == "::" ]]; then host=$(get_global_ipv6 2>/dev/null || echo "请填写IPv6地址"); else host=$(get_public_ipv4 2>/dev/null || echo "请填写服务器地址"); fi; fi
+    if [[ -z "$host" ]]; then
+        if [[ "$listen" == "::" ]]; then
+            host=$(get_global_ipv6 2>/dev/null || echo "请填写IPv6地址")
+        else
+            host=$(get_inbound_ipv4 2>/dev/null || echo "请填写服务器地址")
+        fi
+    fi
+    warn_ingress_ipv4_mismatch "$host"
     name=$(get_node_name "vless")
     show_vless_details "$host" "$port" "$uuid" "$sni" "$public" "$short_id" "$name"
 }
@@ -4890,9 +4967,10 @@ view_snell_config() {
         if [[ "$listen" == *"["* ]]; then
             host=$(get_global_ipv6 2>/dev/null || echo "请填写IPv6地址")
         else
-            host=$(get_public_ipv4 2>/dev/null || echo "请填写服务器地址")
+            host=$(get_inbound_ipv4 2>/dev/null || echo "请填写服务器地址")
         fi
     fi
+    warn_ingress_ipv4_mismatch "$host"
     name=$(get_node_name "snell")
     show_snell_details "$host" "$port" "$psk" "$name"
 }
