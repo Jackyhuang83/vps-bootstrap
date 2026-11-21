@@ -13793,10 +13793,12 @@ gfw_diag_payload() {
     if [[ "$transport" == TCP ]]; then
         jq -n --arg target "$target" --arg country "$country" --argjson port "$port" --argjson fam "$family" --argjson asn "$asn" \
             '{type:"ping",target:$target,locations:[({country:$country,limit:1} + (if $asn>0 then {asn:$asn} else {} end))],
+              timeout:10,
               measurementOptions:{protocol:"TCP",port:$port,packets:2,ipVersion:$fam}}'
     else
         jq -n --arg target "$target" --arg country "$country" --argjson port "$port" --argjson fam "$family" --argjson asn "$asn" \
             '{type:"mtr",target:$target,locations:[({country:$country,limit:1} + (if $asn>0 then {asn:$asn} else {} end))],
+              timeout:30,
               measurementOptions:{protocol:"UDP",port:$port,packets:2,ipVersion:$fam}}'
     fi
 }
@@ -13822,6 +13824,7 @@ gfw_diag_parse_measurement() {
 gfw_diag_globalping_detailed() {
     local target="$1" port="$2" country="$3" family="$4" transport="$5" asn="${6:-0}"
     local payload raw response code id status="" result="" reason="" rtt="" rc=0 i
+    local max_polls=12  # TCP: 10s probe timeout + at least 10s API finalization + margin
     payload=$(gfw_diag_payload "$target" "$port" "$country" "$family" "$transport" "$asn") ||
         { echo 'UNKNOWN|PAYLOAD_INVALID'; return 0; }
     if raw=$(curl -sS --compressed --connect-timeout 5 --max-time 12 \
@@ -13856,7 +13859,10 @@ gfw_diag_globalping_detailed() {
     id=$(jq -r '.id // empty' <<<"$response" 2>/dev/null || true)
     [[ "$id" =~ ^[A-Za-z0-9_-]{6,80}$ ]] ||
         { echo 'UNKNOWN|API_RESULT_MALFORMED'; return 0; }
-    for i in 1 2 3 4 5 6; do
+    # Official Globalping API: allow 10 extra seconds for finalization after probe timeout.
+    # TCP 10s + 12*2s polling; UDP 30s + 22*2s polling.
+    [[ "$transport" == UDP ]] && max_polls=22
+    for (( i=1; i<=max_polls; i++ )); do
         sleep 2
         if raw=$(curl -sS --compressed --connect-timeout 5 --max-time 12 \
             --write-out '\nHTTP_STATUS:%{http_code}' \

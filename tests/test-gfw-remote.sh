@@ -14,11 +14,11 @@ payload=$(gfw_diag_payload 11.22.33.44 443 CN 4 TCP)
 jq -e '.type=="ping" and .target=="11.22.33.44" and
        .locations[0].country=="CN" and .locations[0].limit==1 and
        .measurementOptions.protocol=="TCP" and
-       .measurementOptions.port==443 and .measurementOptions.ipVersion==4' <<<"$payload" >/dev/null
+       .measurementOptions.port==443 and .timeout==10 and .measurementOptions.ipVersion==4' <<<"$payload" >/dev/null
 payload=$(gfw_diag_payload '2001:4860::1' 44444 US 6 UDP)
 jq -e '.type=="mtr" and .locations[0].country=="US" and
        .measurementOptions.protocol=="UDP" and .measurementOptions.packets==2 and
-       .measurementOptions.port==44444 and .measurementOptions.ipVersion==6' <<<"$payload" >/dev/null
+       .measurementOptions.port==44444 and .timeout==30 and .measurementOptions.ipVersion==6' <<<"$payload" >/dev/null
 
 pass='{"status":"finished","results":[{"probe":{"country":"CN","asn":12345},"result":{"status":"finished","stats":{"rcv":2,"loss":0}}}]}'
 fail='{"status":"finished","results":[{"probe":{"country":"CN","asn":12345},"result":{"status":"finished","stats":{"rcv":0,"loss":100}}}]}'
@@ -65,7 +65,19 @@ curl() {
             ;;
         *'/v1/measurements/abcDEF123456'*)
             case "$MOCK_SCENARIO" in
-                delayed) printf '{"status":"in-progress"}\nHTTP_STATUS:200\n' ;;
+                delayed)
+                    printf 'poll\n' >> "$tmp/delayed_polls"
+                    printf '{"status":"in-progress"}\nHTTP_STATUS:200\n' ;;
+                delayed_then_success)
+                    count=$(cat "$tmp/polls" 2>/dev/null || echo 0)
+                    count=$(( count + 1 ))
+                    printf '%s\n' "$count" > "$tmp/polls"
+                    if (( count < 8 )); then
+                        printf '{"status":"in-progress"}\nHTTP_STATUS:200\n'
+                    else
+                        printf '{"status":"finished","results":[{"probe":{"country":"CN","asn":4134},"result":{"status":"finished","stats":{"rcv":2,"loss":0,"avg":77.5}}}]}\nHTTP_STATUS:200\n'
+                    fi
+                    ;;
                 mismatch) printf '{"status":"finished","results":[{"probe":{"country":"CN","asn":9999},"result":{"status":"finished","stats":{"rcv":2,"loss":0}}}]}\nHTTP_STATUS:200\n' ;;
                 *) printf '{"status":"finished","results":[{"probe":{"country":"CN","asn":4134},"result":{"status":"finished","stats":{"rcv":2,"loss":0,"avg":42.6}}}]}\nHTTP_STATUS:200\n' ;;
             esac
@@ -84,7 +96,17 @@ MOCK_SCENARIO=rate_limit
 MOCK_SCENARIO=api_dns_error
 [[ "$(gfw_diag_globalping_detailed 11.22.33.44 443 CN 4 TCP)" == 'UNKNOWN|API_DNS_FAILURE' ]]
 MOCK_SCENARIO=delayed
+rm -f "$tmp/delayed_polls"
 [[ "$(gfw_diag_globalping_detailed 11.22.33.44 443 CN 4 TCP)" == 'UNKNOWN|MEASUREMENT_TIMEOUT' ]]
+[[ "$(wc -l < "$tmp/delayed_polls")" -eq 12 ]]
+rm -f "$tmp/delayed_polls"
+[[ "$(gfw_diag_globalping_detailed 11.22.33.44 443 CN 4 UDP)" == 'UNKNOWN|MEASUREMENT_TIMEOUT' ]]
+[[ "$(wc -l < "$tmp/delayed_polls")" -eq 22 ]]
+MOCK_SCENARIO=delayed_then_success
+rm -f "$tmp/polls"
+[[ "$(gfw_diag_globalping_detailed 11.22.33.44 443 CN 4 TCP 4134)" == 'PASS|TCP_CONNECTED_RTT_77.5ms' ]]
+[[ "$(cat "$tmp/polls")" -eq 8 ]]
+
 MOCK_SCENARIO=mismatch
 [[ "$(gfw_diag_globalping_detailed 11.22.33.44 443 CN 4 TCP 4134)" == 'UNKNOWN|PROBE_RESULT_INCOMPLETE_OR_MISMATCH' ]]
 MOCK_SCENARIO=success
