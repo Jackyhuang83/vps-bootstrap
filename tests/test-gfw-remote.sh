@@ -14,8 +14,8 @@ jq -e '.type=="ping" and .target=="11.22.33.44" and
        .measurementOptions.protocol=="TCP" and
        .measurementOptions.port==443 and .measurementOptions.ipVersion==4' <<<"$payload" >/dev/null
 payload=$(gfw_diag_payload '2001:4860::1' 44444 US 6 UDP)
-jq -e '.type=="traceroute" and .locations[0].country=="US" and
-       .measurementOptions.protocol=="UDP" and
+jq -e '.type=="mtr" and .locations[0].country=="US" and
+       .measurementOptions.protocol=="UDP" and .measurementOptions.packets==2 and
        .measurementOptions.port==44444 and .measurementOptions.ipVersion==6' <<<"$payload" >/dev/null
 
 pass='{"status":"finished","results":[{"probe":{"country":"CN","asn":12345},"result":{"status":"finished","stats":{"rcv":2,"loss":0}}}]}'

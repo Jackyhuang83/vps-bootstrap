@@ -3551,7 +3551,7 @@ update_shadowtls() {
         echo "  7. 重新生成 ShadowTLS 密码"
         echo "  8. 查看当前节点配置"
         echo "  0. 返回"
-        read -rp "请选择 [0-8]: " choice
+        read -rp "请选择 [0-9]: " choice
 
         new_port="$current_port"; new_method="$current_method"; new_ss_key="$current_ss_key"
         new_stls_pass="$current_stls_pass"; new_sni="$current_sni"; new_listen="$current_listen"
@@ -13692,8 +13692,8 @@ gfw_diag_payload() {
               measurementOptions:{protocol:"TCP",port:$port,packets:2,ipVersion:$fam}}'
     else
         jq -n --arg target "$target" --arg country "$country" --argjson port "$port" --argjson fam "$family" \
-            '{type:"traceroute",target:$target,locations:[{country:$country,limit:1}],
-              measurementOptions:{protocol:"UDP",port:$port,ipVersion:$fam}}'
+            '{type:"mtr",target:$target,locations:[{country:$country,limit:1}],
+              measurementOptions:{protocol:"UDP",port:$port,packets:2,ipVersion:$fam}}'
     fi
 }
 
@@ -13767,6 +13767,67 @@ gfw_diag_remote_target() {
     printf '%s' "$input"
 }
 
+# Only records explicitly authorized measurements. No UUIDs, keys or proxy credentials.
+gfw_diag_history_append() {
+    local target="$1" family="$2" proto="$3" port="$4" local_state="$5"
+    local cn="$6" us="$7" verdict="$8" file="$STATE_DIR/gfw-diagnostics-history.jsonl"
+    local tmp="" entry=""
+    [[ -L "$file" ]] && { echo "[历史记录] 拒绝写入符号链接" >&2; return 1; }
+    [[ ! -e "$file" || -f "$file" ]] || return 1
+    mkdir -p "$STATE_DIR" || return 1
+    tmp=$(mktemp "$STATE_DIR/.gfw-history.XXXXXX") || return 1
+    entry=$(jq -cn --arg time "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+      --arg target "$target" --arg family "$family" --arg transport "$proto" \
+      --arg port "$port" --arg local "$local_state" --arg cn "$cn" \
+      --arg us "$us" --arg verdict "$verdict" \
+      '{time:$time,source:"globalping",target:$target,family:$family,
+        transport:$transport,port:$port,local:$local,cn:$cn,us:$us,verdict:$verdict}') ||
+        { rm -f "$tmp"; return 1; }
+    if ! (umask 077; { [[ ! -f "$file" ]] || tail -n 49 "$file"; printf '%s\n' "$entry"; } > "$tmp"); then
+        rm -f "$tmp"; return 1
+    fi
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+}
+
+gfw_diag_history_clear() {
+    local file="$STATE_DIR/gfw-diagnostics-history.jsonl" confirm=""
+    [[ -L "$file" ]] && { echo "[拒绝] 历史路径是符号链接。"; return 1; }
+    [[ -f "$file" ]] || { echo "尚无检测历史。"; return 0; }
+    read -rp "仅删除本工具箱的 GFW 诊断历史，输入 DELETE 确认: " confirm || return 1
+    if [[ "$confirm" != DELETE ]]; then echo "取消删除。"; return 0; fi
+    rm -f -- "$file" && echo "✔ 已删除本地 GFW 诊断历史；代理服务及网络配置未改变。"
+}
+
+gfw_diag_history_show() {
+    local file="$STATE_DIR/gfw-diagnostics-history.jsonl"
+    if [[ ! -f "$file" || -L "$file" ]]; then
+        echo "暂无本工具箱保存的检测记录。"; return 0
+    fi
+    echo "════ 最近 20 条外部探测记录（本地存储，非 GFW 封锁证明）════"
+    tail -n 20 "$file" | jq -r '
+      if type=="object" then
+        "\(.time // "未知") | IPv\(.family // "?") \(.target // "?"):\(.port // "?")/\(.transport // "?") | CN=\(.cn // "UNKNOWN") US=\(.us // "UNKNOWN") | \(.verdict // "INSUFFICIENT_EVIDENCE")"
+      else "记录格式异常" end' 2>/dev/null || echo "[提示] 历史文件部分记录无效。"
+    echo "路径：$file（仅记录目标 IP、端口与检测结论，无节点密钥）"
+}
+
+gfw_diag_trinet_links() {
+    local target="" name proto port service seen="|" any=0
+    target=$(gfw_diag_remote_target 4) || return 1
+    echo "════ 中国电信 / 联通 / 移动 TCP 复核入口 ════"
+    echo "ITDOG: https://www.itdog.cn/tcping/"
+    while IFS='|' read -r name proto port service; do
+        [[ "$proto" == TCP ]] || continue
+        [[ "$seen" == *"|$port|"* ]] && continue
+        seen="$seen$port|"; any=1
+        printf ' %-17s https://www.itdog.cn/tcping/%s:%s\n' "$name" "$target" "$port"
+    done < <(gfw_diag_ports)
+    [[ "$any" == 1 ]] || echo "没有本工具箱管理的 TCP 监听端口。"
+    echo "请分别查看电信、联通、移动测点和海外对照；第三方网页可能需要手动输入端口。"
+    echo "此功能只生成链接，不伪造三网测量结果，也不会上传或保存节点凭据。"
+}
+
 gfw_diag_remote_scan() {
     local family="$1" wanted="$2" target confirmation name proto port service local_state cn us
     local seen="|" found=0 verdict
@@ -13798,9 +13859,16 @@ gfw_diag_remote_scan() {
             verdict=$(gfw_diag_tcp_verdict "$local_state" "$cn" "$us")
             echo "  $verdict"
         else
-            echo "  UDP_PATH_ONLY: traceroute 不能证明 HY2/SS2022 UDP 握手成功或被封。"
+            if [[ "$cn" == PATH_ONLY || "$us" == PATH_ONLY ]]; then
+                verdict=UDP_PATH_ONLY
+            else
+                verdict=INSUFFICIENT_EVIDENCE
+            fi
+            echo "  $verdict: UDP MTR 路径不代表 HY2/SS2022 UDP 双向握手通过。"
             echo "  需要真实客户端的双向协议认证证据，单纯无响应无法判定 GFW。"
         fi
+        gfw_diag_history_append "$target" "$family" "$proto" "$port" "$local_state" "$cn" "$us" "$verdict" ||
+            echo "  [提示] 本地历史记录写入失败，探测结论不受影响。"
     done < <(gfw_diag_ports)
     [[ "$found" == 1 ]] || echo "没有已部署的 $wanted 协议端口。"
     echo "注意：TCP 建连成功不等于 VLESS/Reality/ShadowTLS/Snell 等协议握手成功。"
@@ -13818,8 +13886,11 @@ gfw_diag_menu() {
         echo "  4. 从 CN / US 远程测试全部 TCP 端口（IPv6）"
         echo "  5. 从 CN / US 远程测试 UDP 路径（IPv6，不能证明 UDP 放通）"
         echo "  6. 检测依据与判定边界"
+        echo "  7. 查看最近 20 次检测历史"
+        echo "  8. 中国电信/联通/移动 TCP 核验链接"
+        echo "  9. 清除本地检测历史（需确认）"
         echo "  0. 返回"
-        read -rp "请选择 [0-6]: " choice || return 0
+        read -rp "请选择 [0-8]: " choice || return 0
         case "$choice" in
             1) gfw_diag_local; pause ;;
             2) gfw_diag_remote_scan 4 TCP; pause ;;
@@ -13827,11 +13898,14 @@ gfw_diag_menu() {
             4) gfw_diag_remote_scan 6 TCP; pause ;;
             5) gfw_diag_remote_scan 6 UDP; pause ;;
             6)
-                echo "本机服务正常不等于大陆可达，UDP traceroute 无法证明 HY2 UDP 双向可达。"
+                echo "本机服务正常不等于大陆可达，UDP MTR 路径测试无法证明 HY2 UDP 双向可达。"
                 echo "Globalping CN/US 单探针不能替代电信/联通/移动各 ASN 实测。"
                 echo "CN 失败、US 成功只能说大陆方向疑似干扰，不等于 GFW 封锁证明。"
                 echo "所有外部检测都需要用户明确同意，且只发送公网目标地址和端口。"
                 pause ;;
+            7) gfw_diag_history_show; pause ;;
+            8) gfw_diag_trinet_links; pause ;;
+            9) gfw_diag_history_clear; pause ;;
             0) return ;;
             *) echo "无效选择"; sleep 1 ;;
         esac
