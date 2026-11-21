@@ -2979,6 +2979,12 @@ ask_server_host() {
         done
         SERVER_HOST="$input"
     fi
+
+    # Preserve explicitly entered cloud-NAT/public hostname in dual-stack IPv4 exports.
+    case "$NETWORK_MODE" in
+        ipv6) SERVER_HOST_V6="$SERVER_HOST" ;;
+        *) SERVER_HOST_V4="$SERVER_HOST" ;;
+    esac
 }
 urlencode() {
     local value="$1"
@@ -3480,8 +3486,11 @@ update_ss2022() {
         add_json=$(jq -n --argjson a "$inbound" '[$a]')
         if update_singbox_inbounds "$excluded_tags" "$add_json"; then
             if [[ "$new_network" == "dual" ]]; then
-                SERVER_HOST_V4=$(get_inbound_ipv4 2>/dev/null || true)
-                SERVER_HOST_V6=$(get_public_ipv6 2>/dev/null || get_global_ipv6 2>/dev/null || true)
+                # Do not overwrite an explicitly saved NAT/cloud entry with a new guess.
+                SERVER_HOST_V4=$(get_mode_state_field "ss" "host_v4" 2>/dev/null || true)
+                [[ -n "$SERVER_HOST_V4" ]] || SERVER_HOST_V4=$(get_inbound_ipv4 2>/dev/null || true)
+                SERVER_HOST_V6=$(get_mode_state_field "ss" "host_v6" 2>/dev/null || true)
+                [[ -n "$SERVER_HOST_V6" ]] || SERVER_HOST_V6=$(get_public_ipv6 2>/dev/null || get_global_ipv6 2>/dev/null || true)
             else
                 SERVER_HOST_V4=""
                 SERVER_HOST_V6=""
@@ -3627,8 +3636,11 @@ update_shadowtls() {
 
         if update_singbox_inbounds "$excluded_tags" "$add_json"; then
             if [[ "$new_network" == "dual" ]]; then
-                SERVER_HOST_V4=$(get_inbound_ipv4 2>/dev/null || true)
-                SERVER_HOST_V6=$(get_public_ipv6 2>/dev/null || get_global_ipv6 2>/dev/null || true)
+                # Do not overwrite an explicitly saved NAT/cloud entry with a new guess.
+                SERVER_HOST_V4=$(get_mode_state_field "shadowtls" "host_v4" 2>/dev/null || true)
+                [[ -n "$SERVER_HOST_V4" ]] || SERVER_HOST_V4=$(get_inbound_ipv4 2>/dev/null || true)
+                SERVER_HOST_V6=$(get_mode_state_field "shadowtls" "host_v6" 2>/dev/null || true)
+                [[ -n "$SERVER_HOST_V6" ]] || SERVER_HOST_V6=$(get_public_ipv6 2>/dev/null || get_global_ipv6 2>/dev/null || true)
             else
                 SERVER_HOST_V4=""
                 SERVER_HOST_V6=""
