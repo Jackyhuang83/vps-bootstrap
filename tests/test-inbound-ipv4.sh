@@ -69,6 +69,15 @@ SERVER_HOST=""
 ask_server_host <<<'12.13.14.15' >/dev/null
 assert_eq "$SERVER_HOST" "12.13.14.15" "manual cloud NAT entry"
 
+TEST_SCENARIO=nat
+NETWORK_MODE=dual
+get_public_ipv6() { printf '2001:db8::12'; }
+SERVER_HOST=""
+SERVER_HOST_V4=""
+ask_server_host <<<'12.13.14.15' >/dev/null
+assert_eq "$SERVER_HOST_V4" "12.13.14.15" "manual NAT entry saved for dual-stack export"
+assert_eq "$SERVER_HOST_V6" "2001:db8::12" "dual-stack IPv6 field preserved"
+
 TEST_SCENARIO=multi
 if get_inbound_ipv4 >/dev/null; then echo "FAIL: arbitrary address chosen on multi-IP VPS"; exit 1; fi
 SERVER_HOST=""
