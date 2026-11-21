@@ -3551,7 +3551,7 @@ update_shadowtls() {
         echo "  7. 重新生成 ShadowTLS 密码"
         echo "  8. 查看当前节点配置"
         echo "  0. 返回"
-        read -rp "请选择 [0-8]: " choice
+        read -rp "请选择 [0-9]: " choice
 
         new_port="$current_port"; new_method="$current_method"; new_ss_key="$current_ss_key"
         new_stls_pass="$current_stls_pass"; new_sni="$current_sni"; new_listen="$current_listen"
@@ -13790,6 +13790,15 @@ gfw_diag_history_append() {
     mv -f "$tmp" "$file" || { rm -f "$tmp"; return 1; }
 }
 
+gfw_diag_history_clear() {
+    local file="$STATE_DIR/gfw-diagnostics-history.jsonl" confirm=""
+    [[ -L "$file" ]] && { echo "[拒绝] 历史路径是符号链接。"; return 1; }
+    [[ -f "$file" ]] || { echo "尚无检测历史。"; return 0; }
+    read -rp "仅删除本工具箱的 GFW 诊断历史，输入 DELETE 确认: " confirm || return 1
+    if [[ "$confirm" != DELETE ]]; then echo "取消删除。"; return 0; fi
+    rm -f -- "$file" && echo "✔ 已删除本地 GFW 诊断历史；代理服务及网络配置未改变。"
+}
+
 gfw_diag_history_show() {
     local file="$STATE_DIR/gfw-diagnostics-history.jsonl"
     if [[ ! -f "$file" || -L "$file" ]]; then
@@ -13879,6 +13888,7 @@ gfw_diag_menu() {
         echo "  6. 检测依据与判定边界"
         echo "  7. 查看最近 20 次检测历史"
         echo "  8. 中国电信/联通/移动 TCP 核验链接"
+        echo "  9. 清除本地检测历史（需确认）"
         echo "  0. 返回"
         read -rp "请选择 [0-8]: " choice || return 0
         case "$choice" in
@@ -13888,13 +13898,14 @@ gfw_diag_menu() {
             4) gfw_diag_remote_scan 6 TCP; pause ;;
             5) gfw_diag_remote_scan 6 UDP; pause ;;
             6)
-                echo "本机服务正常不等于大陆可达，UDP traceroute 无法证明 HY2 UDP 双向可达。"
+                echo "本机服务正常不等于大陆可达，UDP MTR 路径测试无法证明 HY2 UDP 双向可达。"
                 echo "Globalping CN/US 单探针不能替代电信/联通/移动各 ASN 实测。"
                 echo "CN 失败、US 成功只能说大陆方向疑似干扰，不等于 GFW 封锁证明。"
                 echo "所有外部检测都需要用户明确同意，且只发送公网目标地址和端口。"
                 pause ;;
             7) gfw_diag_history_show; pause ;;
             8) gfw_diag_trinet_links; pause ;;
+            9) gfw_diag_history_clear; pause ;;
             0) return ;;
             *) echo "无效选择"; sleep 1 ;;
         esac
