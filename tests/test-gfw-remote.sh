@@ -14,11 +14,24 @@ payload=$(gfw_diag_payload 11.22.33.44 443 CN 4 TCP)
 jq -e '.type=="ping" and .target=="11.22.33.44" and
        .locations[0].country=="CN" and .locations[0].limit==1 and
        .measurementOptions.protocol=="TCP" and
-       .measurementOptions.port==443 and .timeout==10 and .measurementOptions.ipVersion==4' <<<"$payload" >/dev/null
+       .measurementOptions.port==443 and .timeout==10 and
+       (.measurementOptions | has("ipVersion") | not)' <<<"$payload" >/dev/null
 payload=$(gfw_diag_payload '2001:4860::1' 44444 US 6 UDP)
 jq -e '.type=="mtr" and .locations[0].country=="US" and
        .measurementOptions.protocol=="UDP" and .measurementOptions.packets==2 and
-       .measurementOptions.port==44444 and .timeout==30 and .measurementOptions.ipVersion==6' <<<"$payload" >/dev/null
+       .measurementOptions.port==44444 and .timeout==30 and
+       (.measurementOptions | has("ipVersion") | not)' <<<"$payload" >/dev/null
+
+
+# Literal IPv4/IPv6 targets MUST omit hostname-only ipVersion. Hostnames retain it.
+payload=$(gfw_diag_payload '2001:db8::1234' 443 CN 6 TCP 4134)
+jq -e '.locations[0].asn==4134 and (.measurementOptions | has("ipVersion") | not)' <<<"$payload" >/dev/null
+payload=$(gfw_diag_payload 11.22.33.44 5555 US 4 UDP)
+jq -e '.measurementOptions.protocol=="UDP" and (.measurementOptions | has("ipVersion") | not)' <<<"$payload" >/dev/null
+payload=$(gfw_diag_payload 'example.org' 443 US 6 TCP)
+jq -e '.measurementOptions.ipVersion==6' <<<"$payload" >/dev/null
+payload=$(gfw_diag_payload 'example.org' 443 US 4 TCP)
+jq -e '.measurementOptions.ipVersion==4' <<<"$payload" >/dev/null
 
 pass='{"status":"finished","results":[{"probe":{"country":"CN","asn":12345},"result":{"status":"finished","stats":{"rcv":2,"loss":0}}}]}'
 fail='{"status":"finished","results":[{"probe":{"country":"CN","asn":12345},"result":{"status":"finished","stats":{"rcv":0,"loss":100}}}]}'
@@ -51,6 +64,10 @@ curl() {
         *'-X POST'*)
             printf '%s\n' "$*" >> "$tmp/requests"
             case "$MOCK_SCENARIO" in
+                request_invalid) printf '{"error":{"type":"validation_error","message":"SECRET_SHOULD_NOT_BE_SHOWN","params":{"measurementOptions":"invalid"}}}\nHTTP_STATUS:400\n' ;;
+                post_200) printf '{"id":"abcDEF123456"}\nHTTP_STATUS:200\n' ;;
+                redirect_302) printf '<html>redirect</html>\nHTTP_STATUS:302\n' ;;
+                invalid_type) printf '{"error":{"type":"CUSTOM_BAD_MSG SECRET_123"}}\nHTTP_STATUS:400\n' ;;
                 no_probe) printf '{"error":{"type":"no_probes_found"}}\nHTTP_STATUS:422\n' ;;
                 rate_limit) printf '{"error":{"type":"rate_limit"}}\nHTTP_STATUS:429\n' ;;
                 api_dns_error) return 6 ;;
@@ -93,6 +110,22 @@ MOCK_SCENARIO=no_probe
 [[ "$(gfw_diag_globalping_detailed 11.22.33.44 443 CN 4 TCP)" == 'UNKNOWN|NO_ONLINE_PROBE' ]]
 MOCK_SCENARIO=rate_limit
 [[ "$(gfw_diag_globalping_detailed 11.22.33.44 443 CN 4 TCP)" == 'UNKNOWN|API_RATE_LIMIT_429' ]]
+
+MOCK_SCENARIO=request_invalid
+out=$(gfw_diag_globalping_detailed 11.22.33.44 443 CN 4 TCP)
+[[ "$out" == 'UNKNOWN|API_HTTP_400_validation_error' ]]
+[[ "$out" != *'SECRET_SHOULD_NOT_BE_SHOWN'* ]]
+[[ "$out" != *'11.22.33.44'* ]]
+MOCK_SCENARIO=post_200
+[[ "$(gfw_diag_globalping_detailed 11.22.33.44 443 CN 4 TCP)" == 'UNKNOWN|API_HTTP_200' ]]
+MOCK_SCENARIO=redirect_302
+[[ "$(gfw_diag_globalping_detailed 11.22.33.44 443 CN 4 TCP)" == 'UNKNOWN|API_HTTP_302' ]]
+MOCK_SCENARIO=invalid_type
+[[ "$(gfw_diag_globalping_detailed 11.22.33.44 443 CN 4 TCP)" == 'UNKNOWN|API_HTTP_400' ]]
+[[ "$(gfw_diag_http_failure_reason 'HTTP_STATUS:400' '{"error":{"type":"validation_error"}}')" == API_HTTP_400_validation_error ]]
+[[ "$(gfw_diag_http_failure_reason 'HTTP_STATUS:422' '{"error":{"type":"other_error"}}')" == API_HTTP_422_other_error ]]
+[[ "$(gfw_diag_http_failure_reason 'HTTP_STATUS:bad' 'invalid')" == API_HTTP_STATUS_INVALID ]]
+
 MOCK_SCENARIO=api_dns_error
 [[ "$(gfw_diag_globalping_detailed 11.22.33.44 443 CN 4 TCP)" == 'UNKNOWN|API_DNS_FAILURE' ]]
 MOCK_SCENARIO=delayed
