@@ -13587,21 +13587,124 @@ server_test_management() {
         echo "  3. 平台流媒体AI通信软件解锁测试"
         echo "  4. Google 测试（送中 / 澳门 / 拉回所在地）"
         echo "  5. 代理协议 IPv6 出站 / 链式兼容性检查"
+        echo "  6. GFW / TCP / UDP 连通性诊断"
         echo "  0. 返回"
         echo -e "${CYAN}═══════════════════════════════════════════════════════${PLAIN}"
-        read -rp "请选择 [0-5]: " c
+        read -rp "请选择 [0-6]: " c
         case "$c" in
             1) test_ip_quality ;;
             2) test_return_route ;;
             3) test_platform_media_ai_communication_unlock ;;
             4) google_test_management ;;
             5) test_proxy_ipv6_egress; pause ;;
+            6) gfw_diag_menu ;;
             0) return ;;
             *) sleep 1 ;;
         esac
     done
 }
 
+
+# ==============================================================================
+# GFW / TCP / UDP diagnostics (read-only, source-backed)
+# Local listening is not evidence of reachability from mainland China.
+# ==============================================================================
+gfw_diag_ports() {
+    local tag port network
+    if [[ -f "$SINGBOX_CONF" ]] && command -v jq >/dev/null 2>&1; then
+        port=$(get_inbound_port "$TAG_SS" 2>/dev/null || true)
+        if validate_port_number "$port" 2>/dev/null; then
+            network=$(jq -r --arg t "$TAG_SS" '.inbounds[]? | select(.tag==$t) | .network // "tcp,udp"' "$SINGBOX_CONF" 2>/dev/null | head -n1)
+            [[ "$network" == *tcp* || "$network" == "" ]] && printf 'SS2022|TCP|%s|sing-box\n' "$port"
+            [[ "$network" == *udp* || "$network" == "" ]] && printf 'SS2022|UDP|%s|sing-box\n' "$port"
+        fi
+        port=$(get_inbound_port "$TAG_STLS" 2>/dev/null || true)
+        validate_port_number "$port" 2>/dev/null && printf 'ShadowTLS v3|TCP|%s|sing-box\n' "$port"
+        port=$(get_inbound_port "$TAG_STLS_UDP" 2>/dev/null || true)
+        validate_port_number "$port" 2>/dev/null && printf 'ShadowTLS UDP|UDP|%s|sing-box\n' "$port"
+    fi
+    if xray_vless_exists; then
+        port=$(get_xray_vless_port 2>/dev/null || true)
+        validate_port_number "$port" 2>/dev/null && printf 'VLESS Reality|TCP|%s|%s\n' "$port" "$XRAY_SERVICE_NAME"
+    fi
+    if [[ -f "$SNELL_CONF" ]]; then
+        port=$(snell_port_from_config 2>/dev/null || true)
+        validate_port_number "$port" 2>/dev/null && printf 'Snell v5|TCP|%s|snell-v5\n' "$port"
+    fi
+    if [[ -f "$SNELL6_CONF" ]]; then
+        port=$(sed -nE 's/^[[:space:]]*listen[[:space:]]*=[[:space:]]*([^,]*).*/\1/p' "$SNELL6_CONF" | head -n1 | grep -oE '[0-9]+$' || true)
+        validate_port_number "$port" 2>/dev/null && printf 'Snell v6|TCP|%s|%s\n' "$port" "$SNELL6_SERVICE_NAME"
+    fi
+    if [[ -f "$HY2_CONF" && -f "$HY2_MANAGED_MARKER" ]] && command -v jq >/dev/null 2>&1; then
+        port=$(jq -r '.listen | capture(":(?<port>[0-9]+)$").port' "$HY2_CONF" 2>/dev/null || true)
+        validate_port_number "$port" 2>/dev/null && printf 'Hysteria 2|UDP|%s|%s\n' "$port" "$HY2_SERVICE_NAME"
+    fi
+    return 0
+}
+
+# Print BOUND (non-loopback), LOOPBACK, NOT_LISTENING or UNKNOWN. Never send data.
+gfw_diag_listener_status() {
+    local transport="$1" port="$2" sockets="" flag=""
+    case "$transport" in TCP) flag="-ltn" ;; UDP) flag="-lun" ;; *) return 1 ;; esac
+    command -v ss >/dev/null 2>&1 || { echo UNKNOWN; return 0; }
+    sockets=$(ss -H "$flag" 2>/dev/null) || { echo UNKNOWN; return 0; }
+    awk -v p="$port" '
+      $4 ~ (":" p "$") {
+        addr=$4; sub(":" p "$","",addr);
+        if (addr=="127.0.0.1" || addr=="[::1]" || addr=="::1") localonly=1;
+        else external=1
+      }
+      END {if(external) print "BOUND"; else if(localonly) print "LOOPBACK"; else print "NOT_LISTENING"}' <<<"$sockets"
+}
+
+gfw_diag_local() {
+    local name proto port service state listen any=0 inbound=""
+    echo "════════════ 全协议本机诊断（只读）════════════"
+    echo "时间: $(date -u '+%Y-%m-%d %H:%M UTC')"
+    inbound=$(get_inbound_ipv4 2>/dev/null || true)
+    echo "公网入口 IPv4 候选: ${inbound:-无法自动确认（云 NAT 请以 VPS 控制台为准）}"
+    echo "注意：不能用 WARP/SNAT 出口 IPv4 代替节点入口。"
+    while IFS='|' read -r name proto port service; do
+        [[ -n "$name" ]] || continue
+        any=1
+        state="STOPPED"
+        service_is_active "$service" && state="RUNNING"
+        listen=$(gfw_diag_listener_status "$proto" "$port")
+        printf ' %-15s %-3s %-5s 服务=%-7s 监听=%s\n' "$name" "$proto" "$port" "$state" "$listen"
+        if [[ "$listen" == LOOPBACK ]]; then
+            echo "   提示：仅回环监听，公网客户端无法直连。"
+        elif [[ "$listen" == NOT_LISTENING || "$state" == STOPPED ]]; then
+            echo "   提示：优先排查服务/监听，不应直接判为 GFW 阻断。"
+        fi
+    done < <(gfw_diag_ports)
+    [[ "$any" == 1 ]] || echo "未找到本工具箱管理的已部署协议；不尝试扫描未授权端口。"
+    echo "结论：本机监听仅确认服务状态，不能证明大陆 TCP/UDP 连通。"
+    echo "UDP 端口有监听 ≠ UDP 双向可达；必须结合远端真实协议请求验证。"
+    echo "不会更改防火墙、路由、WARP、SNI、代理配置或重启服务。"
+}
+
+gfw_diag_menu() {
+    local choice
+    while true; do
+        clear
+        echo -e "${CYAN}════════════ GFW / TCP / UDP 连通性诊断 ════════════${PLAIN}"
+        echo "  1. 一键本机全协议 TCP/UDP 监听与服务检查"
+        echo "  2. 查看检测依据与判定边界"
+        echo "  0. 返回"
+        read -rp "请选择 [0-2]: " choice || return 0
+        case "$choice" in
+            1) gfw_diag_local; pause ;;
+            2)
+                echo "本机监听通过不代表中国大陆可达；网络异常也不等于 GFW 封锁。"
+                echo "TCP 建连成功不代表 TLS/Reality/Snell/SS2022 协议握手成功。"
+                echo "UDP 必须有服务响应或双向收包证据，不能以 nc -u/路由探测当作放通。"
+                echo "应比较中国大陆不同 ASN/运营商与海外对照、历史时段和真实客户端日志。"
+                pause ;;
+            0) return ;;
+            *) echo "无效选择"; sleep 1 ;;
+        esac
+    done
+}
 
 # Experimental isolated Snell -> WARP IPv6 TCP bridge.
 # This is not transparent routing. Surge must point its chained SS2022
