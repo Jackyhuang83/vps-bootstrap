@@ -9,6 +9,7 @@ on:
       - "tests/test-google.sh"
       - "tests/test-mktemp.sh"
       - "tests/test-dns-resolver.sh"
+      - "tests/test-inbound-ipv4.sh"
       - "tests/test-reality-sni.sh"
       - "tests/test-xray-restart.sh"
       - "tests/test-dashboard-nodes.sh"
@@ -32,6 +33,7 @@ on:
       - "tests/test-google.sh"
       - "tests/test-mktemp.sh"
       - "tests/test-dns-resolver.sh"
+      - "tests/test-inbound-ipv4.sh"
       - "tests/test-reality-sni.sh"
       - "tests/test-xray-restart.sh"
       - "tests/test-dashboard-nodes.sh"
@@ -82,6 +84,12 @@ jobs:
           bash -n tests/test-dns-resolver.sh
           shellcheck --severity=error tests/test-dns-resolver.sh
           bash tests/test-dns-resolver.sh
+
+      - name: Distinguish proxy ingress IPv4 from WARP/SNAT egress
+        run: |
+          bash -n tests/test-inbound-ipv4.sh
+          shellcheck --severity=error tests/test-inbound-ipv4.sh
+          bash tests/test-inbound-ipv4.sh
 
       - name: Portable mktemp and updater regression
         run: bash tests/test-mktemp.sh
