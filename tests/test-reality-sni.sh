@@ -52,4 +52,28 @@ fallback=$(select_reality_sni "" <<<"0" || true)
 [[ "$fallback" == *"未验证"* ]] || {
     echo 'FAIL: no compliant targets not labeled unverified'; exit 1
 }
+
+# P8: bilingual labels in the VLESS Reality node detail view only.
+# No service writes, network access or QR rendering in this fixture.
+CYAN="" GREEN="" PLAIN="" YELLOW=""
+show_qr() { :; }
+fixture_uuid='12345678-1234-1234-1234-1234567890ab'
+fixture_key='fixture-public-key-not-a-secret'
+details=$(show_vless_details '203.0.113.9' 12001 "$fixture_uuid" \
+    'www.openssl.org' "$fixture_key" '04154744' 'VLESS-demo')
+expected_fields=
+  协议（protocol）: vless\n  地址（address）: 203.0.113.9\n  端口（port）: 12001\n  用户ID（id）: 12345678-1234-1234-1234-1234567890ab\n  流控（flow）: xtls-rprx-vision\n  传输层安全（TLS）: reality\n  伪装域名（sni）: www.openssl.org\n  公钥（pbk）: fixture-public-key-not-a-secret\n  ShortId（sid）: 04154744'
+[[ "$details" == *"$expected_fields"* ]] || {
+    echo 'FAIL: VLESS bilingual field order/values or colon delimiter mismatch'; exit 1
+}
+[[ "$details" == *'节点名称: VLESS-demo'* ]] || {
+    echo 'FAIL: existing node name label changed'; exit 1
+}
+[[ "$details" == *'vless://12345678-1234-1234-1234-1234567890ab@203.0.113.9:12001?'* ]] || {
+    echo 'FAIL: VLESS URI export changed'; exit 1
+}
+[[ "$details" == *'VLESS-demo = vless, 203.0.113.9, 12001, username=12345678-1234-1234-1234-1234567890ab, flow=xtls-rprx-vision, sni=www.openssl.org, reality-public-key=fixture-public-key-not-a-secret, reality-short-id=04154744'* ]] || {
+    echo 'FAIL: Surge line changed'; exit 1
+}
+
 echo 'PASS: Reality SNI output parser, bounded ranking, preservation and fallback'
