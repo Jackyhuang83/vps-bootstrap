@@ -229,10 +229,13 @@ hy2_details() {
     domain_enc=$(urlencode "$domain")
     name_enc=$(urlencode "$name")
     echo "════════════ Hysteria 2 (QUIC / UDP) ════════════"
-    echo "名称: $name"
-    echo "入口: $host:$port/UDP"
-    echo "SNI / TLS 证书域名: $domain（证书必须由受信任 CA 签发）"
-    echo "密码: $password"
+    echo "节点名称 (name): $name"
+    echo "协议 (protocol): hysteria2"
+    echo "地址 (address): $host"
+    echo "端口 (port): $port"
+    echo "传输协议 (network): QUIC / UDP"
+    echo "TLS 证书域名 (sni): $domain（证书必须由受信任 CA 签发）"
+    echo "认证密码 (password): $password"
     echo ""
     echo "【Surge iOS 5.8+ / Mac 5.4+】"
     echo "$name = hysteria2, $host, $port, password=$password, sni=$domain"
