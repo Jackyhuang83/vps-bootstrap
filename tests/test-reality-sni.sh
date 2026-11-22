@@ -61,8 +61,18 @@ fixture_uuid='12345678-1234-1234-1234-1234567890ab'
 fixture_key='fixture-public-key-not-a-secret'
 details=$(show_vless_details '203.0.113.9' 12001 "$fixture_uuid" \
     'www.openssl.org' "$fixture_key" '04154744' 'VLESS-demo')
-expected_fields=
-  协议（protocol）: vless\n  地址（address）: 203.0.113.9\n  端口（port）: 12001\n  用户ID（id）: 12345678-1234-1234-1234-1234567890ab\n  流控（flow）: xtls-rprx-vision\n  传输层安全（TLS）: reality\n  伪装域名（sni）: www.openssl.org\n  公钥（pbk）: fixture-public-key-not-a-secret\n  ShortId（sid）: 04154744'
+expected_fields=$(cat <<'EXPECTED'
+  协议（protocol）: vless
+  地址（address）: 203.0.113.9
+  端口（port）: 12001
+  用户ID（id）: 12345678-1234-1234-1234-1234567890ab
+  流控（flow）: xtls-rprx-vision
+  传输层安全（TLS）: reality
+  伪装域名（sni）: www.openssl.org
+  公钥（pbk）: fixture-public-key-not-a-secret
+  ShortId（sid）: 04154744
+EXPECTED
+)
 [[ "$details" == *"$expected_fields"* ]] || {
     echo 'FAIL: VLESS bilingual field order/values or colon delimiter mismatch'; exit 1
 }
