@@ -18,6 +18,7 @@ on:
       - "tests/test-reality-sni.sh"
       - "tests/test-xray-restart.sh"
       - "tests/test-dashboard-nodes.sh"
+      - "tests/test-node-details-labels.sh"
       - "tests/test-snell-v6.sh"
       - "tests/test-ipv6-egress.sh"
       - "tests/test-snell-warp-bridge.sh"
@@ -47,6 +48,7 @@ on:
       - "tests/test-reality-sni.sh"
       - "tests/test-xray-restart.sh"
       - "tests/test-dashboard-nodes.sh"
+      - "tests/test-node-details-labels.sh"
       - "tests/test-snell-v6.sh"
       - "tests/test-ipv6-egress.sh"
       - "tests/test-snell-warp-bridge.sh"
@@ -139,6 +141,12 @@ jobs:
 
       - name: Per-core dashboard node status regression
         run: bash tests/test-dashboard-nodes.sh
+
+      - name: Bilingual protocol node detail labels and module checksum regression
+        run: |
+          bash -n tests/test-node-details-labels.sh
+          shellcheck --severity=error tests/test-node-details-labels.sh
+          bash tests/test-node-details-labels.sh
 
       - name: Official Snell v6 module syntax and isolation
         run: |
